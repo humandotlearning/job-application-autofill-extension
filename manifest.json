@@ -2,10 +2,10 @@
   "manifest_version": 3,
   "name": "Job Application Autofill",
   "description": "Bulk-fill job application forms from verified Google Sheet answers.",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "minimum_chrome_version": "114",
   "permissions": ["activeTab", "identity", "scripting", "storage", "sidePanel"],
-  "host_permissions": ["https://docs.google.com/*", "https://sheets.googleapis.com/*", "https://jobs.ashbyhq.com/*", "https://job-boards.greenhouse.io/*", "https://impactxtech.com/*", "https://www.impactxtech.com/*"],
+  "host_permissions": ["https://docs.google.com/*", "https://sheets.googleapis.com/*", "https://jobs.ashbyhq.com/*", "https://job-boards.greenhouse.io/*", "https://impactxtech.com/*", "https://www.impactxtech.com/*", "https://impacttxtech.com/*", "https://www.impacttxtech.com/*", "https://jobs.lever.co/*"],
   "oauth2": {
     "client_id": "REPLACE_WITH_GOOGLE_OAUTH_CLIENT_ID.apps.googleusercontent.com",
     "scopes": ["https://www.googleapis.com/auth/spreadsheets.readonly"]

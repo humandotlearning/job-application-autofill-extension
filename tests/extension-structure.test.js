@@ -26,6 +26,9 @@ test('manifest is a least-privilege Manifest V3 side-panel extension', async () 
     'https://job-boards.greenhouse.io/*',
     'https://impactxtech.com/*',
     'https://www.impactxtech.com/*',
+    'https://impacttxtech.com/*',
+    'https://www.impacttxtech.com/*',
+    'https://jobs.lever.co/*',
   ]);
 });
 
