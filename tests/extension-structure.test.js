@@ -19,7 +19,12 @@ test('manifest is a least-privilege Manifest V3 side-panel extension', async () 
   assert.ok(manifest.permissions.includes('identity'));
   assert.ok(manifest.oauth2.scopes.includes('https://www.googleapis.com/auth/spreadsheets.readonly'));
   assert.ok(!manifest.host_permissions.includes('<all_urls>'));
-  assert.deepEqual(manifest.host_permissions, ['https://docs.google.com/*', 'https://sheets.googleapis.com/*']);
+  assert.deepEqual(manifest.host_permissions, [
+    'https://docs.google.com/*',
+    'https://sheets.googleapis.com/*',
+    'https://jobs.ashbyhq.com/*',
+    'https://job-boards.greenhouse.io/*',
+  ]);
 });
 
 test('side panel contains sync, scan, and bulk-fill controls', async () => {
