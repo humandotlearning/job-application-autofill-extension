@@ -102,9 +102,7 @@ async function importCsv(file) {
 
 async function activeTab() {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-  if (!tab?.id || !/^https?:/i.test(tab.url || '')) {
-    throw new Error('Open an HTTP or HTTPS job application page first.');
-  }
+  if (!tab?.id) throw new Error('No active browser tab was found.');
   return tab;
 }
 
