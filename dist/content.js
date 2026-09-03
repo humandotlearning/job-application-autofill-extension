@@ -138,6 +138,22 @@ function derivedEmailRecords(body, source) {
   return records;
 }
 
+function expandEmailTemplateRecords(records = []) {
+  const expanded = [];
+  const seen = new Set();
+  for (const record of records) {
+    const candidates = record?.type === 'email-template'
+      ? [record, ...derivedEmailRecords(record.answer, record.source || 'email-template')]
+      : [record];
+    for (const candidate of candidates) {
+      if (!candidate?.key || seen.has(candidate.key)) continue;
+      seen.add(candidate.key);
+      expanded.push(candidate);
+    }
+  }
+  return expanded;
+}
+
 function emailTemplateRecords(body, source) {
   return [{
     key: 'email_template',
@@ -425,6 +441,10 @@ function collectChangedResponses(document, initialValues) {
   return records;
 }
 
+function isEmailTemplateField(field) {
+  return /cover letter|covering letter|application message|email body|message/i.test(field.label || '');
+}
+
 function fillElement(document, element, answer) {
   if (element.tagName === 'SELECT') return setSelectValue(element, answer);
   if (element.type === 'radio') return setRadioGroup(document, element, answer);
@@ -469,7 +489,10 @@ function scanAndFillDocument(document, records, { fill = false, overwrite = fals
       seenRadioGroups.add(element.name);
     }
     const field = describeField(document, element);
-    const match = chooseRecord(field, records);
+    let match = chooseRecord(field, records);
+    if (match?.record?.type === 'email-template' && !isEmailTemplateField(field)) {
+      match = chooseRecord(field, records.filter((record) => record.type !== 'email-template'));
+    }
     const item = reportItem(field, match, element, { currentValue: element.value || '' });
     report.scanned.push(item);
 

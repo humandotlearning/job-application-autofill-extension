@@ -155,6 +155,10 @@ export function collectChangedResponses(document, initialValues) {
   return records;
 }
 
+function isEmailTemplateField(field) {
+  return /cover letter|covering letter|application message|email body|message/i.test(field.label || '');
+}
+
 function fillElement(document, element, answer) {
   if (element.tagName === 'SELECT') return setSelectValue(element, answer);
   if (element.type === 'radio') return setRadioGroup(document, element, answer);
@@ -199,7 +203,10 @@ export function scanAndFillDocument(document, records, { fill = false, overwrite
       seenRadioGroups.add(element.name);
     }
     const field = describeField(document, element);
-    const match = chooseRecord(field, records);
+    let match = chooseRecord(field, records);
+    if (match?.record?.type === 'email-template' && !isEmailTemplateField(field)) {
+      match = chooseRecord(field, records.filter((record) => record.type !== 'email-template'));
+    }
     const item = reportItem(field, match, element, { currentValue: element.value || '' });
     report.scanned.push(item);
 

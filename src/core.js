@@ -136,6 +136,22 @@ function derivedEmailRecords(body, source) {
   return records;
 }
 
+export function expandEmailTemplateRecords(records = []) {
+  const expanded = [];
+  const seen = new Set();
+  for (const record of records) {
+    const candidates = record?.type === 'email-template'
+      ? [record, ...derivedEmailRecords(record.answer, record.source || 'email-template')]
+      : [record];
+    for (const candidate of candidates) {
+      if (!candidate?.key || seen.has(candidate.key)) continue;
+      seen.add(candidate.key);
+      expanded.push(candidate);
+    }
+  }
+  return expanded;
+}
+
 function emailTemplateRecords(body, source) {
   return [{
     key: 'email_template',

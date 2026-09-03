@@ -1,4 +1,4 @@
-import { parseCsv, rowsToRecords } from './core.js';
+import { expandEmailTemplateRecords, parseCsv, rowsToRecords } from './core.js';
 import { fetchGoogleSheetRecords, fetchPrivateGoogleSheetRecords } from './data-source.js';
 
 const DEFAULT_SHEET_URL = 'https://docs.google.com/spreadsheets/d/1SoKWd8RL1YpZxP3Bvs5bclF_fhs47VZpk1wh6H6UBJ0/edit?gid=0#gid=0';
@@ -49,7 +49,9 @@ async function saveRecords(records, sheetUrl, source) {
 
 async function getRecords() {
   const { answerRecords = [] } = await chrome.storage.local.get('answerRecords');
-  return answerRecords;
+  const expanded = expandEmailTemplateRecords(answerRecords);
+  if (expanded.length !== answerRecords.length) await chrome.storage.local.set({ answerRecords: expanded });
+  return expanded;
 }
 
 async function getGoogleToken() {

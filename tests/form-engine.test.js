@@ -114,3 +114,19 @@ test('fills a review-only email template only when explicitly enabled', () => {
   assert.equal(filled.filled.length, 1);
   assert.equal(document.querySelector('textarea').value, 'Hello hiring team');
 });
+
+test('does not match the full email template to an ordinary email field', () => {
+  const document = makeDocument(`
+    <label for="email">Email</label><input id="email" type="email">
+    <label for="phone">Phone number</label><input id="phone" type="tel">
+  `);
+  const records = [
+    { key: 'email_template', question: 'Application email or cover letter', answer: 'Hello\nGitHub: https://github.com/example', type: 'email-template', status: 'draft', sensitivity: 'review' },
+    { key: 'phone', question: 'Phone number', answer: '+918882339186', aliases: ['Phone'], type: 'tel', status: 'verified', sensitivity: 'safe' },
+  ];
+  const report = scanAndFillDocument(document, records, { fill: true });
+  assert.equal(document.querySelector('#email').value, '');
+  assert.equal(document.querySelector('#phone').value, '+918882339186');
+  assert.equal(report.review.length, 0);
+  assert.equal(report.filled.length, 1);
+});

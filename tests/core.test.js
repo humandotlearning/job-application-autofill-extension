@@ -4,6 +4,7 @@ import assert from 'node:assert/strict';
 import {
   buildGoogleSheetCsvUrl,
   chooseRecord,
+  expandEmailTemplateRecords,
   normalizeText,
   parseCsv,
   rowsToRecords,
@@ -119,4 +120,18 @@ test('recognizes an unstructured email CSV as a review-only application template
   assert.equal(records.find((record) => record.key === 'preferred_name')?.answer, 'Nithin');
   const match = chooseRecord({ label: 'Cover Letter', type: 'textarea' }, records);
   assert.equal(match.record.key, 'email_template');
+});
+
+test('migrates cached email templates into structured safe records', () => {
+  const expanded = expandEmailTemplateRecords([{
+    key: 'email_template',
+    question: 'Application email or cover letter',
+    answer: 'Warm Regards\nNithin\n+91 8882339186\nGitHub: https://github.com/humandotlearning',
+    type: 'email-template',
+    status: 'draft',
+    sensitivity: 'review',
+    source: 'csv:resume - email.csv',
+  }]);
+  assert.equal(expanded.find((record) => record.key === 'phone')?.answer, '+918882339186');
+  assert.equal(expanded.find((record) => record.key === 'github')?.answer, 'https://github.com/humandotlearning');
 });
