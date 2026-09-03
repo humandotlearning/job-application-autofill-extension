@@ -1,178 +1,112 @@
-# Job Application Autofill Chrome Extension
+# Job Application Autofill
 
-A Manifest V3 side-panel extension that scans the current job application and fills all **verified, safe** answers in one pass. It uses the provided Google Sheet as its default source and keeps the normalized answer cache in Chrome local storage.
+A personal Manifest V3 Chrome extension that fills job forms quickly from a local answer profile, asks an OpenAI model only about unresolved fields, and learns from the values you confirm at submission.
 
-## How it works
+## Runtime flow
 
-### Runtime autofill flow
+```mermaid
+flowchart TD
+    A[Fill application] --> B[Service worker creates applicationRun]
+    B --> C[Inspect visible supported fields]
+    C --> D[Deterministic local matching]
+    D --> E[Fill validated high-confidence answers]
+    E --> F{Fields still empty or invalid?}
+    F -->|No| G[Rescan and validate page]
+    F -->|Yes| H[One Responses API batch]
+    H --> I[Strict JSON decisions]
+    I --> J[Validate type, options, pattern, length, bounds]
+    J --> G
+    G --> K{Manual pause?}
+    K -->|Required/invalid, upload, CAPTCHA, login, unsupported widget| L[Focus first issue and wait]
+    K -->|No| M{One visible Next/Continue?}
+    M -->|Yes| N[Capture page values and click Next]
+    N --> C
+    M -->|No, one Submit| O[Ready to submit]
+    O --> P[User clicks Confirm & submit]
+    P --> Q[Rescan and browser validation]
+    Q --> R[Save every final non-empty answer]
+    R --> S[Submit exactly once]
+```
+
+The page receives field descriptors and validated decisions, never the API key. The model cannot execute selectors or click controls.
+
+## How fields and answers move
+
+```mermaid
+sequenceDiagram
+    participant Panel as Side panel
+    participant Worker as Service worker
+    participant Page as Content script
+    participant Profile as chrome.storage.local
+    participant Run as chrome.storage.session
+    participant OpenAI as OpenAI Responses API
+
+    Panel->>Worker: Fill application
+    Worker->>Run: status=running, keyed by tab
+    Worker->>Page: inspect visible fields
+    Page-->>Worker: descriptors, actions, pause reasons
+    Worker->>Profile: read answerRecords
+    Worker->>Page: apply deterministic decisions
+    Page-->>Worker: applied, kept, failed, reviewRequired
+    Worker->>OpenAI: unresolved descriptors + local records only
+    OpenAI-->>Worker: strict FillDecision JSON
+    Worker->>Page: apply validated decisions
+    Worker->>Page: capture final values before navigation
+    Worker->>Run: page snapshots, unresolved, review, audit
+    Worker->>Page: click one validated Next/Continue
+    Panel->>Worker: Confirm & submit
+    Worker->>Page: inspect and validate again
+    Worker->>Profile: upsert confirmed values and aliases
+    Worker->>Page: real form submission once
+```
+
+## Local learning
 
 ```mermaid
 flowchart LR
-    A[Side panel action] --> B{Answer source}
-    B -->|Sync public sheet| C[Google Sheets CSV export]
-    B -->|Sync private sheet| D[Google OAuth + Sheets API]
-    B -->|Import CSV| E[Local CSV file]
-    C --> F[Parse and normalize rows]
-    D --> F
-    E --> F
-    F --> G[(chrome.storage.local<br/>answerRecords)]
-    G --> H[Load records for active tab]
-    H --> I[content.js + form-engine.js]
-    I --> J[Find supported fields]
-    J --> K[Match autocomplete, labels, aliases,\nname/id, and fuzzy text]
-    K --> L{Verified and safe?}
-    L -->|No| M[Report for review]
-    L -->|Yes| N{Already has a value?}
-    N -->|Yes, replace off| O[Leave unchanged]
-    N -->|No or replace on| P[Fill input, textarea, select,<br/>checkbox, or radio]
-    P --> Q[Dispatch input/change/blur events]
-    I --> R[Return scan report]
-    R --> S[(chrome.storage.session<br/>formSessions per tab)]
+    A[User or ATS completes fields] --> B[Capture non-empty supported values]
+    B --> C[Canonical key from label]
+    C --> D[Merge with existing answerRecords]
+    D --> E[Keep aliases and newest answer]
+    E --> F[(chrome.storage.local)]
+    F --> G[Reuse safe answers automatically]
+    F --> H[Prefill review/legal answers and show them at final review]
 ```
 
-The side panel reads or imports answers, converts them into normalized records, and caches them locally. When you scan or fill, those records are sent only to the active tab. Matching uses the field's autocomplete metadata first, then labels and aliases. Only records marked `verified` and `safe` are filled automatically; the rest appear in the review report.
+Learning has no separate mode or queue. Saving happens only after the explicit final confirmation. Existing `answerRecords` are normalized during migration; obsolete source configuration and pending queues are discarded.
 
-### Learning answers for future use
+## Data sent to the model
 
-```mermaid
-flowchart LR
-    A[Click Start learning] --> B[Snapshot current supported fields]
-    B --> C[Listen for input, change, and blur]
-    C --> D[Compare current value with snapshot]
-    D --> E{Non-empty and changed?}
-    E -->|No| C
-    E -->|Yes| F[Create learned record<br/>with label, answer, type, sensitivity, URL]
-    F --> G[content.js sends runtime message]
-    G --> H[Service worker deduplicates<br/>by key, answer, and tab]
-    H --> I[(chrome.storage.local<br/>pendingLearnedAnswers)]
-    I --> J[Review pending count]
-    J --> K[Approve safe learned answers]
-    K --> L[Promote to answerRecords<br/>status=verified, sensitivity=safe]
-    L --> M[Available to future autofill]
-    I --> N[Sensitive/legal answers<br/>remain review-gated]
-```
+At most one request is made per page, and only when local answers do not cover it. The request contains:
 
-Learning is deliberately two-stage. A changed answer is saved locally as pending immediately, but it does not become an automatic answer until you approve it. Sensitive answers remain pending for manual review. The temporary baseline and learning listeners live in the page; reusable answers live in `chrome.storage.local`. Form reports live separately in tab-scoped `chrome.storage.session` and are cleared when the tab loads or closes.
+- page title and hostname;
+- visible field descriptors: label, type, autocomplete, current value, options, required state, and HTML constraints;
+- local learned answer records: canonical key, question, answer, aliases, type, and sensitivity.
 
-## Current data source
+It does not contain raw HTML, hidden inputs, passwords, cookies, URLs with query strings, or the API key. The model must use evidence from the supplied records and return `ask_user` when evidence is missing or ambiguous. Failed API calls fall back to local fills and a manual pause.
 
-The extension requests host access to all URLs so it can work with arbitrary job boards and ATS providers. It only reads a page when you explicitly trigger a side-panel action; it does not crawl or monitor unrelated pages.
+The extension uses `gpt-5.6-terra` with low reasoning effort, `store: false`, and strict JSON Schema output. The API key is held in trusted `chrome.storage.local` and read only by the extension side panel/service worker.
 
-The extension is preconfigured with:
+## Install and use
 
-```text
-https://docs.google.com/spreadsheets/d/1SoKWd8RL1YpZxP3Bvs5bclF_fhs47VZpk1wh6H6UBJ0/edit?gid=0#gid=0
-```
+1. Run `npm install`, then `npm run build`.
+2. Open `chrome://extensions`, enable Developer mode, and choose **Load unpacked**.
+3. Select `C:\Users\nithi\job-application-autofill-extension`.
+4. Open a job application and open the extension side panel.
+5. Enter an OpenAI API key if you want unresolved-field assistance. Local deterministic filling works without it.
+6. Click **Fill application**. Complete any highlighted required fields or manual steps, then click **Continue**.
+7. Review the attention list and visible form. Click **Confirm & submit** once the final page is ready.
 
-The workbook is private: an unauthenticated export currently returns HTTP 401. The extension therefore supports Google OAuth with the read-only Sheets scope. It reads every tab and combines reusable records.
+The first confirmed application seeds the local profile. Later semantically equivalent forms reuse those answers. Safe answers can fill without review; medium-confidence, long-form, review, and legal answers remain visible in final review.
 
-- `Sheet1`: headerless key/value rows such as `LinkedIn:` and its URL.
-- `common questions`: `Questions` and `Answers` headers.
-- `email`: unstructured email text; ignored by the form-answer importer.
+## Boundaries
 
-It also accepts a local CSV as a fallback. You do **not** need to publish the sheet or enable “Anyone with the link.”
-
-## What the MVP does
-
-- Opens in Chrome's side panel and works in the actual visible tab.
-- Reads all tabs from the configured Google Sheet.
-- Supports `Field/Value`, `Question/Answer`, `Questions/Answers`, and headerless two-column key/value layouts.
-- Finds labels through native labels, ARIA metadata, placeholders, field names, legends, and autocomplete metadata.
-- Bulk-fills text inputs, textareas, selects, checkboxes, and radio groups.
-- Dispatches `input`, `change`, and `blur` events for React-style forms.
-- Preserves fields that already contain a value unless **Replace fields** is enabled.
-- Reports filled, existing, review-gated, unknown, failed, and required-empty fields.
-- Can start an explicit learning observer after autofill and capture later field changes locally as pending answers.
-- Lets you approve safe learned answers for future autofill; sensitive learned answers remain review-gated.
-- Never touches passwords, file uploads, buttons, or submit controls.
-- Defaults salary/CTC, authorization, sponsorship, citizenship, notice-period, reference, and relocation questions to review when the sheet has no policy column.
-- Defaults consent, agreement, attestation, privacy, demographic, disability, veteran, criminal, and conflict questions to legal review.
-
-## One-time installation
-
-The project is already built. To load it:
-
-1. Open `chrome://extensions`.
-2. Enable **Developer mode**.
-3. Select **Load unpacked**.
-4. Choose:
-
-   ```text
-   C:\Users\nithi\job-application-autofill-extension
-   ```
-
-5. Pin **Job Application Autofill** if desired.
-6. Copy the extension ID shown on the extension card; it is needed for private Google Sheet access.
-
-Loading an unpacked extension is a Chrome permission action, so it is intentionally left for you to approve in Chrome.
-
-## Enable private Google Sheet synchronization
-
-1. Open [Google Cloud Console](https://console.cloud.google.com/).
-2. Create or select a project.
-3. Open **APIs & Services → Library** and enable **Google Sheets API**.
-4. Configure the OAuth consent screen. If the app is in testing, add your Google account as a test user.
-5. Open **APIs & Services → Credentials → Create credentials → OAuth client ID**.
-6. Select **Chrome Extension** as the application type.
-7. Paste the extension ID from `chrome://extensions` into **Item ID**.
-8. Copy the generated client ID.
-9. In `manifest.json`, replace:
-
-   ```text
-   REPLACE_WITH_GOOGLE_OAUTH_CLIENT_ID.apps.googleusercontent.com
-   ```
-
-   with the generated client ID.
-10. Return to `chrome://extensions` and click **Reload** on the extension card.
-11. Open the extension side panel and select **Sync Google Sheet**.
-12. Approve the read-only Google Sheets permission.
-
-The extension requests only:
-
-```text
-https://www.googleapis.com/auth/spreadsheets.readonly
-```
-
-Reference: [Chrome OAuth guide](https://developer.chrome.com/docs/extensions/how-to/integrate/oauth).
-
-## Recommended Google Sheet columns
-
-Existing two-column tabs continue to work. For stronger matching and explicit safety, use this optional schema:
-
-| Column | Purpose | Example |
-|---|---|---|
-| `Key` | Stable canonical identifier | `linkedin` |
-| `Question` | Main form label | `LinkedIn URL` |
-| `Answer` | Reusable value | `https://linkedin.com/in/...` |
-| `Aliases` | Semicolon-separated alternate labels | `LinkedIn;LinkedIn profile` |
-| `Type` | Informational field type | `url` |
-| `Status` | `verified` or `draft` | `verified` |
-| `Sensitivity` | `safe`, `review`, or `legal` | `safe` |
-| `Options` | Optional semicolon-separated choices | `Yes;No` |
-
-Only records with `Status=verified` and `Sensitivity=safe` are automatically filled. A blank status defaults to `verified`; a blank sensitivity is inferred conservatively from the question.
-
-## Daily use
-
-1. Open a job application.
-2. Use the employer's **Autofill with Resume** or **Parse Resume** feature first when available.
-3. Open **Job Application Autofill** from the Chrome toolbar.
-4. Select **Sync Google Sheet** after changing the workbook.
-5. Select **Scan form** to preview matches without changing the page.
-6. Select **Fill safe fields** to populate all verified safe matches in one pass.
-7. Review the side-panel report and the visible form.
-8. Select **Start learning** after the first autofill, complete missing answers, and leave the page open while you work.
-9. Review the pending learned-answer count in the side panel. Select **Approve safe learned answers** only after checking them; salary, legal, consent, demographic, authorization, and similar responses stay pending.
-10. Handle resume upload, login, CAPTCHA, consent, and unknown questions manually or through the Hermes workflow.
-11. Submit only after explicit review.
-
-## Local CSV fallback
-
-Select **Import CSV** in the side panel and choose a CSV using one of the supported layouts. A starting template is available at `examples/answers-template.csv`.
+- Resume uploads, CAPTCHA, login, cross-origin iframes, shadow-root controls, and ambiguous custom widgets remain manual pause points.
+- Automation is limited to the active tab and stops after 20 pages.
+- Final submission always requires one explicit user confirmation.
+- This personal unpacked extension uses a direct API key. A public distribution should move model calls behind a backend.
 
 ## Development
-
-PowerShell:
 
 ```powershell
 Set-Location C:\Users\nithi\job-application-autofill-extension
@@ -182,28 +116,17 @@ npm test
 npm run check
 ```
 
-`npm run build` combines the tested ES modules into `dist/content.js`, a classic script that Chrome can inject into job pages.
+The build combines the tested core, form engine, and content bridge into `dist/content.js`, a classic script suitable for runtime injection.
 
-## Test page
+## Demo form
 
-Serve the project over HTTP, because Chrome does not grant `file://` access by default:
+Serve the repository over HTTP:
 
 ```powershell
 Set-Location C:\Users\nithi\job-application-autofill-extension
 python -m http.server 8765
 ```
 
-Then open `http://127.0.0.1:8765/examples/demo-form.html`, import `examples/answers-template.csv`, scan, and fill.
+Then open [http://127.0.0.1:8765/examples/demo-form.html](http://127.0.0.1:8765/examples/demo-form.html). The two-step demo covers text, select, radio, long-form, required fields, a file-upload pause, Next navigation, submission, and second-run learning.
 
-## Known MVP limitations
-
-- Does not upload a resume; Chrome's native file picker remains a user/computer-use operation.
-- Does not automatically click ATS resume-import buttons, Next, Continue, or Submit.
-- Does not yet integrate Hermes answer drafting into the side panel.
-- Does not yet handle controls inside cross-origin iframes or shadow roots.
-- Highly customized comboboxes may be reported as failed and need an ATS adapter.
-- A Microsoft Excel `.xlsx` stored in Drive is not parsed directly. Convert it to a Google Sheet or download it as CSV. The supplied source is already a Google Sheet.
-
-## Privacy
-
-See [PRIVACY.md](PRIVACY.md). Personal answers stay in Chrome local storage and are sent only to the active page when you explicitly scan or fill. The extension does not include analytics or remote AI calls.
+See [PRIVACY.md](PRIVACY.md) for storage and model-data handling.

@@ -2,131 +2,121 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { JSDOM } from 'jsdom';
 
-import { collectChangedResponses, scanAndFillDocument } from '../src/form-engine.js';
+import {
+  applyDecisions,
+  collectAnswerRecords,
+  collectFieldDescriptors,
+  inspectDocument,
+  planDeterministicFill,
+  validateDocument,
+} from '../src/form-engine.js';
 
 function makeDocument(html) {
   return new JSDOM(html, { url: 'https://jobs.example.com/apply' }).window.document;
 }
 
-test('captures only user-completed learnable fields and excludes sensitive questions', () => {
+test('describes supported fields without passwords or hidden inputs', () => {
   const document = makeDocument(`
     <form>
-      <label for="why">Why do you want this role?</label><textarea id="why">Build useful products</textarea>
-      <label for="salary">Expected CTC</label><input id="salary" value="6000000">
-      <label for="email">Email</label><input id="email" value="person@example.com">
+      <label for="name">Full Name</label><input id="name" autocomplete="name" required>
+      <label for="country">Country</label><select id="country"><option value="">Choose</option><option value="IN">India</option></select>
+      <input type="hidden" name="csrf" value="secret"><input type="password" name="password">
+      <input type="file" name="resume">
     </form>
   `);
-  const initial = new Map([
-    ['why', ''],
-    ['salary', ''],
-    ['email', 'person@example.com'],
-  ]);
-  const records = collectChangedResponses(document, initial);
-  assert.deepEqual(records.map(({ question, answer, sensitivity }) => ({ question, answer, sensitivity })), [
-    { question: 'Why do you want this role?', answer: 'Build useful products', sensitivity: 'safe' },
-    { question: 'Expected CTC', answer: '6000000', sensitivity: 'review' },
-  ]);
+  const fields = collectFieldDescriptors(document);
+  assert.deepEqual(fields.map((field) => field.id), ['name', 'country']);
+  assert.equal(fields[0].autocomplete, 'name');
+  assert.equal(fields[0].constraints.pattern, undefined);
+  assert.deepEqual(fields[1].options, ['Choose', 'India']);
 });
 
+test('ignores fields and pause markers inside hidden steps', () => {
+  const document = makeDocument(`
+    <form><label for="visible">Visible name</label><input id="visible"></form>
+    <form hidden><label for="hidden">Hidden name</label><input id="hidden"><p>CAPTCHA</p></form>
+  `);
+  const inspection = inspectDocument(document);
+  assert.deepEqual(inspection.fields.map((field) => field.id), ['visible']);
+  assert.deepEqual(inspection.pauseReasons, []);
+});
 
-test('fills all safe known fields in one pass and dispatches form events', () => {
+test('fills deterministic safe matches and preserves valid existing values', () => {
   const document = makeDocument(`
     <form>
       <label for="name">Full Name</label><input id="name" required>
-      <label for="email">Email Address</label><input id="email" type="email" autocomplete="email" required>
-      <label for="phone">Phone Number</label><input id="phone" type="tel">
+      <label for="email">Email Address</label><input id="email" type="email" value="existing@example.com">
     </form>
   `);
   let changes = 0;
-  document.querySelector('#email').addEventListener('change', () => changes++);
+  document.querySelector('#name').addEventListener('change', () => changes++);
   const records = [
-    { key: 'full_name', question: 'Full Name', answer: 'Nithin Varghese', aliases: ['Name'], status: 'verified', sensitivity: 'safe', type: 'text', options: [] },
-    { key: 'email', question: 'Email Address', answer: 'person@example.com', aliases: ['Email'], status: 'verified', sensitivity: 'safe', type: 'email', options: [] },
-    { key: 'phone', question: 'Phone Number', answer: '9999999999', aliases: ['Mobile'], status: 'verified', sensitivity: 'safe', type: 'tel', options: [] },
+    { key: 'full_name', question: 'Full Name', answer: 'Nithin Varghese', aliases: ['Name'], sensitivity: 'safe', type: 'text' },
+    { key: 'email', question: 'Email Address', answer: 'new@example.com', aliases: [], sensitivity: 'safe', type: 'email' },
   ];
-
-  const report = scanAndFillDocument(document, records, { fill: true });
-
+  const decisions = planDeterministicFill(collectFieldDescriptors(document), records);
+  const result = applyDecisions(document, decisions);
   assert.equal(document.querySelector('#name').value, 'Nithin Varghese');
-  assert.equal(document.querySelector('#email').value, 'person@example.com');
-  assert.equal(document.querySelector('#phone').value, '9999999999');
+  assert.equal(document.querySelector('#email').value, 'existing@example.com');
   assert.equal(changes, 1);
-  assert.equal(report.filled.length, 3);
-  assert.equal(report.unknown.length, 0);
+  assert.equal(result.applied.length, 1);
+  assert.equal(result.kept.length, 1);
 });
 
-test('reports review-gated fields without changing them', () => {
-  const document = makeDocument('<label for="salary">Expected CTC</label><input id="salary" required>');
-  const records = [{ key: 'expected_ctc', question: 'Expected CTC', answer: '5000000', aliases: [], status: 'verified', sensitivity: 'review', type: 'number', options: [] }];
-
-  const report = scanAndFillDocument(document, records, { fill: true });
-
-  assert.equal(document.querySelector('#salary').value, '');
-  assert.equal(report.review.length, 1);
-  assert.equal(report.requiredEmpty.length, 1);
-});
-
-test('selects matching options and leaves submit controls untouched', () => {
+test('applies select, radio, and checkbox decisions only when options validate', () => {
   const document = makeDocument(`
-    <label for="country">Country</label>
-    <select id="country"><option value="">Choose</option><option value="IN">India</option></select>
-    <button type="submit">Submit application</button>
+    <form>
+      <label for="country">Country</label><select id="country"><option value="">Choose</option><option value="IN">India</option></select>
+      <fieldset><legend>Willing to relocate?</legend><label><input type="radio" name="relocate" value="Yes">Yes</label><label><input type="radio" name="relocate" value="No">No</label></fieldset>
+      <label><input id="consent" type="checkbox"> I agree</label>
+    </form>
   `);
-  const records = [{ key: 'country', question: 'Country', answer: 'India', aliases: [], status: 'verified', sensitivity: 'safe', type: 'select', options: [] }];
-
-  const report = scanAndFillDocument(document, records, { fill: true });
-
+  const fields = collectFieldDescriptors(document);
+  const result = applyDecisions(document, fields.map((field) => ({
+    fieldId: field.id,
+    action: 'fill',
+    value: field.id === 'country' ? 'India' : field.id === 'relocate' ? 'Yes' : 'Yes',
+    evidenceKeys: ['country'],
+    confidence: 'high',
+    sensitivity: field.id === 'consent' ? 'legal' : 'safe',
+    reason: 'known record',
+  })));
+  assert.equal(result.failed.length, 0);
   assert.equal(document.querySelector('#country').value, 'IN');
-  assert.equal(report.filled.length, 1);
-  assert.equal(document.querySelector('button').textContent, 'Submit application');
-});
-
-test('matches a radio group by its legend and selects the answer', () => {
-  const document = makeDocument(`
-    <fieldset><legend>Are you willing to relocate?</legend>
-      <label><input type="radio" name="relocate" value="Yes">Yes</label>
-      <label><input type="radio" name="relocate" value="No">No</label>
-    </fieldset>
-  `);
-  const records = [{ key: 'relocate', question: 'Are you willing to relocate?', answer: 'Yes', aliases: ['Willing to relocate'], status: 'verified', sensitivity: 'safe', type: 'radio', options: [] }];
-
-  const report = scanAndFillDocument(document, records, { fill: true });
-
   assert.equal(document.querySelector('input[value="Yes"]').checked, true);
-  assert.equal(report.filled.length, 1);
+  assert.equal(document.querySelector('#consent').checked, true);
 });
 
-test('fills a review-only email template only when explicitly enabled', () => {
-  const document = makeDocument('<textarea aria-label="Cover Letter"></textarea>');
-  const records = [{
-    key: 'email_template',
-    question: 'Application email or cover letter',
-    answer: 'Hello hiring team',
-    aliases: ['Cover Letter'],
-    type: 'email-template',
-    status: 'draft',
-    sensitivity: 'review',
-  }];
-  const review = scanAndFillDocument(document, records, { fill: true });
-  assert.equal(review.filled.length, 0);
-  assert.equal(review.review.length, 1);
-  const filled = scanAndFillDocument(document, records, { fill: true, includeEmailTemplates: true });
-  assert.equal(filled.filled.length, 1);
-  assert.equal(document.querySelector('textarea').value, 'Hello hiring team');
-});
-
-test('does not match the full email template to an ordinary email field', () => {
+test('inspects next and submit actions and detects manual pauses', () => {
   const document = makeDocument(`
-    <label for="email">Email</label><input id="email" type="email">
-    <label for="phone">Phone number</label><input id="phone" type="tel">
+    <h1>Application step 1</h1><p>Complete the CAPTCHA below.</p>
+    <form><label for="name">Name</label><input id="name"><button type="button">Continue</button></form>
+    <input type="file" name="resume">
   `);
-  const records = [
-    { key: 'email_template', question: 'Application email or cover letter', answer: 'Hello\nGitHub: https://github.com/example', type: 'email-template', status: 'draft', sensitivity: 'review' },
-    { key: 'phone', question: 'Phone number', answer: '+918882339186', aliases: ['Phone'], type: 'tel', status: 'verified', sensitivity: 'safe' },
-  ];
-  const report = scanAndFillDocument(document, records, { fill: true });
-  assert.equal(document.querySelector('#email').value, '');
-  assert.equal(document.querySelector('#phone').value, '+918882339186');
-  assert.equal(report.review.length, 0);
-  assert.equal(report.filled.length, 1);
+  const inspection = inspectDocument(document);
+  assert.equal(inspection.actions.find((action) => action.kind === 'next')?.label, 'Continue');
+  assert.deepEqual(inspection.pauseReasons.sort(), ['captcha', 'file_upload']);
+});
+
+test('validates required fields and captures final answers for learning', () => {
+  const document = makeDocument(`
+    <form><label for="name">Full Name</label><input id="name" value="Nithin" required>
+      <label for="salary">Expected CTC</label><input id="salary" value="6000000">
+      <button type="submit">Submit application</button></form>
+  `);
+  const validation = validateDocument(document);
+  assert.equal(validation.ok, true);
+  const records = collectAnswerRecords(document);
+  assert.deepEqual(records.map(({ key, answer, sensitivity }) => ({ key, answer, sensitivity })), [
+    { key: 'full_name', answer: 'Nithin', sensitivity: 'safe' },
+    { key: 'expected_ctc', answer: '6000000', sensitivity: 'review' },
+  ]);
+});
+
+test('classifies a submit-type Next button as navigation and submits only through the final action', () => {
+  const document = makeDocument(`
+    <form><input name="name" value="Nithin"><button>Next</button></form>
+  `);
+  const inspection = inspectDocument(document);
+  assert.equal(inspection.actions[0].kind, 'next');
 });

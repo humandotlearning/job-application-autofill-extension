@@ -1,16 +1,5 @@
 (() => {
 'use strict';
-const HEADER_ALIASES = {
-  key: ['key', 'id', 'canonical key', 'field key'],
-  question: ['question', 'questions', 'field', 'label', 'canonical question', 'prompt'],
-  answer: ['answer', 'answers', 'value', 'response', 'default answer'],
-  aliases: ['aliases', 'alias', 'alternate questions', 'alternate labels'],
-  type: ['type', 'answer type', 'field type'],
-  status: ['status', 'verification', 'verified'],
-  sensitivity: ['sensitivity', 'review policy', 'policy'],
-  options: ['options', 'allowed options', 'choices'],
-};
-
 const AUTOCOMPLETE_KEYS = {
   email: ['email'],
   tel: ['phone', 'phone_number', 'mobile'],
@@ -26,6 +15,8 @@ const AUTOCOMPLETE_KEYS = {
   organization: ['current_employer', 'employer', 'company'],
   url: ['website', 'linkedin', 'portfolio', 'github'],
 };
+
+const SENSITIVITIES = new Set(['safe', 'review', 'legal']);
 
 function normalizeText(value = '') {
   return String(value)
@@ -43,189 +34,43 @@ function slugify(value = '') {
   return normalizeText(value).replace(/\s+/g, '_');
 }
 
-function parseCsv(text) {
-  const source = String(text ?? '').replace(/^\uFEFF/, '');
-  const rows = [];
-  let row = [];
-  let value = '';
-  let quoted = false;
-
-  for (let index = 0; index < source.length; index += 1) {
-    const char = source[index];
-    if (quoted) {
-      if (char === '"' && source[index + 1] === '"') {
-        value += '"';
-        index += 1;
-      } else if (char === '"') {
-        quoted = false;
-      } else {
-        value += char;
-      }
-      continue;
-    }
-
-    if (char === '"') {
-      quoted = true;
-    } else if (char === ',') {
-      row.push(value);
-      value = '';
-    } else if (char === '\n') {
-      row.push(value.replace(/\r$/, ''));
-      rows.push(row);
-      row = [];
-      value = '';
-    } else {
-      value += char;
-    }
-  }
-
-  if (value.length > 0 || row.length > 0 || source.endsWith(',')) {
-    row.push(value.replace(/\r$/, ''));
-    rows.push(row);
-  }
-  return rows.filter((cells) => cells.some((cell) => String(cell).trim() !== ''));
-}
-
-function findColumn(headers, logicalName) {
-  const aliases = HEADER_ALIASES[logicalName];
-  return headers.findIndex((header) => aliases.includes(normalizeText(header)));
-}
-
-function splitList(value = '') {
-  return String(value)
-    .split(/(?:\r?\n|;|\|)/)
-    .map((item) => item.trim())
-    .filter(Boolean);
-}
-
-function normalizeStatus(value) {
-  const normalized = normalizeText(value);
-  if (['yes', 'true', 'approved', 'verified'].includes(normalized)) return 'verified';
-  if (['draft', 'proposed', 'review'].includes(normalized)) return 'draft';
-  return normalized || 'verified';
-}
-
 function inferSensitivity(question, key = '') {
   const text = normalizeText(`${key} ${question}`);
-  if (/\b(consent|agree|agreement|certify|attest|attestation|privacy|terms|declaration|conflict of interest|criminal|gender|race|ethnicity|disability|veteran)\b/.test(text)) {
+  if (/\b(consent|agree|agreement|certif(?:y|ication)|attest|attestation|privacy|terms|declaration|conflict of interest|criminal|gender|race|ethnicity|disability|veteran)\b/.test(text)) {
     return 'legal';
   }
-  if (/\b(ctc|salary|compensation|notice period|sponsorship|sponsor|visa|citizenship|work authorization|reference|reason for leaving|relocat)/.test(text)) {
+  if (/\b(ctc|salary|compensation|notice period|sponsorship|sponsor|visa|citizenship|work authorization|reference|reason for leaving|relocat)\b/.test(text)) {
     return 'review';
   }
   return 'safe';
 }
 
-function derivedEmailRecords(body, source) {
-  const records = [];
-  const add = (key, question, answer, aliases = []) => {
-    if (!answer) return;
-    records.push({ key, question, answer, aliases, type: 'text', status: 'verified', sensitivity: 'safe', options: [], source: `derived:${source}` });
-  };
-  const phone = body.match(/(?:^|\n)\s*(\+?\d[\d\s().-]{7,}\d)\s*$/m)?.[1]?.replace(/[^\d+]/g, '');
-  add('phone', 'Phone number', phone, ['Phone', 'Mobile', 'Telephone']);
-  for (const [key, question, aliases, pattern] of [
-    ['github', 'GitHub URL', ['GitHub', 'Github profile'], /GitHub:\s*(https?:\/\/\S+)/i],
-    ['portfolio', 'Portfolio URL', ['Portfolio', 'Personal website'], /Portfolio:\s*(https?:\/\/\S+)/i],
-    ['email', 'Email address', ['Email', 'E-mail'], /(?:Email|E-mail):\s*(\S+@\S+)/i],
-  ]) add(key, question, body.match(pattern)?.[1]?.replace(/[),.;]+$/, ''), aliases);
-  const signature = body.match(/(?:warm regards|best regards|regards|sincerely),?\s*\n\s*([A-Za-z][A-Za-z .'-]*)\s*\n\s*\+?\d/im)?.[1]?.trim();
-  if (signature) {
-    const parts = signature.split(/\s+/).filter(Boolean);
-    if (parts.length > 1) add('full_name', 'Full name', signature, ['Name', 'Candidate name']);
-    else add('preferred_name', 'Preferred first name', signature, ['First name', 'Given name']);
-  }
-  return records;
-}
-
-function expandEmailTemplateRecords(records = []) {
-  const expanded = [];
+function uniqueStrings(values = []) {
   const seen = new Set();
-  for (const record of records) {
-    const candidates = record?.type === 'email-template'
-      ? [record, ...derivedEmailRecords(record.answer, record.source || 'email-template')]
-      : [record];
-    for (const candidate of candidates) {
-      if (!candidate?.key || seen.has(candidate.key)) continue;
-      seen.add(candidate.key);
-      expanded.push(candidate);
-    }
-  }
-  return expanded;
+  return values
+    .map((value) => String(value ?? '').trim())
+    .filter((value) => value && !seen.has(normalizeText(value)) && seen.add(normalizeText(value)));
 }
 
-function emailTemplateRecords(body, source) {
-  return [{
-    key: 'email_template',
-    question: 'Application email or cover letter',
-    answer: body,
-    aliases: ['Email body', 'Cover Letter', 'Covering Letter', 'Application message', 'Message'],
-    type: 'email-template',
-    status: 'draft',
-    sensitivity: 'review',
-    options: [],
-    source,
-  }, ...derivedEmailRecords(body, source)];
-}
-
-function rowsToRecords(rows, source = 'google-sheet') {
-  if (!Array.isArray(rows) || rows.length === 0) return [];
-  const headers = rows[0].map((header) => String(header).trim());
-  let columns = Object.fromEntries(
-    Object.keys(HEADER_ALIASES).map((name) => [name, findColumn(headers, name)]),
-  );
-  let dataRows = rows.slice(1);
-
-  const hasHeaders = columns.answer >= 0 && (columns.question >= 0 || columns.key >= 0);
-  if (!hasHeaders) {
-    const hasKeyValueRows = rows.some((cells) => String(cells[0] ?? '').trim() && String(cells[1] ?? '').trim());
-    if (!hasKeyValueRows) {
-      const body = rows.flat().map((cell) => String(cell ?? '').trim()).filter(Boolean).join('\n');
-      if (body && /email|cover letter|message/i.test(source)) {
-        return emailTemplateRecords(body, source);
-      }
-      return [];
-    }
-    columns = {
-      key: 0,
-      question: 0,
-      answer: 1,
-      aliases: -1,
-      type: -1,
-      status: -1,
-      sensitivity: -1,
-      options: -1,
-    };
-    dataRows = rows;
-  }
-
-  return dataRows.flatMap((cells) => {
-    const cell = (column) => (column >= 0 ? String(cells[column] ?? '').trim() : '');
-    const question = cell(columns.question) || cell(columns.key);
-    const answer = cell(columns.answer);
-    if (!question || !answer) return [];
-    const key = slugify(cell(columns.key) || question);
-    return [{
-      key,
-      question,
-      answer,
-      aliases: splitList(cell(columns.aliases)),
-      type: normalizeText(cell(columns.type)) || 'text',
-      status: normalizeStatus(cell(columns.status)),
-      sensitivity: normalizeText(cell(columns.sensitivity)) || inferSensitivity(question, key),
-      options: splitList(cell(columns.options)),
-      source,
-    }];
-  });
-}
-
-function buildGoogleSheetCsvUrl(input) {
-  const url = new URL(String(input).trim());
-  const idMatch = url.pathname.match(/\/spreadsheets\/d\/([^/]+)/);
-  if (!idMatch) throw new Error('Enter a valid Google Sheets URL.');
-  const fragment = new URLSearchParams(url.hash.replace(/^#/, ''));
-  const gid = url.searchParams.get('gid') || fragment.get('gid') || '0';
-  return `https://docs.google.com/spreadsheets/d/${idMatch[1]}/gviz/tq?tqx=out:csv&gid=${encodeURIComponent(gid)}`;
+function normalizeAnswerRecord(record = {}) {
+  const question = String(record.question || record.label || record.key || '').trim();
+  const key = slugify(record.key || question);
+  const answer = String(record.answer ?? '').trim();
+  const aliases = uniqueStrings(Array.isArray(record.aliases) ? record.aliases : []);
+  if (!aliases.length && question) aliases.push(question);
+  const sensitivity = SENSITIVITIES.has(record.sensitivity) ? record.sensitivity : inferSensitivity(question, key);
+  const updatedAt = typeof record.updatedAt === 'string' && !Number.isNaN(Date.parse(record.updatedAt))
+    ? record.updatedAt
+    : new Date().toISOString();
+  return {
+    key,
+    question: question || key.replace(/_/g, ' '),
+    answer,
+    aliases,
+    type: String(record.type || 'text'),
+    sensitivity,
+    updatedAt,
+  };
 }
 
 function tokens(value) {
@@ -247,27 +92,28 @@ function candidateLabels(record) {
     .filter(Boolean);
 }
 
-function chooseRecord(field, records) {
+function chooseRecord(field = {}, records = []) {
   if (!Array.isArray(records) || records.length === 0) return null;
   const fieldTexts = [field.label, field.name, field.id, field.placeholder]
     .map(normalizeText)
     .filter(Boolean);
   const autocomplete = normalizeText(String(field.autocomplete || '').split(' ').at(-1));
   const preferredKeys = AUTOCOMPLETE_KEYS[autocomplete] || [];
-
   if (preferredKeys.length) {
-    const exact = records.find((record) => preferredKeys.includes(slugify(record.key)));
+    const exact = records.find((record) => preferredKeys.includes(slugify(record.key)) && String(record.answer ?? '').trim());
     if (exact) return { record: exact, confidence: 'exact', score: 1, reason: `autocomplete:${autocomplete}` };
   }
 
   let best = null;
   for (const record of records) {
+    if (!String(record.answer ?? '').trim()) continue;
     for (const fieldText of fieldTexts) {
       for (const candidate of candidateLabels(record)) {
-        let score = 0;
-        if (fieldText === candidate) score = 1;
-        else if (fieldText.includes(candidate) || candidate.includes(fieldText)) score = 0.9;
-        else score = similarity(fieldText, candidate);
+        const score = fieldText === candidate
+          ? 1
+          : fieldText.includes(candidate) || candidate.includes(fieldText)
+            ? 0.9
+            : similarity(fieldText, candidate);
         if (!best || score > best.score) best = { record, score, reason: `label:${candidate}` };
       }
     }
@@ -276,15 +122,96 @@ function chooseRecord(field, records) {
   if (!best || best.score < 0.5) return null;
   return {
     ...best,
-    confidence: best.score >= 0.9 ? 'exact' : best.score >= 0.7 ? 'high' : 'medium',
+    confidence: best.score >= 0.9 ? 'high' : best.score >= 0.7 ? 'high' : 'medium',
   };
 }
 
-function shouldAutofill(record) {
-  return normalizeText(record?.status) === 'verified'
-    && normalizeText(record?.sensitivity || 'safe') === 'safe';
+function numberConstraint(value, fallback) {
+  const number = Number(value);
+  return Number.isFinite(number) ? number : fallback;
 }
 
+function validateFillValue(field = {}, value) {
+  if (value == null || String(value).trim() === '') return { ok: false, reason: 'value is empty' };
+  const text = String(value).trim();
+  const constraints = field.constraints || {};
+  if (Array.isArray(field.options) && field.options.length) {
+    const normalized = normalizeText(text);
+    if (!field.options.some((option) => normalizeText(option) === normalized)) {
+      return { ok: false, reason: 'value is not one of the available options' };
+    }
+  }
+  if (constraints.minLength != null && text.length < Number(constraints.minLength)) return { ok: false, reason: 'value is shorter than the field minimum' };
+  if (constraints.maxLength != null && text.length > Number(constraints.maxLength)) return { ok: false, reason: 'value is longer than the field maximum' };
+  if (constraints.pattern) {
+    try {
+      if (!(new RegExp(constraints.pattern)).test(text)) return { ok: false, reason: 'value does not match the field pattern' };
+    } catch {
+      return { ok: false, reason: 'field pattern is invalid' };
+    }
+  }
+  const type = normalizeText(field.type);
+  if (type === 'email' && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(text)) return { ok: false, reason: 'value is not a valid email' };
+  if (type === 'url') {
+    try {
+      if (!/^https?:/i.test(text)) throw new Error('protocol');
+      new URL(text);
+    } catch {
+      return { ok: false, reason: 'value is not a valid URL' };
+    }
+  }
+  if (type === 'number' || type === 'range') {
+    const numeric = Number(text);
+    if (!Number.isFinite(numeric)) return { ok: false, reason: 'value is not numeric' };
+    if (constraints.min != null && numeric < numberConstraint(constraints.min, -Infinity)) return { ok: false, reason: 'value is below the minimum' };
+    if (constraints.max != null && numeric > numberConstraint(constraints.max, Infinity)) return { ok: false, reason: 'value is above the maximum' };
+  }
+  if (type === 'checkbox' && !['yes', 'no', 'true', 'false', 'checked', 'unchecked'].includes(normalizeText(text))) {
+    return { ok: false, reason: 'checkbox value must be yes or no' };
+  }
+  return { ok: true, reason: 'valid' };
+}
+
+function shouldReviewDecision(decision = {}, field = {}) {
+  return decision.sensitivity !== 'safe'
+    || decision.confidence !== 'high'
+    || normalizeText(field.type) === 'textarea'
+    || String(decision.value ?? '').length > 240;
+}
+
+function shouldAutofill(record = {}) {
+  return String(record.answer ?? '').trim() !== '' && record.sensitivity === 'safe';
+}
+
+function upsertAnswerRecords(existing = [], incoming = [], updatedAt = new Date().toISOString()) {
+  const merged = new Map();
+  for (const record of existing) {
+    const normalized = normalizeAnswerRecord(record);
+    if (normalized.key && normalized.answer) merged.set(normalized.key, normalized);
+  }
+  for (const record of incoming) {
+    const next = normalizeAnswerRecord({ ...record, updatedAt });
+    if (!next.key || !next.answer) continue;
+    const previous = merged.get(next.key);
+    if (!previous) {
+      merged.set(next.key, next);
+      continue;
+    }
+    merged.set(next.key, {
+      ...next,
+      aliases: uniqueStrings([
+        ...(previous.aliases || []),
+        ...(next.aliases || []),
+        previous.question,
+        next.question,
+      ]),
+    });
+  }
+  return [...merged.values()];
+}
+
+
+const IGNORED_TYPES = new Set(['hidden', 'password', 'file', 'submit', 'button', 'reset', 'image']);
 
 function textFromIds(document, ids = '') {
   return String(ids)
@@ -295,7 +222,7 @@ function textFromIds(document, ids = '') {
 }
 
 function labelFor(document, element) {
-  if (element.type === 'radio' || element.type === 'checkbox') {
+  if (element.type === 'radio') {
     const legend = element.closest('fieldset')?.querySelector('legend')?.textContent?.trim();
     if (legend) return legend;
   }
@@ -312,15 +239,95 @@ function labelFor(document, element) {
     || '';
 }
 
-function describeField(document, element) {
+function isSupported(element) {
+  if (!['INPUT', 'TEXTAREA', 'SELECT'].includes(element.tagName)) return false;
+  if (element.disabled || element.readOnly) return false;
+  return !IGNORED_TYPES.has(String(element.type || '').toLowerCase());
+}
+
+function isVisible(element) {
+  for (let current = element; current; current = current.parentElement) {
+    if (current.hidden || current.getAttribute('aria-hidden') === 'true') return false;
+    const style = current.getAttribute('style') || '';
+    if (/(?:^|;)\s*(?:display\s*:\s*none|visibility\s*:\s*hidden)/i.test(style)) return false;
+  }
+  return true;
+}
+
+function fieldIdentity(element, index) {
+  return element.id || element.name || `field_${index}`;
+}
+
+function formElements(document) {
+  return [...document.querySelectorAll('input, textarea, select')].filter((element) => isSupported(element) && isVisible(element));
+}
+
+function uniqueFields(document) {
+  const fields = [];
+  const seenRadioGroups = new Set();
+  for (const [index, element] of formElements(document).entries()) {
+    if (element.type === 'radio' && element.name) {
+      if (seenRadioGroups.has(element.name)) continue;
+      seenRadioGroups.add(element.name);
+    }
+    fields.push({ element, index });
+  }
+  return fields;
+}
+
+function fieldOptions(document, element) {
+  if (element.tagName === 'SELECT') return [...element.options].map((option) => option.textContent.trim()).filter(Boolean);
+  if (element.type === 'radio') {
+    const group = formElements(document).filter((candidate) => candidate.type === 'radio' && candidate.name === element.name);
+    return group.map((candidate) => optionText(candidate)).filter(Boolean);
+  }
+  if (element.type === 'checkbox') return ['Yes', 'No'];
+  return [];
+}
+
+function optionText(element) {
+  const label = [...(element.labels || [])].map((item) => item.textContent || '').join(' ').trim();
+  return label || element.getAttribute('aria-label') || element.value || '';
+}
+
+function fieldValue(document, element) {
+  if (element.type === 'checkbox') return element.checked ? 'Yes' : '';
+  if (element.type === 'radio') return element.checked ? optionText(element) : '';
+  if (element.tagName === 'SELECT') {
+    const selected = element.selectedOptions?.[0];
+    return selected?.value ? selected.textContent.trim() : '';
+  }
+  return String(element.value || '').trim();
+}
+
+function constraintsFor(element) {
+  const constraints = {};
+  for (const attribute of ['min', 'max', 'pattern']) {
+    if (element.hasAttribute(attribute)) constraints[attribute] = element.getAttribute(attribute);
+  }
+  for (const attribute of ['minLength', 'maxLength']) {
+    const htmlAttribute = attribute.toLowerCase();
+    if (element.hasAttribute(htmlAttribute)) constraints[attribute] = Number(element.getAttribute(htmlAttribute));
+  }
+  return constraints;
+}
+
+function describeField(document, element, index) {
+  const type = element.tagName === 'SELECT' ? 'select' : element.tagName === 'TEXTAREA' ? 'textarea' : (element.type || 'text');
   return {
+    id: fieldIdentity(element, index),
     label: labelFor(document, element),
-    name: element.name || '',
-    id: element.id || '',
-    placeholder: element.placeholder || '',
+    type,
     autocomplete: element.autocomplete || '',
-    type: element.tagName === 'SELECT' ? 'select' : (element.type || element.tagName.toLowerCase()),
+    required: Boolean(element.required),
+    currentValue: fieldValue(document, element),
+    options: fieldOptions(document, element),
+    constraints: constraintsFor(element),
   };
+}
+
+function collectFieldDescriptors(document) {
+  return uniqueFields(document).map(({ element, index }) => describeField(document, element, index));
 }
 
 function dispatchFormEvents(element) {
@@ -332,9 +339,7 @@ function dispatchFormEvents(element) {
 
 function setTextValue(element, value) {
   const view = element.ownerDocument.defaultView;
-  const prototype = element.tagName === 'TEXTAREA'
-    ? view.HTMLTextAreaElement?.prototype
-    : view.HTMLInputElement?.prototype;
+  const prototype = element.tagName === 'TEXTAREA' ? view.HTMLTextAreaElement?.prototype : view.HTMLInputElement?.prototype;
   const setter = prototype && Object.getOwnPropertyDescriptor(prototype, 'value')?.set;
   if (setter) setter.call(element, String(value));
   else element.value = String(value);
@@ -344,29 +349,20 @@ function setTextValue(element, value) {
 
 function setSelectValue(element, answer) {
   const expected = normalizeText(answer);
-  const option = [...element.options].find((candidate) => (
-    normalizeText(candidate.value) === expected || normalizeText(candidate.textContent) === expected
-  ));
+  const option = [...element.options].find((candidate) => normalizeText(candidate.value) === expected || normalizeText(candidate.textContent) === expected);
   if (!option) return false;
   element.value = option.value;
   dispatchFormEvents(element);
   return element.value === option.value;
 }
 
-function optionText(element) {
-  const label = [...(element.labels || [])].map((item) => item.textContent || '').join(' ');
-  return label || element.value || element.getAttribute('aria-label') || '';
+function radioGroup(document, element) {
+  return formElements(document).filter((candidate) => candidate.type === 'radio' && candidate.name === element.name);
 }
 
 function setRadioGroup(document, element, answer) {
-  const escapedName = globalThis.CSS?.escape ? CSS.escape(element.name) : element.name.replace(/["\\]/g, '\\$&');
-  const group = element.name
-    ? [...document.querySelectorAll(`input[type="radio"][name="${escapedName}"]`)]
-    : [element];
   const expected = normalizeText(answer);
-  const option = group.find((candidate) => (
-    normalizeText(candidate.value) === expected || normalizeText(optionText(candidate)) === expected
-  ));
+  const option = radioGroup(document, element).find((candidate) => normalizeText(candidate.value) === expected || normalizeText(optionText(candidate)) === expected);
   if (!option) return false;
   option.checked = true;
   dispatchFormEvents(option);
@@ -381,70 +377,6 @@ function setCheckbox(element, answer) {
   return true;
 }
 
-function hasValue(element) {
-  if (element.type === 'checkbox' || element.type === 'radio') return element.checked;
-  return String(element.value || '').trim() !== '';
-}
-
-function fieldValue(element) {
-  if (element.type === 'checkbox') return element.checked ? 'Yes' : 'No';
-  if (element.type === 'radio') return element.checked ? (optionText(element) || element.value) : '';
-  return String(element.value || '').trim();
-}
-
-function fieldIdentity(element, index) {
-  return element.id || element.name || `field_${index}`;
-}
-
-function formElements(document) {
-  return [...document.querySelectorAll('input, textarea, select')].filter(isSupported);
-}
-
-function snapshotFormValues(document) {
-  const values = new Map();
-  const seenRadioGroups = new Set();
-  for (const [index, element] of formElements(document).entries()) {
-    if (element.type === 'radio' && element.name) {
-      if (seenRadioGroups.has(element.name)) continue;
-      seenRadioGroups.add(element.name);
-    }
-    values.set(fieldIdentity(element, index), fieldValue(element));
-  }
-  return values;
-}
-
-function collectChangedResponses(document, initialValues) {
-  const records = [];
-  const seenRadioGroups = new Set();
-  for (const [index, element] of formElements(document).entries()) {
-    if (element.type === 'radio' && element.name) {
-      if (seenRadioGroups.has(element.name)) continue;
-      seenRadioGroups.add(element.name);
-    }
-    const answer = fieldValue(element);
-    const identity = fieldIdentity(element, index);
-    if (!answer || answer === initialValues.get(identity)) continue;
-    const field = describeField(document, element);
-    const key = slugify(field.label || field.name || field.id || identity);
-    records.push({
-      key,
-      question: field.label || field.name || field.id || 'Unlabelled field',
-      answer,
-      aliases: [],
-      type: field.type,
-      status: 'draft',
-      sensitivity: inferSensitivity(field.label, key),
-      options: element.tagName === 'SELECT' ? [...element.options].map((option) => option.textContent.trim()).filter(Boolean) : [],
-      source: `learned:${document.location.href}`,
-    });
-  }
-  return records;
-}
-
-function isEmailTemplateField(field) {
-  return /cover letter|covering letter|application message|email body|message/i.test(field.label || '');
-}
-
 function fillElement(document, element, answer) {
   if (element.tagName === 'SELECT') return setSelectValue(element, answer);
   if (element.type === 'radio') return setRadioGroup(document, element, answer);
@@ -452,138 +384,246 @@ function fillElement(document, element, answer) {
   return setTextValue(element, answer);
 }
 
-function reportItem(field, match, element, extra = {}) {
-  return {
-    label: field.label || field.name || field.id || 'Unlabelled field',
-    key: match?.record?.key || null,
-    answer: match?.record?.answer || null,
-    confidence: match?.confidence || null,
-    reason: match?.reason || null,
-    required: Boolean(element.required),
-    ...extra,
-  };
+function elementsForField(document, fieldId) {
+  const byId = document.getElementById(fieldId);
+  if (byId && isSupported(byId)) return [byId];
+  return formElements(document).filter((element) => element.name === fieldId || element.id === fieldId);
 }
 
-function isSupported(element) {
-  if (!['INPUT', 'TEXTAREA', 'SELECT'].includes(element.tagName)) return false;
-  if (element.disabled || element.readOnly) return false;
-  return !['hidden', 'password', 'file', 'submit', 'button', 'reset', 'image'].includes(element.type);
+function elementForField(document, fieldId) {
+  return elementsForField(document, fieldId)[0] || null;
 }
 
-function scanAndFillDocument(document, records, { fill = false, overwrite = false, includeEmailTemplates = false } = {}) {
-  const report = {
-    scanned: [],
-    filled: [],
-    review: [],
-    unknown: [],
-    unchanged: [],
-    failed: [],
-    requiredEmpty: [],
-  };
-  const seenRadioGroups = new Set();
-  const elements = [...document.querySelectorAll('input, textarea, select')].filter(isSupported);
+function currentField(document, fieldId) {
+  const element = elementForField(document, fieldId);
+  if (!element) return null;
+  const index = uniqueFields(document).findIndex(({ element: candidate }) => candidate === element);
+  return describeField(document, element, Math.max(index, 0));
+}
 
-  for (const element of elements) {
-    if (element.type === 'radio' && element.name) {
-      if (seenRadioGroups.has(element.name)) continue;
-      seenRadioGroups.add(element.name);
-    }
-    const field = describeField(document, element);
-    let match = chooseRecord(field, records);
-    if (match?.record?.type === 'email-template' && !isEmailTemplateField(field)) {
-      match = chooseRecord(field, records.filter((record) => record.type !== 'email-template'));
-    }
-    const item = reportItem(field, match, element, { currentValue: element.value || '' });
-    report.scanned.push(item);
+function effectiveSensitivity(field, decision) {
+  const inferred = inferSensitivity(field.label, field.id);
+  if (inferred === 'legal' || decision.sensitivity === 'legal') return 'legal';
+  if (inferred === 'review' || decision.sensitivity === 'review') return 'review';
+  return 'safe';
+}
 
+function addReviewIfNeeded(result, field, decision, value) {
+  const effective = { ...decision, sensitivity: effectiveSensitivity(field, decision), value };
+  if (value && shouldReviewDecision(effective, field)) result.reviewRequired.push({ ...effective, field });
+}
+
+function planDeterministicFill(fields, records) {
+  return fields.map((field) => {
+    const match = chooseRecord(field, records);
     if (!match) {
-      report.unknown.push(item);
-      continue;
+      return {
+        fieldId: field.id,
+        action: 'ask_user',
+        value: null,
+        evidenceKeys: [],
+        confidence: 'low',
+        sensitivity: inferSensitivity(field.label, field.id),
+        reason: 'No local answer matched this field',
+      };
     }
-    const templateAllowed = includeEmailTemplates && match.record.type === 'email-template';
-    if (!shouldAutofill(match.record) && !templateAllowed) {
-      report.review.push(item);
-      continue;
-    }
-    if (hasValue(element) && !overwrite) {
-      report.unchanged.push(item);
-      continue;
-    }
-    if (!fill) continue;
-
-    if (fillElement(document, element, match.record.answer)) {
-      report.filled.push({ ...item, currentValue: match.record.answer });
-    } else {
-      report.failed.push(item);
-    }
-  }
-
-  report.requiredEmpty = elements
-    .filter((element) => element.required && !hasValue(element))
-    .map((element) => ({
-      label: labelFor(document, element) || element.name || element.id || 'Unlabelled field',
-      type: element.type || element.tagName.toLowerCase(),
-    }));
-  return report;
+    return {
+      fieldId: field.id,
+      action: 'fill',
+      value: match.record.answer,
+      evidenceKeys: [match.record.key],
+      confidence: match.confidence === 'exact' ? 'high' : match.confidence,
+      sensitivity: match.record.sensitivity || inferSensitivity(field.label, field.id),
+      reason: match.reason,
+    };
+  });
 }
 
-
-let learningSession = null;
-
-function stopLearning() {
-  if (!learningSession) return;
-  for (const [eventName, listener] of learningSession.listeners) {
-    document.removeEventListener(eventName, listener, true);
+function applyDecisions(document, decisions = []) {
+  const result = { applied: [], kept: [], reviewRequired: [], unresolved: [], failed: [] };
+  for (const decision of decisions) {
+    const field = currentField(document, decision.fieldId);
+    if (!field) {
+      result.failed.push({ fieldId: decision.fieldId, reason: 'Field is no longer on the page' });
+      continue;
+    }
+    const element = elementForField(document, decision.fieldId);
+    if (decision.action === 'keep') {
+      result.kept.push({ fieldId: field.id, value: field.currentValue });
+      addReviewIfNeeded(result, field, decision, field.currentValue);
+      continue;
+    }
+    if (decision.action === 'ask_user') {
+      result.unresolved.push({ fieldId: field.id, label: field.label, reason: decision.reason });
+      addReviewIfNeeded(result, field, decision, field.currentValue);
+      continue;
+    }
+    const current = field.currentValue;
+    if (current && validateFillValue(field, current).ok) {
+      result.kept.push({ fieldId: field.id, value: current });
+      addReviewIfNeeded(result, field, decision, current);
+      continue;
+    }
+    const validation = validateFillValue(field, decision.value);
+    if (!validation.ok) {
+      result.failed.push({ fieldId: field.id, label: field.label, value: decision.value, reason: validation.reason });
+      continue;
+    }
+    if (!fillElement(document, element, decision.value)) {
+      result.failed.push({ fieldId: field.id, label: field.label, value: decision.value, reason: 'The page rejected this value' });
+      continue;
+    }
+    const applied = { ...decision, field, value: decision.value };
+    result.applied.push(applied);
+    addReviewIfNeeded(result, field, decision, decision.value);
   }
-  learningSession = null;
+  return result;
 }
 
-function startLearning() {
-  stopLearning();
-  const initialValues = snapshotFormValues(document);
-  const listeners = [];
-  const capture = () => {
-    const records = collectChangedResponses(document, initialValues);
-    if (records.length) chrome.runtime.sendMessage({ type: 'JOB_AUTOFILL_LEARNED', records }).catch(() => {});
+function actionLabel(element) {
+  return String(element.textContent || element.value || element.getAttribute('aria-label') || '').replace(/\s+/g, ' ').trim();
+}
+
+function collectActions(document) {
+  const actions = [];
+  const candidates = [...document.querySelectorAll('button, input[type="submit"], input[type="button"], a, [role="button"]')];
+  for (const [index, element] of candidates.entries()) {
+    if (element.disabled || !isVisible(element)) continue;
+    const label = actionLabel(element);
+    if (!label) continue;
+    const type = String(element.type || '').toLowerCase();
+    const nextLabel = /^(next|continue|save and continue|proceed|review application|next step)\b/i.test(label);
+    const kind = nextLabel
+      ? 'next'
+      : type === 'submit' || /\b(submit|apply|finish|complete application|send application)\b/i.test(label)
+        ? 'submit'
+        : 'other';
+    actions.push({ id: `action_${actions.length}`, label, kind, type: type || element.tagName.toLowerCase() });
+  }
+  return actions;
+}
+
+function pauseReasons(document) {
+  const reasons = [];
+  const visibleText = [...(document.body?.querySelectorAll('*') || [])]
+    .filter(isVisible)
+    .map((element) => element.textContent || '')
+    .join(' ');
+  if ([...document.querySelectorAll('input[type="file"]:not([disabled])')].some((element) => isVisible(element) && !(element.files?.length || element.value))) reasons.push('file_upload');
+  const captchaElement = [...document.querySelectorAll('[id*="captcha" i], [class*="captcha" i], [id*="recaptcha" i], [class*="recaptcha" i]')].some(isVisible);
+  if (captchaElement || /\bcaptcha\b/i.test(visibleText)) reasons.push('captcha');
+  if ([...document.querySelectorAll('input[type="password"]:not([disabled])')].some(isVisible) || /\b(sign in|log in|login)\b/i.test(visibleText)) reasons.push('login');
+  if ([...document.querySelectorAll('[contenteditable="true"], [role="combobox"], [aria-haspopup="listbox"]')].some(isVisible)) reasons.push('unsupported_widget');
+  const nextCount = collectActions(document).filter((action) => action.kind === 'next').length;
+  const submitCount = collectActions(document).filter((action) => action.kind === 'submit').length;
+  if (nextCount > 1 || submitCount > 1) reasons.push('ambiguous_navigation');
+  return [...new Set(reasons)];
+}
+
+function inspectDocument(document) {
+  const actions = collectActions(document);
+  return {
+    page: { title: document.title || '', domain: document.location?.hostname || '' },
+    fields: collectFieldDescriptors(document),
+    actions,
+    pauseReasons: pauseReasons(document),
   };
-  for (const eventName of ['input', 'change', 'blur']) {
-    document.addEventListener(eventName, capture, true);
-    listeners.push([eventName, capture]);
-  }
-  learningSession = { initialValues, listeners };
-  return { ok: true, observed: snapshotFormValues(document).size };
 }
+
+function validateDocument(document) {
+  const requiredEmpty = [];
+  const invalid = [];
+  for (const field of collectFieldDescriptors(document)) {
+    const element = elementForField(document, field.id);
+    if (field.required && !field.currentValue) requiredEmpty.push({ fieldId: field.id, label: field.label, type: field.type });
+    if (element?.checkValidity && !element.checkValidity()) invalid.push({ fieldId: field.id, label: field.label, type: field.type });
+  }
+  return { ok: requiredEmpty.length === 0 && invalid.length === 0, requiredEmpty, invalid };
+}
+
+function collectAnswerRecords(document) {
+  return collectFieldDescriptors(document)
+    .filter((field) => field.currentValue)
+    .map((field) => ({
+      key: slugify(field.label || field.id),
+      question: field.label || field.id,
+      answer: field.currentValue,
+      aliases: [field.label, field.id].filter(Boolean),
+      type: field.type,
+      sensitivity: inferSensitivity(field.label, field.id),
+    }));
+}
+
+function focusField(document, fieldId) {
+  const element = elementForField(document, fieldId);
+  element?.focus?.();
+  return Boolean(element);
+}
+
+function findActionElement(document, actionId) {
+  const actions = [...document.querySelectorAll('button, input[type="submit"], input[type="button"], a, [role="button"]')];
+  let index = 0;
+  for (const element of actions) {
+    if (element.disabled || !isVisible(element) || !actionLabel(element)) continue;
+    const action = collectActions(document).find((candidate) => candidate.id === `action_${index}`);
+    if (action?.id === actionId) return { element, action };
+    index += 1;
+  }
+  return null;
+}
+
+function clickAction(document, actionId) {
+  const found = findActionElement(document, actionId);
+  if (!found || found.action.kind !== 'next') return { ok: false, error: 'Navigation action is unavailable or not a validated Next control' };
+  found.element.click();
+  return { ok: true, action: found.action };
+}
+
+function submitDocument(document) {
+  const submits = collectActions(document).filter((action) => action.kind === 'submit');
+  if (submits.length !== 1) return { ok: false, error: 'The page does not have one unambiguous submit control' };
+  const found = findActionElement(document, submits[0].id);
+  const form = found?.element.form || document.querySelector('form');
+  if (!form) return { ok: false, error: 'No form is available for submission' };
+  if (typeof form.requestSubmit === 'function') form.requestSubmit(found.element.type === 'submit' ? found.element : undefined);
+  else if (typeof form.submit === 'function') form.submit();
+  else return { ok: false, error: 'The page does not expose a form submission method' };
+  return { ok: true };
+}
+
 
 if (!globalThis.__jobApplicationAutofillInstalled) {
   globalThis.__jobApplicationAutofillInstalled = true;
   chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
-    if (message?.type === 'JOB_AUTOFILL_PING') {
-      sendResponse({ ok: true });
-      return false;
-    }
-    if (message?.type === 'JOB_AUTOFILL_START_LEARNING') {
-      try {
-        sendResponse(startLearning());
-      } catch (error) {
-        sendResponse({ ok: false, error: error.message });
-      }
-      return false;
-    }
-    if (message?.type === 'JOB_AUTOFILL_STOP_LEARNING') {
-      stopLearning();
-      sendResponse({ ok: true });
-      return false;
-    }
-    if (!['JOB_AUTOFILL_SCAN', 'JOB_AUTOFILL_FILL'].includes(message?.type)) return false;
-
     try {
-      const report = scanAndFillDocument(document, message.records || [], {
-        fill: message.type === 'JOB_AUTOFILL_FILL',
-        overwrite: Boolean(message.overwrite),
-        includeEmailTemplates: Boolean(message.includeEmailTemplates),
-      });
-      report.page = { title: document.title, url: location.href };
-      sendResponse({ ok: true, report });
+      switch (message?.type) {
+        case 'JOB_APP_PING':
+          sendResponse({ ok: true });
+          break;
+        case 'JOB_APP_INSPECT':
+          sendResponse({ ok: true, inspection: inspectDocument(document) });
+          break;
+        case 'JOB_APP_APPLY':
+          sendResponse({ ok: true, result: applyDecisions(document, message.decisions || []) });
+          break;
+        case 'JOB_APP_CAPTURE':
+          sendResponse({ ok: true, records: collectAnswerRecords(document) });
+          break;
+        case 'JOB_APP_VALIDATE':
+          sendResponse({ ok: true, validation: validateDocument(document) });
+          break;
+        case 'JOB_APP_FOCUS':
+          sendResponse({ ok: focusField(document, message.fieldId) });
+          break;
+        case 'JOB_APP_CLICK_NEXT':
+          sendResponse(clickAction(document, message.actionId));
+          break;
+        case 'JOB_APP_SUBMIT':
+          sendResponse(submitDocument(document));
+          break;
+        default:
+          return false;
+      }
     } catch (error) {
       sendResponse({ ok: false, error: error.message });
     }

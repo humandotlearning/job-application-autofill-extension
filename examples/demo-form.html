@@ -11,17 +11,18 @@
     fieldset label { display: inline-flex; width: auto; gap: 6px; margin-right: 18px; font-weight: 400; }
     fieldset input { width: auto; }
     button { padding: 10px; }
+    [hidden] { display: none; }
+    .note { color: #5d6670; }
   </style>
 </head>
 <body>
-  <h1>Autofill test form</h1>
-  <p>This local page contains safe, review-gated, and unknown fields.</p>
-  <form>
+  <h1>Autofill two-step demo</h1>
+  <p class="note">Fill this form once, confirm submission, then reload and run it again to reuse the learned answers.</p>
+
+  <form id="profile-step">
+    <h2>Step 1 · Profile</h2>
     <label>Full Name <input name="fullName" autocomplete="name" required></label>
     <label>Email Address <input type="email" name="email" autocomplete="email" required></label>
-    <label>Phone Number <input type="tel" name="phone" autocomplete="tel"></label>
-    <label>LinkedIn URL <input type="url" name="linkedin"></label>
-    <label>GitHub URL <input type="url" name="github"></label>
     <label>Country
       <select name="country" required>
         <option value="">Choose one</option>
@@ -29,18 +30,37 @@
         <option value="US">United States</option>
       </select>
     </label>
-    <label>What is your notice period? <input name="noticePeriod" required></label>
+    <button type="button" id="continue-profile">Continue</button>
+  </form>
+
+  <form id="questions-step" hidden>
+    <h2>Step 2 · Questions</h2>
+    <label>Notice period <input name="noticePeriod" required></label>
     <fieldset>
-      <legend>Are you authorized to work in India?</legend>
-      <label><input type="radio" name="authorization" value="Yes" required> Yes</label>
-      <label><input type="radio" name="authorization" value="No" required> No</label>
+      <legend>Are you willing to relocate?</legend>
+      <label><input type="radio" name="relocate" value="Yes" required> Yes</label>
+      <label><input type="radio" name="relocate" value="No" required> No</label>
     </fieldset>
-    <label>Why do you want this role? <textarea name="motivation"></textarea></label>
-    <label>What is your favorite ML paper? <textarea name="unknownQuestion"></textarea></label>
+    <label>Why do you want this role? <textarea name="motivation" required></textarea></label>
     <label>Resume <input type="file" name="resume"></label>
-    <label>Password <input type="password" name="password"></label>
     <button type="submit">Submit application</button>
   </form>
-  <script>document.querySelector('form').addEventListener('submit', (event) => event.preventDefault());</script>
+
+  <p id="complete" hidden>Submitted. Reload the page to test second-run autofill.</p>
+  <script>
+    const profile = document.querySelector('#profile-step');
+    const questions = document.querySelector('#questions-step');
+    profile.addEventListener('submit', (event) => event.preventDefault());
+    profile.querySelector('#continue-profile').addEventListener('click', () => {
+      profile.hidden = true;
+      questions.hidden = false;
+      questions.querySelector('input, textarea, select')?.focus();
+    });
+    questions.addEventListener('submit', (event) => {
+      event.preventDefault();
+      questions.hidden = true;
+      document.querySelector('#complete').hidden = false;
+    });
+  </script>
 </body>
 </html>

@@ -1,15 +1,11 @@
 {
   "manifest_version": 3,
   "name": "Job Application Autofill",
-  "description": "Bulk-fill job application forms from verified Google Sheet answers.",
+  "description": "Fast, accurate local-first job application autofill with optional LLM assistance.",
   "version": "0.1.3",
   "minimum_chrome_version": "114",
-  "permissions": ["activeTab", "identity", "scripting", "storage", "sidePanel"],
+  "permissions": ["activeTab", "scripting", "storage", "sidePanel"],
   "host_permissions": ["<all_urls>"],
-  "oauth2": {
-    "client_id": "REPLACE_WITH_GOOGLE_OAUTH_CLIENT_ID.apps.googleusercontent.com",
-    "scopes": ["https://www.googleapis.com/auth/spreadsheets.readonly"]
-  },
   "background": {
     "service_worker": "src/service-worker.js",
     "type": "module"

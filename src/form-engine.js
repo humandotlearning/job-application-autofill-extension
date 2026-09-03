@@ -1,4 +1,13 @@
-import { chooseRecord, inferSensitivity, normalizeText, shouldAutofill, slugify } from './core.js';
+import {
+  chooseRecord,
+  inferSensitivity,
+  normalizeText,
+  shouldReviewDecision,
+  slugify,
+  validateFillValue,
+} from './core.js';
+
+const IGNORED_TYPES = new Set(['hidden', 'password', 'file', 'submit', 'button', 'reset', 'image']);
 
 function textFromIds(document, ids = '') {
   return String(ids)
@@ -9,7 +18,7 @@ function textFromIds(document, ids = '') {
 }
 
 function labelFor(document, element) {
-  if (element.type === 'radio' || element.type === 'checkbox') {
+  if (element.type === 'radio') {
     const legend = element.closest('fieldset')?.querySelector('legend')?.textContent?.trim();
     if (legend) return legend;
   }
@@ -26,15 +35,95 @@ function labelFor(document, element) {
     || '';
 }
 
-function describeField(document, element) {
+function isSupported(element) {
+  if (!['INPUT', 'TEXTAREA', 'SELECT'].includes(element.tagName)) return false;
+  if (element.disabled || element.readOnly) return false;
+  return !IGNORED_TYPES.has(String(element.type || '').toLowerCase());
+}
+
+function isVisible(element) {
+  for (let current = element; current; current = current.parentElement) {
+    if (current.hidden || current.getAttribute('aria-hidden') === 'true') return false;
+    const style = current.getAttribute('style') || '';
+    if (/(?:^|;)\s*(?:display\s*:\s*none|visibility\s*:\s*hidden)/i.test(style)) return false;
+  }
+  return true;
+}
+
+function fieldIdentity(element, index) {
+  return element.id || element.name || `field_${index}`;
+}
+
+function formElements(document) {
+  return [...document.querySelectorAll('input, textarea, select')].filter((element) => isSupported(element) && isVisible(element));
+}
+
+function uniqueFields(document) {
+  const fields = [];
+  const seenRadioGroups = new Set();
+  for (const [index, element] of formElements(document).entries()) {
+    if (element.type === 'radio' && element.name) {
+      if (seenRadioGroups.has(element.name)) continue;
+      seenRadioGroups.add(element.name);
+    }
+    fields.push({ element, index });
+  }
+  return fields;
+}
+
+function fieldOptions(document, element) {
+  if (element.tagName === 'SELECT') return [...element.options].map((option) => option.textContent.trim()).filter(Boolean);
+  if (element.type === 'radio') {
+    const group = formElements(document).filter((candidate) => candidate.type === 'radio' && candidate.name === element.name);
+    return group.map((candidate) => optionText(candidate)).filter(Boolean);
+  }
+  if (element.type === 'checkbox') return ['Yes', 'No'];
+  return [];
+}
+
+function optionText(element) {
+  const label = [...(element.labels || [])].map((item) => item.textContent || '').join(' ').trim();
+  return label || element.getAttribute('aria-label') || element.value || '';
+}
+
+function fieldValue(document, element) {
+  if (element.type === 'checkbox') return element.checked ? 'Yes' : '';
+  if (element.type === 'radio') return element.checked ? optionText(element) : '';
+  if (element.tagName === 'SELECT') {
+    const selected = element.selectedOptions?.[0];
+    return selected?.value ? selected.textContent.trim() : '';
+  }
+  return String(element.value || '').trim();
+}
+
+function constraintsFor(element) {
+  const constraints = {};
+  for (const attribute of ['min', 'max', 'pattern']) {
+    if (element.hasAttribute(attribute)) constraints[attribute] = element.getAttribute(attribute);
+  }
+  for (const attribute of ['minLength', 'maxLength']) {
+    const htmlAttribute = attribute.toLowerCase();
+    if (element.hasAttribute(htmlAttribute)) constraints[attribute] = Number(element.getAttribute(htmlAttribute));
+  }
+  return constraints;
+}
+
+function describeField(document, element, index) {
+  const type = element.tagName === 'SELECT' ? 'select' : element.tagName === 'TEXTAREA' ? 'textarea' : (element.type || 'text');
   return {
+    id: fieldIdentity(element, index),
     label: labelFor(document, element),
-    name: element.name || '',
-    id: element.id || '',
-    placeholder: element.placeholder || '',
+    type,
     autocomplete: element.autocomplete || '',
-    type: element.tagName === 'SELECT' ? 'select' : (element.type || element.tagName.toLowerCase()),
+    required: Boolean(element.required),
+    currentValue: fieldValue(document, element),
+    options: fieldOptions(document, element),
+    constraints: constraintsFor(element),
   };
+}
+
+export function collectFieldDescriptors(document) {
+  return uniqueFields(document).map(({ element, index }) => describeField(document, element, index));
 }
 
 function dispatchFormEvents(element) {
@@ -46,9 +135,7 @@ function dispatchFormEvents(element) {
 
 function setTextValue(element, value) {
   const view = element.ownerDocument.defaultView;
-  const prototype = element.tagName === 'TEXTAREA'
-    ? view.HTMLTextAreaElement?.prototype
-    : view.HTMLInputElement?.prototype;
+  const prototype = element.tagName === 'TEXTAREA' ? view.HTMLTextAreaElement?.prototype : view.HTMLInputElement?.prototype;
   const setter = prototype && Object.getOwnPropertyDescriptor(prototype, 'value')?.set;
   if (setter) setter.call(element, String(value));
   else element.value = String(value);
@@ -58,29 +145,20 @@ function setTextValue(element, value) {
 
 function setSelectValue(element, answer) {
   const expected = normalizeText(answer);
-  const option = [...element.options].find((candidate) => (
-    normalizeText(candidate.value) === expected || normalizeText(candidate.textContent) === expected
-  ));
+  const option = [...element.options].find((candidate) => normalizeText(candidate.value) === expected || normalizeText(candidate.textContent) === expected);
   if (!option) return false;
   element.value = option.value;
   dispatchFormEvents(element);
   return element.value === option.value;
 }
 
-function optionText(element) {
-  const label = [...(element.labels || [])].map((item) => item.textContent || '').join(' ');
-  return label || element.value || element.getAttribute('aria-label') || '';
+function radioGroup(document, element) {
+  return formElements(document).filter((candidate) => candidate.type === 'radio' && candidate.name === element.name);
 }
 
 function setRadioGroup(document, element, answer) {
-  const escapedName = globalThis.CSS?.escape ? CSS.escape(element.name) : element.name.replace(/["\\]/g, '\\$&');
-  const group = element.name
-    ? [...document.querySelectorAll(`input[type="radio"][name="${escapedName}"]`)]
-    : [element];
   const expected = normalizeText(answer);
-  const option = group.find((candidate) => (
-    normalizeText(candidate.value) === expected || normalizeText(optionText(candidate)) === expected
-  ));
+  const option = radioGroup(document, element).find((candidate) => normalizeText(candidate.value) === expected || normalizeText(optionText(candidate)) === expected);
   if (!option) return false;
   option.checked = true;
   dispatchFormEvents(option);
@@ -95,70 +173,6 @@ function setCheckbox(element, answer) {
   return true;
 }
 
-function hasValue(element) {
-  if (element.type === 'checkbox' || element.type === 'radio') return element.checked;
-  return String(element.value || '').trim() !== '';
-}
-
-function fieldValue(element) {
-  if (element.type === 'checkbox') return element.checked ? 'Yes' : 'No';
-  if (element.type === 'radio') return element.checked ? (optionText(element) || element.value) : '';
-  return String(element.value || '').trim();
-}
-
-function fieldIdentity(element, index) {
-  return element.id || element.name || `field_${index}`;
-}
-
-function formElements(document) {
-  return [...document.querySelectorAll('input, textarea, select')].filter(isSupported);
-}
-
-export function snapshotFormValues(document) {
-  const values = new Map();
-  const seenRadioGroups = new Set();
-  for (const [index, element] of formElements(document).entries()) {
-    if (element.type === 'radio' && element.name) {
-      if (seenRadioGroups.has(element.name)) continue;
-      seenRadioGroups.add(element.name);
-    }
-    values.set(fieldIdentity(element, index), fieldValue(element));
-  }
-  return values;
-}
-
-export function collectChangedResponses(document, initialValues) {
-  const records = [];
-  const seenRadioGroups = new Set();
-  for (const [index, element] of formElements(document).entries()) {
-    if (element.type === 'radio' && element.name) {
-      if (seenRadioGroups.has(element.name)) continue;
-      seenRadioGroups.add(element.name);
-    }
-    const answer = fieldValue(element);
-    const identity = fieldIdentity(element, index);
-    if (!answer || answer === initialValues.get(identity)) continue;
-    const field = describeField(document, element);
-    const key = slugify(field.label || field.name || field.id || identity);
-    records.push({
-      key,
-      question: field.label || field.name || field.id || 'Unlabelled field',
-      answer,
-      aliases: [],
-      type: field.type,
-      status: 'draft',
-      sensitivity: inferSensitivity(field.label, key),
-      options: element.tagName === 'SELECT' ? [...element.options].map((option) => option.textContent.trim()).filter(Boolean) : [],
-      source: `learned:${document.location.href}`,
-    });
-  }
-  return records;
-}
-
-function isEmailTemplateField(field) {
-  return /cover letter|covering letter|application message|email body|message/i.test(field.label || '');
-}
-
 function fillElement(document, element, answer) {
   if (element.tagName === 'SELECT') return setSelectValue(element, answer);
   if (element.type === 'radio') return setRadioGroup(document, element, answer);
@@ -166,77 +180,209 @@ function fillElement(document, element, answer) {
   return setTextValue(element, answer);
 }
 
-function reportItem(field, match, element, extra = {}) {
-  return {
-    label: field.label || field.name || field.id || 'Unlabelled field',
-    key: match?.record?.key || null,
-    answer: match?.record?.answer || null,
-    confidence: match?.confidence || null,
-    reason: match?.reason || null,
-    required: Boolean(element.required),
-    ...extra,
-  };
+function elementsForField(document, fieldId) {
+  const byId = document.getElementById(fieldId);
+  if (byId && isSupported(byId)) return [byId];
+  return formElements(document).filter((element) => element.name === fieldId || element.id === fieldId);
 }
 
-function isSupported(element) {
-  if (!['INPUT', 'TEXTAREA', 'SELECT'].includes(element.tagName)) return false;
-  if (element.disabled || element.readOnly) return false;
-  return !['hidden', 'password', 'file', 'submit', 'button', 'reset', 'image'].includes(element.type);
+function elementForField(document, fieldId) {
+  return elementsForField(document, fieldId)[0] || null;
 }
 
-export function scanAndFillDocument(document, records, { fill = false, overwrite = false, includeEmailTemplates = false } = {}) {
-  const report = {
-    scanned: [],
-    filled: [],
-    review: [],
-    unknown: [],
-    unchanged: [],
-    failed: [],
-    requiredEmpty: [],
-  };
-  const seenRadioGroups = new Set();
-  const elements = [...document.querySelectorAll('input, textarea, select')].filter(isSupported);
+function currentField(document, fieldId) {
+  const element = elementForField(document, fieldId);
+  if (!element) return null;
+  const index = uniqueFields(document).findIndex(({ element: candidate }) => candidate === element);
+  return describeField(document, element, Math.max(index, 0));
+}
 
-  for (const element of elements) {
-    if (element.type === 'radio' && element.name) {
-      if (seenRadioGroups.has(element.name)) continue;
-      seenRadioGroups.add(element.name);
-    }
-    const field = describeField(document, element);
-    let match = chooseRecord(field, records);
-    if (match?.record?.type === 'email-template' && !isEmailTemplateField(field)) {
-      match = chooseRecord(field, records.filter((record) => record.type !== 'email-template'));
-    }
-    const item = reportItem(field, match, element, { currentValue: element.value || '' });
-    report.scanned.push(item);
+function effectiveSensitivity(field, decision) {
+  const inferred = inferSensitivity(field.label, field.id);
+  if (inferred === 'legal' || decision.sensitivity === 'legal') return 'legal';
+  if (inferred === 'review' || decision.sensitivity === 'review') return 'review';
+  return 'safe';
+}
 
+function addReviewIfNeeded(result, field, decision, value) {
+  const effective = { ...decision, sensitivity: effectiveSensitivity(field, decision), value };
+  if (value && shouldReviewDecision(effective, field)) result.reviewRequired.push({ ...effective, field });
+}
+
+export function planDeterministicFill(fields, records) {
+  return fields.map((field) => {
+    const match = chooseRecord(field, records);
     if (!match) {
-      report.unknown.push(item);
-      continue;
+      return {
+        fieldId: field.id,
+        action: 'ask_user',
+        value: null,
+        evidenceKeys: [],
+        confidence: 'low',
+        sensitivity: inferSensitivity(field.label, field.id),
+        reason: 'No local answer matched this field',
+      };
     }
-    const templateAllowed = includeEmailTemplates && match.record.type === 'email-template';
-    if (!shouldAutofill(match.record) && !templateAllowed) {
-      report.review.push(item);
-      continue;
-    }
-    if (hasValue(element) && !overwrite) {
-      report.unchanged.push(item);
-      continue;
-    }
-    if (!fill) continue;
+    return {
+      fieldId: field.id,
+      action: 'fill',
+      value: match.record.answer,
+      evidenceKeys: [match.record.key],
+      confidence: match.confidence === 'exact' ? 'high' : match.confidence,
+      sensitivity: match.record.sensitivity || inferSensitivity(field.label, field.id),
+      reason: match.reason,
+    };
+  });
+}
 
-    if (fillElement(document, element, match.record.answer)) {
-      report.filled.push({ ...item, currentValue: match.record.answer });
-    } else {
-      report.failed.push(item);
+export function applyDecisions(document, decisions = []) {
+  const result = { applied: [], kept: [], reviewRequired: [], unresolved: [], failed: [] };
+  for (const decision of decisions) {
+    const field = currentField(document, decision.fieldId);
+    if (!field) {
+      result.failed.push({ fieldId: decision.fieldId, reason: 'Field is no longer on the page' });
+      continue;
     }
+    const element = elementForField(document, decision.fieldId);
+    if (decision.action === 'keep') {
+      result.kept.push({ fieldId: field.id, value: field.currentValue });
+      addReviewIfNeeded(result, field, decision, field.currentValue);
+      continue;
+    }
+    if (decision.action === 'ask_user') {
+      result.unresolved.push({ fieldId: field.id, label: field.label, reason: decision.reason });
+      addReviewIfNeeded(result, field, decision, field.currentValue);
+      continue;
+    }
+    const current = field.currentValue;
+    if (current && validateFillValue(field, current).ok) {
+      result.kept.push({ fieldId: field.id, value: current });
+      addReviewIfNeeded(result, field, decision, current);
+      continue;
+    }
+    const validation = validateFillValue(field, decision.value);
+    if (!validation.ok) {
+      result.failed.push({ fieldId: field.id, label: field.label, value: decision.value, reason: validation.reason });
+      continue;
+    }
+    if (!fillElement(document, element, decision.value)) {
+      result.failed.push({ fieldId: field.id, label: field.label, value: decision.value, reason: 'The page rejected this value' });
+      continue;
+    }
+    const applied = { ...decision, field, value: decision.value };
+    result.applied.push(applied);
+    addReviewIfNeeded(result, field, decision, decision.value);
   }
+  return result;
+}
 
-  report.requiredEmpty = elements
-    .filter((element) => element.required && !hasValue(element))
-    .map((element) => ({
-      label: labelFor(document, element) || element.name || element.id || 'Unlabelled field',
-      type: element.type || element.tagName.toLowerCase(),
+function actionLabel(element) {
+  return String(element.textContent || element.value || element.getAttribute('aria-label') || '').replace(/\s+/g, ' ').trim();
+}
+
+function collectActions(document) {
+  const actions = [];
+  const candidates = [...document.querySelectorAll('button, input[type="submit"], input[type="button"], a, [role="button"]')];
+  for (const [index, element] of candidates.entries()) {
+    if (element.disabled || !isVisible(element)) continue;
+    const label = actionLabel(element);
+    if (!label) continue;
+    const type = String(element.type || '').toLowerCase();
+    const nextLabel = /^(next|continue|save and continue|proceed|review application|next step)\b/i.test(label);
+    const kind = nextLabel
+      ? 'next'
+      : type === 'submit' || /\b(submit|apply|finish|complete application|send application)\b/i.test(label)
+        ? 'submit'
+        : 'other';
+    actions.push({ id: `action_${actions.length}`, label, kind, type: type || element.tagName.toLowerCase() });
+  }
+  return actions;
+}
+
+function pauseReasons(document) {
+  const reasons = [];
+  const visibleText = [...(document.body?.querySelectorAll('*') || [])]
+    .filter(isVisible)
+    .map((element) => element.textContent || '')
+    .join(' ');
+  if ([...document.querySelectorAll('input[type="file"]:not([disabled])')].some((element) => isVisible(element) && !(element.files?.length || element.value))) reasons.push('file_upload');
+  const captchaElement = [...document.querySelectorAll('[id*="captcha" i], [class*="captcha" i], [id*="recaptcha" i], [class*="recaptcha" i]')].some(isVisible);
+  if (captchaElement || /\bcaptcha\b/i.test(visibleText)) reasons.push('captcha');
+  if ([...document.querySelectorAll('input[type="password"]:not([disabled])')].some(isVisible) || /\b(sign in|log in|login)\b/i.test(visibleText)) reasons.push('login');
+  if ([...document.querySelectorAll('[contenteditable="true"], [role="combobox"], [aria-haspopup="listbox"]')].some(isVisible)) reasons.push('unsupported_widget');
+  const nextCount = collectActions(document).filter((action) => action.kind === 'next').length;
+  const submitCount = collectActions(document).filter((action) => action.kind === 'submit').length;
+  if (nextCount > 1 || submitCount > 1) reasons.push('ambiguous_navigation');
+  return [...new Set(reasons)];
+}
+
+export function inspectDocument(document) {
+  const actions = collectActions(document);
+  return {
+    page: { title: document.title || '', domain: document.location?.hostname || '' },
+    fields: collectFieldDescriptors(document),
+    actions,
+    pauseReasons: pauseReasons(document),
+  };
+}
+
+export function validateDocument(document) {
+  const requiredEmpty = [];
+  const invalid = [];
+  for (const field of collectFieldDescriptors(document)) {
+    const element = elementForField(document, field.id);
+    if (field.required && !field.currentValue) requiredEmpty.push({ fieldId: field.id, label: field.label, type: field.type });
+    if (element?.checkValidity && !element.checkValidity()) invalid.push({ fieldId: field.id, label: field.label, type: field.type });
+  }
+  return { ok: requiredEmpty.length === 0 && invalid.length === 0, requiredEmpty, invalid };
+}
+
+export function collectAnswerRecords(document) {
+  return collectFieldDescriptors(document)
+    .filter((field) => field.currentValue)
+    .map((field) => ({
+      key: slugify(field.label || field.id),
+      question: field.label || field.id,
+      answer: field.currentValue,
+      aliases: [field.label, field.id].filter(Boolean),
+      type: field.type,
+      sensitivity: inferSensitivity(field.label, field.id),
     }));
-  return report;
+}
+
+export function focusField(document, fieldId) {
+  const element = elementForField(document, fieldId);
+  element?.focus?.();
+  return Boolean(element);
+}
+
+function findActionElement(document, actionId) {
+  const actions = [...document.querySelectorAll('button, input[type="submit"], input[type="button"], a, [role="button"]')];
+  let index = 0;
+  for (const element of actions) {
+    if (element.disabled || !isVisible(element) || !actionLabel(element)) continue;
+    const action = collectActions(document).find((candidate) => candidate.id === `action_${index}`);
+    if (action?.id === actionId) return { element, action };
+    index += 1;
+  }
+  return null;
+}
+
+export function clickAction(document, actionId) {
+  const found = findActionElement(document, actionId);
+  if (!found || found.action.kind !== 'next') return { ok: false, error: 'Navigation action is unavailable or not a validated Next control' };
+  found.element.click();
+  return { ok: true, action: found.action };
+}
+
+export function submitDocument(document) {
+  const submits = collectActions(document).filter((action) => action.kind === 'submit');
+  if (submits.length !== 1) return { ok: false, error: 'The page does not have one unambiguous submit control' };
+  const found = findActionElement(document, submits[0].id);
+  const form = found?.element.form || document.querySelector('form');
+  if (!form) return { ok: false, error: 'No form is available for submission' };
+  if (typeof form.requestSubmit === 'function') form.requestSubmit(found.element.type === 'submit' ? found.element : undefined);
+  else if (typeof form.submit === 'function') form.submit();
+  else return { ok: false, error: 'The page does not expose a form submission method' };
+  return { ok: true };
 }

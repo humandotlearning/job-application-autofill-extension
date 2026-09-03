@@ -8,33 +8,44 @@ async function readJson(path) {
   return JSON.parse(await readFile(new URL(path, root), 'utf8'));
 }
 
-test('manifest is a least-privilege Manifest V3 side-panel extension', async () => {
+test('manifest has only the permissions needed for local autofill', async () => {
   const manifest = await readJson('manifest.json');
   assert.equal(manifest.manifest_version, 3);
   assert.equal(manifest.side_panel.default_path, 'sidepanel.html');
-  assert.ok(manifest.permissions.includes('activeTab'));
-  assert.ok(manifest.permissions.includes('scripting'));
-  assert.ok(manifest.permissions.includes('storage'));
-  assert.ok(manifest.permissions.includes('sidePanel'));
-  assert.ok(manifest.permissions.includes('identity'));
-  assert.ok(manifest.oauth2.scopes.includes('https://www.googleapis.com/auth/spreadsheets.readonly'));
+  assert.deepEqual(manifest.permissions.sort(), ['activeTab', 'scripting', 'sidePanel', 'storage'].sort());
+  assert.equal(manifest.permissions.includes('identity'), false);
+  assert.equal('oauth2' in manifest, false);
   assert.ok(manifest.host_permissions.includes('<all_urls>'));
 });
 
-test('side panel contains sync, scan, and bulk-fill controls', async () => {
+test('side panel contains only the key, run, review, and submit controls', async () => {
   const html = await readFile(new URL('sidepanel.html', root), 'utf8');
-  assert.match(html, /id="sync-sheet"/);
-  assert.match(html, /id="scan-form"/);
-  assert.match(html, /id="fill-form"/);
-  assert.match(html, /id="csv-file"/);
-  assert.match(html, /id="start-learning"/);
-  assert.match(html, /id="approve-learned"/);
-  assert.doesNotMatch(html, /id="submit-application"/);
+  assert.match(html, /id="openai-api-key"/);
+  assert.match(html, /id="run-form"/);
+  assert.match(html, /id="confirm-submit"/);
+  assert.match(html, /id="review-list"/);
+  for (const id of ['sync-sheet', 'scan-form', 'fill-form', 'csv-file', 'start-learning', 'approve-learned', 'overwrite', 'fill-email-template', 'sheet-url']) {
+    assert.doesNotMatch(html, new RegExp(`id="${id}"`));
+  }
 });
 
-test('the provided Google Sheet is the initial data source', async () => {
-  const source = await readFile(new URL('src/sidepanel.js', root), 'utf8');
-  assert.match(source, /1SoKWd8RL1YpZxP3Bvs5bclF_fhs47VZpk1wh6H6UBJ0/);
+test('legacy source and pending-learning workflow is absent', async () => {
+  const [worker, panel] = await Promise.all([
+    readFile(new URL('src/service-worker.js', root), 'utf8'),
+    readFile(new URL('src/sidepanel.js', root), 'utf8'),
+  ]);
+  assert.doesNotMatch(worker, /formSessions|JOB_AUTOFILL_APPROVE_SAFE_LEARNED/);
+  assert.doesNotMatch(panel, /Google|CSV|pendingLearnedAnswers|Start learning|overwrite/i);
+});
+
+test('the worker owns one run lifecycle and the obsolete source files are deleted', async () => {
+  const worker = await readFile(new URL('src/service-worker.js', root), 'utf8');
+  assert.match(worker, /JOB_RUN_START/);
+  assert.match(worker, /JOB_RUN_CONTINUE/);
+  assert.match(worker, /JOB_RUN_CONFIRM_SUBMIT/);
+  assert.match(worker, /applicationRun/);
+  await assert.rejects(readFile(new URL('src/data-source.js', root)));
+  await assert.rejects(readFile(new URL('examples/answers-template.csv', root)));
 });
 
 test('build tooling produces a classic content-script bundle', async () => {

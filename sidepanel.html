@@ -8,84 +8,48 @@
 </head>
 <body>
   <header>
-    <div class="eyebrow">VISIBLE-TAB ASSISTANT</div>
+    <div class="eyebrow">FAST, LOCAL-FIRST ASSISTANT</div>
     <h1>Job Application Autofill</h1>
-    <p>Use the ATS resume importer first, then fill every verified field in one pass.</p>
+    <p>Known answers fill immediately. Only unresolved fields use the answer planner.</p>
   </header>
 
   <main>
-    <section class="card" aria-labelledby="source-title">
+    <section class="card" aria-labelledby="profile-title">
       <div class="section-heading">
-        <div>
-          <span class="step">01</span>
-          <h2 id="source-title">Answer source</h2>
-        </div>
+        <div><span class="step">01</span><h2 id="profile-title">Your answer profile</h2></div>
         <span id="record-count" class="pill">0 answers</span>
       </div>
-
-      <label for="sheet-url">Google Sheet URL</label>
-      <textarea id="sheet-url" rows="3" spellcheck="false"></textarea>
-      <div class="button-row">
-        <button id="sync-sheet" class="primary">Sync Google Sheet</button>
-        <label class="button secondary" for="csv-file">Import CSV</label>
-        <input id="csv-file" type="file" accept=".csv,text/csv">
-      </div>
-      <p class="hint">Expected columns: <strong>Field/Question</strong> and <strong>Value/Answer</strong>. Optional: Key, Aliases, Type, Status, Sensitivity.</p>
+      <label for="openai-api-key">OpenAI API key <span class="muted">(optional for local-only fill)</span></label>
+      <input id="openai-api-key" type="password" autocomplete="off" spellcheck="false" placeholder="sk-…">
+      <p class="hint">Stored only in trusted extension storage. The key is never sent to the page.</p>
     </section>
 
-    <section class="card" aria-labelledby="form-title">
+    <section class="card" aria-labelledby="run-title">
       <div class="section-heading">
-        <div>
-          <span class="step">02</span>
-          <h2 id="form-title">Current form</h2>
-        </div>
-        <span id="page-state" class="pill neutral">Not scanned</span>
+        <div><span class="step">02</span><h2 id="run-title">Current application</h2></div>
+        <span id="run-state" class="pill neutral">Ready</span>
       </div>
-      <div class="button-row two">
-        <button id="scan-form" class="secondary">Scan form</button>
-        <button id="fill-form" class="primary">Fill safe fields</button>
-      </div>
-      <div class="button-row">
-        <button id="fill-email-template" class="secondary">Fill email template (review)</button>
-      </div>
-      <label class="toggle">
-        <input id="overwrite" type="checkbox">
-        <span>Replace fields that already contain a value</span>
-      </label>
-      <label class="toggle">
-        <input id="learn-responses" type="checkbox">
-        <span>Enable learning for answers I complete on this page</span>
-      </label>
-      <div class="button-row">
-        <button id="start-learning" class="secondary">Start learning</button>
-        <button id="approve-learned" class="primary" disabled>Approve safe learned answers</button>
-      </div>
-      <p class="hint"><span id="pending-count">0 pending</span>. New answers stay local and pending; salary, legal, consent, demographic, authorization, and similar fields are never auto-approved.</p>
-
+      <button id="run-form" class="primary full">Fill application</button>
+      <p id="run-hint" class="hint">The first completed application teaches the local profile. Uploads, CAPTCHA, and login stay manual.</p>
     </section>
 
-    <section id="summary" class="summary-grid" aria-live="polite" hidden>
-      <div><strong id="count-scanned">0</strong><span>Scanned</span></div>
-      <div><strong id="count-filled">0</strong><span>Filled</span></div>
-      <div><strong id="count-review">0</strong><span>Review</span></div>
-      <div><strong id="count-unknown">0</strong><span>Unknown</span></div>
-      <div><strong id="count-errors">0</strong><span>Required empty</span></div>
-    </section>
-
-    <section id="results-card" class="card" aria-labelledby="results-title" hidden>
+    <section id="review-card" class="card" aria-labelledby="review-title" hidden>
       <div class="section-heading">
-        <div>
-          <span class="step">03</span>
-          <h2 id="results-title">Review</h2>
-        </div>
+        <div><span class="step">03</span><h2 id="review-title">Needs your attention</h2></div>
       </div>
-      <div id="results"></div>
+      <div id="review-list"></div>
+      <details id="audit-details" class="audit">
+        <summary>Show all filled values</summary>
+        <div id="audit-list"></div>
+      </details>
+      <button id="confirm-submit" class="primary full" disabled>Confirm &amp; submit</button>
+      <p class="hint">Submission is never automatic. Confirmation saves every final non-empty answer for future forms.</p>
     </section>
   </main>
 
   <footer>
     <span id="status-dot" class="status-dot"></span>
-    <span id="status">Ready. Sync the answer sheet to begin.</span>
+    <span id="status">Ready.</span>
   </footer>
   <script type="module" src="src/sidepanel.js"></script>
 </body>

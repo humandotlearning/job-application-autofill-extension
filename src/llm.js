@@ -1,3 +1,5 @@
+import { inferSensitivity } from './core.js';
+
 const RESPONSE_URL = 'https://api.openai.com/v1/responses';
 const MODEL = 'gpt-5.6-terra';
 const MAX_OUTPUT_TOKENS = 250;
@@ -82,7 +84,7 @@ function buildRequestBody({ fields, records, page }) {
         content: [
           {
             type: 'input_text',
-            text: 'Plan autofill decisions using only supplied records. Return one decision per field.',
+            text: 'Plan autofill decisions using only supplied learned answer records. Return exactly one decision per supplied field. Transform an answer only when the records provide evidence. Never invent qualifications, dates, salary, authorization, sponsorship, identity, or any other fact. Use ask_user when evidence is missing, ambiguous, unsupported, or invalid. Never select controls or use selectors.',
           },
         ],
       },
@@ -90,12 +92,12 @@ function buildRequestBody({ fields, records, page }) {
         role: 'user',
         content: [
           {
-            type: 'input_json',
-            input_json: {
+            type: 'input_text',
+            text: JSON.stringify({
               page: sanitizePage(page),
               fields: fields.map(sanitizeField),
               records: records.map(sanitizeRecord),
-            },
+            }),
           },
         ],
       },
@@ -123,8 +125,17 @@ function sanitizeField(field) {
     id: field.id,
     label: field.label ?? '',
     type: field.type ?? '',
+    autocomplete: field.autocomplete ?? '',
     required: Boolean(field.required),
+    currentValue: field.currentValue ?? '',
     options: Array.isArray(field.options) ? field.options.filter((option) => typeof option === 'string') : [],
+    constraints: {
+      min: field.constraints?.min,
+      max: field.constraints?.max,
+      minLength: field.constraints?.minLength,
+      maxLength: field.constraints?.maxLength,
+      pattern: field.constraints?.pattern,
+    },
   };
 }
 
@@ -135,9 +146,7 @@ function sanitizeRecord(record) {
     answer: record.answer ?? '',
     aliases: Array.isArray(record.aliases) ? record.aliases.filter((alias) => typeof alias === 'string') : [],
     type: record.type ?? '',
-    status: record.status ?? '',
     sensitivity: record.sensitivity ?? '',
-    source: record.source ?? '',
   };
 }
 
@@ -165,11 +174,26 @@ function validateDecisions(payload, fields, records) {
 
   const fieldIds = new Set(fields.map((field) => field.id));
   const recordKeys = new Set(records.map((record) => record.key));
+  if (payload.decisions.length !== fieldIds.size) {
+    throw new Error('Answer planner response must contain exactly one decision for every field');
+  }
 
-  return payload.decisions.map((decision) => validateDecision(decision, fieldIds, recordKeys));
+  const seen = new Set();
+  const decisions = payload.decisions.map((decision) => {
+    const validated = validateDecision(decision, fieldIds, recordKeys, fields, records);
+    if (seen.has(validated.fieldId)) {
+      throw new Error(`Answer planner response contains a duplicate decision for field: ${validated.fieldId}`);
+    }
+    seen.add(validated.fieldId);
+    return validated;
+  });
+  if (seen.size !== fieldIds.size) {
+    throw new Error('Answer planner response is missing a decision for at least one field');
+  }
+  return decisions;
 }
 
-function validateDecision(decision, fieldIds, recordKeys) {
+function validateDecision(decision, fieldIds, recordKeys, fields, records) {
   if (!decision || typeof decision !== 'object' || Array.isArray(decision)) {
     throw new Error('Answer planner response violates schema: each decision must be an object');
   }
@@ -216,6 +240,13 @@ function validateDecision(decision, fieldIds, recordKeys) {
     }
     if (evidenceKeys.length === 0) {
       throw new Error('Answer planner fill decisions require at least one evidence key');
+    }
+    const field = fields.find((candidate) => candidate.id === fieldId);
+    if (field && inferSensitivity(field.label, field.id) !== 'safe' && sensitivity === 'safe') {
+      throw new Error(`Answer planner marked a sensitive field as safe: ${fieldId}`);
+    }
+    if (records.some((record) => evidenceKeys.includes(record.key) && ['review', 'legal'].includes(record.sensitivity)) && sensitivity === 'safe') {
+      throw new Error(`Answer planner marked sensitive evidence as safe: ${fieldId}`);
     }
   }
 
