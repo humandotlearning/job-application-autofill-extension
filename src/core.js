@@ -114,6 +114,42 @@ export function inferSensitivity(question, key = '') {
   return 'safe';
 }
 
+function derivedEmailRecords(body, source) {
+  const records = [];
+  const add = (key, question, answer, aliases = []) => {
+    if (!answer) return;
+    records.push({ key, question, answer, aliases, type: 'text', status: 'verified', sensitivity: 'safe', options: [], source: `derived:${source}` });
+  };
+  const phone = body.match(/(?:^|\n)\s*(\+?\d[\d\s().-]{7,}\d)\s*$/m)?.[1]?.replace(/[^\d+]/g, '');
+  add('phone', 'Phone number', phone, ['Phone', 'Mobile', 'Telephone']);
+  for (const [key, question, aliases, pattern] of [
+    ['github', 'GitHub URL', ['GitHub', 'Github profile'], /GitHub:\s*(https?:\/\/\S+)/i],
+    ['portfolio', 'Portfolio URL', ['Portfolio', 'Personal website'], /Portfolio:\s*(https?:\/\/\S+)/i],
+    ['email', 'Email address', ['Email', 'E-mail'], /(?:Email|E-mail):\s*(\S+@\S+)/i],
+  ]) add(key, question, body.match(pattern)?.[1]?.replace(/[),.;]+$/, ''), aliases);
+  const signature = body.match(/(?:warm regards|best regards|regards|sincerely),?\s*\n\s*([A-Za-z][A-Za-z .'-]*)\s*\n\s*\+?\d/im)?.[1]?.trim();
+  if (signature) {
+    const parts = signature.split(/\s+/).filter(Boolean);
+    if (parts.length > 1) add('full_name', 'Full name', signature, ['Name', 'Candidate name']);
+    else add('preferred_name', 'Preferred first name', signature, ['First name', 'Given name']);
+  }
+  return records;
+}
+
+function emailTemplateRecords(body, source) {
+  return [{
+    key: 'email_template',
+    question: 'Application email or cover letter',
+    answer: body,
+    aliases: ['Email body', 'Cover Letter', 'Covering Letter', 'Application message', 'Message'],
+    type: 'email-template',
+    status: 'draft',
+    sensitivity: 'review',
+    options: [],
+    source,
+  }, ...derivedEmailRecords(body, source)];
+}
+
 export function rowsToRecords(rows, source = 'google-sheet') {
   if (!Array.isArray(rows) || rows.length === 0) return [];
   const headers = rows[0].map((header) => String(header).trim());
@@ -128,17 +164,7 @@ export function rowsToRecords(rows, source = 'google-sheet') {
     if (!hasKeyValueRows) {
       const body = rows.flat().map((cell) => String(cell ?? '').trim()).filter(Boolean).join('\n');
       if (body && /email|cover letter|message/i.test(source)) {
-        return [{
-          key: 'email_template',
-          question: 'Application email or cover letter',
-          answer: body,
-          aliases: ['Email body', 'Cover Letter', 'Covering Letter', 'Application message', 'Message'],
-          type: 'email-template',
-          status: 'draft',
-          sensitivity: 'review',
-          options: [],
-          source,
-        }];
+        return emailTemplateRecords(body, source);
       }
       return [];
     }

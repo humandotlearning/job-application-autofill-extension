@@ -109,11 +109,14 @@ test('defaults sensitive questions to review when the sheet omits policy', () =>
 });
 
 test('recognizes an unstructured email CSV as a review-only application template', () => {
-  const records = rowsToRecords([['Hi Noeon team,\n\nI am interested in this role.']], 'resume - email.csv');
-  assert.equal(records.length, 1);
+  const records = rowsToRecords([['Warm Regards\nNithin\n+91 8882339186\nGithub: https://github.com/humandotlearning\nPortfolio: https://humandotlearning.github.io/']], 'resume - email.csv');
   assert.equal(records[0].type, 'email-template');
   assert.equal(records[0].status, 'draft');
   assert.equal(records[0].sensitivity, 'review');
+  assert.equal(records.find((record) => record.key === 'phone')?.answer, '+918882339186');
+  assert.equal(records.find((record) => record.key === 'github')?.answer, 'https://github.com/humandotlearning');
+  assert.equal(records.find((record) => record.key === 'portfolio')?.answer, 'https://humandotlearning.github.io/');
+  assert.equal(records.find((record) => record.key === 'preferred_name')?.answer, 'Nithin');
   const match = chooseRecord({ label: 'Cover Letter', type: 'textarea' }, records);
   assert.equal(match.record.key, 'email_template');
 });
