@@ -4,6 +4,8 @@ A Manifest V3 side-panel extension that scans the current job application and fi
 
 ## Current data source
 
+The extension requests host access to all URLs so it can work with arbitrary job boards and ATS providers. It only reads a page when you explicitly trigger a side-panel action; it does not crawl or monitor unrelated pages.
+
 The extension is preconfigured with:
 
 ```text
@@ -11,8 +13,6 @@ https://docs.google.com/spreadsheets/d/1SoKWd8RL1YpZxP3Bvs5bclF_fhs47VZpk1wh6H6U
 ```
 
 The workbook is private: an unauthenticated export currently returns HTTP 401. The extension therefore supports Google OAuth with the read-only Sheets scope. It reads every tab and combines reusable records.
-
-The observed workbook layouts are supported:
 
 - `Sheet1`: headerless key/value rows such as `LinkedIn:` and its URL.
 - `common questions`: `Questions` and `Answers` headers.

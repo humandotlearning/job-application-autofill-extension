@@ -18,18 +18,7 @@ test('manifest is a least-privilege Manifest V3 side-panel extension', async () 
   assert.ok(manifest.permissions.includes('sidePanel'));
   assert.ok(manifest.permissions.includes('identity'));
   assert.ok(manifest.oauth2.scopes.includes('https://www.googleapis.com/auth/spreadsheets.readonly'));
-  assert.ok(!manifest.host_permissions.includes('<all_urls>'));
-  assert.deepEqual(manifest.host_permissions, [
-    'https://docs.google.com/*',
-    'https://sheets.googleapis.com/*',
-    'https://jobs.ashbyhq.com/*',
-    'https://job-boards.greenhouse.io/*',
-    'https://impactxtech.com/*',
-    'https://www.impactxtech.com/*',
-    'https://impacttxtech.com/*',
-    'https://www.impacttxtech.com/*',
-    'https://jobs.lever.co/*',
-  ]);
+  assert.ok(manifest.host_permissions.includes('<all_urls>'));
 });
 
 test('side panel contains sync, scan, and bulk-fill controls', async () => {
