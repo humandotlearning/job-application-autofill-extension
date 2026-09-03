@@ -47,6 +47,28 @@ async function saveRecords(records, sheetUrl, source) {
   updateRecordCount(records);
 }
 
+async function saveFormSession(tabId, report) {
+  const { formSessions = {} } = await chrome.storage.session.get({ formSessions: {} });
+  formSessions[String(tabId)] = { report, savedAt: Date.now() };
+  await chrome.storage.session.set({ formSessions });
+}
+
+function clearReport() {
+  elements.summary.hidden = true;
+  elements.resultsCard.hidden = true;
+  elements.results.replaceChildren();
+  elements.pageState.textContent = 'Not scanned';
+  elements.pageState.className = 'pill neutral';
+  for (const id of ['count-scanned', 'count-filled', 'count-review', 'count-unknown', 'count-errors']) byId(id).textContent = '0';
+}
+
+async function restoreFormSession(tabId) {
+  const { formSessions = {} } = await chrome.storage.session.get({ formSessions: {} });
+  const session = formSessions[String(tabId)];
+  if (session?.report) renderReport(session.report);
+  else clearReport();
+}
+
 async function getRecords() {
   const { answerRecords = [] } = await chrome.storage.local.get('answerRecords');
   const expanded = expandEmailTemplateRecords(answerRecords);
@@ -131,6 +153,7 @@ async function runFormAction(fill, includeEmailTemplates = false) {
     });
     if (!response?.ok) throw new Error(response?.error || 'The form did not return a report.');
     renderReport(response.report);
+    await saveFormSession(tab.id, response.report);
     const count = response.report.filled.length;
     setStatus(fill ? `Filled ${count} safe field${count === 1 ? '' : 's'}; review the page before continuing.` : 'Form scan complete.');
   } catch (error) {
@@ -228,6 +251,8 @@ async function hydrate() {
   const stored = await chrome.storage.local.get(['sheetUrl', 'answerRecords', 'lastSyncedAt']);
   elements.sheetUrl.value = stored.sheetUrl || DEFAULT_SHEET_URL;
   updateRecordCount(stored.answerRecords || []);
+  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+  if (tab?.id) await restoreFormSession(tab.id);
   if (stored.lastSyncedAt) setStatus(`Ready. Last synced ${new Date(stored.lastSyncedAt).toLocaleString()}.`);
 }
 
@@ -247,6 +272,13 @@ elements.startLearning.addEventListener('click', startLearning);
 elements.approveLearned.addEventListener('click', approveSafeLearned);
 chrome.storage.onChanged.addListener((changes, area) => {
   if (area === 'local' && changes.pendingLearnedAnswers) refreshLearningCount();
+  if (area === 'session' && changes.formSessions) {
+    chrome.tabs.query({ active: true, currentWindow: true }).then(([tab]) => tab?.id && restoreFormSession(tab.id));
+  }
+});
+chrome.tabs.onActivated.addListener(({ tabId }) => restoreFormSession(tabId));
+chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
+  if (changeInfo.status === 'loading') restoreFormSession(tabId);
 });
 chrome.runtime.onMessage.addListener((message) => {
   if (message?.type === 'JOB_AUTOFILL_LEARNED_SAVED' && message.added > 0) {

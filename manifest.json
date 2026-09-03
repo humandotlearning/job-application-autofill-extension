@@ -5,7 +5,7 @@
   "version": "0.1.1",
   "minimum_chrome_version": "114",
   "permissions": ["activeTab", "identity", "scripting", "storage", "sidePanel"],
-  "host_permissions": ["https://docs.google.com/*", "https://sheets.googleapis.com/*", "https://jobs.ashbyhq.com/*", "https://job-boards.greenhouse.io/*"],
+  "host_permissions": ["https://docs.google.com/*", "https://sheets.googleapis.com/*", "https://jobs.ashbyhq.com/*", "https://job-boards.greenhouse.io/*", "https://impactxtech.com/*", "https://www.impactxtech.com/*"],
   "oauth2": {
     "client_id": "REPLACE_WITH_GOOGLE_OAUTH_CLIENT_ID.apps.googleusercontent.com",
     "scopes": ["https://www.googleapis.com/auth/spreadsheets.readonly"]

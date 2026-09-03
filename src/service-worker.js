@@ -31,6 +31,23 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   return true;
 });
 
+chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
+  if (changeInfo.status !== 'loading') return;
+  chrome.storage.session.get({ formSessions: {} }).then(({ formSessions }) => {
+    if (!formSessions[String(tabId)]) return;
+    delete formSessions[String(tabId)];
+    return chrome.storage.session.set({ formSessions });
+  }).catch(() => {});
+});
+
+chrome.tabs.onRemoved.addListener((tabId) => {
+  chrome.storage.session.get({ formSessions: {} }).then(({ formSessions }) => {
+    if (!formSessions[String(tabId)]) return;
+    delete formSessions[String(tabId)];
+    return chrome.storage.session.set({ formSessions });
+  }).catch(() => {});
+});
+
 chrome.runtime.onInstalled.addListener(async () => {
   await chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true });
   if (chrome.storage.local.setAccessLevel) {
