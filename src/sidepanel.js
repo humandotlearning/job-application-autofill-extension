@@ -248,4 +248,11 @@ elements.approveLearned.addEventListener('click', approveSafeLearned);
 chrome.storage.onChanged.addListener((changes, area) => {
   if (area === 'local' && changes.pendingLearnedAnswers) refreshLearningCount();
 });
+chrome.runtime.onMessage.addListener((message) => {
+  if (message?.type === 'JOB_AUTOFILL_LEARNED_SAVED' && message.added > 0) {
+    refreshLearningCount();
+    setStatus(`Saved ${message.added} new answer${message.added === 1 ? '' : 's'} for review.`);
+  }
+});
+
 hydrate().then(refreshLearningCount).catch((error) => setStatus(error.message, 'error'));

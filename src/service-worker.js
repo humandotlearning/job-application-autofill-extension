@@ -2,12 +2,19 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   if (message?.type !== 'JOB_AUTOFILL_LEARNED' || !Array.isArray(message.records)) return false;
   chrome.storage.local.get({ pendingLearnedAnswers: [] }).then(({ pendingLearnedAnswers }) => {
     const merged = [...pendingLearnedAnswers];
+    let added = 0;
     for (const record of message.records) {
       const duplicate = merged.find((item) => item.key === record.key && item.answer === record.answer);
-      if (!duplicate) merged.push({ ...record, learnedAt: new Date().toISOString() });
+      if (!duplicate) {
+        merged.push({ ...record, learnedAt: new Date().toISOString() });
+        added += 1;
+      }
     }
-    return chrome.storage.local.set({ pendingLearnedAnswers: merged });
-  }).then(() => sendResponse({ ok: true })).catch((error) => sendResponse({ ok: false, error: error.message }));
+    return chrome.storage.local.set({ pendingLearnedAnswers: merged }).then(() => added);
+  }).then((added) => {
+    chrome.runtime.sendMessage({ type: 'JOB_AUTOFILL_LEARNED_SAVED', added }).catch(() => {});
+    sendResponse({ ok: true, added });
+  }).catch((error) => sendResponse({ ok: false, error: error.message }));
   return true;
 });
 
