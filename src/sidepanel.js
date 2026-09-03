@@ -214,8 +214,10 @@ function renderReport(report) {
 
 async function refreshLearningCount() {
   const { pendingLearnedAnswers = [] } = await chrome.storage.local.get('pendingLearnedAnswers');
-  elements.pendingCount.textContent = `${pendingLearnedAnswers.length} pending`;
-  elements.approveLearned.disabled = !pendingLearnedAnswers.some((record) => record.sensitivity === 'safe');
+  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+  const pending = pendingLearnedAnswers.filter((record) => record.tabId == null || record.tabId === tab?.id);
+  elements.pendingCount.textContent = `${pending.length} pending`;
+  elements.approveLearned.disabled = !pending.some((record) => record.sensitivity === 'safe');
 }
 
 async function startLearning() {
@@ -237,7 +239,8 @@ async function startLearning() {
 async function approveSafeLearned() {
   setBusy(true);
   try {
-    const response = await chrome.runtime.sendMessage({ type: 'JOB_AUTOFILL_APPROVE_SAFE_LEARNED' });
+    const tab = await activeTab();
+    const response = await chrome.runtime.sendMessage({ type: 'JOB_AUTOFILL_APPROVE_SAFE_LEARNED', tabId: tab.id });
     if (!response?.ok) throw new Error(response?.error || 'Could not approve learned answers.');
     setStatus('Approved safe learned answers for future autofill. Sensitive answers remain review-gated.');
   } catch (error) {
@@ -282,8 +285,11 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
 });
 chrome.runtime.onMessage.addListener((message) => {
   if (message?.type === 'JOB_AUTOFILL_LEARNED_SAVED' && message.added > 0) {
-    refreshLearningCount();
-    setStatus(`Saved ${message.added} new answer${message.added === 1 ? '' : 's'} for review.`);
+    chrome.tabs.query({ active: true, currentWindow: true }).then(([tab]) => {
+      if (tab?.id !== message.tabId) return;
+      refreshLearningCount();
+      setStatus(`Saved ${message.added} new answer${message.added === 1 ? '' : 's'} for review.`);
+    });
   }
 });
 
