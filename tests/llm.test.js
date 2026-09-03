@@ -335,3 +335,19 @@ test('rejects a safe proposal for a review-sensitive field', async () => {
     /sensitive|safe/i,
   );
 });
+
+test('rejects an invented value even when the evidence key exists', async () => {
+  await assert.rejects(
+    callAnswerPlanner({
+      apiKey: 'test-api-key',
+      page: { title: 'Application', domain: 'jobs.example.com' },
+      fields: [{ id: 'name', label: 'Full name', type: 'text' }],
+      records: [{ key: 'candidate_name', question: 'Candidate name', answer: 'Nithin', sensitivity: 'safe' }],
+    }, {
+      fetchImpl: async () => plannerResponse([{
+        fieldId: 'name', action: 'fill', value: 'Invented Person', evidenceKeys: ['candidate_name'], confidence: 'high', sensitivity: 'safe', reason: 'Unrelated value',
+      }]),
+    }),
+    /evidence|transformation/i,
+  );
+});

@@ -212,6 +212,7 @@ function upsertAnswerRecords(existing = [], incoming = [], updatedAt = new Date(
 
 
 const IGNORED_TYPES = new Set(['hidden', 'password', 'file', 'submit', 'button', 'reset', 'image']);
+const SECRET_MARKER = /(?:password|passcode|passwd|pwd|secret|token|csrf|auth[_-]?token)/i;
 
 function textFromIds(document, ids = '') {
   return String(ids)
@@ -242,7 +243,8 @@ function labelFor(document, element) {
 function isSupported(element) {
   if (!['INPUT', 'TEXTAREA', 'SELECT'].includes(element.tagName)) return false;
   if (element.disabled || element.readOnly) return false;
-  return !IGNORED_TYPES.has(String(element.type || '').toLowerCase());
+  if (IGNORED_TYPES.has(String(element.type || '').toLowerCase())) return false;
+  return !SECRET_MARKER.test(`${element.name || ''} ${element.id || ''} ${element.autocomplete || ''}`);
 }
 
 function isVisible(element) {
@@ -250,6 +252,8 @@ function isVisible(element) {
     if (current.hidden || current.getAttribute('aria-hidden') === 'true') return false;
     const style = current.getAttribute('style') || '';
     if (/(?:^|;)\s*(?:display\s*:\s*none|visibility\s*:\s*hidden)/i.test(style)) return false;
+    const computed = current.ownerDocument.defaultView?.getComputedStyle?.(current);
+    if (computed && (computed.display === 'none' || computed.visibility === 'hidden' || computed.contentVisibility === 'hidden')) return false;
   }
   return true;
 }
@@ -276,7 +280,12 @@ function uniqueFields(document) {
 }
 
 function fieldOptions(document, element) {
-  if (element.tagName === 'SELECT') return [...element.options].map((option) => option.textContent.trim()).filter(Boolean);
+  if (element.tagName === 'SELECT') {
+    return [...element.options]
+      .flatMap((option) => [option.textContent.trim(), option.value.trim()])
+      .filter(Boolean)
+      .filter((option, index, options) => options.findIndex((candidate) => normalizeText(candidate) === normalizeText(option)) === index);
+  }
   if (element.type === 'radio') {
     const group = formElements(document).filter((candidate) => candidate.type === 'radio' && candidate.name === element.name);
     return group.map((candidate) => optionText(candidate)).filter(Boolean);
@@ -493,9 +502,10 @@ function collectActions(document) {
     if (!label) continue;
     const type = String(element.type || '').toLowerCase();
     const nextLabel = /^(next|continue|save and continue|proceed|review application|next step)\b/i.test(label);
+    const formControl = element.tagName === 'BUTTON' || element.tagName === 'INPUT';
     const kind = nextLabel
       ? 'next'
-      : type === 'submit' || /\b(submit|apply|finish|complete application|send application)\b/i.test(label)
+      : formControl && (type === 'submit' || /\b(submit|apply|finish|complete application|send application)\b/i.test(label))
         ? 'submit'
         : 'other';
     actions.push({ id: `action_${actions.length}`, label, kind, type: type || element.tagName.toLowerCase() });
@@ -512,7 +522,10 @@ function pauseReasons(document) {
   if ([...document.querySelectorAll('input[type="file"]:not([disabled])')].some((element) => isVisible(element) && !(element.files?.length || element.value))) reasons.push('file_upload');
   const captchaElement = [...document.querySelectorAll('[id*="captcha" i], [class*="captcha" i], [id*="recaptcha" i], [class*="recaptcha" i]')].some(isVisible);
   if (captchaElement || /\bcaptcha\b/i.test(visibleText)) reasons.push('captcha');
-  if ([...document.querySelectorAll('input[type="password"]:not([disabled])')].some(isVisible) || /\b(sign in|log in|login)\b/i.test(visibleText)) reasons.push('login');
+  const loginPath = /(?:^|\/)(?:login|signin|sign-in)(?:\/|$)/i.test(document.location?.pathname || '');
+  const loginForm = [...document.querySelectorAll('form[action]')].some((form) => /login|signin|sign-in/i.test(form.action || form.getAttribute('action') || ''));
+  const loginHeading = [...document.querySelectorAll('h1, h2, h3')].some((element) => isVisible(element) && /^(?:sign in|log in|login)$/i.test(element.textContent.trim()));
+  if ([...document.querySelectorAll('input[type="password"]:not([disabled])')].some(isVisible) || loginPath || loginForm || loginHeading) reasons.push('login');
   if ([...document.querySelectorAll('[contenteditable="true"], [role="combobox"], [aria-haspopup="listbox"]')].some(isVisible)) reasons.push('unsupported_widget');
   const nextCount = collectActions(document).filter((action) => action.kind === 'next').length;
   const submitCount = collectActions(document).filter((action) => action.kind === 'submit').length;
@@ -583,14 +596,39 @@ function submitDocument(document) {
   const submits = collectActions(document).filter((action) => action.kind === 'submit');
   if (submits.length !== 1) return { ok: false, error: 'The page does not have one unambiguous submit control' };
   const found = findActionElement(document, submits[0].id);
-  const form = found?.element.form || document.querySelector('form');
-  if (!form) return { ok: false, error: 'No form is available for submission' };
-  if (typeof form.requestSubmit === 'function') form.requestSubmit(found.element.type === 'submit' ? found.element : undefined);
-  else if (typeof form.submit === 'function') form.submit();
-  else return { ok: false, error: 'The page does not expose a form submission method' };
+  const form = found?.element.form;
+  if (!form) return { ok: false, error: 'The validated submit control is not attached to a form' };
+  let submitEvent = null;
+  const listener = (event) => { submitEvent = event; };
+  form.addEventListener('submit', listener, true);
+  try {
+    if (typeof form.requestSubmit === 'function') form.requestSubmit(found.element.type === 'submit' ? found.element : undefined);
+    else if (typeof form.submit === 'function') form.submit();
+    else return { ok: false, error: 'The page does not expose a form submission method' };
+  } finally {
+    form.removeEventListener('submit', listener, true);
+  }
+  if (typeof form.requestSubmit === 'function' && !submitEvent) return { ok: false, error: 'The browser did not dispatch a submit event' };
+  if (submitEvent?.defaultPrevented) return { ok: false, error: 'The page prevented form submission' };
   return { ok: true };
 }
 
+
+function notifyNavigation() {
+  let sent = false;
+  let observer;
+  const send = () => {
+    if (sent) return;
+    sent = true;
+    observer?.disconnect();
+    chrome.runtime.sendMessage({ type: 'JOB_APP_NAVIGATED' }).catch(() => {});
+  };
+  if (typeof MutationObserver === 'function' && document.documentElement) {
+    observer = new MutationObserver(send);
+    observer.observe(document.documentElement, { subtree: true, childList: true, attributes: true });
+  }
+  setTimeout(send, 500);
+}
 
 if (!globalThis.__jobApplicationAutofillInstalled) {
   globalThis.__jobApplicationAutofillInstalled = true;
@@ -616,7 +654,11 @@ if (!globalThis.__jobApplicationAutofillInstalled) {
           sendResponse({ ok: focusField(document, message.fieldId) });
           break;
         case 'JOB_APP_CLICK_NEXT':
-          sendResponse(clickAction(document, message.actionId));
+          {
+            const result = clickAction(document, message.actionId);
+            if (result.ok) notifyNavigation();
+            sendResponse(result);
+          }
           break;
         case 'JOB_APP_SUBMIT':
           sendResponse(submitDocument(document));

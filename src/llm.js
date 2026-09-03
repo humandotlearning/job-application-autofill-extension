@@ -1,4 +1,4 @@
-import { inferSensitivity } from './core.js';
+import { inferSensitivity, normalizeText } from './core.js';
 
 const RESPONSE_URL = 'https://api.openai.com/v1/responses';
 const MODEL = 'gpt-5.6-terra';
@@ -193,6 +193,29 @@ function validateDecisions(payload, fields, records) {
   return decisions;
 }
 
+function comparableValue(field, value) {
+  const text = String(value ?? '').trim();
+  const type = normalizeText(field?.type);
+  if (type === 'number' || type === 'range') return text.replace(/[\s,]/g, '');
+  if (type === 'tel') return text.replace(/[^\d+]/g, '');
+  if (type === 'url') {
+    try {
+      const url = new URL(text);
+      return `${url.protocol}//${url.host}${url.pathname.replace(/\/$/, '')}${url.search}${url.hash}`.toLowerCase();
+    } catch {
+      return normalizeText(text);
+    }
+  }
+  return normalizeText(text);
+}
+
+function hasEvidenceForValue(field, value, evidenceKeys, records) {
+  const expected = comparableValue(field, value);
+  return records
+    .filter((record) => evidenceKeys.includes(record.key))
+    .some((record) => comparableValue(field, record.answer) === expected);
+}
+
 function validateDecision(decision, fieldIds, recordKeys, fields, records) {
   if (!decision || typeof decision !== 'object' || Array.isArray(decision)) {
     throw new Error('Answer planner response violates schema: each decision must be an object');
@@ -247,6 +270,9 @@ function validateDecision(decision, fieldIds, recordKeys, fields, records) {
     }
     if (records.some((record) => evidenceKeys.includes(record.key) && ['review', 'legal'].includes(record.sensitivity)) && sensitivity === 'safe') {
       throw new Error(`Answer planner marked sensitive evidence as safe: ${fieldId}`);
+    }
+    if (!field || !hasEvidenceForValue(field, value, evidenceKeys, records)) {
+      throw new Error(`Answer planner value is not an allowed transformation of its evidence: ${fieldId}`);
     }
   }
 

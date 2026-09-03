@@ -8,6 +8,22 @@ import {
   submitDocument,
 } from './form-engine.js';
 
+function notifyNavigation() {
+  let sent = false;
+  let observer;
+  const send = () => {
+    if (sent) return;
+    sent = true;
+    observer?.disconnect();
+    chrome.runtime.sendMessage({ type: 'JOB_APP_NAVIGATED' }).catch(() => {});
+  };
+  if (typeof MutationObserver === 'function' && document.documentElement) {
+    observer = new MutationObserver(send);
+    observer.observe(document.documentElement, { subtree: true, childList: true, attributes: true });
+  }
+  setTimeout(send, 500);
+}
+
 if (!globalThis.__jobApplicationAutofillInstalled) {
   globalThis.__jobApplicationAutofillInstalled = true;
   chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
@@ -32,7 +48,11 @@ if (!globalThis.__jobApplicationAutofillInstalled) {
           sendResponse({ ok: focusField(document, message.fieldId) });
           break;
         case 'JOB_APP_CLICK_NEXT':
-          sendResponse(clickAction(document, message.actionId));
+          {
+            const result = clickAction(document, message.actionId);
+            if (result.ok) notifyNavigation();
+            sendResponse(result);
+          }
           break;
         case 'JOB_APP_SUBMIT':
           sendResponse(submitDocument(document));

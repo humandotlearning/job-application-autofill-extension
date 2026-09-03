@@ -8,6 +8,7 @@ import {
   collectFieldDescriptors,
   inspectDocument,
   planDeterministicFill,
+  submitDocument,
   validateDocument,
 } from '../src/form-engine.js';
 
@@ -28,14 +29,19 @@ test('describes supported fields without passwords or hidden inputs', () => {
   assert.deepEqual(fields.map((field) => field.id), ['name', 'country']);
   assert.equal(fields[0].autocomplete, 'name');
   assert.equal(fields[0].constraints.pattern, undefined);
-  assert.deepEqual(fields[1].options, ['Choose', 'India']);
+  assert.deepEqual(fields[1].options, ['Choose', 'India', 'IN']);
 });
 
 test('ignores fields and pause markers inside hidden steps', () => {
   const document = makeDocument(`
     <form><label for="visible">Visible name</label><input id="visible"></form>
     <form hidden><label for="hidden">Hidden name</label><input id="hidden"><p>CAPTCHA</p></form>
+    <form class="css-hidden"><label for="styled">Styled hidden</label><input id="styled"></form>
+    <input id="pwd-hint" name="passwordHint" type="text"><input autocomplete="current-password" type="text">
   `);
+  const style = document.createElement('style');
+  style.textContent = '.css-hidden { display: none; }';
+  document.head.append(style);
   const inspection = inspectDocument(document);
   assert.deepEqual(inspection.fields.map((field) => field.id), ['visible']);
   assert.deepEqual(inspection.pauseReasons, []);
@@ -87,6 +93,21 @@ test('applies select, radio, and checkbox decisions only when options validate',
   assert.equal(document.querySelector('#consent').checked, true);
 });
 
+test('promotes inferred sensitive fields to final review even when a record says safe', () => {
+  const document = makeDocument('<label for="salary">Expected CTC</label><input id="salary">');
+  const result = applyDecisions(document, [{
+    fieldId: 'salary',
+    action: 'fill',
+    value: '5000000',
+    evidenceKeys: ['salary'],
+    confidence: 'high',
+    sensitivity: 'safe',
+    reason: 'Known value',
+  }]);
+  assert.equal(result.applied.length, 1);
+  assert.equal(result.reviewRequired[0].sensitivity, 'review');
+});
+
 test('inspects next and submit actions and detects manual pauses', () => {
   const document = makeDocument(`
     <h1>Application step 1</h1><p>Complete the CAPTCHA below.</p>
@@ -119,4 +140,16 @@ test('classifies a submit-type Next button as navigation and submits only throug
   `);
   const inspection = inspectDocument(document);
   assert.equal(inspection.actions[0].kind, 'next');
+});
+
+test('uses the validated form submit control and reports prevented submission', () => {
+  const document = makeDocument(`
+    <form id="other"><button type="button">Other action</button></form>
+    <form id="target"><input name="name" value="Nithin"><button type="submit">Submit application</button></form>
+  `);
+  let submits = 0;
+  document.querySelector('#target').addEventListener('submit', (event) => { submits += 1; event.preventDefault(); });
+  const result = submitDocument(document);
+  assert.equal(result.ok, false);
+  assert.equal(submits, 1);
 });

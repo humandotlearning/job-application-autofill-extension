@@ -11,6 +11,7 @@ test('runs deterministic plus LLM fill, gates submission, and saves confirmed an
   const updatedListeners = [];
   const removedListeners = [];
   let currentValue = '';
+  let currentPage = 0;
   let plannerCalls = 0;
   let submissions = 0;
 
@@ -25,9 +26,11 @@ test('runs deterministic plus LLM fill, gates submission, and saves confirmed an
     get currentValue() { return currentValue; },
   };
   const inspection = () => ({
-    page: { title: 'Demo application', domain: 'jobs.example.com' },
-    fields: [{ ...field, currentValue }],
-    actions: [{ id: 'action_0', label: 'Submit application', kind: 'submit', type: 'submit' }],
+    page: { title: currentPage ? `Demo application step ${currentPage}` : 'Demo application', domain: 'jobs.example.com' },
+    fields: [{ ...field, label: currentPage ? `Step ${currentPage} full name` : field.label, currentValue }],
+    actions: currentPage === 1
+      ? [{ id: 'action_0', label: 'Next', kind: 'next', type: 'submit' }]
+      : [{ id: 'action_0', label: 'Submit application', kind: 'submit', type: 'submit' }],
     pauseReasons: [],
   });
 
@@ -82,7 +85,7 @@ test('runs deterministic plus LLM fill, gates submission, and saves confirmed an
   };
 
   await import(`../src/service-worker.js?test=${Date.now()}`);
-  const dispatch = (message) => new Promise((resolve) => listeners[0](message, {}, resolve));
+  const dispatch = (message, sender = {}) => new Promise((resolve) => listeners[0](message, sender, resolve));
 
   const started = await dispatch({ type: 'JOB_RUN_START', tabId: 7 });
   assert.equal(started.ok, true);
@@ -101,6 +104,18 @@ test('runs deterministic plus LLM fill, gates submission, and saves confirmed an
   assert.equal(submissions, 1);
   const secondRun = await dispatch({ type: 'JOB_RUN_START', tabId: 7 });
   assert.equal(secondRun.run.status, 'ready_to_submit');
+  assert.equal(plannerCalls, 1);
+  const secondConfirmed = await dispatch({ type: 'JOB_RUN_CONFIRM_SUBMIT', tabId: 7 });
+  assert.equal(secondConfirmed.ok, true);
+  assert.equal(secondConfirmed.run.status, 'submitted');
+  assert.equal(submissions, 2);
+  currentPage = 1;
+  const pagedRun = await dispatch({ type: 'JOB_RUN_START', tabId: 7 });
+  assert.equal(pagedRun.run.status, 'running');
+  currentPage = 2;
+  const navigated = await dispatch({ type: 'JOB_APP_NAVIGATED' }, { tab: { id: 7 } });
+  assert.equal(navigated.run.status, 'ready_to_submit');
+  assert.equal(navigated.run.pageNumber, 2);
   assert.equal(plannerCalls, 1);
   assert.equal(updatedListeners.length, 1);
   assert.equal(removedListeners.length, 1);

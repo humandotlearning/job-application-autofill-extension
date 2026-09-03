@@ -61,6 +61,7 @@ function nowRun(tabId) {
     reviewRequired: [],
     unresolved: [],
     audit: [],
+    llmPages: [],
     llmError: null,
     submitted: false,
     startedAt: new Date().toISOString(),
@@ -72,12 +73,19 @@ function fieldMap(fields) {
   return new Map(fields.map((field) => [field.id, field]));
 }
 
+function pageSignature(inspection) {
+  return JSON.stringify({
+    fields: inspection.fields.map((field) => [field.id, field.label, field.type, field.options]),
+    actions: inspection.actions.map((action) => [action.kind, action.label]),
+  });
+}
+
 function unresolvedFields(fields, validation = {}) {
   const invalidIds = new Set((validation.invalid || []).map((field) => field.fieldId));
   return fields.filter((field) => !field.currentValue || invalidIds.has(field.id));
 }
 
-function reviewItems(fields, decisions, existing = []) {
+function reviewItems(fields, decisions, existing = [], appliedReviews = []) {
   const byId = fieldMap(fields);
   const items = [...existing];
   for (const decision of decisions) {
@@ -98,6 +106,17 @@ function reviewItems(fields, decisions, existing = []) {
     if (field.currentValue && field.type === 'textarea') {
       items.push({ fieldId: field.id, label: field.label || field.id, value: field.currentValue, sensitivity: 'safe', confidence: 'medium', reason: 'Long-form answer requires review' });
     }
+  }
+  for (const item of appliedReviews) {
+    const field = item.field || byId.get(item.fieldId);
+    if (field?.currentValue) items.push({
+      fieldId: field.id,
+      label: field.label || field.id,
+      value: field.currentValue,
+      sensitivity: item.sensitivity,
+      confidence: item.confidence,
+      reason: item.reason,
+    });
   }
   return [...new Map(items.map((item) => [item.fieldId, item])).values()];
 }
@@ -138,6 +157,7 @@ async function processPage(tabId) {
   try {
     let run = await getRun(tabId);
     if (!run || run.status !== 'running') return run;
+    run.llmPages = Array.isArray(run.llmPages) ? run.llmPages : [];
     if (run.pageNumber > MAX_PAGES) {
       run.status = 'waiting_user';
       run.unresolved = [{ reason: 'The application exceeded the automatic page limit.' }];
@@ -148,7 +168,15 @@ async function processPage(tabId) {
     let inspected = await sendToTab(tabId, { type: 'JOB_APP_INSPECT' });
     if (!inspected?.ok) throw new Error(inspected?.error || 'The page could not be inspected');
     let inspection = inspected.inspection;
+    const currentPageSignature = pageSignature(inspection);
+    if (run.lastAction === 'next' && run.pageSignature === currentPageSignature) {
+      run.status = 'waiting_user';
+      run.waitingFor = 'navigation_not_detected';
+      run.unresolved = [{ reason: 'The page did not change after Next/Continue.' }];
+      return saveRun(run);
+    }
     run.lastAction = null;
+    run.pageSignature = currentPageSignature;
     const localDecisions = planDeterministicFill(inspection.fields, records);
     const localResult = await sendToTab(tabId, { type: 'JOB_APP_APPLY', decisions: localDecisions });
     if (!localResult?.ok) throw new Error(localResult?.error || 'The page rejected local answers');
@@ -158,14 +186,19 @@ async function processPage(tabId) {
     const localValidationResponse = await sendToTab(tabId, { type: 'JOB_APP_VALIDATE' });
     const localValidation = localValidationResponse?.validation || {};
     let allDecisions = [...localDecisions];
+    let appliedReviews = [...(localResult.result?.reviewRequired || [])];
     let llmError = null;
     const remaining = unresolvedFields(inspection.fields, localValidation);
-    if (remaining.length && apiKey) {
+    const llmPageKey = `${run.pageNumber}:${currentPageSignature}`;
+    if (remaining.length && apiKey && !run.llmPages.includes(llmPageKey)) {
+      run.llmPages = [...run.llmPages, llmPageKey];
+      await saveRun(run);
       try {
         const llmDecisions = await callAnswerPlanner({ apiKey, fields: remaining, records, page: inspection.page });
         const llmResult = await sendToTab(tabId, { type: 'JOB_APP_APPLY', decisions: llmDecisions.decisions });
         if (!llmResult?.ok) throw new Error(llmResult?.error || 'The page rejected an answer planner value');
         allDecisions = [...allDecisions, ...llmDecisions.decisions];
+        appliedReviews = [...appliedReviews, ...(llmResult.result?.reviewRequired || [])];
       } catch (error) {
         llmError = error.message;
       }
@@ -176,7 +209,7 @@ async function processPage(tabId) {
     const validationResponse = await sendToTab(tabId, { type: 'JOB_APP_VALIDATE' });
     const validation = validationResponse?.validation || { ok: false, requiredEmpty: [], invalid: [] };
     run = await capturePage(tabId, run, inspection);
-    run.reviewRequired = reviewItems(inspection.fields, allDecisions, run.reviewRequired);
+    run.reviewRequired = reviewItems(inspection.fields, allDecisions, run.reviewRequired, appliedReviews);
     const invalidIds = new Set((validation.invalid || []).map((field) => field.fieldId));
     run.unresolved = inspection.fields
       .filter((field) => !field.currentValue || invalidIds.has(field.id))
@@ -210,9 +243,7 @@ async function processPage(tabId) {
       run.status = 'running';
       run.lastAction = 'next';
       run.waitingFor = null;
-      const saved = await saveRun(run);
-      setTimeout(() => processPage(tabId).catch(() => {}), 250);
-      return saved;
+      return saveRun(run);
     }
     if (submitActions.length === 1 && validation.ok) {
       run.status = 'ready_to_submit';
@@ -227,8 +258,10 @@ async function processPage(tabId) {
     const run = await getRun(tabId);
     if (!run) return null;
     if (run.lastAction === 'next') {
-      setTimeout(() => processPage(tabId).catch(() => {}), 500);
-      return run;
+      run.status = 'waiting_user';
+      run.waitingFor = 'navigation_not_detected';
+      run.unresolved = [{ reason: 'The page could not be inspected after Next/Continue.' }];
+      return saveRun(run);
     }
     run.status = 'waiting_user';
     run.waitingFor = 'extension_error';
@@ -298,7 +331,16 @@ async function confirmSubmit(tabId) {
   }
 }
 
-chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (message?.type === 'JOB_APP_NAVIGATED') {
+    const tabId = sender?.tab?.id;
+    (async () => {
+      const run = tabId ? await getRun(tabId) : null;
+      if (run?.status !== 'running' || run.lastAction !== 'next') return { ok: true, run };
+      return { ok: true, run: await processPage(tabId) };
+    })().then(sendResponse).catch((error) => sendResponse({ ok: false, error: error.message }));
+    return true;
+  }
   if (!['JOB_RUN_START', 'JOB_RUN_CONTINUE', 'JOB_RUN_CONFIRM_SUBMIT', 'JOB_RUN_STATE'].includes(message?.type)) return false;
   (async () => {
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
