@@ -2,6 +2,58 @@
 
 A Manifest V3 side-panel extension that scans the current job application and fills all **verified, safe** answers in one pass. It uses the provided Google Sheet as its default source and keeps the normalized answer cache in Chrome local storage.
 
+## How it works
+
+### Runtime autofill flow
+
+```mermaid
+flowchart LR
+    A[Side panel action] --> B{Answer source}
+    B -->|Sync public sheet| C[Google Sheets CSV export]
+    B -->|Sync private sheet| D[Google OAuth + Sheets API]
+    B -->|Import CSV| E[Local CSV file]
+    C --> F[Parse and normalize rows]
+    D --> F
+    E --> F
+    F --> G[(chrome.storage.local<br/>answerRecords)]
+    G --> H[Load records for active tab]
+    H --> I[content.js + form-engine.js]
+    I --> J[Find supported fields]
+    J --> K[Match autocomplete, labels, aliases,\nname/id, and fuzzy text]
+    K --> L{Verified and safe?}
+    L -->|No| M[Report for review]
+    L -->|Yes| N{Already has a value?}
+    N -->|Yes, replace off| O[Leave unchanged]
+    N -->|No or replace on| P[Fill input, textarea, select,<br/>checkbox, or radio]
+    P --> Q[Dispatch input/change/blur events]
+    I --> R[Return scan report]
+    R --> S[(chrome.storage.session<br/>formSessions per tab)]
+```
+
+The side panel reads or imports answers, converts them into normalized records, and caches them locally. When you scan or fill, those records are sent only to the active tab. Matching uses the field's autocomplete metadata first, then labels and aliases. Only records marked `verified` and `safe` are filled automatically; the rest appear in the review report.
+
+### Learning answers for future use
+
+```mermaid
+flowchart LR
+    A[Click Start learning] --> B[Snapshot current supported fields]
+    B --> C[Listen for input, change, and blur]
+    C --> D[Compare current value with snapshot]
+    D --> E{Non-empty and changed?}
+    E -->|No| C
+    E -->|Yes| F[Create learned record<br/>with label, answer, type, sensitivity, URL]
+    F --> G[content.js sends runtime message]
+    G --> H[Service worker deduplicates<br/>by key, answer, and tab]
+    H --> I[(chrome.storage.local<br/>pendingLearnedAnswers)]
+    I --> J[Review pending count]
+    J --> K[Approve safe learned answers]
+    K --> L[Promote to answerRecords<br/>status=verified, sensitivity=safe]
+    L --> M[Available to future autofill]
+    I --> N[Sensitive/legal answers<br/>remain review-gated]
+```
+
+Learning is deliberately two-stage. A changed answer is saved locally as pending immediately, but it does not become an automatic answer until you approve it. Sensitive answers remain pending for manual review. The temporary baseline and learning listeners live in the page; reusable answers live in `chrome.storage.local`. Form reports live separately in tab-scoped `chrome.storage.session` and are cleared when the tab loads or closes.
+
 ## Current data source
 
 The extension requests host access to all URLs so it can work with arbitrary job boards and ATS providers. It only reads a page when you explicitly trigger a side-panel action; it does not crawl or monitor unrelated pages.
