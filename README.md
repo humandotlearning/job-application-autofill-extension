@@ -30,6 +30,8 @@ It also accepts a local CSV as a fallback. You do **not** need to publish the sh
 - Dispatches `input`, `change`, and `blur` events for React-style forms.
 - Preserves fields that already contain a value unless **Replace fields** is enabled.
 - Reports filled, existing, review-gated, unknown, failed, and required-empty fields.
+- Can start an explicit learning observer after autofill and capture later field changes locally as pending answers.
+- Lets you approve safe learned answers for future autofill; sensitive learned answers remain review-gated.
 - Never touches passwords, file uploads, buttons, or submit controls.
 - Defaults salary/CTC, authorization, sponsorship, citizenship, notice-period, reference, and relocation questions to review when the sheet has no policy column.
 - Defaults consent, agreement, attestation, privacy, demographic, disability, veteran, criminal, and conflict questions to legal review.
@@ -107,8 +109,10 @@ Only records with `Status=verified` and `Sensitivity=safe` are automatically fil
 5. Select **Scan form** to preview matches without changing the page.
 6. Select **Fill safe fields** to populate all verified safe matches in one pass.
 7. Review the side-panel report and the visible form.
-8. Handle resume upload, login, CAPTCHA, consent, and unknown questions manually or through the Hermes workflow.
-9. Submit only after explicit review.
+8. Select **Start learning** after the first autofill, complete missing answers, and leave the page open while you work.
+9. Review the pending learned-answer count in the side panel. Select **Approve safe learned answers** only after checking them; salary, legal, consent, demographic, authorization, and similar responses stay pending.
+10. Handle resume upload, login, CAPTCHA, consent, and unknown questions manually or through the Hermes workflow.
+11. Submit only after explicit review.
 
 ## Local CSV fallback
 

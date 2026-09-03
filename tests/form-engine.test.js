@@ -2,11 +2,32 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { JSDOM } from 'jsdom';
 
-import { scanAndFillDocument } from '../src/form-engine.js';
+import { collectChangedResponses, scanAndFillDocument } from '../src/form-engine.js';
 
 function makeDocument(html) {
   return new JSDOM(html, { url: 'https://jobs.example.com/apply' }).window.document;
 }
+
+test('captures only user-completed learnable fields and excludes sensitive questions', () => {
+  const document = makeDocument(`
+    <form>
+      <label for="why">Why do you want this role?</label><textarea id="why">Build useful products</textarea>
+      <label for="salary">Expected CTC</label><input id="salary" value="6000000">
+      <label for="email">Email</label><input id="email" value="person@example.com">
+    </form>
+  `);
+  const initial = new Map([
+    ['why', ''],
+    ['salary', ''],
+    ['email', 'person@example.com'],
+  ]);
+  const records = collectChangedResponses(document, initial);
+  assert.deepEqual(records.map(({ question, answer, sensitivity }) => ({ question, answer, sensitivity })), [
+    { question: 'Why do you want this role?', answer: 'Build useful products', sensitivity: 'safe' },
+    { question: 'Expected CTC', answer: '6000000', sensitivity: 'review' },
+  ]);
+});
+
 
 test('fills all safe known fields in one pass and dispatches form events', () => {
   const document = makeDocument(`

@@ -10,6 +10,10 @@ const elements = {
   scanForm: byId('scan-form'),
   fillForm: byId('fill-form'),
   fillEmailTemplate: byId('fill-email-template'),
+  startLearning: byId('start-learning'),
+  approveLearned: byId('approve-learned'),
+  learnResponses: byId('learn-responses'),
+  pendingCount: byId('pending-count'),
   overwrite: byId('overwrite'),
   recordCount: byId('record-count'),
   pageState: byId('page-state'),
@@ -26,7 +30,7 @@ function setStatus(message, state = 'ok') {
 }
 
 function setBusy(busy) {
-  for (const button of [elements.syncSheet, elements.scanForm, elements.fillForm, elements.fillEmailTemplate]) button.disabled = busy;
+  for (const button of [elements.syncSheet, elements.scanForm, elements.fillForm, elements.fillEmailTemplate, elements.startLearning, elements.approveLearned]) button.disabled = busy;
 }
 
 function updateRecordCount(records) {
@@ -117,7 +121,6 @@ async function runFormAction(fill, includeEmailTemplates = false) {
   setStatus(fill ? (includeEmailTemplates ? 'Filling the saved email template…' : 'Filling verified fields in one pass…') : 'Scanning the current form…', 'busy');
   try {
     const records = await getRecords();
-    if (!records.length) throw new Error('Sync the Google Sheet or import a CSV before scanning.');
     const tab = await activeTab();
     await ensureContentScript(tab.id);
     const response = await chrome.tabs.sendMessage(tab.id, {
@@ -186,6 +189,41 @@ function renderReport(report) {
   }
 }
 
+async function refreshLearningCount() {
+  const { pendingLearnedAnswers = [] } = await chrome.storage.local.get('pendingLearnedAnswers');
+  elements.pendingCount.textContent = `${pendingLearnedAnswers.length} pending`;
+  elements.approveLearned.disabled = !pendingLearnedAnswers.some((record) => record.sensitivity === 'safe');
+}
+
+async function startLearning() {
+  setBusy(true);
+  try {
+    const tab = await activeTab();
+    await ensureContentScript(tab.id);
+    const response = await chrome.tabs.sendMessage(tab.id, { type: 'JOB_AUTOFILL_START_LEARNING' });
+    if (!response?.ok) throw new Error(response?.error || 'Could not start learning on this page.');
+    elements.learnResponses.checked = true;
+    setStatus(`Learning enabled for ${response.observed} current fields. Complete the missing answers, then review the pending queue.`);
+  } catch (error) {
+    setStatus(error.message, 'error');
+  } finally {
+    setBusy(false);
+  }
+}
+
+async function approveSafeLearned() {
+  setBusy(true);
+  try {
+    const response = await chrome.runtime.sendMessage({ type: 'JOB_AUTOFILL_APPROVE_SAFE_LEARNED' });
+    if (!response?.ok) throw new Error(response?.error || 'Could not approve learned answers.');
+    setStatus('Approved safe learned answers for future autofill. Sensitive answers remain review-gated.');
+  } catch (error) {
+    setStatus(error.message, 'error');
+  } finally {
+    setBusy(false);
+    await refreshLearningCount();
+  }
+}
 async function hydrate() {
   const stored = await chrome.storage.local.get(['sheetUrl', 'answerRecords', 'lastSyncedAt']);
   elements.sheetUrl.value = stored.sheetUrl || DEFAULT_SHEET_URL;
@@ -205,4 +243,9 @@ elements.fillEmailTemplate.addEventListener('click', () => {
     runFormAction(true, true);
   }
 });
-hydrate().catch((error) => setStatus(error.message, 'error'));
+elements.startLearning.addEventListener('click', startLearning);
+elements.approveLearned.addEventListener('click', approveSafeLearned);
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area === 'local' && changes.pendingLearnedAnswers) refreshLearningCount();
+});
+hydrate().then(refreshLearningCount).catch((error) => setStatus(error.message, 'error'));

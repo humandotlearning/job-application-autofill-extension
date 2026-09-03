@@ -1,4 +1,4 @@
-import { chooseRecord, normalizeText, shouldAutofill } from './core.js';
+import { chooseRecord, inferSensitivity, normalizeText, shouldAutofill, slugify } from './core.js';
 
 function textFromIds(document, ids = '') {
   return String(ids)
@@ -98,6 +98,61 @@ function setCheckbox(element, answer) {
 function hasValue(element) {
   if (element.type === 'checkbox' || element.type === 'radio') return element.checked;
   return String(element.value || '').trim() !== '';
+}
+
+function fieldValue(element) {
+  if (element.type === 'checkbox') return element.checked ? 'Yes' : 'No';
+  if (element.type === 'radio') return element.checked ? (optionText(element) || element.value) : '';
+  return String(element.value || '').trim();
+}
+
+function fieldIdentity(element, index) {
+  return element.id || element.name || `field_${index}`;
+}
+
+function formElements(document) {
+  return [...document.querySelectorAll('input, textarea, select')].filter(isSupported);
+}
+
+export function snapshotFormValues(document) {
+  const values = new Map();
+  const seenRadioGroups = new Set();
+  for (const [index, element] of formElements(document).entries()) {
+    if (element.type === 'radio' && element.name) {
+      if (seenRadioGroups.has(element.name)) continue;
+      seenRadioGroups.add(element.name);
+    }
+    values.set(fieldIdentity(element, index), fieldValue(element));
+  }
+  return values;
+}
+
+export function collectChangedResponses(document, initialValues) {
+  const records = [];
+  const seenRadioGroups = new Set();
+  for (const [index, element] of formElements(document).entries()) {
+    if (element.type === 'radio' && element.name) {
+      if (seenRadioGroups.has(element.name)) continue;
+      seenRadioGroups.add(element.name);
+    }
+    const answer = fieldValue(element);
+    const identity = fieldIdentity(element, index);
+    if (!answer || answer === initialValues.get(identity)) continue;
+    const field = describeField(document, element);
+    const key = slugify(field.label || field.name || field.id || identity);
+    records.push({
+      key,
+      question: field.label || field.name || field.id || 'Unlabelled field',
+      answer,
+      aliases: [],
+      type: field.type,
+      status: 'draft',
+      sensitivity: inferSensitivity(field.label, key),
+      options: element.tagName === 'SELECT' ? [...element.options].map((option) => option.textContent.trim()).filter(Boolean) : [],
+      source: `learned:${document.location.href}`,
+    });
+  }
+  return records;
 }
 
 function fillElement(document, element, answer) {

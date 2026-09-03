@@ -28,6 +28,8 @@ test('side panel contains sync, scan, and bulk-fill controls', async () => {
   assert.match(html, /id="scan-form"/);
   assert.match(html, /id="fill-form"/);
   assert.match(html, /id="csv-file"/);
+  assert.match(html, /id="start-learning"/);
+  assert.match(html, /id="approve-learned"/);
   assert.doesNotMatch(html, /id="submit-application"/);
 });
 

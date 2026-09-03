@@ -52,7 +52,16 @@
         <input id="overwrite" type="checkbox">
         <span>Replace fields that already contain a value</span>
       </label>
-      <p class="guardrail">Review-gated, draft, password, upload, and submit controls are never filled automatically.</p>
+      <label class="toggle">
+        <input id="learn-responses" type="checkbox">
+        <span>Enable learning for answers I complete on this page</span>
+      </label>
+      <div class="button-row">
+        <button id="start-learning" class="secondary">Start learning</button>
+        <button id="approve-learned" class="primary" disabled>Approve safe learned answers</button>
+      </div>
+      <p class="hint"><span id="pending-count">0 pending</span>. New answers stay local and pending; salary, legal, consent, demographic, authorization, and similar fields are never auto-approved.</p>
+
     </section>
 
     <section id="summary" class="summary-grid" aria-live="polite" hidden>

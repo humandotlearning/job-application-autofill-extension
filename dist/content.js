@@ -105,7 +105,7 @@ function normalizeStatus(value) {
   return normalized || 'verified';
 }
 
-function inferSensitivity(question, key) {
+function inferSensitivity(question, key = '') {
   const text = normalizeText(`${key} ${question}`);
   if (/\b(consent|agree|agreement|certify|attest|attestation|privacy|terms|declaration|conflict of interest|criminal|gender|race|ethnicity|disability|veteran)\b/.test(text)) {
     return 'legal';
@@ -344,6 +344,61 @@ function hasValue(element) {
   return String(element.value || '').trim() !== '';
 }
 
+function fieldValue(element) {
+  if (element.type === 'checkbox') return element.checked ? 'Yes' : 'No';
+  if (element.type === 'radio') return element.checked ? (optionText(element) || element.value) : '';
+  return String(element.value || '').trim();
+}
+
+function fieldIdentity(element, index) {
+  return element.id || element.name || `field_${index}`;
+}
+
+function formElements(document) {
+  return [...document.querySelectorAll('input, textarea, select')].filter(isSupported);
+}
+
+function snapshotFormValues(document) {
+  const values = new Map();
+  const seenRadioGroups = new Set();
+  for (const [index, element] of formElements(document).entries()) {
+    if (element.type === 'radio' && element.name) {
+      if (seenRadioGroups.has(element.name)) continue;
+      seenRadioGroups.add(element.name);
+    }
+    values.set(fieldIdentity(element, index), fieldValue(element));
+  }
+  return values;
+}
+
+function collectChangedResponses(document, initialValues) {
+  const records = [];
+  const seenRadioGroups = new Set();
+  for (const [index, element] of formElements(document).entries()) {
+    if (element.type === 'radio' && element.name) {
+      if (seenRadioGroups.has(element.name)) continue;
+      seenRadioGroups.add(element.name);
+    }
+    const answer = fieldValue(element);
+    const identity = fieldIdentity(element, index);
+    if (!answer || answer === initialValues.get(identity)) continue;
+    const field = describeField(document, element);
+    const key = slugify(field.label || field.name || field.id || identity);
+    records.push({
+      key,
+      question: field.label || field.name || field.id || 'Unlabelled field',
+      answer,
+      aliases: [],
+      type: field.type,
+      status: 'draft',
+      sensitivity: inferSensitivity(field.label, key),
+      options: element.tagName === 'SELECT' ? [...element.options].map((option) => option.textContent.trim()).filter(Boolean) : [],
+      source: `learned:${document.location.href}`,
+    });
+  }
+  return records;
+}
+
 function fillElement(document, element, answer) {
   if (element.tagName === 'SELECT') return setSelectValue(element, answer);
   if (element.type === 'radio') return setRadioGroup(document, element, answer);
@@ -424,10 +479,49 @@ function scanAndFillDocument(document, records, { fill = false, overwrite = fals
 }
 
 
+let learningSession = null;
+
+function stopLearning() {
+  if (!learningSession) return;
+  for (const [eventName, listener] of learningSession.listeners) {
+    document.removeEventListener(eventName, listener, true);
+  }
+  learningSession = null;
+}
+
+function startLearning() {
+  stopLearning();
+  const initialValues = snapshotFormValues(document);
+  const listeners = [];
+  const capture = () => {
+    const records = collectChangedResponses(document, initialValues);
+    if (records.length) chrome.runtime.sendMessage({ type: 'JOB_AUTOFILL_LEARNED', records }).catch(() => {});
+  };
+  for (const eventName of ['input', 'change', 'blur']) {
+    document.addEventListener(eventName, capture, true);
+    listeners.push([eventName, capture]);
+  }
+  learningSession = { initialValues, listeners };
+  return { ok: true, observed: snapshotFormValues(document).size };
+}
+
 if (!globalThis.__jobApplicationAutofillInstalled) {
   globalThis.__jobApplicationAutofillInstalled = true;
   chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     if (message?.type === 'JOB_AUTOFILL_PING') {
+      sendResponse({ ok: true });
+      return false;
+    }
+    if (message?.type === 'JOB_AUTOFILL_START_LEARNING') {
+      try {
+        sendResponse(startLearning());
+      } catch (error) {
+        sendResponse({ ok: false, error: error.message });
+      }
+      return false;
+    }
+    if (message?.type === 'JOB_AUTOFILL_STOP_LEARNING') {
+      stopLearning();
       sendResponse({ ok: true });
       return false;
     }

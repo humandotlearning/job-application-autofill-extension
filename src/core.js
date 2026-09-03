@@ -103,7 +103,7 @@ function normalizeStatus(value) {
   return normalized || 'verified';
 }
 
-function inferSensitivity(question, key) {
+export function inferSensitivity(question, key = '') {
   const text = normalizeText(`${key} ${question}`);
   if (/\b(consent|agree|agreement|certify|attest|attestation|privacy|terms|declaration|conflict of interest|criminal|gender|race|ethnicity|disability|veteran)\b/.test(text)) {
     return 'legal';
