@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Job Application Autofill</title>
+  <link rel="stylesheet" href="src/sidepanel.css">
+</head>
+<body>
+  <header>
+    <div class="eyebrow">VISIBLE-TAB ASSISTANT</div>
+    <h1>Job Application Autofill</h1>
+    <p>Use the ATS resume importer first, then fill every verified field in one pass.</p>
+  </header>
+
+  <main>
+    <section class="card" aria-labelledby="source-title">
+      <div class="section-heading">
+        <div>
+          <span class="step">01</span>
+          <h2 id="source-title">Answer source</h2>
+        </div>
+        <span id="record-count" class="pill">0 answers</span>
+      </div>
+
+      <label for="sheet-url">Google Sheet URL</label>
+      <textarea id="sheet-url" rows="3" spellcheck="false"></textarea>
+      <div class="button-row">
+        <button id="sync-sheet" class="primary">Sync Google Sheet</button>
+        <label class="button secondary" for="csv-file">Import CSV</label>
+        <input id="csv-file" type="file" accept=".csv,text/csv">
+      </div>
+      <p class="hint">Expected columns: <strong>Field/Question</strong> and <strong>Value/Answer</strong>. Optional: Key, Aliases, Type, Status, Sensitivity.</p>
+    </section>
+
+    <section class="card" aria-labelledby="form-title">
+      <div class="section-heading">
+        <div>
+          <span class="step">02</span>
+          <h2 id="form-title">Current form</h2>
+        </div>
+        <span id="page-state" class="pill neutral">Not scanned</span>
+      </div>
+      <div class="button-row two">
+        <button id="scan-form" class="secondary">Scan form</button>
+        <button id="fill-form" class="primary">Fill safe fields</button>
+      </div>
+      <label class="toggle">
+        <input id="overwrite" type="checkbox">
+        <span>Replace fields that already contain a value</span>
+      </label>
+      <p class="guardrail">Review-gated, draft, password, upload, and submit controls are never filled automatically.</p>
+    </section>
+
+    <section id="summary" class="summary-grid" aria-live="polite" hidden>
+      <div><strong id="count-scanned">0</strong><span>Scanned</span></div>
+      <div><strong id="count-filled">0</strong><span>Filled</span></div>
+      <div><strong id="count-review">0</strong><span>Review</span></div>
+      <div><strong id="count-unknown">0</strong><span>Unknown</span></div>
+      <div><strong id="count-errors">0</strong><span>Required empty</span></div>
+    </section>
+
+    <section id="results-card" class="card" aria-labelledby="results-title" hidden>
+      <div class="section-heading">
+        <div>
+          <span class="step">03</span>
+          <h2 id="results-title">Review</h2>
+        </div>
+      </div>
+      <div id="results"></div>
+    </section>
+  </main>
+
+  <footer>
+    <span id="status-dot" class="status-dot"></span>
+    <span id="status">Ready. Sync the answer sheet to begin.</span>
+  </footer>
+  <script type="module" src="src/sidepanel.js"></script>
+</body>
+</html>

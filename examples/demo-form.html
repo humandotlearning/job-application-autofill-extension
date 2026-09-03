@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Autofill Demo Job Form</title>
+  <style>
+    body { max-width: 720px; margin: 40px auto; padding: 0 20px; font: 16px/1.5 system-ui; }
+    form { display: grid; gap: 14px; }
+    label, legend { font-weight: 650; }
+    input, select, textarea { width: 100%; padding: 9px; font: inherit; }
+    fieldset label { display: inline-flex; width: auto; gap: 6px; margin-right: 18px; font-weight: 400; }
+    fieldset input { width: auto; }
+    button { padding: 10px; }
+  </style>
+</head>
+<body>
+  <h1>Autofill test form</h1>
+  <p>This local page contains safe, review-gated, and unknown fields.</p>
+  <form>
+    <label>Full Name <input name="fullName" autocomplete="name" required></label>
+    <label>Email Address <input type="email" name="email" autocomplete="email" required></label>
+    <label>Phone Number <input type="tel" name="phone" autocomplete="tel"></label>
+    <label>LinkedIn URL <input type="url" name="linkedin"></label>
+    <label>GitHub URL <input type="url" name="github"></label>
+    <label>Country
+      <select name="country" required>
+        <option value="">Choose one</option>
+        <option value="IN">India</option>
+        <option value="US">United States</option>
+      </select>
+    </label>
+    <label>What is your notice period? <input name="noticePeriod" required></label>
+    <fieldset>
+      <legend>Are you authorized to work in India?</legend>
+      <label><input type="radio" name="authorization" value="Yes" required> Yes</label>
+      <label><input type="radio" name="authorization" value="No" required> No</label>
+    </fieldset>
+    <label>Why do you want this role? <textarea name="motivation"></textarea></label>
+    <label>What is your favorite ML paper? <textarea name="unknownQuestion"></textarea></label>
+    <label>Resume <input type="file" name="resume"></label>
+    <label>Password <input type="password" name="password"></label>
+    <button type="submit">Submit application</button>
+  </form>
+  <script>document.querySelector('form').addEventListener('submit', (event) => event.preventDefault());</script>
+</body>
+</html>
