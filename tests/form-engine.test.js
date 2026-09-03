@@ -74,3 +74,22 @@ test('matches a radio group by its legend and selects the answer', () => {
   assert.equal(document.querySelector('input[value="Yes"]').checked, true);
   assert.equal(report.filled.length, 1);
 });
+
+test('fills a review-only email template only when explicitly enabled', () => {
+  const document = makeDocument('<textarea aria-label="Cover Letter"></textarea>');
+  const records = [{
+    key: 'email_template',
+    question: 'Application email or cover letter',
+    answer: 'Hello hiring team',
+    aliases: ['Cover Letter'],
+    type: 'email-template',
+    status: 'draft',
+    sensitivity: 'review',
+  }];
+  const review = scanAndFillDocument(document, records, { fill: true });
+  assert.equal(review.filled.length, 0);
+  assert.equal(review.review.length, 1);
+  const filled = scanAndFillDocument(document, records, { fill: true, includeEmailTemplates: true });
+  assert.equal(filled.filled.length, 1);
+  assert.equal(document.querySelector('textarea').value, 'Hello hiring team');
+});

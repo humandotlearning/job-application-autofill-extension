@@ -125,7 +125,7 @@ function isSupported(element) {
   return !['hidden', 'password', 'file', 'submit', 'button', 'reset', 'image'].includes(element.type);
 }
 
-export function scanAndFillDocument(document, records, { fill = false, overwrite = false } = {}) {
+export function scanAndFillDocument(document, records, { fill = false, overwrite = false, includeEmailTemplates = false } = {}) {
   const report = {
     scanned: [],
     filled: [],
@@ -152,7 +152,8 @@ export function scanAndFillDocument(document, records, { fill = false, overwrite
       report.unknown.push(item);
       continue;
     }
-    if (!shouldAutofill(match.record)) {
+    const templateAllowed = includeEmailTemplates && match.record.type === 'email-template';
+    if (!shouldAutofill(match.record) && !templateAllowed) {
       report.review.push(item);
       continue;
     }

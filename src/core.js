@@ -125,7 +125,23 @@ export function rowsToRecords(rows, source = 'google-sheet') {
   const hasHeaders = columns.answer >= 0 && (columns.question >= 0 || columns.key >= 0);
   if (!hasHeaders) {
     const hasKeyValueRows = rows.some((cells) => String(cells[0] ?? '').trim() && String(cells[1] ?? '').trim());
-    if (!hasKeyValueRows) return [];
+    if (!hasKeyValueRows) {
+      const body = rows.flat().map((cell) => String(cell ?? '').trim()).filter(Boolean).join('\n');
+      if (body && /email|cover letter|message/i.test(source)) {
+        return [{
+          key: 'email_template',
+          question: 'Application email or cover letter',
+          answer: body,
+          aliases: ['Email body', 'Cover Letter', 'Covering Letter', 'Application message', 'Message'],
+          type: 'email-template',
+          status: 'draft',
+          sensitivity: 'review',
+          options: [],
+          source,
+        }];
+      }
+      return [];
+    }
     columns = {
       key: 0,
       question: 0,

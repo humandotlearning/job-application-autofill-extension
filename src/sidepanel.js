@@ -9,6 +9,7 @@ const elements = {
   csvFile: byId('csv-file'),
   scanForm: byId('scan-form'),
   fillForm: byId('fill-form'),
+  fillEmailTemplate: byId('fill-email-template'),
   overwrite: byId('overwrite'),
   recordCount: byId('record-count'),
   pageState: byId('page-state'),
@@ -25,7 +26,7 @@ function setStatus(message, state = 'ok') {
 }
 
 function setBusy(busy) {
-  for (const button of [elements.syncSheet, elements.scanForm, elements.fillForm]) button.disabled = busy;
+  for (const button of [elements.syncSheet, elements.scanForm, elements.fillForm, elements.fillEmailTemplate]) button.disabled = busy;
 }
 
 function updateRecordCount(records) {
@@ -111,9 +112,9 @@ async function ensureContentScript(tabId) {
   }
 }
 
-async function runFormAction(fill) {
+async function runFormAction(fill, includeEmailTemplates = false) {
   setBusy(true);
-  setStatus(fill ? 'Filling verified fields in one pass…' : 'Scanning the current form…', 'busy');
+  setStatus(fill ? (includeEmailTemplates ? 'Filling the saved email template…' : 'Filling verified fields in one pass…') : 'Scanning the current form…', 'busy');
   try {
     const records = await getRecords();
     if (!records.length) throw new Error('Sync the Google Sheet or import a CSV before scanning.');
@@ -123,6 +124,7 @@ async function runFormAction(fill) {
       type: fill ? 'JOB_AUTOFILL_FILL' : 'JOB_AUTOFILL_SCAN',
       records,
       overwrite: elements.overwrite.checked,
+      includeEmailTemplates,
     });
     if (!response?.ok) throw new Error(response?.error || 'The form did not return a report.');
     renderReport(response.report);
@@ -198,4 +200,9 @@ elements.csvFile.addEventListener('change', () => {
 });
 elements.scanForm.addEventListener('click', () => runFormAction(false));
 elements.fillForm.addEventListener('click', () => runFormAction(true));
+elements.fillEmailTemplate.addEventListener('click', () => {
+  if (window.confirm('Fill the saved email/cover-letter template into a matching field? Review it before continuing.')) {
+    runFormAction(true, true);
+  }
+});
 hydrate().catch((error) => setStatus(error.message, 'error'));

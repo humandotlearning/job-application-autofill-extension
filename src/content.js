@@ -13,6 +13,7 @@ if (!globalThis.__jobApplicationAutofillInstalled) {
       const report = scanAndFillDocument(document, message.records || [], {
         fill: message.type === 'JOB_AUTOFILL_FILL',
         overwrite: Boolean(message.overwrite),
+        includeEmailTemplates: Boolean(message.includeEmailTemplates),
       });
       report.page = { title: document.title, url: location.href };
       sendResponse({ ok: true, report });

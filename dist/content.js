@@ -127,7 +127,23 @@ function rowsToRecords(rows, source = 'google-sheet') {
   const hasHeaders = columns.answer >= 0 && (columns.question >= 0 || columns.key >= 0);
   if (!hasHeaders) {
     const hasKeyValueRows = rows.some((cells) => String(cells[0] ?? '').trim() && String(cells[1] ?? '').trim());
-    if (!hasKeyValueRows) return [];
+    if (!hasKeyValueRows) {
+      const body = rows.flat().map((cell) => String(cell ?? '').trim()).filter(Boolean).join('\n');
+      if (body && /email|cover letter|message/i.test(source)) {
+        return [{
+          key: 'email_template',
+          question: 'Application email or cover letter',
+          answer: body,
+          aliases: ['Email body', 'Cover Letter', 'Covering Letter', 'Application message', 'Message'],
+          type: 'email-template',
+          status: 'draft',
+          sensitivity: 'review',
+          options: [],
+          source,
+        }];
+      }
+      return [];
+    }
     columns = {
       key: 0,
       question: 0,
@@ -353,7 +369,7 @@ function isSupported(element) {
   return !['hidden', 'password', 'file', 'submit', 'button', 'reset', 'image'].includes(element.type);
 }
 
-function scanAndFillDocument(document, records, { fill = false, overwrite = false } = {}) {
+function scanAndFillDocument(document, records, { fill = false, overwrite = false, includeEmailTemplates = false } = {}) {
   const report = {
     scanned: [],
     filled: [],
@@ -380,7 +396,8 @@ function scanAndFillDocument(document, records, { fill = false, overwrite = fals
       report.unknown.push(item);
       continue;
     }
-    if (!shouldAutofill(match.record)) {
+    const templateAllowed = includeEmailTemplates && match.record.type === 'email-template';
+    if (!shouldAutofill(match.record) && !templateAllowed) {
       report.review.push(item);
       continue;
     }
@@ -420,6 +437,7 @@ if (!globalThis.__jobApplicationAutofillInstalled) {
       const report = scanAndFillDocument(document, message.records || [], {
         fill: message.type === 'JOB_AUTOFILL_FILL',
         overwrite: Boolean(message.overwrite),
+        includeEmailTemplates: Boolean(message.includeEmailTemplates),
       });
       report.page = { title: document.title, url: location.href };
       sendResponse({ ok: true, report });

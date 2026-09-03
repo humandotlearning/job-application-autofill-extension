@@ -107,3 +107,13 @@ test('defaults sensitive questions to review when the sheet omits policy', () =>
   assert.equal(records[1].sensitivity, 'legal');
   assert.equal(records[2].sensitivity, 'safe');
 });
+
+test('recognizes an unstructured email CSV as a review-only application template', () => {
+  const records = rowsToRecords([['Hi Noeon team,\n\nI am interested in this role.']], 'resume - email.csv');
+  assert.equal(records.length, 1);
+  assert.equal(records[0].type, 'email-template');
+  assert.equal(records[0].status, 'draft');
+  assert.equal(records[0].sensitivity, 'review');
+  const match = chooseRecord({ label: 'Cover Letter', type: 'textarea' }, records);
+  assert.equal(match.record.key, 'email_template');
+});

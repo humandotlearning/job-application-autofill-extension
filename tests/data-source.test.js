@@ -81,7 +81,8 @@ test('reads and combines all private workbook tabs through the authenticated She
     },
   );
 
-  assert.deepEqual(records.map((record) => record.key), ['linkedin', 'why_this_role']);
+  assert.deepEqual(records.map((record) => record.key), ['linkedin', 'why_this_role', 'email_template']);
+  assert.equal(records.find((record) => record.key === 'email_template').status, 'draft');
   assert.equal(urls[0].options.headers.Authorization, 'Bearer oauth-token');
   assert.match(urls[1].url, /values:batchGet/);
   assert.match(urls[1].url, /common%2Bquestions|common\+questions|common%20questions/);
