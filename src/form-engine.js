@@ -9,6 +9,8 @@ import {
 
 const IGNORED_TYPES = new Set(['hidden', 'password', 'file', 'submit', 'button', 'reset', 'image']);
 const SECRET_MARKER = /(?:password|passcode|passwd|pwd|secret|token|csrf|auth[_-]?token)/i;
+const CUSTOM_WIDGET_SELECTOR = '[role="combobox"], button[aria-haspopup="listbox"]';
+const EMPTY_CUSTOM_WIDGET_VALUE = /^(?:choose|select)\b/i;
 
 function textFromIds(document, ids = '') {
   return String(ids)
@@ -54,6 +56,96 @@ function isVisible(element) {
   return true;
 }
 
+function customWidgetElements(document) {
+  return [...document.querySelectorAll(CUSTOM_WIDGET_SELECTOR)]
+    .filter((element) => isVisible(element))
+    .filter((element) => element.closest('form, main, [role="main"]') || hasNearbyFormControl(element))
+    .filter((element) => element.getAttribute('aria-label') || element.getAttribute('name') || hasNearbyFormControl(element));
+}
+
+function hasNearbyFormControl(element) {
+  return [...(element.parentElement?.children || [])]
+    .some((sibling) => sibling !== element && ['INPUT', 'TEXTAREA', 'SELECT'].includes(sibling.tagName));
+}
+
+function customWidgetValue(element) {
+  const value = String(element.getAttribute('aria-valuetext') || element.textContent || '').replace(/\s+/g, ' ').trim();
+  return EMPTY_CUSTOM_WIDGET_VALUE.test(value) ? '' : value;
+}
+
+function customWidgetRequired(element) {
+  return element.getAttribute('aria-required') === 'true'
+    || /\brequired\b/i.test(element.getAttribute('aria-label') || '')
+    || Boolean(element.required);
+}
+
+function visibleText(element) {
+  return String(element?.textContent || '').replace(/\s+/g, ' ').trim();
+}
+
+function associatedLabelText(document, element) {
+  const labels = [...(element.labels || [])]
+    .map((label) => visibleText(label))
+    .filter(Boolean);
+  if (labels.length) return labels.join(' ');
+  if (!element.id) return '';
+  const explicit = [...document.querySelectorAll('label')]
+    .filter((label) => label.getAttribute('for') === element.id)
+    .map((label) => visibleText(label))
+    .filter(Boolean);
+  return explicit.join(' ');
+}
+
+function nearestFieldGroupLabel(element) {
+  for (let current = element.parentElement; current; current = current.parentElement) {
+    const candidates = [...current.querySelectorAll('label, legend')]
+      .map((candidate) => visibleText(candidate))
+      .filter(Boolean);
+    const unique = [...new Set(candidates)];
+    if (unique.length === 1) return unique[0];
+  }
+  return '';
+}
+
+function customWidgetLabel(document, element) {
+  const associated = associatedLabelText(document, element);
+  if (associated) return associated;
+  const labelledBy = textFromIds(document, element.getAttribute('aria-labelledby'));
+  if (labelledBy) return labelledBy;
+  const fieldGroupLabel = nearestFieldGroupLabel(element);
+  if (fieldGroupLabel) return fieldGroupLabel;
+
+  const displayed = customWidgetValue(element);
+  const ariaLabel = String(element.getAttribute('aria-label') || '').replace(/\s+/g, ' ').trim();
+  const withoutState = ariaLabel.replace(/\b(?:required|optional)\b/gi, ' ').replace(/\s+/g, ' ').trim();
+  const normalizedLabel = normalizeText(withoutState);
+  const normalizedValue = normalizeText(displayed);
+  const withoutValue = displayed && normalizedLabel.endsWith(normalizedValue)
+    ? withoutState.slice(0, withoutState.length - displayed.length).replace(/[,:-]\s*$/, '').trim()
+    : withoutState;
+  return withoutValue || ariaLabel || element.getAttribute('name') || element.id || '';
+}
+
+function customOptionText(element) {
+  return String(element.textContent || element.getAttribute('aria-label') || '').replace(/\s+/g, ' ').trim();
+}
+
+function customOptionValue(element) {
+  return String(element.getAttribute('data-value') || element.getAttribute('value') || '').trim();
+}
+
+function customWidgetOptions(document, element) {
+  const controlledId = element.getAttribute('aria-controls');
+  const controlled = controlledId ? document.getElementById(controlledId) : null;
+  const listboxes = controlled?.matches?.('[role="listbox"]')
+    ? [controlled]
+    : [...document.querySelectorAll('[role="listbox"]')];
+  return listboxes
+    .filter((listbox) => isVisible(listbox))
+    .flatMap((listbox) => [...listbox.querySelectorAll('[role="option"]')])
+    .filter((option) => isVisible(option));
+}
+
 function fieldIdentity(element, index) {
   return element.id || element.name || `field_${index}`;
 }
@@ -76,6 +168,12 @@ function uniqueFields(document) {
 }
 
 function fieldOptions(document, element) {
+  if (customWidgetElements(document).includes(element)) {
+    return customWidgetOptions(document, element)
+      .flatMap((option) => [customOptionText(option), customOptionValue(option)])
+      .filter(Boolean)
+      .filter((option, index, options) => options.findIndex((candidate) => normalizeText(candidate) === normalizeText(option)) === index);
+  }
   if (element.tagName === 'SELECT') {
     return [...element.options]
       .flatMap((option) => [option.textContent.trim(), option.value.trim()])
@@ -96,6 +194,7 @@ function optionText(element) {
 }
 
 function fieldValue(document, element) {
+  if (customWidgetElements(document).includes(element)) return customWidgetValue(element);
   if (element.type === 'checkbox') return element.checked ? 'Yes' : '';
   if (element.type === 'radio') return element.checked ? optionText(element) : '';
   if (element.tagName === 'SELECT') {
@@ -132,7 +231,21 @@ function describeField(document, element, index) {
 }
 
 export function collectFieldDescriptors(document) {
-  return uniqueFields(document).map(({ element, index }) => describeField(document, element, index));
+  const nativeFields = uniqueFields(document).map(({ element, index }) => describeField(document, element, index));
+  const customFields = customWidgetElements(document)
+    .filter((element, index) => !nativeFields.some((field) => field.id === fieldIdentity(element, index)))
+    .map((element, index) => ({
+      id: fieldIdentity(element, index),
+      label: customWidgetLabel(document, element),
+      type: 'select',
+      widget: 'custom',
+      autocomplete: element.getAttribute('autocomplete') || '',
+      required: customWidgetRequired(element),
+      currentValue: fieldValue(document, element),
+      options: fieldOptions(document, element),
+      constraints: {},
+    }));
+  return [...nativeFields, ...customFields];
 }
 
 function dispatchFormEvents(element) {
@@ -182,17 +295,56 @@ function setCheckbox(element, answer) {
   return true;
 }
 
-function fillElement(document, element, answer) {
-  if (element.tagName === 'SELECT') return setSelectValue(element, answer);
-  if (element.type === 'radio') return setRadioGroup(document, element, answer);
-  if (element.type === 'checkbox') return setCheckbox(element, answer);
-  return setTextValue(element, answer);
+function waitForCustomOptions(document, element, timeoutMs = 750) {
+  const startedAt = Date.now();
+  return new Promise((resolve) => {
+    const check = () => {
+      const options = customWidgetOptions(document, element);
+      if (options.length || Date.now() - startedAt >= timeoutMs) {
+        resolve(options);
+        return;
+      }
+      setTimeout(check, 25);
+    };
+    check();
+  });
+}
+
+async function setCustomChoiceValue(document, element, answer) {
+  element.click();
+  const expected = normalizeText(answer);
+  const options = await waitForCustomOptions(document, element);
+  const matches = options.filter((option) => normalizeText(customOptionText(option)) === expected
+    || normalizeText(customOptionValue(option)) === expected);
+  if (matches.length !== 1) return { ok: false, reason: 'The custom widget does not expose one unique exact option' };
+  matches[0].click();
+  const backingInput = element.parentElement?.querySelector('input, textarea');
+  if (backingInput) dispatchFormEvents(backingInput);
+  dispatchFormEvents(element);
+  const displayed = normalizeText(fieldValue(document, element));
+  const backingValue = normalizeText(backingInput?.value || '');
+  if (displayed !== expected && backingValue !== expected) {
+    return { ok: false, reason: 'The custom widget did not accept the selected option' };
+  }
+  return { ok: true };
+}
+
+async function fillElement(document, element, answer) {
+  if (customWidgetElements(document).includes(element)) return setCustomChoiceValue(document, element, answer);
+  if (element.tagName === 'SELECT') return { ok: setSelectValue(element, answer) };
+  if (element.type === 'radio') return { ok: setRadioGroup(document, element, answer) };
+  if (element.type === 'checkbox') return { ok: setCheckbox(element, answer) };
+  return { ok: setTextValue(element, answer) };
 }
 
 function elementsForField(document, fieldId) {
   const byId = document.getElementById(fieldId);
-  if (byId && isSupported(byId)) return [byId];
-  return formElements(document).filter((element) => element.name === fieldId || element.id === fieldId);
+  if (byId && (isSupported(byId) || customWidgetElements(document).includes(byId))) return [byId];
+  const customFields = customWidgetElements(document);
+  const generatedCustomIndex = customFields.findIndex((element, index) => fieldIdentity(element, index) === fieldId);
+  if (generatedCustomIndex >= 0) return [customFields[generatedCustomIndex]];
+  return [...formElements(document), ...customFields]
+    .filter((element) => element.name === fieldId || element.id === fieldId);
 }
 
 function elementForField(document, fieldId) {
@@ -200,10 +352,7 @@ function elementForField(document, fieldId) {
 }
 
 function currentField(document, fieldId) {
-  const element = elementForField(document, fieldId);
-  if (!element) return null;
-  const index = uniqueFields(document).findIndex(({ element: candidate }) => candidate === element);
-  return describeField(document, element, Math.max(index, 0));
+  return collectFieldDescriptors(document).find((field) => field.id === fieldId) || null;
 }
 
 function effectiveSensitivity(field, decision) {
@@ -218,8 +367,30 @@ function addReviewIfNeeded(result, field, decision, value) {
   if (value && shouldReviewDecision(effective, field)) result.reviewRequired.push({ ...effective, field });
 }
 
-export function planDeterministicFill(fields, records) {
+function isExplicitCoverField(field = {}) {
+  const label = normalizeText(`${field.label || ''} ${field.name || ''} ${field.id || ''}`);
+  return /\bcover letter\b|\bcover message\b|\bmessage to hiring manager\b|\bnote to recruiter\b|\brecruiter message\b/.test(label);
+}
+
+function coverMessageDecision(field, coverMessages = []) {
+  if (!isExplicitCoverField(field)) return null;
+  const template = coverMessages.find((message) => String(message.body || '').trim());
+  if (!template) return null;
+  return {
+    fieldId: field.id,
+    action: 'fill',
+    value: template.body,
+    evidenceKeys: [`cover_message:${template.id}`],
+    confidence: 'high',
+    sensitivity: 'review',
+    reason: 'Imported cover-message template; review before submitting',
+  };
+}
+
+export function planDeterministicFill(fields, records, coverMessages = []) {
   return fields.map((field) => {
+    const coverDecision = coverMessageDecision(field, coverMessages);
+    if (coverDecision) return coverDecision;
     const match = chooseRecord(field, records);
     if (!match) {
       return {
@@ -244,7 +415,7 @@ export function planDeterministicFill(fields, records) {
   });
 }
 
-export function applyDecisions(document, decisions = []) {
+export async function applyDecisions(document, decisions = []) {
   const result = { applied: [], kept: [], reviewRequired: [], unresolved: [], failed: [] };
   for (const decision of decisions) {
     const field = currentField(document, decision.fieldId);
@@ -274,8 +445,9 @@ export function applyDecisions(document, decisions = []) {
       result.failed.push({ fieldId: field.id, label: field.label, value: decision.value, reason: validation.reason });
       continue;
     }
-    if (!fillElement(document, element, decision.value)) {
-      result.failed.push({ fieldId: field.id, label: field.label, value: decision.value, reason: 'The page rejected this value' });
+    const fillResult = await fillElement(document, element, decision.value);
+    if (!fillResult?.ok) {
+      result.failed.push({ fieldId: field.id, label: field.label, value: decision.value, reason: fillResult?.reason || 'The page rejected this value' });
       continue;
     }
     const applied = { ...decision, field, value: decision.value };
@@ -301,7 +473,7 @@ function collectActions(document) {
     const formControl = element.tagName === 'BUTTON' || element.tagName === 'INPUT';
     const kind = nextLabel
       ? 'next'
-      : formControl && (type === 'submit' || /\b(submit|apply|finish|complete application|send application)\b/i.test(label))
+        : formControl && /\b(submit|apply|finish|complete application|send application)\b/i.test(label)
         ? 'submit'
         : 'other';
     actions.push({ id: `action_${actions.length}`, label, kind, type: type || element.tagName.toLowerCase() });
@@ -322,7 +494,10 @@ function pauseReasons(document) {
   const loginForm = [...document.querySelectorAll('form[action]')].some((form) => /login|signin|sign-in/i.test(form.action || form.getAttribute('action') || ''));
   const loginHeading = [...document.querySelectorAll('h1, h2, h3')].some((element) => isVisible(element) && /^(?:sign in|log in|login)$/i.test(element.textContent.trim()));
   if ([...document.querySelectorAll('input[type="password"]:not([disabled])')].some(isVisible) || loginPath || loginForm || loginHeading) reasons.push('login');
-  if ([...document.querySelectorAll('[contenteditable="true"], [role="combobox"], [aria-haspopup="listbox"]')].some(isVisible)) reasons.push('unsupported_widget');
+  const unresolvedCustomWidget = customWidgetElements(document)
+    .some((element) => customWidgetRequired(element) && !customWidgetValue(element));
+  const contentEditable = [...document.querySelectorAll('[contenteditable="true"]')].some(isVisible);
+  if (contentEditable || unresolvedCustomWidget) reasons.push('unsupported_widget');
   const nextCount = collectActions(document).filter((action) => action.kind === 'next').length;
   const submitCount = collectActions(document).filter((action) => action.kind === 'submit').length;
   if (nextCount > 1 || submitCount > 1) reasons.push('ambiguous_navigation');

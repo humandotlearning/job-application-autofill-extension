@@ -47,7 +47,164 @@ test('ignores fields and pause markers inside hidden steps', () => {
   assert.deepEqual(inspection.pauseReasons, []);
 });
 
-test('fills deterministic safe matches and preserves valid existing values', () => {
+test('discovers selected custom listbox fields but ignores utility menus', () => {
+  const document = makeDocument(`
+    <button id="language" aria-haspopup="listbox">English</button>
+    <main>
+      <div>
+        <span>Country</span>
+        <button id="country" name="country" aria-haspopup="listbox" aria-label="Country India Required">India</button>
+        <input type="text" value="country-id" aria-hidden="true">
+      </div>
+    </main>
+  `);
+  const inspection = inspectDocument(document);
+  assert.deepEqual(inspection.fields.map((field) => field.id), ['country']);
+  assert.equal(inspection.fields[0].type, 'select');
+  assert.equal(inspection.fields[0].label, 'Country');
+  assert.equal(inspection.fields[0].currentValue, 'India');
+  assert.deepEqual(inspection.pauseReasons, []);
+  assert.deepEqual(collectAnswerRecords(document).map(({ key, answer }) => ({ key, answer })), [
+    { key: 'country', answer: 'India' },
+  ]);
+});
+
+test('prefers the nearby Workday question label over a placeholder aria-label for custom widgets', () => {
+  const document = makeDocument(`
+    <form>
+      <fieldset>
+        <legend>Highest Level of Education</legend>
+        <div class="workday-field">
+          <button id="education" name="education" aria-haspopup="listbox" aria-label="Select One Required">Select One</button>
+          <input type="text" value="" aria-hidden="true">
+        </div>
+      </fieldset>
+    </form>
+  `);
+
+  const fields = collectFieldDescriptors(document);
+
+  assert.equal(fields[0].id, 'education');
+  assert.equal(fields[0].label, 'Highest Level of Education');
+});
+
+test('pauses for an empty required custom choice field', () => {
+  const document = makeDocument(`
+    <main>
+      <button id="previous-worker" name="previousWorker" aria-haspopup="listbox" aria-label="Have you worked here? Required">Select One</button>
+      <input type="text" value="" aria-hidden="true">
+    </main>
+  `);
+  const inspection = inspectDocument(document);
+  const validation = validateDocument(document);
+  assert.equal(inspection.pauseReasons.includes('unsupported_widget'), true);
+  assert.equal(validation.ok, false);
+  assert.deepEqual(validation.requiredEmpty.map((field) => field.fieldId), ['previous-worker']);
+});
+
+test('selects an exact option from a generic custom listbox after delayed rendering', async () => {
+  const document = makeDocument(`
+    <main>
+      <button id="country" name="country" aria-haspopup="listbox" aria-label="Country Required">Choose country</button>
+      <input type="text" value="" aria-hidden="true">
+    </main>
+  `);
+  const button = document.querySelector('#country');
+  button.addEventListener('click', () => {
+    setTimeout(() => {
+      const listbox = document.createElement('div');
+      listbox.setAttribute('role', 'listbox');
+      const option = document.createElement('div');
+      option.setAttribute('role', 'option');
+      option.textContent = 'India';
+      option.addEventListener('click', () => {
+        button.textContent = 'India';
+        listbox.remove();
+      });
+      listbox.append(option);
+      document.body.append(listbox);
+    }, 10);
+  });
+
+  const field = inspectDocument(document).fields[0];
+  const result = await applyDecisions(document, [{
+    fieldId: field.id,
+    action: 'fill',
+    value: 'India',
+    evidenceKeys: ['country'],
+    confidence: 'high',
+    sensitivity: 'safe',
+    reason: 'Known country',
+  }]);
+
+  assert.equal(result.failed.length, 0);
+  assert.equal(result.applied.length, 1);
+  assert.equal(document.querySelector('#country').textContent, 'India');
+});
+
+test('applies to an accessible custom choice without an id or name', async () => {
+  const document = makeDocument(`
+    <main><button aria-haspopup="listbox" aria-label="Country Required">Choose country</button></main>
+  `);
+  const button = document.querySelector('button');
+  button.addEventListener('click', () => {
+    const listbox = document.createElement('div');
+    listbox.setAttribute('role', 'listbox');
+    const option = document.createElement('div');
+    option.setAttribute('role', 'option');
+    option.textContent = 'India';
+    option.addEventListener('click', () => {
+      button.textContent = 'India';
+      listbox.remove();
+    });
+    listbox.append(option);
+    document.body.append(listbox);
+  });
+
+  const field = inspectDocument(document).fields[0];
+  const result = await applyDecisions(document, [{
+    fieldId: field.id,
+    action: 'fill',
+    value: 'India',
+    evidenceKeys: ['country'],
+    confidence: 'high',
+    sensitivity: 'safe',
+    reason: 'Known country',
+  }]);
+
+  assert.equal(result.failed.length, 0);
+  assert.equal(result.applied.length, 1);
+  assert.equal(button.textContent, 'India');
+});
+
+test('does not choose an ambiguous custom option', async () => {
+  const document = makeDocument(`
+    <main><button id="country" aria-haspopup="listbox" aria-label="Country Required">Choose country</button></main>
+  `);
+  const button = document.querySelector('#country');
+  button.addEventListener('click', () => {
+    const listbox = document.createElement('div');
+    listbox.setAttribute('role', 'listbox');
+    for (const text of ['India', 'India']) {
+      const option = document.createElement('div');
+      option.setAttribute('role', 'option');
+      option.textContent = text;
+      listbox.append(option);
+    }
+    document.body.append(listbox);
+  });
+
+  const result = await applyDecisions(document, [{
+    fieldId: 'country', action: 'fill', value: 'India', evidenceKeys: ['country'],
+    confidence: 'high', sensitivity: 'safe', reason: 'Known country',
+  }]);
+
+  assert.equal(result.applied.length, 0);
+  assert.equal(result.failed.length, 1);
+  assert.match(result.failed[0].reason, /unique exact option/i);
+});
+
+test('fills deterministic safe matches and preserves valid existing values', async () => {
   const document = makeDocument(`
     <form>
       <label for="name">Full Name</label><input id="name" required>
@@ -61,7 +218,7 @@ test('fills deterministic safe matches and preserves valid existing values', () 
     { key: 'email', question: 'Email Address', answer: 'new@example.com', aliases: [], sensitivity: 'safe', type: 'email' },
   ];
   const decisions = planDeterministicFill(collectFieldDescriptors(document), records);
-  const result = applyDecisions(document, decisions);
+  const result = await applyDecisions(document, decisions);
   assert.equal(document.querySelector('#name').value, 'Nithin Varghese');
   assert.equal(document.querySelector('#email').value, 'existing@example.com');
   assert.equal(changes, 1);
@@ -69,7 +226,29 @@ test('fills deterministic safe matches and preserves valid existing values', () 
   assert.equal(result.kept.length, 1);
 });
 
-test('applies select, radio, and checkbox decisions only when options validate', () => {
+test('matches spaced brand labels when the field uses a generated id', () => {
+  const document = makeDocument(`
+    <form>
+      <label for="936e4371-8d8e-4c19-9be7-845898b93bb0">Linked In Profile:</label>
+      <input id="936e4371-8d8e-4c19-9be7-845898b93bb0" required>
+    </form>
+  `);
+  const records = [{
+    key: 'linkedin',
+    question: 'LinkedIn',
+    answer: 'https://www.linkedin.com/in/nithin1357',
+    aliases: ['LinkedIn'],
+    sensitivity: 'safe',
+    type: 'url',
+  }];
+
+  const decisions = planDeterministicFill(collectFieldDescriptors(document), records);
+
+  assert.equal(decisions[0].action, 'fill');
+  assert.equal(decisions[0].value, 'https://www.linkedin.com/in/nithin1357');
+});
+
+test('applies select, radio, and checkbox decisions only when options validate', async () => {
   const document = makeDocument(`
     <form>
       <label for="country">Country</label><select id="country"><option value="">Choose</option><option value="IN">India</option></select>
@@ -78,7 +257,7 @@ test('applies select, radio, and checkbox decisions only when options validate',
     </form>
   `);
   const fields = collectFieldDescriptors(document);
-  const result = applyDecisions(document, fields.map((field) => ({
+  const result = await applyDecisions(document, fields.map((field) => ({
     fieldId: field.id,
     action: 'fill',
     value: field.id === 'country' ? 'India' : field.id === 'relocate' ? 'Yes' : 'Yes',
@@ -93,9 +272,9 @@ test('applies select, radio, and checkbox decisions only when options validate',
   assert.equal(document.querySelector('#consent').checked, true);
 });
 
-test('promotes inferred sensitive fields to final review even when a record says safe', () => {
+test('promotes inferred sensitive fields to final review even when a record says safe', async () => {
   const document = makeDocument('<label for="salary">Expected CTC</label><input id="salary">');
-  const result = applyDecisions(document, [{
+  const result = await applyDecisions(document, [{
     fieldId: 'salary',
     action: 'fill',
     value: '5000000',
