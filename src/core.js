@@ -55,12 +55,14 @@ export function normalizeAnswerRecord(record = {}) {
   const key = slugify(record.key || question);
   const answer = String(record.answer ?? '').trim();
   const aliases = uniqueStrings(Array.isArray(record.aliases) ? record.aliases : []);
+  const alternatives = uniqueStrings(Array.isArray(record.alternatives) ? record.alternatives : [])
+    .filter((value) => normalizeText(value) !== normalizeText(answer));
   if (!aliases.length && question) aliases.push(question);
   const sensitivity = SENSITIVITIES.has(record.sensitivity) ? record.sensitivity : inferSensitivity(question, key);
   const updatedAt = typeof record.updatedAt === 'string' && !Number.isNaN(Date.parse(record.updatedAt))
     ? record.updatedAt
     : new Date().toISOString();
-  return {
+  const normalized = {
     key,
     question: question || key.replace(/_/g, ' '),
     answer,
@@ -69,6 +71,8 @@ export function normalizeAnswerRecord(record = {}) {
     sensitivity,
     updatedAt,
   };
+  if (alternatives.length) normalized.alternatives = alternatives;
+  return normalized;
 }
 
 function tokens(value) {
@@ -82,6 +86,10 @@ function similarity(left, right) {
   let intersection = 0;
   for (const token of a) if (b.has(token)) intersection += 1;
   return intersection / new Set([...a, ...b]).size;
+}
+
+function compactText(value) {
+  return normalizeText(value).replace(/\s+/g, '');
 }
 
 function candidateLabels(record) {
@@ -107,9 +115,14 @@ export function chooseRecord(field = {}, records = []) {
     if (!String(record.answer ?? '').trim()) continue;
     for (const fieldText of fieldTexts) {
       for (const candidate of candidateLabels(record)) {
-        const score = fieldText === candidate
+        const compactFieldText = compactText(fieldText);
+        const compactCandidate = compactText(candidate);
+        const score = fieldText === candidate || compactFieldText === compactCandidate
           ? 1
-          : fieldText.includes(candidate) || candidate.includes(fieldText)
+          : fieldText.includes(candidate)
+            || candidate.includes(fieldText)
+            || compactFieldText.includes(compactCandidate)
+            || compactCandidate.includes(compactFieldText)
             ? 0.9
             : similarity(fieldText, candidate);
         if (!best || score > best.score) best = { record, score, reason: `label:${candidate}` };
@@ -203,6 +216,11 @@ export function upsertAnswerRecords(existing = [], incoming = [], updatedAt = ne
         previous.question,
         next.question,
       ]),
+      ...(uniqueStrings([...(previous.alternatives || []), ...(next.alternatives || [])])
+        .filter((value) => normalizeText(value) !== normalizeText(next.answer)).length
+        ? { alternatives: uniqueStrings([...(previous.alternatives || []), ...(next.alternatives || [])])
+          .filter((value) => normalizeText(value) !== normalizeText(next.answer)) }
+        : {}),
     });
   }
   return [...merged.values()];

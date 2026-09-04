@@ -11,6 +11,7 @@ const IGNORED_TYPES = new Set(['hidden', 'password', 'file', 'submit', 'button',
 const SECRET_MARKER = /(?:password|passcode|passwd|pwd|secret|token|csrf|auth[_-]?token)/i;
 const CUSTOM_WIDGET_SELECTOR = '[role="combobox"], button[aria-haspopup="listbox"]';
 const EMPTY_CUSTOM_WIDGET_VALUE = /^(?:choose|select)\b/i;
+const CUSTOM_WIDGET_PROMPT_LABEL = /^(?:choose|select)(?:\s+(?:one|an?\s+option|an?\s+answer|a\s+value))?$/i;
 
 function textFromIds(document, ids = '') {
   return String(ids)
@@ -125,7 +126,11 @@ function customWidgetLabel(document, element) {
   const withoutValue = displayed && normalizedLabel.endsWith(normalizedValue)
     ? withoutState.slice(0, withoutState.length - displayed.length).replace(/[,:-]\s*$/, '').trim()
     : withoutState;
-  return withoutValue || ariaLabel || element.getAttribute('name') || element.id || '';
+  const fallback = withoutValue && !CUSTOM_WIDGET_PROMPT_LABEL.test(withoutValue)
+    ? withoutValue
+    : '';
+  return fallback || (ariaLabel && !CUSTOM_WIDGET_PROMPT_LABEL.test(ariaLabel.replace(/\b(?:required|optional)\b/gi, ' ').replace(/\s+/g, ' ').trim()) ? ariaLabel : '')
+    || element.getAttribute('name') || element.id || '';
 }
 
 function customOptionText(element) {
@@ -545,8 +550,10 @@ export function collectAnswerRecords(document) {
 
 export function focusField(document, fieldId) {
   const element = elementForField(document, fieldId);
-  element?.focus?.();
-  return Boolean(element);
+  if (!element) return false;
+  element.scrollIntoView?.({ block: 'center', inline: 'nearest' });
+  element.focus?.({ preventScroll: true });
+  return true;
 }
 
 function findActionElement(document, actionId) {
@@ -566,25 +573,4 @@ export function clickAction(document, actionId) {
   if (!found || found.action.kind !== 'next') return { ok: false, error: 'Navigation action is unavailable or not a validated Next control' };
   found.element.click();
   return { ok: true, action: found.action };
-}
-
-export function submitDocument(document) {
-  const submits = collectActions(document).filter((action) => action.kind === 'submit');
-  if (submits.length !== 1) return { ok: false, error: 'The page does not have one unambiguous submit control' };
-  const found = findActionElement(document, submits[0].id);
-  const form = found?.element.form;
-  if (!form) return { ok: false, error: 'The validated submit control is not attached to a form' };
-  let submitEvent = null;
-  const listener = (event) => { submitEvent = event; };
-  form.addEventListener('submit', listener, true);
-  try {
-    if (typeof form.requestSubmit === 'function') form.requestSubmit(found.element.type === 'submit' ? found.element : undefined);
-    else if (typeof form.submit === 'function') form.submit();
-    else return { ok: false, error: 'The page does not expose a form submission method' };
-  } finally {
-    form.removeEventListener('submit', listener, true);
-  }
-  if (typeof form.requestSubmit === 'function' && !submitEvent) return { ok: false, error: 'The browser did not dispatch a submit event' };
-  if (submitEvent?.defaultPrevented) return { ok: false, error: 'The page prevented form submission' };
-  return { ok: true };
 }

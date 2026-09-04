@@ -54,6 +54,20 @@ function createResponse(payload, ok = true, status = 200, statusText = 'OK') {
   };
 }
 
+test('rejects a non-ASCII API key before constructing a request header', async () => {
+  let fetchCalls = 0;
+  await assert.rejects(
+    () => callAnswerPlanner({ ...createInput(), apiKey: 'test\u2011api-key' }, {
+      fetchImpl: async () => {
+        fetchCalls += 1;
+        return createResponse({});
+      },
+    }),
+    /ASCII|unsupported characters/i,
+  );
+  assert.equal(fetchCalls, 0);
+});
+
 test('sends one sanitized structured-output request and returns decisions', async () => {
   const calls = [];
   const input = createInput();
@@ -131,7 +145,7 @@ test('sends one sanitized structured-output request and returns decisions', asyn
   const body = JSON.parse(calls[0].options.body);
   assert.equal(body.model, 'gpt-5.6-terra');
   assert.equal(body.store, false);
-  assert.equal(body.max_output_tokens <= 300, true);
+  assert.ok(body.max_output_tokens >= 512);
   assert.equal(body.reasoning.effort, 'low');
   assert.equal(body.text.format.type, 'json_schema');
   assert.equal(body.text.format.strict, true);
@@ -154,6 +168,44 @@ test('rejects non-2xx responses', async () => {
     }),
     /400|Bad Request|bad request/i,
   );
+});
+
+test('reports when the planner response is incomplete instead of hiding the token-limit cause', async () => {
+  await assert.rejects(
+    callAnswerPlanner(createInput(), {
+      fetchImpl: async () => createResponse({
+        status: 'incomplete',
+        incomplete_details: { reason: 'max_output_tokens' },
+        output: [],
+      }),
+    }),
+    /incomplete|max_output_tokens|output tokens/i,
+  );
+});
+
+test('budgets enough output tokens for every requested field decision', async () => {
+  const fields = Array.from({ length: 12 }, (_, index) => ({
+    id: `field_${index}`,
+    label: `Field ${index}`,
+    type: 'text',
+  }));
+  const decisions = fields.map((field) => ({
+    fieldId: field.id,
+    action: 'ask_user',
+    value: null,
+    evidenceKeys: [],
+    confidence: 'low',
+    sensitivity: 'safe',
+    reason: 'No supported evidence',
+  }));
+  let requestBody;
+  await callAnswerPlanner({ ...createInput(), fields }, {
+    fetchImpl: async (_url, options) => {
+      requestBody = JSON.parse(options.body);
+      return plannerResponse(decisions);
+    },
+  });
+  assert.ok(requestBody.max_output_tokens >= fields.length * 64);
 });
 
 test('surfaces refusals and network failures for deterministic fallback handling', async () => {

@@ -5,7 +5,6 @@ import {
   inspectDocument,
   validateDocument,
   focusField,
-  submitDocument,
 } from './form-engine.js';
 
 function notifyNavigation() {
@@ -36,8 +35,10 @@ if (!globalThis.__jobApplicationAutofillInstalled) {
           sendResponse({ ok: true, inspection: inspectDocument(document) });
           break;
         case 'JOB_APP_APPLY':
-          sendResponse({ ok: true, result: applyDecisions(document, message.decisions || []) });
-          break;
+          applyDecisions(document, message.decisions || [])
+            .then((result) => sendResponse({ ok: true, result }))
+            .catch((error) => sendResponse({ ok: false, error: error.message }));
+          return true;
         case 'JOB_APP_CAPTURE':
           sendResponse({ ok: true, records: collectAnswerRecords(document) });
           break;
@@ -53,9 +54,6 @@ if (!globalThis.__jobApplicationAutofillInstalled) {
             if (result.ok) notifyNavigation();
             sendResponse(result);
           }
-          break;
-        case 'JOB_APP_SUBMIT':
-          sendResponse(submitDocument(document));
           break;
         default:
           return false;

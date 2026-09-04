@@ -6,9 +6,9 @@ import {
   applyDecisions,
   collectAnswerRecords,
   collectFieldDescriptors,
+  focusField,
   inspectDocument,
   planDeterministicFill,
-  submitDocument,
   validateDocument,
 } from '../src/form-engine.js';
 
@@ -86,6 +86,19 @@ test('prefers the nearby Workday question label over a placeholder aria-label fo
 
   assert.equal(fields[0].id, 'education');
   assert.equal(fields[0].label, 'Highest Level of Education');
+});
+
+test('extracts an associated Workday label before its verbose button aria-label', () => {
+  const document = makeDocument(`
+    <form>
+      <label for="degree">Degree</label>
+      <button id="degree" name="degree" aria-haspopup="listbox" aria-label="Degree University or College Diploma; Undergraduate or Bachelor’s Degree Required">Select One</button>
+      <input type="text" value="" aria-hidden="true">
+    </form>
+  `);
+  const field = collectFieldDescriptors(document)[0];
+  assert.equal(field.label, 'Degree');
+  assert.equal(field.currentValue, '');
 });
 
 test('pauses for an empty required custom choice field', () => {
@@ -289,7 +302,19 @@ test('does not reuse an unrelated ancestor label for a custom widget', () => {
 
   assert.equal(fields[0].id, 'other');
   assert.equal(fields[1].id, 'education');
-  assert.equal(fields[1].label, 'Select One');
+  assert.equal(fields[1].label, 'education');
+});
+
+test('does not use a custom widget prompt as its question label', () => {
+  const document = makeDocument(`
+    <main>
+      <button id="authorization" name="workAuthorization" aria-haspopup="listbox" aria-label="Select One Required">Select One</button>
+      <input type="text" value="" aria-hidden="true">
+    </main>
+  `);
+  const field = collectFieldDescriptors(document)[0];
+  assert.equal(field.label, 'workAuthorization');
+  assert.equal(field.currentValue, '');
 });
 
 test('fills deterministic safe matches and preserves valid existing values', async () => {
@@ -401,7 +426,7 @@ test('validates required fields and captures final answers for learning', () => 
   ]);
 });
 
-test('classifies a submit-type Next button as navigation and submits only through the final action', () => {
+test('classifies a submit-type Next button as navigation without submitting it', () => {
   const document = makeDocument(`
     <form><input name="name" value="Nithin"><button>Next</button></form>
   `);
@@ -409,14 +434,9 @@ test('classifies a submit-type Next button as navigation and submits only throug
   assert.equal(inspection.actions[0].kind, 'next');
 });
 
-test('uses the validated form submit control and reports prevented submission', () => {
-  const document = makeDocument(`
-    <form id="other"><button type="button">Other action</button></form>
-    <form id="target"><input name="name" value="Nithin"><button type="submit">Submit application</button></form>
-  `);
-  let submits = 0;
-  document.querySelector('#target').addEventListener('submit', (event) => { submits += 1; event.preventDefault(); });
-  const result = submitDocument(document);
-  assert.equal(result.ok, false);
-  assert.equal(submits, 1);
+test('focuses a matching field without changing its value', () => {
+  const document = makeDocument('<form><label for="name">Full name</label><input id="name" value="Nithin"></form>');
+  assert.equal(focusField(document, 'name'), true);
+  assert.equal(document.querySelector('#name').value, 'Nithin');
+  assert.equal(document.activeElement.id, 'name');
 });

@@ -1,50 +1,103 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-test('runs deterministic plus LLM fill, gates submission, and saves confirmed answers once', async () => {
+function createHarness({
+  autoAdvancePages = false,
+  answerRecords = [{ key: 'full_name', question: 'Full name', answer: 'Nithin', aliases: ['Full name'], type: 'text', sensitivity: 'safe', updatedAt: '2025-01-01T00:00:00.000Z' }],
+  coverMessages = [],
+  pagesByTab = {},
+} = {}) {
   const localData = {
-    openaiApiKey: 'test-key',
-    answerRecords: [{ key: 'candidate_name', question: 'Candidate profile fact', answer: 'Nithin', aliases: [], type: 'text', sensitivity: 'safe', updatedAt: '2025-01-01T00:00:00.000Z' }],
+    openaiApiKey: '',
+    autoAdvancePages,
+    answerRecords: [...answerRecords],
+    coverMessages: [...coverMessages],
+    datasourceMeta: null,
   };
   const sessionData = {};
   const listeners = [];
   const updatedListeners = [];
   const removedListeners = [];
-  let currentValue = '';
-  let currentPage = 0;
-  let plannerCalls = 0;
-  let submissions = 0;
+  const tabs = new Map(Object.entries(pagesByTab).map(([tabId, spec]) => [Number(tabId), {
+    currentPage: 0,
+    nextClicks: 0,
+    focusCalls: [],
+    submitCalls: 0,
+    messages: [],
+    messageTargets: [],
+    injections: [],
+    frames: (spec.frames || [{ frameId: 0, context: null, pages: spec.pages }]).map((frame) => ({
+      frameId: frame.frameId ?? 0,
+      context: frame.context || {},
+      currentPage: 0,
+      failNextMessages: frame.failNextMessages || 0,
+      pages: frame.pages.map((page) => ({ ...page })),
+    })),
+    pages: (spec.pages || []).map((page) => ({ ...page })),
+  }]));
 
-  const field = {
-    id: 'full_name',
-    label: 'Full name',
-    type: 'text',
-    autocomplete: 'name',
-    required: true,
-    options: [],
-    constraints: {},
-    get currentValue() { return currentValue; },
-  };
-  const inspection = () => ({
-    page: { title: currentPage ? `Demo application step ${currentPage}` : 'Demo application', domain: 'jobs.example.com' },
-    fields: [{ ...field, label: currentPage ? `Step ${currentPage} full name` : field.label, currentValue }],
-    actions: currentPage === 1
-      ? [{ id: 'action_0', label: 'Next', kind: 'next', type: 'submit' }]
-      : [{ id: 'action_0', label: 'Submit application', kind: 'submit', type: 'submit' }],
-    pauseReasons: [],
-  });
+  function currentTabState(tabId) {
+    const state = tabs.get(tabId);
+    if (!state) throw new Error(`Unknown test tab ${tabId}`);
+    return state;
+  }
 
-  globalThis.fetch = async () => {
-    plannerCalls += 1;
+  function materializeField(field, valueOverrides = {}) {
     return {
-      ok: true,
-      status: 200,
-      statusText: 'OK',
-      json: async () => ({ output: [{ type: 'message', content: [{ type: 'output_text', text: JSON.stringify({ decisions: [{
-        fieldId: 'full_name', action: 'fill', value: 'Nithin', evidenceKeys: ['candidate_name'], confidence: 'high', sensitivity: 'safe', reason: 'Learned profile value',
-      }] }) }] }] }),
+      autocomplete: '',
+      constraints: {},
+      options: [],
+      required: false,
+      currentValue: '',
+      ...field,
+      currentValue: Object.prototype.hasOwnProperty.call(valueOverrides, field.id)
+        ? valueOverrides[field.id]
+        : (field.currentValue || ''),
     };
-  };
+  }
+
+  function frameFor(tabId, frameId = 0) {
+    const state = currentTabState(tabId);
+    const frame = state.frames.find((candidate) => candidate.frameId === frameId);
+    if (!frame) throw new Error(`Unknown test frame ${frameId}`);
+    if (state.frames.length === 1 && frameId === 0) frame.currentPage = state.currentPage;
+    return frame;
+  }
+
+  function inspectionFor(tabId, frameId = 0) {
+    const frame = frameFor(tabId, frameId);
+    const page = frame.pages[frame.currentPage];
+    return {
+      page: page.page || { title: frame.context.title || `Step ${frame.currentPage + 1}`, domain: frame.context.domain || 'jobs.example.com' },
+      fields: page.fields.map((field) => materializeField(field, page.values || {})),
+      actions: page.actions || [],
+      pauseReasons: page.pauseReasons || [],
+    };
+  }
+
+  function validationFor(tabId, frameId = 0) {
+    const frame = frameFor(tabId, frameId);
+    const page = frame.pages[frame.currentPage];
+    const inspection = inspectionFor(tabId, frameId);
+    const requiredEmpty = inspection.fields
+      .filter((field) => field.required && !String(field.currentValue || '').trim())
+      .map((field) => ({ fieldId: field.id, label: field.label, type: field.type }));
+    const invalid = new Set(page.invalidFieldIds || []);
+    return {
+      ok: requiredEmpty.length === 0 && invalid.size === 0,
+      requiredEmpty,
+      invalid: inspection.fields
+        .filter((field) => invalid.has(field.id))
+        .map((field) => ({ fieldId: field.id, label: field.label, type: field.type })),
+    };
+  }
+
+  globalThis.fetch = async () => ({
+    ok: true,
+    status: 200,
+    statusText: 'OK',
+    json: async () => ({ output: [] }),
+  });
 
   globalThis.chrome = {
     storage: {
@@ -57,66 +110,599 @@ test('runs deterministic plus LLM fill, gates submission, and saves confirmed an
       session: {
         get: async (defaults) => ({ ...defaults, ...sessionData }),
         set: async (values) => Object.assign(sessionData, values),
+        clear: async () => {
+          for (const key of Object.keys(sessionData)) delete sessionData[key];
+        },
       },
     },
     runtime: {
       onMessage: { addListener: (listener) => listeners.push(listener) },
       onInstalled: { addListener: () => {} },
+      getURL: () => 'chrome-extension://seed-data.json',
     },
     tabs: {
       query: async () => [{ id: 7 }],
-      sendMessage: async (_tabId, message) => {
-        if (message.type === 'JOB_APP_INSPECT') return { ok: true, inspection: inspection() };
+      sendMessage: async (tabId, message, options = {}) => {
+        const state = currentTabState(tabId);
+        const frameId = options.frameId ?? 0;
+        const frame = frameFor(tabId, frameId);
+        if (frame.failNextMessages > 0) {
+          frame.failNextMessages -= 1;
+          throw new Error(`Frame ${frameId} is not ready`);
+        }
+        state.messages.push(message);
+        state.messageTargets.push({ message, frameId });
+        const page = frame.pages[frame.currentPage];
+        if (message.type === 'JOB_APP_INSPECT') return { ok: true, inspection: inspectionFor(tabId, frameId) };
         if (message.type === 'JOB_APP_APPLY') {
-          const decision = message.decisions.find((item) => item.action === 'fill');
-          if (decision) currentValue = decision.value;
+          for (const decision of message.decisions || []) {
+            if (decision.action !== 'fill') continue;
+            if (!page.values) page.values = {};
+            if (!Object.prototype.hasOwnProperty.call(page.values, decision.fieldId)) page.values[decision.fieldId] = decision.value;
+          }
           return { ok: true, result: { applied: [], kept: [], reviewRequired: [], unresolved: [], failed: [] } };
         }
-        if (message.type === 'JOB_APP_VALIDATE') return { ok: true, validation: { ok: Boolean(currentValue), requiredEmpty: currentValue ? [] : [{ fieldId: 'full_name', label: 'Full name' }], invalid: [] } };
-        if (message.type === 'JOB_APP_CAPTURE') return { ok: true, records: currentValue ? [{ key: 'full_name', question: 'Full name', answer: currentValue, aliases: ['Full name'], type: 'text', sensitivity: 'safe' }] : [] };
-        if (message.type === 'JOB_APP_SUBMIT') { submissions += 1; return { ok: true }; }
+        if (message.type === 'JOB_APP_VALIDATE') return { ok: true, validation: validationFor(tabId, frameId) };
+        if (message.type === 'JOB_APP_CAPTURE') {
+          const inspection = inspectionFor(tabId, frameId);
+          return {
+            ok: true,
+            records: inspection.fields
+              .filter((field) => String(field.currentValue || '').trim())
+              .map((field) => ({
+                key: field.id,
+                question: field.label,
+                answer: field.currentValue,
+                aliases: [field.label],
+                type: field.type,
+                sensitivity: field.sensitivity || 'safe',
+              })),
+          };
+        }
+        if (message.type === 'JOB_APP_CLICK_NEXT') {
+          state.nextClicks += 1;
+          if (page.advanceOnClick) {
+            frame.currentPage = Math.min(frame.currentPage + 1, frame.pages.length - 1);
+            if (state.frames.length === 1 && frameId === 0) state.currentPage = frame.currentPage;
+          }
+          return { ok: true };
+        }
+        if (message.type === 'JOB_APP_FOCUS') {
+          state.focusCalls.push(message.fieldId);
+          return { ok: true };
+        }
+        if (message.type === 'JOB_APP_SUBMIT') {
+          state.submitCalls += 1;
+          return { ok: true };
+        }
         return { ok: true };
       },
       onUpdated: { addListener: (listener) => updatedListeners.push(listener) },
       onRemoved: { addListener: (listener) => removedListeners.push(listener) },
     },
-    scripting: { executeScript: async () => {} },
+    scripting: {
+      executeScript: async (details) => {
+        const tabId = details.target?.tabId;
+        if (!tabId || !tabs.has(tabId)) return [];
+        const state = currentTabState(tabId);
+        const frameIds = details.target?.allFrames
+          ? state.frames.map((frame) => frame.frameId)
+          : (details.target?.frameIds || [0]);
+        if (details.func) {
+          return frameIds.map((frameId) => {
+            const frame = frameFor(tabId, frameId);
+            return { frameId, result: { title: frame.context.title || '', pathname: frame.context.pathname || '' } };
+          });
+        }
+        state.injections.push({ files: details.files || [], frameIds });
+        return frameIds.map((frameId) => ({ frameId, result: undefined }));
+      },
+    },
     sidePanel: { setPanelBehavior: async () => {} },
   };
 
+  return {
+    localData,
+    sessionData,
+    listeners,
+    tabs,
+    updatedListeners,
+    removedListeners,
+    dispatch: async (message, sender = {}) => new Promise((resolve) => {
+      const handled = listeners[0](message, sender, resolve);
+      if (handled === false) resolve({ ok: false, unhandled: true });
+    }),
+  };
+}
+
+test('selects the application iframe and routes the run to that frame', async () => {
+  const harness = createHarness({
+    answerRecords: [
+      { key: 'full_name', question: 'Full name', answer: 'Nithin', aliases: ['Full name'], type: 'text', sensitivity: 'safe' },
+      { key: 'email', question: 'Email', answer: 'person@example.com', aliases: ['Email'], type: 'email', sensitivity: 'safe' },
+    ],
+    pagesByTab: {
+      7: {
+        frames: [
+          {
+            frameId: 0,
+            context: { title: 'Working at Arm | Jobs & Careers', pathname: '/jobs/16536/principal-software-engineer/candidate' },
+            pages: [{
+              fields: [{ id: 'alert_email', label: 'Email *', type: 'text', required: true }],
+              actions: [{ id: 'action_0', label: 'Subscribe', kind: 'other', type: 'button' }],
+            }],
+          },
+          {
+            frameId: 3,
+            context: { title: 'Create Your Profile - Principal Software Engineer', pathname: '/jobs/16536/principal-software-engineer/candidate' },
+            pages: [{
+              fields: [
+                { id: 'full_name', label: 'Full name', type: 'text', required: true },
+                { id: 'email', label: 'Email', type: 'email', required: true },
+              ],
+              actions: [{ id: 'action_0', label: 'Next', kind: 'next', type: 'submit' }],
+            }],
+          },
+        ],
+      },
+    },
+  });
+
   await import(`../src/service-worker.js?test=${Date.now()}`);
-  const dispatch = (message, sender = {}) => new Promise((resolve) => listeners[0](message, sender, resolve));
+  const started = await harness.dispatch({ type: 'JOB_RUN_START', tabId: 7 });
+  const focused = await harness.dispatch({ type: 'JOB_RUN_FOCUS_FIELD', tabId: 7, fieldId: 'full_name' });
+  const advanced = await harness.dispatch({ type: 'JOB_RUN_ADVANCE_PAGE', tabId: 7 });
 
-  const started = await dispatch({ type: 'JOB_RUN_START', tabId: 7 });
-  assert.equal(started.ok, true);
-  assert.equal(started.run.status, 'ready_to_submit');
-  assert.equal(plannerCalls, 1);
-  assert.equal(localData.answerRecords.length, 1);
+  assert.equal(started.run.status, 'page_ready');
+  assert.equal(started.run.frame.frameId, 3);
+  assert.equal(focused.ok, true);
+  assert.equal(advanced.ok, true);
+  assert.equal(harness.tabs.get(7).messageTargets.some(({ message, frameId }) => message.type === 'JOB_APP_APPLY' && frameId === 3), true);
+  assert.equal(harness.tabs.get(7).messageTargets
+    .filter(({ message }) => ['JOB_APP_APPLY', 'JOB_APP_VALIDATE', 'JOB_APP_CAPTURE', 'JOB_APP_FOCUS', 'JOB_APP_CLICK_NEXT'].includes(message.type))
+    .every(({ frameId }) => frameId === 3), true);
+});
 
-  const confirmed = await dispatch({ type: 'JOB_RUN_CONFIRM_SUBMIT', tabId: 7 });
-  assert.equal(confirmed.ok, true);
-  assert.equal(confirmed.run.status, 'submitted');
-  assert.equal(submissions, 1);
-  assert.equal(localData.answerRecords.find((record) => record.key === 'full_name').answer, 'Nithin');
+test('pauses without applying when no frame looks like an application', async () => {
+  const harness = createHarness({
+    pagesByTab: {
+      7: {
+        frames: [
+          {
+            frameId: 0,
+            context: { title: 'Working at Arm | Jobs & Careers', pathname: '/jobs/16536/candidate' },
+            pages: [{
+              fields: [{ id: 'alert_email', label: 'Email for job alerts', type: 'text', required: true }],
+              actions: [{ id: 'action_0', label: 'Subscribe', kind: 'other', type: 'button' }],
+            }],
+          },
+          {
+            frameId: 2,
+            context: { title: 'Cookie Settings', pathname: '/cookie-preferences' },
+            pages: [{
+              fields: [{ id: 'cookie_consent', label: 'Cookie consent', type: 'checkbox', required: false }],
+              actions: [{ id: 'action_0', label: 'Save preferences', kind: 'other', type: 'button' }],
+            }],
+          },
+        ],
+      },
+    },
+  });
 
-  const duplicate = await dispatch({ type: 'JOB_RUN_CONFIRM_SUBMIT', tabId: 7 });
-  assert.equal(duplicate.ok, false);
-  assert.equal(submissions, 1);
-  const secondRun = await dispatch({ type: 'JOB_RUN_START', tabId: 7 });
-  assert.equal(secondRun.run.status, 'ready_to_submit');
-  assert.equal(plannerCalls, 1);
-  const secondConfirmed = await dispatch({ type: 'JOB_RUN_CONFIRM_SUBMIT', tabId: 7 });
-  assert.equal(secondConfirmed.ok, true);
-  assert.equal(secondConfirmed.run.status, 'submitted');
-  assert.equal(submissions, 2);
-  currentPage = 1;
-  const pagedRun = await dispatch({ type: 'JOB_RUN_START', tabId: 7 });
-  assert.equal(pagedRun.run.status, 'running');
-  currentPage = 2;
-  const navigated = await dispatch({ type: 'JOB_APP_NAVIGATED' }, { tab: { id: 7 } });
-  assert.equal(navigated.run.status, 'ready_to_submit');
+  await import(`../src/service-worker.js?test=${Date.now()}`);
+  const started = await harness.dispatch({ type: 'JOB_RUN_START', tabId: 7 });
+
+  assert.equal(started.run.status, 'waiting_user');
+  assert.equal(started.run.waitingFor, 'no_application_frame');
+  assert.equal(harness.tabs.get(7).messages.some((message) => message.type === 'JOB_APP_APPLY'), false);
+});
+
+test('pauses without applying when application frames tie', async () => {
+  const harness = createHarness({
+    answerRecords: [{ key: 'full_name', question: 'Full name', answer: 'Nithin', aliases: ['Full name'], type: 'text', sensitivity: 'safe' }],
+    pagesByTab: {
+      7: {
+        frames: [
+          {
+            frameId: 1,
+            context: { title: 'Candidate Application', pathname: '/apply' },
+            pages: [{
+              fields: [{ id: 'full_name', label: 'Full name', type: 'text', required: true }],
+              actions: [{ id: 'action_0', label: 'Submit application', kind: 'submit', type: 'submit' }],
+            }],
+          },
+          {
+            frameId: 2,
+            context: { title: 'Candidate Application', pathname: '/apply' },
+            pages: [{
+              fields: [{ id: 'full_name', label: 'Full name', type: 'text', required: true }],
+              actions: [{ id: 'action_0', label: 'Submit application', kind: 'submit', type: 'submit' }],
+            }],
+          },
+        ],
+      },
+    },
+  });
+
+  await import(`../src/service-worker.js?test=${Date.now()}`);
+  const started = await harness.dispatch({ type: 'JOB_RUN_START', tabId: 7 });
+
+  assert.equal(started.run.status, 'waiting_user');
+  assert.equal(started.run.waitingFor, 'ambiguous_application_frame');
+  assert.equal(harness.tabs.get(7).messages.some((message) => message.type === 'JOB_APP_APPLY'), false);
+});
+
+test('ignores navigation notifications from utility frames', async () => {
+  const harness = createHarness({
+    autoAdvancePages: true,
+    answerRecords: [{ key: 'full_name', question: 'Full name', answer: 'Nithin', aliases: ['Full name'], type: 'text', sensitivity: 'safe' }],
+    pagesByTab: {
+      7: {
+        frames: [
+          {
+            frameId: 0,
+            context: { title: 'Job alerts', pathname: '/jobs/16536/candidate' },
+            pages: [{
+              fields: [{ id: 'alert_email', label: 'Email for job alerts', type: 'text', required: false }],
+              actions: [{ id: 'action_0', label: 'Subscribe', kind: 'other', type: 'button' }],
+            }],
+          },
+          {
+            frameId: 3,
+            context: { title: 'Candidate Application', pathname: '/apply' },
+            pages: [
+              {
+                fields: [{ id: 'full_name', label: 'Full name', type: 'text', required: true }],
+                actions: [{ id: 'action_0', label: 'Next', kind: 'next', type: 'submit' }],
+                advanceOnClick: true,
+              },
+              {
+                fields: [{ id: 'full_name', label: 'Full name', type: 'text', required: true }],
+                actions: [{ id: 'action_0', label: 'Submit application', kind: 'submit', type: 'submit' }],
+              },
+            ],
+          },
+        ],
+      },
+    },
+  });
+
+  await import(`../src/service-worker.js?test=${Date.now()}`);
+  const started = await harness.dispatch({ type: 'JOB_RUN_START', tabId: 7 });
+  const inspectCountBefore = harness.tabs.get(7).messageTargets.filter(({ message }) => message.type === 'JOB_APP_INSPECT').length;
+  const ignored = await harness.dispatch({ type: 'JOB_APP_NAVIGATED' }, { tab: { id: 7 }, frameId: 0 });
+
+  assert.equal(started.run.status, 'running');
+  assert.equal(ignored.run.status, 'running');
+  assert.equal(ignored.run.pageNumber, 2);
+  assert.equal(harness.tabs.get(7).messageTargets.filter(({ message }) => message.type === 'JOB_APP_INSPECT').length, inspectCountBefore);
+});
+
+test('processes navigation notifications from the selected application frame', async () => {
+  const harness = createHarness({
+    autoAdvancePages: true,
+    answerRecords: [{ key: 'full_name', question: 'Full name', answer: 'Nithin', aliases: ['Full name'], type: 'text', sensitivity: 'safe' }],
+    pagesByTab: {
+      7: {
+        frames: [
+          {
+            frameId: 0,
+            context: { title: 'Job alerts', pathname: '/jobs/16536/candidate' },
+            pages: [{
+              fields: [{ id: 'alert_email', label: 'Email for job alerts', type: 'text', required: false }],
+              actions: [{ id: 'action_0', label: 'Subscribe', kind: 'other', type: 'button' }],
+            }],
+          },
+          {
+            frameId: 3,
+            context: { title: 'Candidate Application', pathname: '/apply' },
+            pages: [
+              {
+                fields: [{ id: 'full_name', label: 'Full name', type: 'text', required: true }],
+                actions: [{ id: 'action_0', label: 'Next', kind: 'next', type: 'submit' }],
+                advanceOnClick: true,
+              },
+              {
+                fields: [{ id: 'full_name', label: 'Full name', type: 'text', required: true }],
+                actions: [{ id: 'action_0', label: 'Submit application', kind: 'submit', type: 'submit' }],
+              },
+            ],
+          },
+        ],
+      },
+    },
+  });
+
+  await import(`../src/service-worker.js?test=${Date.now()}`);
+  await harness.dispatch({ type: 'JOB_RUN_START', tabId: 7 });
+  const navigated = await harness.dispatch({ type: 'JOB_APP_NAVIGATED' }, { tab: { id: 7 }, frameId: 3 });
+
+  assert.equal(navigated.ok, true);
+  assert.equal(navigated.run.status, 'ready_for_user_submit');
   assert.equal(navigated.run.pageNumber, 2);
-  assert.equal(plannerCalls, 1);
-  assert.equal(updatedListeners.length, 1);
-  assert.equal(removedListeners.length, 1);
+  assert.equal(harness.tabs.get(7).messageTargets.filter(({ message }) => message.type === 'JOB_APP_APPLY').every(({ frameId }) => frameId === 3), true);
+});
+
+test('reinjects a stale frame before inspecting it', async () => {
+  const harness = createHarness({
+    answerRecords: [{ key: 'full_name', question: 'Full name', answer: 'Nithin', aliases: ['Full name'], type: 'text', sensitivity: 'safe' }],
+    pagesByTab: {
+      7: {
+        frames: [{
+          frameId: 3,
+          failNextMessages: 1,
+          context: { title: 'Candidate Application', pathname: '/apply' },
+          pages: [{
+            fields: [{ id: 'full_name', label: 'Full name', type: 'text', required: true }],
+            actions: [{ id: 'action_0', label: 'Submit application', kind: 'submit', type: 'submit' }],
+          }],
+        }],
+      },
+    },
+  });
+
+  await import(`../src/service-worker.js?test=${Date.now()}`);
+  const started = await harness.dispatch({ type: 'JOB_RUN_START', tabId: 7 });
+
+  assert.equal(started.run.status, 'ready_for_user_submit');
+  assert.equal(harness.tabs.get(7).injections.some(({ frameIds }) => frameIds.length === 1 && frameIds[0] === 3), true);
+});
+
+test('default run fills one page and stops in page_ready without clicking Next', async () => {
+  const harness = createHarness({
+    pagesByTab: {
+      7: {
+        pages: [{
+          fields: [{ id: 'full_name', label: 'Full name', type: 'text', required: true }],
+          actions: [{ id: 'action_0', label: 'Save and Continue', kind: 'next', type: 'submit' }],
+        }],
+      },
+    },
+  });
+
+  await import(`../src/service-worker.js?test=${Date.now()}`);
+  const started = await harness.dispatch({ type: 'JOB_RUN_START', tabId: 7 });
+
+  assert.equal(started.ok, true);
+  assert.equal(started.run.status, 'page_ready');
+  assert.equal(harness.tabs.get(7).nextClicks, 0);
+  assert.equal(started.run.nextAction?.id, 'action_0');
+  assert.deepEqual(started.run.actionRequired, []);
+  assert.equal(started.run.audit[0].answer, 'Nithin');
+});
+
+test('explicit page advance revalidates, captures, and clicks one Next action', async () => {
+  const harness = createHarness({
+    pagesByTab: {
+      7: {
+        pages: [
+          {
+            fields: [{ id: 'full_name', label: 'Full name', type: 'text', required: true }],
+            actions: [{ id: 'action_0', label: 'Save and Continue', kind: 'next', type: 'submit' }],
+          },
+          {
+            fields: [{ id: 'portfolio', label: 'Portfolio', type: 'url', required: false }],
+            actions: [{ id: 'action_0', label: 'Submit application', kind: 'submit', type: 'submit' }],
+          },
+        ],
+      },
+    },
+  });
+
+  await import(`../src/service-worker.js?test=${Date.now()}`);
+  const started = await harness.dispatch({ type: 'JOB_RUN_START', tabId: 7 });
+  assert.equal(started.run.status, 'page_ready');
+
+  const advancing = await harness.dispatch({ type: 'JOB_RUN_ADVANCE_PAGE', tabId: 7 });
+  assert.equal(advancing.ok, true);
+  assert.equal(advancing.run.status, 'running');
+  assert.equal(harness.tabs.get(7).nextClicks, 1);
+
+  harness.tabs.get(7).currentPage = 1;
+  const navigated = await harness.dispatch({ type: 'JOB_APP_NAVIGATED' }, { tab: { id: 7 } });
+  assert.equal(navigated.ok, true);
+  assert.equal(navigated.run.status, 'ready_for_user_submit');
+  assert.equal(navigated.run.pageNumber, 2);
+});
+
+test('autoAdvancePages true retains automatic page progression', async () => {
+  const harness = createHarness({
+    autoAdvancePages: true,
+    pagesByTab: {
+      7: {
+        pages: [
+          {
+            fields: [{ id: 'full_name', label: 'Full name', type: 'text', required: true }],
+            actions: [{ id: 'action_0', label: 'Next', kind: 'next', type: 'submit' }],
+            advanceOnClick: true,
+          },
+          {
+            fields: [{ id: 'cover_letter', label: 'Cover letter', type: 'textarea', required: false }],
+            actions: [{ id: 'action_0', label: 'Submit application', kind: 'submit', type: 'submit' }],
+          },
+        ],
+      },
+    },
+  });
+
+  await import(`../src/service-worker.js?test=${Date.now()}`);
+  const started = await harness.dispatch({ type: 'JOB_RUN_START', tabId: 7 });
+  assert.equal(started.run.status, 'running');
+  assert.equal(harness.tabs.get(7).nextClicks, 1);
+
+  const navigated = await harness.dispatch({ type: 'JOB_APP_NAVIGATED' }, { tab: { id: 7 } });
+  assert.equal(navigated.ok, true);
+  assert.equal(navigated.run.status, 'ready_for_user_submit');
+});
+
+test('autoAdvancePages continues automatically after each navigation', async () => {
+  const harness = createHarness({
+    autoAdvancePages: true,
+    pagesByTab: {
+      7: {
+        pages: [
+          {
+            fields: [{ id: 'full_name', label: 'Full name', type: 'text', required: true }],
+            actions: [{ id: 'action_0', label: 'Next', kind: 'next', type: 'submit' }],
+            advanceOnClick: true,
+          },
+          {
+            fields: [{ id: 'full_name', label: 'Full name', type: 'text', required: true }],
+            actions: [{ id: 'action_0', label: 'Next', kind: 'next', type: 'submit' }],
+            advanceOnClick: true,
+          },
+          {
+            fields: [{ id: 'full_name', label: 'Full name', type: 'text', required: true }],
+            actions: [{ id: 'action_0', label: 'Submit application', kind: 'submit', type: 'submit' }],
+          },
+        ],
+      },
+    },
+  });
+
+  await import(`../src/service-worker.js?test=${Date.now()}`);
+  await harness.dispatch({ type: 'JOB_RUN_START', tabId: 7 });
+  const firstNavigation = await harness.dispatch({ type: 'JOB_APP_NAVIGATED' }, { tab: { id: 7 } });
+  assert.equal(firstNavigation.run.status, 'running');
+  assert.equal(harness.tabs.get(7).nextClicks, 2);
+
+  const finalNavigation = await harness.dispatch({ type: 'JOB_APP_NAVIGATED' }, { tab: { id: 7 } });
+  assert.equal(finalNavigation.run.status, 'ready_for_user_submit');
+  assert.equal(finalNavigation.run.pageNumber, 3);
+});
+
+test('does not advance beyond the 20-page limit', async () => {
+  const pages = Array.from({ length: 20 }, (_, index) => ({
+    fields: [{ id: 'full_name', label: 'Full name', type: 'text', required: true }],
+    actions: [{ id: 'action_0', label: 'Next', kind: 'next', type: 'submit' }],
+    advanceOnClick: index < 19,
+  }));
+  const harness = createHarness({ pagesByTab: { 7: { pages } } });
+
+  await import(`../src/service-worker.js?test=${Date.now()}`);
+  await harness.dispatch({ type: 'JOB_RUN_START', tabId: 7 });
+  let run = null;
+  for (let page = 1; page < 20; page += 1) {
+    const advanced = await harness.dispatch({ type: 'JOB_RUN_ADVANCE_PAGE', tabId: 7 });
+    assert.equal(advanced.ok, true);
+    run = await harness.dispatch({ type: 'JOB_APP_NAVIGATED' }, { tab: { id: 7 } });
+    if (run.run.status === 'waiting_user') break;
+  }
+
+  assert.equal(run.run.status, 'waiting_user');
+  assert.equal(run.run.pageNumber, 20);
+  assert.equal(harness.tabs.get(7).nextClicks, 19);
+});
+
+test('worker categorizes blockers, optional unresolved fields, review items, and audit values separately', async () => {
+  const harness = createHarness({
+    answerRecords: [{ key: 'full_name', question: 'Full name', answer: 'Nithin', aliases: ['Full name'], type: 'text', sensitivity: 'safe' }],
+    coverMessages: [{ id: 'default', title: 'Default', body: 'I would like to contribute to your team with a strong engineering background and hands-on execution across product delivery.' }],
+    pagesByTab: {
+      7: {
+        pages: [{
+          fields: [
+            { id: 'full_name', label: 'Full name', type: 'text', required: true },
+            { id: 'work_authorization', label: 'Work authorization', type: 'text', required: true },
+            { id: 'portfolio', label: 'Portfolio', type: 'url', required: false },
+            { id: 'cover_letter', label: 'Cover letter', type: 'textarea', required: false, sensitivity: 'review' },
+          ],
+          actions: [{ id: 'action_0', label: 'Submit application', kind: 'submit', type: 'submit' }],
+        }],
+      },
+    },
+  });
+
+  await import(`../src/service-worker.js?test=${Date.now()}`);
+  const started = await harness.dispatch({ type: 'JOB_RUN_START', tabId: 7 });
+
+  assert.equal(started.run.status, 'waiting_user');
+  assert.equal(started.run.actionRequired.some((item) => item.fieldId === 'work_authorization'), true);
+  assert.equal(started.run.optionalUnresolved.some((item) => item.fieldId === 'portfolio'), true);
+  assert.equal(started.run.reviewRequired.some((item) => item.fieldId === 'cover_letter'), true);
+  assert.equal(started.run.audit.some((item) => item.key === 'full_name'), true);
+  assert.equal(harness.tabs.get(7).focusCalls[0], 'work_authorization');
+});
+
+test('final save persists answers without any submit message or site submit click', async () => {
+  const harness = createHarness({
+    pagesByTab: {
+      7: {
+        pages: [{
+          fields: [
+            { id: 'full_name', label: 'Full name', type: 'text', required: true },
+            { id: 'github', label: 'GitHub', type: 'url', required: false, currentValue: 'https://github.com/nithin' },
+          ],
+          actions: [{ id: 'action_0', label: 'Submit application', kind: 'submit', type: 'submit' }],
+        }],
+      },
+    },
+  });
+
+  await import(`../src/service-worker.js?test=${Date.now()}`);
+  const started = await harness.dispatch({ type: 'JOB_RUN_START', tabId: 7 });
+  assert.equal(started.run.status, 'ready_for_user_submit');
+  assert.equal(harness.localData.answerRecords.some((record) => record.key === 'github'), false);
+
+  const saved = await harness.dispatch({ type: 'JOB_RUN_SAVE_ANSWERS', tabId: 7 });
+  assert.equal(saved.ok, true);
+  assert.equal(saved.run.status, 'answers_saved');
+  assert.equal(harness.localData.answerRecords.some((record) => record.key === 'github'), true);
+  assert.equal(harness.tabs.get(7).submitCalls, 0);
+  assert.equal(harness.tabs.get(7).messages.some((message) => message.type === 'JOB_APP_SUBMIT'), false);
+});
+
+test('field focus requests target the matching control and tab runs stay isolated', async () => {
+  const harness = createHarness({
+    answerRecords: [
+      { key: 'full_name', question: 'Full name', answer: 'Nithin', aliases: ['Full name'], type: 'text', sensitivity: 'safe' },
+      { key: 'email', question: 'Email', answer: 'person@example.com', aliases: ['Email'], type: 'text', sensitivity: 'safe' },
+    ],
+    pagesByTab: {
+      7: {
+        pages: [{
+          fields: [
+            { id: 'full_name', label: 'Full name', type: 'text', required: true },
+            { id: 'portfolio', label: 'Portfolio', type: 'url', required: false },
+          ],
+          actions: [{ id: 'action_0', label: 'Submit application', kind: 'submit', type: 'submit' }],
+        }],
+      },
+      8: {
+        pages: [{
+          fields: [{ id: 'email', label: 'Email', type: 'email', required: true }],
+          actions: [{ id: 'action_0', label: 'Submit application', kind: 'submit', type: 'submit' }],
+        }],
+      },
+    },
+  });
+
+  await import(`../src/service-worker.js?test=${Date.now()}`);
+  const tabSeven = await harness.dispatch({ type: 'JOB_RUN_START', tabId: 7 });
+  const tabEight = await harness.dispatch({ type: 'JOB_RUN_START', tabId: 8 });
+  const focused = await harness.dispatch({ type: 'JOB_RUN_FOCUS_FIELD', tabId: 7, fieldId: 'portfolio' });
+
+  assert.equal(tabSeven.run.audit.some((item) => item.key === 'full_name'), true);
+  assert.equal(tabEight.run.audit.some((item) => item.key === 'email'), true);
+  assert.equal(tabSeven.run.audit.some((item) => item.key === 'email'), false);
+  assert.equal(focused.ok, true);
+  assert.deepEqual(harness.tabs.get(7).focusCalls, ['portfolio']);
+  assert.deepEqual(harness.tabs.get(8).focusCalls, []);
+});
+
+test('old confirm-submit message path is removed', async () => {
+  const harness = createHarness({
+    pagesByTab: {
+      7: {
+        pages: [{
+          fields: [{ id: 'full_name', label: 'Full name', type: 'text', required: true }],
+          actions: [{ id: 'action_0', label: 'Submit application', kind: 'submit', type: 'submit' }],
+        }],
+      },
+    },
+  });
+
+  await import(`../src/service-worker.js?test=${Date.now()}`);
+  const response = await harness.dispatch({ type: 'JOB_RUN_CONFIRM_SUBMIT', tabId: 7 });
+  assert.equal(response.unhandled, true);
 });
