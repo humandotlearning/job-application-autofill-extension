@@ -8,43 +8,86 @@
 </head>
 <body>
   <header>
-    <div class="eyebrow">FAST, LOCAL-FIRST ASSISTANT</div>
+    <div class="eyebrow">GUIDED APPLICATION ASSISTANT</div>
     <h1>Job Application Autofill</h1>
-    <p>Known answers fill immediately. Only unresolved fields use the answer planner.</p>
+    <p>Fill one page at a time, review what needs attention, then submit on the application site yourself.</p>
   </header>
 
   <main>
-    <section class="card" aria-labelledby="profile-title">
+    <section class="card hero-card" aria-labelledby="run-title">
       <div class="section-heading">
-        <div><span class="step">01</span><h2 id="profile-title">Your answer profile</h2></div>
-        <span id="record-count" class="pill">0 answers</span>
-      </div>
-      <label for="openai-api-key">OpenAI API key <span class="muted">(optional for local-only fill)</span></label>
-      <input id="openai-api-key" type="password" autocomplete="off" spellcheck="false" placeholder="sk-…">
-      <p class="hint">Stored only in trusted extension storage. The key is never sent to the page.</p>
-    </section>
-
-    <section class="card" aria-labelledby="run-title">
-      <div class="section-heading">
-        <div><span class="step">02</span><h2 id="run-title">Current application</h2></div>
+        <div><span class="step">01</span><h2 id="run-title">Current application</h2></div>
         <span id="run-state" class="pill neutral">Ready</span>
       </div>
-      <button id="run-form" class="primary full">Fill application</button>
-      <p id="run-hint" class="hint">The first completed application teaches the local profile. Uploads, CAPTCHA, and login stay manual.</p>
+      <button id="primary-action" class="primary full" type="button">Fill this page</button>
+      <div id="secondary-actions" class="button-row compact-row" hidden>
+        <button id="check-page" type="button">Check again</button>
+        <button id="advance-page" type="button">Continue to next page</button>
+        <button id="save-answers" type="button">Save answers</button>
+      </div>
+      <p id="run-hint" class="hint">Uploads, CAPTCHA, login, inaccessible widgets, and final site submission stay manual.</p>
+    </section>
+
+    <section id="action-required-card" class="card" aria-labelledby="action-required-title" hidden>
+      <div class="section-heading">
+        <div><span class="step">02</span><h2 id="action-required-title">Action required</h2></div>
+        <span id="action-required-count" class="pill neutral">0</span>
+      </div>
+      <div id="action-required-list"></div>
     </section>
 
     <section id="review-card" class="card" aria-labelledby="review-title" hidden>
       <div class="section-heading">
-        <div><span class="step">03</span><h2 id="review-title">Needs your attention</h2></div>
+        <div><span class="step">03</span><h2 id="review-title">Review before submitting</h2></div>
+        <span id="review-count" class="pill neutral">0</span>
       </div>
       <div id="review-list"></div>
-      <details id="audit-details" class="audit">
-        <summary>Show all filled values</summary>
-        <div id="audit-list"></div>
-      </details>
-      <button id="confirm-submit" class="primary full" disabled>Confirm &amp; submit</button>
-      <p class="hint">Submission is never automatic. Confirmation saves every final non-empty answer for future forms.</p>
+      <p id="submit-instructions" class="hint" hidden>Saved answers are local only. Review the application page and click Submit on the site when you are ready.</p>
     </section>
+
+    <details id="optional-details" class="card collapsible">
+      <summary>
+        <span>Optional unanswered</span>
+        <span id="optional-count" class="pill neutral">0</span>
+      </summary>
+      <div id="optional-list" class="details-body"></div>
+    </details>
+
+    <details id="audit-details" class="card collapsible">
+      <summary>
+        <span>All filled values</span>
+        <span id="audit-count" class="pill neutral">0</span>
+      </summary>
+      <div id="audit-list" class="details-body"></div>
+    </details>
+
+    <details id="settings-data" class="card collapsible">
+      <summary>
+        <span>Settings &amp; data</span>
+      </summary>
+      <div class="details-body">
+        <div class="section-heading settings-heading">
+          <div><span class="step">04</span><h2 id="profile-title">Answer profile</h2></div>
+          <span id="record-count" class="pill neutral">0 answers</span>
+        </div>
+        <label for="openai-api-key">OpenAI API key <span class="muted">(optional for answer planner)</span></label>
+        <input id="openai-api-key" type="password" autocomplete="off" spellcheck="false" placeholder="sk-…">
+        <label class="checkbox-row" for="auto-advance-pages">
+          <input id="auto-advance-pages" type="checkbox">
+          <span>Auto-advance pages when exactly one valid Next action is found</span>
+        </label>
+        <div class="section-heading settings-heading inline-top">
+          <div><span class="step">05</span><h2 id="datasource-title">Datasource</h2></div>
+          <span id="cover-message-count" class="pill neutral">0 cover messages</span>
+        </div>
+        <p id="datasource-hint" class="hint compact">Saved answers and cover messages stay in trusted Chrome storage.</p>
+        <div class="button-row">
+          <button id="export-datasource" type="button">Export backup</button>
+          <button id="import-datasource-button" type="button">Import backup</button>
+        </div>
+        <input id="import-datasource" type="file" accept="application/json" hidden>
+      </div>
+    </details>
   </main>
 
   <footer>

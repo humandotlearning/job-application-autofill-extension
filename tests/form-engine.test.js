@@ -6,9 +6,9 @@ import {
   applyDecisions,
   collectAnswerRecords,
   collectFieldDescriptors,
+  focusField,
   inspectDocument,
   planDeterministicFill,
-  submitDocument,
   validateDocument,
 } from '../src/form-engine.js';
 
@@ -47,7 +47,277 @@ test('ignores fields and pause markers inside hidden steps', () => {
   assert.deepEqual(inspection.pauseReasons, []);
 });
 
-test('fills deterministic safe matches and preserves valid existing values', () => {
+test('discovers selected custom listbox fields but ignores utility menus', () => {
+  const document = makeDocument(`
+    <button id="language" aria-haspopup="listbox">English</button>
+    <main>
+      <div>
+        <span>Country</span>
+        <button id="country" name="country" aria-haspopup="listbox" aria-label="Country India Required">India</button>
+        <input type="text" value="country-id" aria-hidden="true">
+      </div>
+    </main>
+  `);
+  const inspection = inspectDocument(document);
+  assert.deepEqual(inspection.fields.map((field) => field.id), ['country']);
+  assert.equal(inspection.fields[0].type, 'select');
+  assert.equal(inspection.fields[0].label, 'Country');
+  assert.equal(inspection.fields[0].currentValue, 'India');
+  assert.deepEqual(inspection.pauseReasons, []);
+  assert.deepEqual(collectAnswerRecords(document).map(({ key, answer }) => ({ key, answer })), [
+    { key: 'country', answer: 'India' },
+  ]);
+});
+
+test('prefers the nearby Workday question label over a placeholder aria-label for custom widgets', () => {
+  const document = makeDocument(`
+    <form>
+      <fieldset>
+        <legend>Highest Level of Education</legend>
+        <div class="workday-field">
+          <button id="education" name="education" aria-haspopup="listbox" aria-label="Select One Required">Select One</button>
+          <input type="text" value="" aria-hidden="true">
+        </div>
+      </fieldset>
+    </form>
+  `);
+
+  const fields = collectFieldDescriptors(document);
+
+  assert.equal(fields[0].id, 'education');
+  assert.equal(fields[0].label, 'Highest Level of Education');
+});
+
+test('extracts an associated Workday label before its verbose button aria-label', () => {
+  const document = makeDocument(`
+    <form>
+      <label for="degree">Degree</label>
+      <button id="degree" name="degree" aria-haspopup="listbox" aria-label="Degree University or College Diploma; Undergraduate or Bachelor’s Degree Required">Select One</button>
+      <input type="text" value="" aria-hidden="true">
+    </form>
+  `);
+  const field = collectFieldDescriptors(document)[0];
+  assert.equal(field.label, 'Degree');
+  assert.equal(field.currentValue, '');
+});
+
+test('pauses for an empty required custom choice field', () => {
+  const document = makeDocument(`
+    <main>
+      <button id="previous-worker" name="previousWorker" aria-haspopup="listbox" aria-label="Have you worked here? Required">Select One</button>
+      <input type="text" value="" aria-hidden="true">
+    </main>
+  `);
+  const inspection = inspectDocument(document);
+  const validation = validateDocument(document);
+  assert.equal(inspection.pauseReasons.includes('unsupported_widget'), true);
+  assert.equal(validation.ok, false);
+  assert.deepEqual(validation.requiredEmpty.map((field) => field.fieldId), ['previous-worker']);
+});
+
+test('selects an exact option from a generic custom listbox after delayed rendering', async () => {
+  const document = makeDocument(`
+    <main>
+      <button type="button" id="country" name="country" aria-haspopup="listbox" aria-label="Country Required">Choose country</button>
+      <input type="text" value="" aria-hidden="true">
+    </main>
+  `);
+  const button = document.querySelector('#country');
+  button.addEventListener('click', () => {
+    setTimeout(() => {
+      const listbox = document.createElement('div');
+      listbox.setAttribute('role', 'listbox');
+      const option = document.createElement('div');
+      option.setAttribute('role', 'option');
+      option.textContent = 'India';
+      option.addEventListener('click', () => {
+        button.textContent = 'India';
+        listbox.remove();
+      });
+      listbox.append(option);
+      document.body.append(listbox);
+    }, 10);
+  });
+
+  const field = inspectDocument(document).fields[0];
+  const result = await applyDecisions(document, [{
+    fieldId: field.id,
+    action: 'fill',
+    value: 'India',
+    evidenceKeys: ['country'],
+    confidence: 'high',
+    sensitivity: 'safe',
+    reason: 'Known country',
+  }]);
+
+  assert.equal(result.failed.length, 0);
+  assert.equal(result.applied.length, 1);
+  assert.equal(document.querySelector('#country').textContent, 'India');
+});
+
+test('applies to an accessible custom choice without an id or name', async () => {
+  const document = makeDocument(`
+    <main><button type="button" aria-haspopup="listbox" aria-label="Country Required">Choose country</button></main>
+  `);
+  const button = document.querySelector('button');
+  button.addEventListener('click', () => {
+    const listbox = document.createElement('div');
+    listbox.setAttribute('role', 'listbox');
+    const option = document.createElement('div');
+    option.setAttribute('role', 'option');
+    option.textContent = 'India';
+    option.addEventListener('click', () => {
+      button.textContent = 'India';
+      listbox.remove();
+    });
+    listbox.append(option);
+    document.body.append(listbox);
+  });
+
+  const field = inspectDocument(document).fields[0];
+  const result = await applyDecisions(document, [{
+    fieldId: field.id,
+    action: 'fill',
+    value: 'India',
+    evidenceKeys: ['country'],
+    confidence: 'high',
+    sensitivity: 'safe',
+    reason: 'Known country',
+  }]);
+
+  assert.equal(result.failed.length, 0);
+  assert.equal(result.applied.length, 1);
+  assert.equal(button.textContent, 'India');
+});
+
+async function runCustomFailureScenario(html, attach, fieldId, reason) {
+  const document = makeDocument(html);
+  attach(document);
+  const field = collectFieldDescriptors(document).find((candidate) => candidate.id === fieldId);
+  const result = await applyDecisions(document, [{
+    fieldId: field.id,
+    action: 'fill',
+    value: 'India',
+    evidenceKeys: [fieldId],
+    confidence: 'high',
+    sensitivity: 'safe',
+    reason: 'Known country',
+  }]);
+  assert.equal(result.applied.length, 0);
+  assert.equal(result.failed.length, 0);
+  assert.deepEqual(result.unresolved.map(({ reason: actualReason }) => actualReason), [reason]);
+}
+
+test('returns unresolved when a custom widget exposes duplicate exact options', async () => {
+  await runCustomFailureScenario(`
+    <form>
+      <button type="button" id="ambiguous" name="ambiguous" aria-haspopup="listbox" aria-label="Ambiguous Required">Choose one</button>
+      <input type="text" value="" aria-hidden="true">
+    </form>
+  `, (document) => {
+    document.querySelector('#ambiguous').addEventListener('click', () => {
+      const listbox = document.createElement('div');
+      listbox.setAttribute('role', 'listbox');
+      for (const text of ['India', 'India']) {
+        const option = document.createElement('div');
+        option.setAttribute('role', 'option');
+        option.textContent = text;
+        listbox.append(option);
+      }
+      document.body.append(listbox);
+    });
+  }, 'ambiguous', 'The custom widget does not expose one unique exact option');
+});
+
+test('returns unresolved when a custom widget never reveals options', async () => {
+  await runCustomFailureScenario(`
+    <form>
+      <button type="button" id="unavailable" name="unavailable" aria-haspopup="listbox" aria-label="Unavailable Required">Choose one</button>
+      <input type="text" value="" aria-hidden="true">
+    </form>
+  `, (document) => {
+    document.querySelector('#unavailable').addEventListener('click', () => {});
+  }, 'unavailable', 'The custom widget did not reveal any options');
+});
+
+test('returns unresolved when a custom widget rejects the selected option', async () => {
+  await runCustomFailureScenario(`
+    <form>
+      <button type="button" id="rejected" name="rejected" aria-haspopup="listbox" aria-label="Rejected Required">Choose one</button>
+      <input type="text" value="" aria-hidden="true">
+    </form>
+  `, (document) => {
+    document.querySelector('#rejected').addEventListener('click', () => {
+      const listbox = document.createElement('div');
+      listbox.setAttribute('role', 'listbox');
+      const option = document.createElement('div');
+      option.setAttribute('role', 'option');
+      option.textContent = 'India';
+      option.addEventListener('click', () => {});
+      listbox.append(option);
+      document.body.append(listbox);
+    });
+  }, 'rejected', 'The custom widget did not accept the selected option');
+});
+
+test('keeps native fill failures in failed', async () => {
+  const document = makeDocument(`
+    <form>
+      <label for="email">Email</label><input id="email" type="email">
+    </form>
+  `);
+
+  const field = collectFieldDescriptors(document)[0];
+  const result = await applyDecisions(document, [{
+    fieldId: field.id,
+    action: 'fill',
+    value: 'not-an-email',
+    evidenceKeys: ['email'],
+    confidence: 'high',
+    sensitivity: 'safe',
+    reason: 'Known email',
+  }]);
+
+  assert.equal(result.applied.length, 0);
+  assert.equal(result.unresolved.length, 0);
+  assert.equal(result.failed.length, 1);
+  assert.match(result.failed[0].reason, /valid email/i);
+});
+
+test('does not reuse an unrelated ancestor label for a custom widget', () => {
+  const document = makeDocument(`
+    <form>
+      <div class="layout">
+        <label for="other">Other field</label>
+        <input id="other" value="value">
+        <div class="question">
+          <button type="button" id="education" name="education" aria-haspopup="listbox" aria-label="Select One Required">Select One</button>
+          <input type="text" value="" aria-hidden="true">
+        </div>
+      </div>
+    </form>
+  `);
+
+  const fields = collectFieldDescriptors(document);
+
+  assert.equal(fields[0].id, 'other');
+  assert.equal(fields[1].id, 'education');
+  assert.equal(fields[1].label, 'education');
+});
+
+test('does not use a custom widget prompt as its question label', () => {
+  const document = makeDocument(`
+    <main>
+      <button id="authorization" name="workAuthorization" aria-haspopup="listbox" aria-label="Select One Required">Select One</button>
+      <input type="text" value="" aria-hidden="true">
+    </main>
+  `);
+  const field = collectFieldDescriptors(document)[0];
+  assert.equal(field.label, 'workAuthorization');
+  assert.equal(field.currentValue, '');
+});
+
+test('fills deterministic safe matches and preserves valid existing values', async () => {
   const document = makeDocument(`
     <form>
       <label for="name">Full Name</label><input id="name" required>
@@ -61,7 +331,7 @@ test('fills deterministic safe matches and preserves valid existing values', () 
     { key: 'email', question: 'Email Address', answer: 'new@example.com', aliases: [], sensitivity: 'safe', type: 'email' },
   ];
   const decisions = planDeterministicFill(collectFieldDescriptors(document), records);
-  const result = applyDecisions(document, decisions);
+  const result = await applyDecisions(document, decisions);
   assert.equal(document.querySelector('#name').value, 'Nithin Varghese');
   assert.equal(document.querySelector('#email').value, 'existing@example.com');
   assert.equal(changes, 1);
@@ -69,7 +339,29 @@ test('fills deterministic safe matches and preserves valid existing values', () 
   assert.equal(result.kept.length, 1);
 });
 
-test('applies select, radio, and checkbox decisions only when options validate', () => {
+test('matches spaced brand labels when the field uses a generated id', () => {
+  const document = makeDocument(`
+    <form>
+      <label for="936e4371-8d8e-4c19-9be7-845898b93bb0">Linked In Profile:</label>
+      <input id="936e4371-8d8e-4c19-9be7-845898b93bb0" required>
+    </form>
+  `);
+  const records = [{
+    key: 'linkedin',
+    question: 'LinkedIn',
+    answer: 'https://www.linkedin.com/in/nithin1357',
+    aliases: ['LinkedIn'],
+    sensitivity: 'safe',
+    type: 'url',
+  }];
+
+  const decisions = planDeterministicFill(collectFieldDescriptors(document), records);
+
+  assert.equal(decisions[0].action, 'fill');
+  assert.equal(decisions[0].value, 'https://www.linkedin.com/in/nithin1357');
+});
+
+test('applies select, radio, and checkbox decisions only when options validate', async () => {
   const document = makeDocument(`
     <form>
       <label for="country">Country</label><select id="country"><option value="">Choose</option><option value="IN">India</option></select>
@@ -78,7 +370,7 @@ test('applies select, radio, and checkbox decisions only when options validate',
     </form>
   `);
   const fields = collectFieldDescriptors(document);
-  const result = applyDecisions(document, fields.map((field) => ({
+  const result = await applyDecisions(document, fields.map((field) => ({
     fieldId: field.id,
     action: 'fill',
     value: field.id === 'country' ? 'India' : field.id === 'relocate' ? 'Yes' : 'Yes',
@@ -93,9 +385,9 @@ test('applies select, radio, and checkbox decisions only when options validate',
   assert.equal(document.querySelector('#consent').checked, true);
 });
 
-test('promotes inferred sensitive fields to final review even when a record says safe', () => {
+test('promotes inferred sensitive fields to final review even when a record says safe', async () => {
   const document = makeDocument('<label for="salary">Expected CTC</label><input id="salary">');
-  const result = applyDecisions(document, [{
+  const result = await applyDecisions(document, [{
     fieldId: 'salary',
     action: 'fill',
     value: '5000000',
@@ -134,7 +426,7 @@ test('validates required fields and captures final answers for learning', () => 
   ]);
 });
 
-test('classifies a submit-type Next button as navigation and submits only through the final action', () => {
+test('classifies a submit-type Next button as navigation without submitting it', () => {
   const document = makeDocument(`
     <form><input name="name" value="Nithin"><button>Next</button></form>
   `);
@@ -142,14 +434,9 @@ test('classifies a submit-type Next button as navigation and submits only throug
   assert.equal(inspection.actions[0].kind, 'next');
 });
 
-test('uses the validated form submit control and reports prevented submission', () => {
-  const document = makeDocument(`
-    <form id="other"><button type="button">Other action</button></form>
-    <form id="target"><input name="name" value="Nithin"><button type="submit">Submit application</button></form>
-  `);
-  let submits = 0;
-  document.querySelector('#target').addEventListener('submit', (event) => { submits += 1; event.preventDefault(); });
-  const result = submitDocument(document);
-  assert.equal(result.ok, false);
-  assert.equal(submits, 1);
+test('focuses a matching field without changing its value', () => {
+  const document = makeDocument('<form><label for="name">Full name</label><input id="name" value="Nithin"></form>');
+  assert.equal(focusField(document, 'name'), true);
+  assert.equal(document.querySelector('#name').value, 'Nithin');
+  assert.equal(document.activeElement.id, 'name');
 });

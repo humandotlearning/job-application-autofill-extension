@@ -2,7 +2,9 @@ import { inferSensitivity, normalizeText } from './core.js';
 
 const RESPONSE_URL = 'https://api.openai.com/v1/responses';
 const MODEL = 'gpt-5.6-terra';
-const MAX_OUTPUT_TOKENS = 250;
+const MIN_OUTPUT_TOKENS = 512;
+const TOKENS_PER_FIELD = 160;
+const MAX_OUTPUT_TOKENS = 12_000;
 const ACTIONS = new Set(['keep', 'fill', 'ask_user']);
 const CONFIDENCE = new Set(['high', 'medium', 'low']);
 const SENSITIVITY = new Set(['safe', 'review', 'legal']);
@@ -39,6 +41,7 @@ export async function callAnswerPlanner(
   { apiKey, fields = [], records = [], page = {} },
   { fetchImpl = fetch, timeoutMs = 10_000 } = {},
 ) {
+  const normalizedApiKey = normalizeApiKey(apiKey);
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(new Error('Answer planner request timed out')), timeoutMs);
 
@@ -47,7 +50,7 @@ export async function callAnswerPlanner(
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        Authorization: `Bearer ${apiKey}`,
+        Authorization: `Bearer ${normalizedApiKey}`,
       },
       body: JSON.stringify(buildRequestBody({ fields, records, page })),
       signal: controller.signal,
@@ -72,12 +75,20 @@ export async function callAnswerPlanner(
   }
 }
 
+function normalizeApiKey(value) {
+  const apiKey = String(value ?? '').trim();
+  if (!/^[\x21-\x7E]+$/.test(apiKey)) {
+    throw new Error('OpenAI API key contains unsupported characters. Paste the ASCII key exactly as issued.');
+  }
+  return apiKey;
+}
+
 function buildRequestBody({ fields, records, page }) {
   return {
     model: MODEL,
     reasoning: { effort: 'low' },
     store: false,
-    max_output_tokens: MAX_OUTPUT_TOKENS,
+    max_output_tokens: outputTokenBudget(fields),
     input: [
       {
         role: 'system',
@@ -150,11 +161,21 @@ function sanitizeRecord(record) {
   };
 }
 
+function outputTokenBudget(fields = []) {
+  return Math.min(MAX_OUTPUT_TOKENS, Math.max(MIN_OUTPUT_TOKENS, fields.length * TOKENS_PER_FIELD));
+}
+
 function extractStructuredOutput(payload) {
+  const incompleteReason = payload?.incomplete_details?.reason || payload?.incompleteDetails?.reason;
+  if (payload?.status === 'incomplete' || incompleteReason) {
+    throw new Error(`Answer planner response was incomplete${incompleteReason ? ` (${incompleteReason})` : ''}.`);
+  }
+
+  const directText = typeof payload?.output_text === 'string' ? payload.output_text : '';
   const text = payload?.output
     ?.flatMap((item) => Array.isArray(item?.content) ? item.content : [])
     ?.find((item) => item?.type === 'output_text' && typeof item.text === 'string')
-    ?.text;
+    ?.text || directText;
 
   if (!text) {
     throw new Error('Answer planner response is missing structured output text');
