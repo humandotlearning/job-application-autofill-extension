@@ -97,7 +97,9 @@ function associatedLabelText(document, element) {
 }
 
 function nearestFieldGroupLabel(element) {
-  for (let current = element.parentElement; current; current = current.parentElement) {
+  const group = element.closest('fieldset, [role="group"]');
+  if (!group) return '';
+  for (const current of [group]) {
     const candidates = [...current.querySelectorAll('label, legend')]
       .map((candidate) => visibleText(candidate))
       .filter(Boolean);
@@ -314,9 +316,10 @@ async function setCustomChoiceValue(document, element, answer) {
   element.click();
   const expected = normalizeText(answer);
   const options = await waitForCustomOptions(document, element);
+  if (!options.length) return { ok: false, unresolved: true, reason: 'The custom widget did not reveal any options' };
   const matches = options.filter((option) => normalizeText(customOptionText(option)) === expected
     || normalizeText(customOptionValue(option)) === expected);
-  if (matches.length !== 1) return { ok: false, reason: 'The custom widget does not expose one unique exact option' };
+  if (matches.length !== 1) return { ok: false, unresolved: true, reason: 'The custom widget does not expose one unique exact option' };
   matches[0].click();
   const backingInput = element.parentElement?.querySelector('input, textarea');
   if (backingInput) dispatchFormEvents(backingInput);
@@ -324,7 +327,7 @@ async function setCustomChoiceValue(document, element, answer) {
   const displayed = normalizeText(fieldValue(document, element));
   const backingValue = normalizeText(backingInput?.value || '');
   if (displayed !== expected && backingValue !== expected) {
-    return { ok: false, reason: 'The custom widget did not accept the selected option' };
+    return { ok: false, unresolved: true, reason: 'The custom widget did not accept the selected option' };
   }
   return { ok: true };
 }
@@ -447,7 +450,9 @@ export async function applyDecisions(document, decisions = []) {
     }
     const fillResult = await fillElement(document, element, decision.value);
     if (!fillResult?.ok) {
-      result.failed.push({ fieldId: field.id, label: field.label, value: decision.value, reason: fillResult?.reason || 'The page rejected this value' });
+      const issue = { fieldId: field.id, label: field.label, value: decision.value, reason: fillResult?.reason || 'The page rejected this value' };
+      if (fillResult?.unresolved) result.unresolved.push(issue);
+      else result.failed.push(issue);
       continue;
     }
     const applied = { ...decision, field, value: decision.value };

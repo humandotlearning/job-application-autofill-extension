@@ -105,7 +105,7 @@ test('pauses for an empty required custom choice field', () => {
 test('selects an exact option from a generic custom listbox after delayed rendering', async () => {
   const document = makeDocument(`
     <main>
-      <button id="country" name="country" aria-haspopup="listbox" aria-label="Country Required">Choose country</button>
+      <button type="button" id="country" name="country" aria-haspopup="listbox" aria-label="Country Required">Choose country</button>
       <input type="text" value="" aria-hidden="true">
     </main>
   `);
@@ -144,7 +144,7 @@ test('selects an exact option from a generic custom listbox after delayed render
 
 test('applies to an accessible custom choice without an id or name', async () => {
   const document = makeDocument(`
-    <main><button aria-haspopup="listbox" aria-label="Country Required">Choose country</button></main>
+    <main><button type="button" aria-haspopup="listbox" aria-label="Country Required">Choose country</button></main>
   `);
   const button = document.querySelector('button');
   button.addEventListener('click', () => {
@@ -177,31 +177,119 @@ test('applies to an accessible custom choice without an id or name', async () =>
   assert.equal(button.textContent, 'India');
 });
 
-test('does not choose an ambiguous custom option', async () => {
-  const document = makeDocument(`
-    <main><button id="country" aria-haspopup="listbox" aria-label="Country Required">Choose country</button></main>
-  `);
-  const button = document.querySelector('#country');
-  button.addEventListener('click', () => {
-    const listbox = document.createElement('div');
-    listbox.setAttribute('role', 'listbox');
-    for (const text of ['India', 'India']) {
+async function runCustomFailureScenario(html, attach, fieldId, reason) {
+  const document = makeDocument(html);
+  attach(document);
+  const field = collectFieldDescriptors(document).find((candidate) => candidate.id === fieldId);
+  const result = await applyDecisions(document, [{
+    fieldId: field.id,
+    action: 'fill',
+    value: 'India',
+    evidenceKeys: [fieldId],
+    confidence: 'high',
+    sensitivity: 'safe',
+    reason: 'Known country',
+  }]);
+  assert.equal(result.applied.length, 0);
+  assert.equal(result.failed.length, 0);
+  assert.deepEqual(result.unresolved.map(({ reason: actualReason }) => actualReason), [reason]);
+}
+
+test('returns unresolved when a custom widget exposes duplicate exact options', async () => {
+  await runCustomFailureScenario(`
+    <form>
+      <button type="button" id="ambiguous" name="ambiguous" aria-haspopup="listbox" aria-label="Ambiguous Required">Choose one</button>
+      <input type="text" value="" aria-hidden="true">
+    </form>
+  `, (document) => {
+    document.querySelector('#ambiguous').addEventListener('click', () => {
+      const listbox = document.createElement('div');
+      listbox.setAttribute('role', 'listbox');
+      for (const text of ['India', 'India']) {
+        const option = document.createElement('div');
+        option.setAttribute('role', 'option');
+        option.textContent = text;
+        listbox.append(option);
+      }
+      document.body.append(listbox);
+    });
+  }, 'ambiguous', 'The custom widget does not expose one unique exact option');
+});
+
+test('returns unresolved when a custom widget never reveals options', async () => {
+  await runCustomFailureScenario(`
+    <form>
+      <button type="button" id="unavailable" name="unavailable" aria-haspopup="listbox" aria-label="Unavailable Required">Choose one</button>
+      <input type="text" value="" aria-hidden="true">
+    </form>
+  `, (document) => {
+    document.querySelector('#unavailable').addEventListener('click', () => {});
+  }, 'unavailable', 'The custom widget did not reveal any options');
+});
+
+test('returns unresolved when a custom widget rejects the selected option', async () => {
+  await runCustomFailureScenario(`
+    <form>
+      <button type="button" id="rejected" name="rejected" aria-haspopup="listbox" aria-label="Rejected Required">Choose one</button>
+      <input type="text" value="" aria-hidden="true">
+    </form>
+  `, (document) => {
+    document.querySelector('#rejected').addEventListener('click', () => {
+      const listbox = document.createElement('div');
+      listbox.setAttribute('role', 'listbox');
       const option = document.createElement('div');
       option.setAttribute('role', 'option');
-      option.textContent = text;
+      option.textContent = 'India';
+      option.addEventListener('click', () => {});
       listbox.append(option);
-    }
-    document.body.append(listbox);
-  });
+      document.body.append(listbox);
+    });
+  }, 'rejected', 'The custom widget did not accept the selected option');
+});
 
+test('keeps native fill failures in failed', async () => {
+  const document = makeDocument(`
+    <form>
+      <label for="email">Email</label><input id="email" type="email">
+    </form>
+  `);
+
+  const field = collectFieldDescriptors(document)[0];
   const result = await applyDecisions(document, [{
-    fieldId: 'country', action: 'fill', value: 'India', evidenceKeys: ['country'],
-    confidence: 'high', sensitivity: 'safe', reason: 'Known country',
+    fieldId: field.id,
+    action: 'fill',
+    value: 'not-an-email',
+    evidenceKeys: ['email'],
+    confidence: 'high',
+    sensitivity: 'safe',
+    reason: 'Known email',
   }]);
 
   assert.equal(result.applied.length, 0);
+  assert.equal(result.unresolved.length, 0);
   assert.equal(result.failed.length, 1);
-  assert.match(result.failed[0].reason, /unique exact option/i);
+  assert.match(result.failed[0].reason, /valid email/i);
+});
+
+test('does not reuse an unrelated ancestor label for a custom widget', () => {
+  const document = makeDocument(`
+    <form>
+      <div class="layout">
+        <label for="other">Other field</label>
+        <input id="other" value="value">
+        <div class="question">
+          <button type="button" id="education" name="education" aria-haspopup="listbox" aria-label="Select One Required">Select One</button>
+          <input type="text" value="" aria-hidden="true">
+        </div>
+      </div>
+    </form>
+  `);
+
+  const fields = collectFieldDescriptors(document);
+
+  assert.equal(fields[0].id, 'other');
+  assert.equal(fields[1].id, 'education');
+  assert.equal(fields[1].label, 'Select One');
 });
 
 test('fills deterministic safe matches and preserves valid existing values', async () => {
