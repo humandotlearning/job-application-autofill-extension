@@ -5,27 +5,23 @@ import {
   inspectDocument,
   validateDocument,
   focusField,
-  submitDocument,
+  waitForDocumentSettled,
 } from './form-engine.js';
+import { createLearningSession } from './learning.js';
 
 function notifyNavigation() {
-  let sent = false;
-  let observer;
-  const send = () => {
-    if (sent) return;
-    sent = true;
-    observer?.disconnect();
-    chrome.runtime.sendMessage({ type: 'JOB_APP_NAVIGATED' }).catch(() => {});
-  };
-  if (typeof MutationObserver === 'function' && document.documentElement) {
-    observer = new MutationObserver(send);
-    observer.observe(document.documentElement, { subtree: true, childList: true, attributes: true });
-  }
-  setTimeout(send, 500);
+  waitForDocumentSettled(document).then(() => chrome.runtime.sendMessage({ type: 'JOB_APP_NAVIGATED' })).catch(() => {});
 }
 
 if (!globalThis.__jobApplicationAutofillInstalled) {
   globalThis.__jobApplicationAutofillInstalled = true;
+  const learning = createLearningSession(document, {
+    capture: () => collectAnswerRecords(document),
+    send: (message) => chrome.runtime.sendMessage(message),
+  });
+  chrome.runtime.sendMessage({ type: 'JOB_APP_LEARNING_STATUS' }).then((response) => {
+    if (response?.applicationId) learning.activate(response.applicationId);
+  }).catch(() => {});
   chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     try {
       switch (message?.type) {
@@ -33,11 +29,15 @@ if (!globalThis.__jobApplicationAutofillInstalled) {
           sendResponse({ ok: true });
           break;
         case 'JOB_APP_INSPECT':
-          sendResponse({ ok: true, inspection: inspectDocument(document) });
-          break;
+          waitForDocumentSettled(document, { minWaitMs: 150, quietMs: 75 }).then(() => sendResponse({ ok: true, inspection: inspectDocument(document) }))
+            .catch((error) => sendResponse({ ok: false, error: error.message }));
+          return true;
         case 'JOB_APP_APPLY':
-          sendResponse({ ok: true, result: applyDecisions(document, message.decisions || []) });
-          break;
+          if (message.applicationId) learning.activate(message.applicationId);
+          applyDecisions(document, message.decisions || [])
+            .then((result) => sendResponse({ ok: true, result }))
+            .catch((error) => sendResponse({ ok: false, error: error.message }));
+          return true;
         case 'JOB_APP_CAPTURE':
           sendResponse({ ok: true, records: collectAnswerRecords(document) });
           break;
@@ -48,15 +48,12 @@ if (!globalThis.__jobApplicationAutofillInstalled) {
           sendResponse({ ok: focusField(document, message.fieldId) });
           break;
         case 'JOB_APP_CLICK_NEXT':
-          {
+          learning.flush().then(() => {
             const result = clickAction(document, message.actionId);
             if (result.ok) notifyNavigation();
             sendResponse(result);
-          }
-          break;
-        case 'JOB_APP_SUBMIT':
-          sendResponse(submitDocument(document));
-          break;
+          }).catch((error) => sendResponse({ ok: false, error: error.message }));
+          return true;
         default:
           return false;
       }

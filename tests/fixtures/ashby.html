@@ -1,0 +1,8 @@
+<!doctype html><title>Ashby application fixture</title>
+<main><form aria-label="Job application">
+  <div class="ashby-application-form-field-entry"><label for="location">Location</label><input id="location" role="combobox" aria-label="Location" aria-autocomplete="list" aria-controls="locations" aria-expanded="false"></div>
+  <div><label for="languages">Languages</label><button id="languages" type="button" role="combobox" aria-label="Languages" aria-controls="language-options" aria-multiselectable="true">Select options</button></div>
+  <button type="submit">Submit application</button>
+</form></main>
+<div id="locations" role="listbox" hidden></div>
+<div id="language-options" role="listbox" aria-multiselectable="true" hidden><div role="option" aria-selected="false">English</div><div role="option" aria-selected="false">French</div></div>

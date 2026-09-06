@@ -6,7 +6,7 @@
   "scripts": {
     "build": "node scripts/build.mjs",
     "test": "node --test",
-    "check": "node --check src/core.js && node --check src/form-engine.js && node --check src/content.js && node --check src/sidepanel.js && node --check src/service-worker.js && node --check src/llm.js && node --check scripts/build.mjs"
+    "check": "node --check src/core.js && node --check src/form-engine.js && node --check src/content.js && node --check src/learning.js && node --check src/datasource.js && node --check src/sidepanel.js && node --check src/service-worker.js && node --check src/llm.js && node --check scripts/build.mjs"
   },
   "devDependencies": {
     "jsdom": "26.1.0"

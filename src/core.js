@@ -2,19 +2,41 @@ const AUTOCOMPLETE_KEYS = {
   email: ['email'],
   tel: ['phone', 'phone_number', 'mobile'],
   name: ['full_name', 'name'],
-  'given-name': ['first_name', 'given_name'],
-  'family-name': ['last_name', 'family_name', 'surname'],
+  'given name': ['first_name', 'given_name'],
+  'family name': ['last_name', 'family_name', 'surname'],
   country: ['country'],
-  'country-name': ['country'],
-  'address-level1': ['state', 'region'],
-  'address-level2': ['city'],
-  'postal-code': ['postal_code', 'zip_code', 'pincode'],
-  'street-address': ['address', 'street_address'],
+  'country name': ['country'],
+  'address level1': ['state', 'region'],
+  'address level2': ['city'],
+  'postal code': ['postal_code', 'zip_code', 'pincode'],
+  'street address': ['address', 'street_address'],
   organization: ['current_employer', 'employer', 'company'],
   url: ['website', 'linkedin', 'portfolio', 'github'],
 };
 
+const GENERIC_NAME_LABELS = new Set(['name', 'your name', 'applicant name', 'candidate name']);
+
+export function canonicalConcept(value = '') {
+  const text = normalizeText(value).replace(/^(?:what is |please enter |enter )?(?:your )/, '').replace(/\blinked in\b/g, 'linkedin').replace(/\bgit hub\b/g, 'github');
+  if (GENERIC_NAME_LABELS.has(text)) return 'generic_name';
+  if (/^(?:first|given|forename) name$/.test(text)) return 'first_name';
+  if (/^(?:last|family) name$|^surname$/.test(text)) return 'last_name';
+  if (/^(?:full|complete|legal) name$/.test(text)) return 'full_name';
+  if (/^(?:preferred name|nickname|preferred first name)$/.test(text)) return 'preferred_name';
+  if (/^(?:dob|date of birth|birth date|birthday)$/.test(text)) return 'date_of_birth';
+  if (/^(?:email|email address|e mail)$/.test(text)) return 'email';
+  if (/^(?:phone|phone number|mobile|mobile number|telephone)$/.test(text)) return 'phone';
+  if (/^(?:github|github profile|github url)$/.test(text)) return 'github_url';
+  if (/^(?:linkedin|linkedin profile|linkedin url)$/.test(text)) return 'linkedin_url';
+  if (/^(?:portfolio|portfolio url|personal website|website)$/.test(text)) return 'portfolio_url';
+  return slugify(text);
+}
+
 const SENSITIVITIES = new Set(['safe', 'review', 'legal']);
+
+function timestamp(value, fallback = new Date().toISOString()) {
+  return typeof value === 'string' && !Number.isNaN(Date.parse(value)) ? value : fallback;
+}
 
 export function normalizeText(value = '') {
   return String(value)
@@ -40,6 +62,7 @@ export function inferSensitivity(question, key = '') {
   if (/\b(ctc|salary|compensation|notice period|sponsorship|sponsor|visa|citizenship|work authorization|reference|reason for leaving|relocat)\b/.test(text)) {
     return 'review';
   }
+  if (/\b(ssn|social security|passport|national identity|date of birth|birthday)\b/.test(text)) return 'review';
   return 'safe';
 }
 
@@ -52,15 +75,19 @@ function uniqueStrings(values = []) {
 
 export function normalizeAnswerRecord(record = {}) {
   const question = String(record.question || record.label || record.key || '').trim();
-  const key = slugify(record.key || question);
+  let key = slugify(record.key || question);
+  const scope = slugify(record.entityId || '');
+  if (scope && !key.endsWith(`_${scope}`)) key = `${key}_${scope}`;
   const answer = String(record.answer ?? '').trim();
   const aliases = uniqueStrings(Array.isArray(record.aliases) ? record.aliases : []);
+  const alternatives = uniqueStrings(Array.isArray(record.alternatives) ? record.alternatives : [])
+    .filter((value) => normalizeText(value) !== normalizeText(answer));
   if (!aliases.length && question) aliases.push(question);
   const sensitivity = SENSITIVITIES.has(record.sensitivity) ? record.sensitivity : inferSensitivity(question, key);
   const updatedAt = typeof record.updatedAt === 'string' && !Number.isNaN(Date.parse(record.updatedAt))
     ? record.updatedAt
     : new Date().toISOString();
-  return {
+  const normalized = {
     key,
     question: question || key.replace(/_/g, ' '),
     answer,
@@ -69,6 +96,19 @@ export function normalizeAnswerRecord(record = {}) {
     sensitivity,
     updatedAt,
   };
+  for (const key of ['id', 'concept', 'entityId', 'entityType', 'context', 'provenance', 'confirmedAt', 'confirmationState', 'pendingAnswer']) {
+    if (record[key] != null && String(record[key]).trim()) normalized[key] = String(record[key]).trim();
+  }
+  if (Array.isArray(record.history) && record.history.length) {
+    normalized.history = record.history.map((item) => ({
+      answer: String(item?.answer ?? '').trim(),
+      updatedAt: timestamp(item?.updatedAt, updatedAt),
+      provenance: String(item?.provenance || 'unknown'),
+    })).filter((item) => item.answer);
+  }
+  for (const key of ['userEdited', 'completed']) if (typeof record[key] === 'boolean') normalized[key] = record[key];
+  if (alternatives.length) normalized.alternatives = alternatives;
+  return normalized;
 }
 
 function tokens(value) {
@@ -84,40 +124,95 @@ function similarity(left, right) {
   return intersection / new Set([...a, ...b]).size;
 }
 
+function compactText(value) {
+  return normalizeText(value).replace(/\s+/g, '');
+}
+
 function candidateLabels(record) {
   return [record.key?.replace(/_/g, ' '), record.question, ...(record.aliases || [])]
     .map(normalizeText)
     .filter(Boolean);
 }
 
+export function recordScopeCompatible(field, record) {
+  if (record.confirmationState === 'pending') return false;
+  if (record.alternatives?.length && record.confirmationState !== 'confirmed') return false;
+  if (field.entityId && record.entityId && field.entityId !== record.entityId) return false;
+  if (record.entityId && !field.entityId) return false;
+  if (field.entityType && record.entityType && field.entityType !== record.entityType) return false;
+  const otherPerson = /reference|referee|emergency|supervisor|manager/;
+  if (otherPerson.test(normalizeText(field.section)) || otherPerson.test(normalizeText(record.context))) {
+    if (normalizeText(field.section) !== normalizeText(record.context)) return false;
+  }
+  if (field.entityType && !record.entityId && /company|employer|school|university|degree|job title/.test(normalizeText(record.question || record.key))) return false;
+  return true;
+}
+
 export function chooseRecord(field = {}, records = []) {
   if (!Array.isArray(records) || records.length === 0) return null;
+  records = records.filter((record) => recordScopeCompatible(field, record));
   const fieldTexts = [field.label, field.name, field.id, field.placeholder]
     .map(normalizeText)
     .filter(Boolean);
   const autocomplete = normalizeText(String(field.autocomplete || '').split(' ').at(-1));
-  const preferredKeys = AUTOCOMPLETE_KEYS[autocomplete] || [];
-  if (preferredKeys.length) {
-    const exact = records.find((record) => preferredKeys.includes(slugify(record.key)) && String(record.answer ?? '').trim());
+  const autocompleteToken = normalizeText(String(field.autocomplete || '').replace(/\s+/g, ' '));
+  const fieldLabel = fieldTexts.join(' ');
+  const preferredKeys = AUTOCOMPLETE_KEYS[autocompleteToken] || AUTOCOMPLETE_KEYS[autocomplete] || [];
+  const fieldConcept = canonicalConcept(field.label || field.name || field.id || '');
+  const unambiguous = (candidates) => new Set(candidates.map((record) => String(record.answer).trim())).size === 1 ? candidates[0] : null;
+  if (fieldConcept === 'generic_name') {
+    const fullName = unambiguous(records.filter((record) => canonicalConcept(record.concept || record.key || record.question) === 'full_name' && String(record.answer ?? '').trim()));
+    return fullName ? { record: fullName, confidence: 'high', score: 1, reason: 'generic-name:full_name' } : null;
+  }
+  if (fieldConcept) {
+    const conceptCandidates = records.filter((record) => String(record.answer ?? '').trim()
+      && canonicalConcept(record.concept || record.key || record.question) === fieldConcept);
+    if (conceptCandidates.length > 1 && !unambiguous(conceptCandidates)) return null;
+    const conceptMatch = unambiguous(conceptCandidates);
+    if (conceptMatch) return { record: conceptMatch, confidence: 'high', score: 1, reason: `concept:${fieldConcept}` };
+  }
+  if (preferredKeys.length || autocompleteToken === 'url') {
+    let candidates = records.filter((record) => preferredKeys.includes(slugify(record.key)) && String(record.answer ?? '').trim());
+    if (autocompleteToken === 'url') {
+      const compatible = records.filter((record) => {
+        const concept = canonicalConcept(record.key || record.question);
+        return String(record.answer ?? '').trim()
+          && (concept === fieldConcept || candidateLabels(record).some((candidate) => fieldLabel.includes(normalizeText(candidate))));
+      });
+      if (compatible.length) candidates = compatible;
+      else candidates = [];
+    }
+    const exact = unambiguous(candidates);
     if (exact) return { record: exact, confidence: 'exact', score: 1, reason: `autocomplete:${autocomplete}` };
   }
 
   let best = null;
+  const bestByRecord = new Map();
   for (const record of records) {
     if (!String(record.answer ?? '').trim()) continue;
+    const recordConcept = canonicalConcept(record.concept || record.key || record.question);
+    if (['first_name', 'last_name', 'full_name', 'preferred_name', 'github_url', 'linkedin_url', 'portfolio_url', 'date_of_birth'].includes(fieldConcept)
+      && recordConcept !== fieldConcept) continue;
+    if (fieldConcept && fieldConcept !== 'generic_name' && fieldConcept !== slugify(field.label || field.name || field.id || '')
+      && recordConcept !== fieldConcept
+      && ['github_url', 'linkedin_url', 'portfolio_url'].includes(fieldConcept)) continue;
     for (const fieldText of fieldTexts) {
       for (const candidate of candidateLabels(record)) {
-        const score = fieldText === candidate
+        const compactFieldText = compactText(fieldText);
+        const compactCandidate = compactText(candidate);
+        const score = fieldText === candidate || compactFieldText === compactCandidate
           ? 1
-          : fieldText.includes(candidate) || candidate.includes(fieldText)
-            ? 0.9
-            : similarity(fieldText, candidate);
-        if (!best || score > best.score) best = { record, score, reason: `label:${candidate}` };
+          : similarity(fieldText, candidate);
+        const candidateMatch = { record, score, reason: `label:${candidate}` };
+        if (!bestByRecord.has(record.key) || score > bestByRecord.get(record.key).score) bestByRecord.set(record.key, candidateMatch);
+        if (!best || score > best.score) best = candidateMatch;
       }
     }
   }
 
   if (!best || best.score < 0.5) return null;
+  const ranked = [...bestByRecord.values()].sort((left, right) => right.score - left.score);
+  if (ranked.length > 1 && ranked[1].score === best.score && ranked[1].record.key !== best.record.key) return null;
   return {
     ...best,
     confidence: best.score >= 0.9 ? 'high' : best.score >= 0.7 ? 'high' : 'medium',
@@ -134,8 +229,8 @@ export function validateFillValue(field = {}, value) {
   const text = String(value).trim();
   const constraints = field.constraints || {};
   if (Array.isArray(field.options) && field.options.length) {
-    const normalized = normalizeText(text);
-    if (!field.options.some((option) => normalizeText(option) === normalized)) {
+    const values = field.multiple ? text.split(/\s*[,;]\s*/) : [text];
+    if (!values.every((value) => field.options.some((option) => normalizeText(option) === normalizeText(value)))) {
       return { ok: false, reason: 'value is not one of the available options' };
     }
   }
@@ -195,6 +290,14 @@ export function upsertAnswerRecords(existing = [], incoming = [], updatedAt = ne
       merged.set(next.key, next);
       continue;
     }
+    const history = [
+      ...(previous.history || []),
+      ...(next.history || []),
+      ...(normalizeText(previous.answer) !== normalizeText(next.answer)
+        && (previous.provenance || next.provenance)
+        ? [{ answer: previous.answer, updatedAt: previous.updatedAt, provenance: previous.provenance || 'unknown' }]
+        : []),
+    ];
     merged.set(next.key, {
       ...next,
       aliases: uniqueStrings([
@@ -203,7 +306,39 @@ export function upsertAnswerRecords(existing = [], incoming = [], updatedAt = ne
         previous.question,
         next.question,
       ]),
+      ...(uniqueStrings([...(previous.alternatives || []), ...(next.alternatives || [])])
+        .filter((value) => normalizeText(value) !== normalizeText(next.answer)).length
+        ? { alternatives: uniqueStrings([...(previous.alternatives || []), ...(next.alternatives || [])])
+          .filter((value) => normalizeText(value) !== normalizeText(next.answer)) }
+        : {}),
+      ...(history.length ? { history } : {}),
     });
   }
   return [...merged.values()];
+}
+
+export function mergeLearnedAnswers(existing = [], incoming = [], now = new Date().toISOString()) {
+  let result = existing.map(normalizeAnswerRecord);
+  for (const raw of incoming) {
+    if (raw.provenance !== 'user' || raw.completed === false || !validateFillValue({ type: raw.type }, raw.answer).ok) continue;
+    const next = normalizeAnswerRecord({ ...raw, updatedAt: now });
+    const previous = result.find((record) => record.key === next.key);
+    const changed = previous && previous.answer !== next.answer;
+    const sensitive = inferSensitivity(next.question, next.key) !== 'safe' || next.sensitivity !== 'safe';
+    if (changed) {
+      result = result.map((record) => record.key === next.key ? {
+        ...record,
+        pendingAnswer: next.answer,
+        confirmationState: 'pending',
+        alternatives: uniqueStrings([...(record.alternatives || []), next.answer]),
+      } : record);
+    } else if (!previous) {
+      result = upsertAnswerRecords(result, [{ ...next, id: next.id || next.key,
+        concept: next.concept || canonicalConcept(next.question),
+        confirmationState: sensitive ? 'pending' : 'confirmed',
+        ...(sensitive ? {} : { confirmedAt: now }),
+      }], now);
+    }
+  }
+  return result;
 }
