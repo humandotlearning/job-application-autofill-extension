@@ -76,7 +76,10 @@ function uniqueStrings(values = []) {
 export function normalizeAnswerRecord(record = {}) {
   const question = String(record.question || record.label || record.key || '').trim();
   let key = slugify(record.key || question);
-  const scope = slugify(record.entityId || '');
+  // Employment sections receive unstable DOM ids on every ATS.  A saved
+  // employment identity is the durable scope used to carry an answer across
+  // those sections (for example, Lever -> Workday).
+  const scope = slugify(record.employmentId || record.entityId || '');
   if (scope && !key.endsWith(`_${scope}`)) key = `${key}_${scope}`;
   const answer = String(record.answer ?? '').trim();
   const aliases = uniqueStrings(Array.isArray(record.aliases) ? record.aliases : []);
@@ -96,7 +99,7 @@ export function normalizeAnswerRecord(record = {}) {
     sensitivity,
     updatedAt,
   };
-  for (const key of ['id', 'concept', 'entityId', 'entityType', 'context', 'provenance', 'confirmedAt', 'confirmationState', 'pendingAnswer']) {
+  for (const key of ['id', 'concept', 'entityId', 'entityType', 'employmentId', 'context', 'provenance', 'confirmedAt', 'confirmationState', 'pendingAnswer']) {
     if (record[key] != null && String(record[key]).trim()) normalized[key] = String(record[key]).trim();
   }
   if (Array.isArray(record.history) && record.history.length) {
@@ -137,7 +140,8 @@ function candidateLabels(record) {
 export function recordScopeCompatible(field, record) {
   if (record.confirmationState === 'pending') return false;
   if (record.alternatives?.length && record.confirmationState !== 'confirmed') return false;
-  if (field.entityId && record.entityId && field.entityId !== record.entityId) return false;
+  const sameEmployment = Boolean(field.employmentId && record.employmentId && field.employmentId === record.employmentId);
+  if (field.entityId && record.entityId && field.entityId !== record.entityId && !sameEmployment) return false;
   if (record.entityId && !field.entityId) return false;
   if (field.entityType && record.entityType && field.entityType !== record.entityType) return false;
   const otherPerson = /reference|referee|emergency|supervisor|manager/;
@@ -317,7 +321,7 @@ export function upsertAnswerRecords(existing = [], incoming = [], updatedAt = ne
   return [...merged.values()];
 }
 
-export function mergeLearnedAnswers(existing = [], incoming = [], now = new Date().toISOString()) {
+export function mergeLearnedAnswers(existing = [], incoming = [], now = new Date().toISOString(), { confirm = false } = {}) {
   let result = existing.map(normalizeAnswerRecord);
   for (const raw of incoming) {
     if (raw.provenance !== 'user' || raw.completed === false || !validateFillValue({ type: raw.type }, raw.answer).ok) continue;
@@ -325,7 +329,16 @@ export function mergeLearnedAnswers(existing = [], incoming = [], now = new Date
     const previous = result.find((record) => record.key === next.key);
     const changed = previous && previous.answer !== next.answer;
     const sensitive = inferSensitivity(next.question, next.key) !== 'safe' || next.sensitivity !== 'safe';
-    if (changed) {
+    if (changed && confirm) {
+      result = upsertAnswerRecords(result, [{
+        ...next,
+        id: next.id || next.key,
+        concept: next.concept || canonicalConcept(next.question),
+        confirmationState: 'confirmed',
+        pendingAnswer: '',
+        confirmedAt: now,
+      }], now);
+    } else if (changed) {
       result = result.map((record) => record.key === next.key ? {
         ...record,
         pendingAnswer: next.answer,
@@ -335,8 +348,8 @@ export function mergeLearnedAnswers(existing = [], incoming = [], now = new Date
     } else if (!previous) {
       result = upsertAnswerRecords(result, [{ ...next, id: next.id || next.key,
         concept: next.concept || canonicalConcept(next.question),
-        confirmationState: sensitive ? 'pending' : 'confirmed',
-        ...(sensitive ? {} : { confirmedAt: now }),
+        confirmationState: confirm || !sensitive ? 'confirmed' : 'pending',
+        ...(confirm || !sensitive ? { confirmedAt: now } : {}),
       }], now);
     }
   }

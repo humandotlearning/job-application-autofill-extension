@@ -78,7 +78,10 @@ function uniqueStrings(values = []) {
 function normalizeAnswerRecord(record = {}) {
   const question = String(record.question || record.label || record.key || '').trim();
   let key = slugify(record.key || question);
-  const scope = slugify(record.entityId || '');
+  // Employment sections receive unstable DOM ids on every ATS.  A saved
+  // employment identity is the durable scope used to carry an answer across
+  // those sections (for example, Lever -> Workday).
+  const scope = slugify(record.employmentId || record.entityId || '');
   if (scope && !key.endsWith(`_${scope}`)) key = `${key}_${scope}`;
   const answer = String(record.answer ?? '').trim();
   const aliases = uniqueStrings(Array.isArray(record.aliases) ? record.aliases : []);
@@ -98,7 +101,7 @@ function normalizeAnswerRecord(record = {}) {
     sensitivity,
     updatedAt,
   };
-  for (const key of ['id', 'concept', 'entityId', 'entityType', 'context', 'provenance', 'confirmedAt', 'confirmationState', 'pendingAnswer']) {
+  for (const key of ['id', 'concept', 'entityId', 'entityType', 'employmentId', 'context', 'provenance', 'confirmedAt', 'confirmationState', 'pendingAnswer']) {
     if (record[key] != null && String(record[key]).trim()) normalized[key] = String(record[key]).trim();
   }
   if (Array.isArray(record.history) && record.history.length) {
@@ -139,7 +142,8 @@ function candidateLabels(record) {
 function recordScopeCompatible(field, record) {
   if (record.confirmationState === 'pending') return false;
   if (record.alternatives?.length && record.confirmationState !== 'confirmed') return false;
-  if (field.entityId && record.entityId && field.entityId !== record.entityId) return false;
+  const sameEmployment = Boolean(field.employmentId && record.employmentId && field.employmentId === record.employmentId);
+  if (field.entityId && record.entityId && field.entityId !== record.entityId && !sameEmployment) return false;
   if (record.entityId && !field.entityId) return false;
   if (field.entityType && record.entityType && field.entityType !== record.entityType) return false;
   const otherPerson = /reference|referee|emergency|supervisor|manager/;
@@ -319,7 +323,7 @@ function upsertAnswerRecords(existing = [], incoming = [], updatedAt = new Date(
   return [...merged.values()];
 }
 
-function mergeLearnedAnswers(existing = [], incoming = [], now = new Date().toISOString()) {
+function mergeLearnedAnswers(existing = [], incoming = [], now = new Date().toISOString(), { confirm = false } = {}) {
   let result = existing.map(normalizeAnswerRecord);
   for (const raw of incoming) {
     if (raw.provenance !== 'user' || raw.completed === false || !validateFillValue({ type: raw.type }, raw.answer).ok) continue;
@@ -327,7 +331,16 @@ function mergeLearnedAnswers(existing = [], incoming = [], now = new Date().toIS
     const previous = result.find((record) => record.key === next.key);
     const changed = previous && previous.answer !== next.answer;
     const sensitive = inferSensitivity(next.question, next.key) !== 'safe' || next.sensitivity !== 'safe';
-    if (changed) {
+    if (changed && confirm) {
+      result = upsertAnswerRecords(result, [{
+        ...next,
+        id: next.id || next.key,
+        concept: next.concept || canonicalConcept(next.question),
+        confirmationState: 'confirmed',
+        pendingAnswer: '',
+        confirmedAt: now,
+      }], now);
+    } else if (changed) {
       result = result.map((record) => record.key === next.key ? {
         ...record,
         pendingAnswer: next.answer,
@@ -337,8 +350,8 @@ function mergeLearnedAnswers(existing = [], incoming = [], now = new Date().toIS
     } else if (!previous) {
       result = upsertAnswerRecords(result, [{ ...next, id: next.id || next.key,
         concept: next.concept || canonicalConcept(next.question),
-        confirmationState: sensitive ? 'pending' : 'confirmed',
-        ...(sensitive ? {} : { confirmedAt: now }),
+        confirmationState: confirm || !sensitive ? 'confirmed' : 'pending',
+        ...(confirm || !sensitive ? { confirmedAt: now } : {}),
       }], now);
     }
   }
@@ -944,12 +957,46 @@ function coverMessageDecision(field, coverMessages = []) {
   };
 }
 
-function planDeterministicFill(fields, records, coverMessages = []) {
+function hiringCompanyDefault(field, profile = {}, page = {}) {
+  const text = normalizeText(`${field.label || ''} ${field.name || ''} ${field.id || ''}`);
+  // Do not turn referrals, professional references, or broad declarations
+  // into company-relationship answers.
+  if (/referr|professional reference|reference contact|conflict of interest/.test(text)) return null;
+  // ATS pages commonly expose the employer in the title ("Acme Careers —
+  // Apply"). Use only that deliberate title shape; a generic page title stays
+  // unresolved rather than receiving a guess.
+  const titleCompany = String(page.title || '').match(/^\s*(.+?)\s+(?:careers?|jobs?)\b/i)?.[1] || '';
+  const company = normalizeText(field.targetCompany || page.company || titleCompany);
+  if (!company) return null;
+  const employer = (profile.employment || []).find((entry) => normalizeText(entry.company) === company);
+  if (/have you (?:ever |previously )?worked (?:at|for|with)|former employee|prior employment/.test(text)) {
+    return employer ? { value: 'Yes', reason: 'Confirmed prior employer' } : { value: 'No', reason: 'No prior employment at this company' };
+  }
+  if (/relative|family member|related to/.test(text)) {
+    return { value: profile.defaults?.relatedToHiringCompany || 'No', reason: 'Profile company-relationship default' };
+  }
+  if (/know (?:anyone|someone)|friends? (?:or )?contacts?|any contacts? (?:at|in)/.test(text)) {
+    return { value: profile.defaults?.knownAtHiringCompany || 'No', reason: 'Profile company-contact default' };
+  }
+  return null;
+}
+
+function planDeterministicFill(fields, records, coverMessages = [], profile = {}, page = {}) {
   return fields.map((field) => {
     const coverDecision = coverMessageDecision(field, coverMessages);
     if (coverDecision) return coverDecision;
     const match = chooseRecord(field, records);
     if (!match) {
+      const defaultAnswer = hiringCompanyDefault(field, profile, page);
+      if (defaultAnswer) return {
+        fieldId: field.id,
+        action: 'fill',
+        value: defaultAnswer.value,
+        evidenceKeys: [],
+        confidence: 'high',
+        sensitivity: 'review',
+        reason: defaultAnswer.reason,
+      };
       if (['full_name', 'generic_name'].includes(canonicalConcept(field.label))) {
         const first = chooseRecord({ ...field, label: 'First name', autocomplete: '', id: '', name: '', placeholder: '' }, records);
         const last = chooseRecord({ ...field, label: 'Last name', autocomplete: '', id: '', name: '', placeholder: '' }, records);

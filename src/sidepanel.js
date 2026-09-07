@@ -3,6 +3,9 @@ const elements = {
   apiKey: byId('openai-api-key'),
   apiModel: byId('openai-model'),
   autoAdvance: byId('auto-advance-pages'),
+  employerName: byId('employer-name'),
+  relatedDefault: byId('related-default'),
+  knownDefault: byId('known-default'),
   recordCount: byId('record-count'),
   coverMessageCount: byId('cover-message-count'),
   datasourceHint: byId('datasource-hint'),
@@ -67,6 +70,11 @@ function updateDatasourceSummary(datasource = {}) {
   elements.recordCount.textContent = `${answerCount} answer${answerCount === 1 ? '' : 's'}`;
   elements.coverMessageCount.textContent = `${coverMessageCount} cover message${coverMessageCount === 1 ? '' : 's'}`;
   if (datasource.learnedChanges) renderLearnedChanges(datasource.learnedChanges);
+  if (datasource.profile) {
+    elements.employerName.value = datasource.profile.employment?.[0]?.company || 'DeepSight AI Labs';
+    elements.relatedDefault.value = datasource.profile.defaults?.relatedToHiringCompany || 'No';
+    elements.knownDefault.value = datasource.profile.defaults?.knownAtHiringCompany || 'No';
+  }
 }
 
 function renderLearnedChanges(records) {
@@ -275,11 +283,23 @@ async function sendRunAction(type) {
     if (!response?.ok) throw new Error(response?.error || 'The application action could not be completed.');
     renderRun(response.run);
     if (type === 'JOB_RUN_SAVE_ANSWERS') {
-      const count = response.savedCount || 0;
-      const message = count > 0
-        ? `Saved ${count} filled value${count === 1 ? '' : 's'} locally.`
-        : 'No filled values found on this page; nothing was saved.';
-      setSaveFeedback(message, count > 0 ? 'success' : 'empty');
+      const legacyResponse = !['persisted', 'updated', 'unchanged', 'unresolved'].some((key) => Object.hasOwn(response, key));
+      if (legacyResponse) {
+        const count = response.savedCount || 0;
+        const message = count > 0
+          ? `Saved ${count} filled value${count === 1 ? '' : 's'} locally.`
+          : 'No filled values found on this page; nothing was saved.';
+        setSaveFeedback(message, count > 0 ? 'success' : 'empty');
+        setStatus(message);
+        return;
+      }
+      const parts = [];
+      if (response.persisted) parts.push(`${response.persisted} new reusable`);
+      if (response.updated) parts.push(`${response.updated} updated`);
+      if (response.unchanged) parts.push(`${response.unchanged} unchanged`);
+      if (response.unresolved) parts.push(`${response.unresolved} need attention`);
+      const message = parts.length ? `Saved: ${parts.join(', ')}.` : 'No reusable values changed; current values remain in this application draft.';
+      setSaveFeedback(message, response.savedCount > 0 ? 'success' : 'empty');
       setStatus(message);
     }
   } catch (error) {
@@ -388,12 +408,27 @@ async function saveSettings() {
   setStatus(elements.autoAdvance.checked ? 'Automatic page advance enabled.' : 'Automatic page advance disabled.');
 }
 
+async function saveProfile() {
+  try {
+    const company = elements.employerName.value.trim() || 'DeepSight AI Labs';
+    elements.employerName.value = company;
+    const response = await chrome.runtime.sendMessage({ type: 'JOB_DATASOURCE_PROFILE_UPDATE', profile: {
+      employment: [{ company }],
+      defaults: { relatedToHiringCompany: elements.relatedDefault.value, knownAtHiringCompany: elements.knownDefault.value },
+    } });
+    if (!response?.ok) throw new Error(response?.error || 'Could not save profile defaults.');
+    updateDatasourceSummary(response.datasource);
+    setStatus('Profile defaults saved. They will be used on identified company questions.');
+  } catch (error) { setStatus(error.message, 'error'); }
+}
+
 elements.apiKey.addEventListener('change', saveApiKey);
 elements.apiKey.addEventListener('blur', saveApiKey);
 elements.apiKey.addEventListener('input', saveApiKey);
 elements.apiModel.addEventListener('change', saveModel);
 elements.apiModel.addEventListener('blur', saveModel);
 elements.autoAdvance.addEventListener('change', saveSettings);
+for (const field of [elements.employerName, elements.relatedDefault, elements.knownDefault]) field.addEventListener('change', saveProfile);
 elements.exportDatasource.addEventListener('click', exportDatasource);
 elements.importDatasourceButton.addEventListener('click', () => elements.importDatasource.click());
 elements.importDatasource.addEventListener('change', () => importDatasource(elements.importDatasource.files?.[0]));

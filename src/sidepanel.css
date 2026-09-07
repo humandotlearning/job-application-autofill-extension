@@ -26,8 +26,8 @@ main { padding: 14px; }
 .section-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 13px; }
 label { display: block; margin: 0 0 6px; color: var(--muted); font-size: 12px; font-weight: 650; }
 .muted { font-weight: 400; }
-input { width: 100%; padding: 10px; border: 1px solid var(--border); border-radius: 10px; outline: none; color: var(--text); background: #0e1217; font: 12px ui-monospace, SFMono-Regular, Consolas, monospace; }
-input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(215,255,69,.08); }
+input, select { width: 100%; padding: 10px; border: 1px solid var(--border); border-radius: 10px; outline: none; color: var(--text); background: #0e1217; font: 12px ui-monospace, SFMono-Regular, Consolas, monospace; }
+input:focus, select:focus { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(215,255,69,.08); }
 .hint { margin-top: 10px; font-size: 11px; }
 .compact { margin-top: 0; }
 .button-row { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 12px; }
@@ -71,5 +71,5 @@ footer { position: sticky; bottom: 0; display: flex; align-items: center; gap: 8
 @keyframes pulse { to { opacity: .35; } }
 @media (prefers-color-scheme: light) {
   :root { --bg: #f4f6f0; --card: #fff; --card-2: #eef1e8; --text: #172017; --muted: #627063; --border: #d7ddd3; --accent: #6d8700; --accent-ink: #fff; --ok: #20743f; --warning: #805600; --danger: #b42335; }
-  input { background: #fafcf8; }
+  input, select { background: #fafcf8; }
 }

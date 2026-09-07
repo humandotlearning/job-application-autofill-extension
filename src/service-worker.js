@@ -90,15 +90,17 @@ async function initializeDatasource() {
       answerRecords: seeded.answerRecords,
       coverMessages: seeded.coverMessages,
       datasourceMeta: seeded.datasourceMeta,
+      profile: seeded.profile,
     });
     return seeded;
   }
-  if (legacyRecords.length || !stored.datasourceMeta) {
+  if (legacyRecords.length || !stored.datasourceMeta || !stored.profile) {
     current.datasourceMeta ||= { schemaVersion: current.schemaVersion, initializedAt: new Date().toISOString() };
     await chrome.storage.local.set({
       answerRecords: current.answerRecords,
       coverMessages: current.coverMessages,
       datasourceMeta: current.datasourceMeta,
+      profile: current.profile,
     });
   }
   return current;
@@ -114,11 +116,44 @@ async function saveDatasource(state) {
     answerRecords: state.answerRecords,
     coverMessages: state.coverMessages,
     datasourceMeta: state.datasourceMeta,
+    profile: state.profile,
   });
   return state;
 }
 
-async function persistLearnedRecords(records = [], run = null) {
+function scopeEmploymentRecords(records = [], profile = {}) {
+  const employment = profile.employment || [];
+  const confirmed = employment[0];
+  if (!confirmed) return records;
+  const matchingSections = new Set(records
+    .filter((record) => record.entityType === 'employment'
+      && /company|employer|organization/.test(String(record.question || record.key || '').toLowerCase())
+      && String(record.answer || '').trim().toLowerCase() === confirmed.company.toLowerCase())
+    .map((record) => record.entityId));
+  return records.map((record) => matchingSections.has(record.entityId)
+    ? { ...record, employmentId: confirmed.id }
+    : record);
+}
+
+function saveStats(before = [], after = [], records = []) {
+  let persisted = 0;
+  let updated = 0;
+  let unchanged = 0;
+  let unresolved = 0;
+  for (const raw of records) {
+    const record = normalizeAnswerRecord(raw);
+    if (!record.answer || raw.completed === false) { unresolved += 1; continue; }
+    const previous = before.find((item) => item.key === record.key);
+    const next = after.find((item) => item.key === record.key);
+    if (!next) { unresolved += 1; continue; }
+    if (!previous) persisted += 1;
+    else if (previous.answer !== next.answer) updated += 1;
+    else unchanged += 1;
+  }
+  return { persisted, updated, unchanged, unresolved, savedCount: persisted + updated };
+}
+
+async function persistLearnedRecords(records = [], run = null, { promote = false } = {}) {
   const now = new Date().toISOString();
   datasourceWriteChain = datasourceWriteChain.catch(() => {}).then(async () => {
     const current = await getDatasource();
@@ -142,12 +177,22 @@ async function persistLearnedRecords(records = [], run = null) {
       drafts[id] = { applicationId: run.startedAt, tabId: run.tabId, frame: run.frame, updatedAt: now, records: upsertAnswerRecords(previous, learned, now) };
       await chrome.storage.local.set({ applicationDrafts: drafts });
     }
-    const answerRecords = mergeLearnedAnswers(current.answerRecords, changedRecords || learned, now);
-    return saveDatasource({
+    const scoped = scopeEmploymentRecords(promote ? learned : (changedRecords || learned), current.profile);
+    // Mutation events are drafts only.  A deliberate Save promotes the exact
+    // current values, which prevents delayed page events from overwriting a
+    // correction the user just saved.
+    const promotable = scoped
+      .filter((record) => record.provenance !== 'autofill')
+      .map((record) => ({ ...record, provenance: 'user', userEdited: true }));
+    const answerRecords = promote
+      ? mergeLearnedAnswers(current.answerRecords, promotable, now, { confirm: true })
+      : current.answerRecords;
+    const state = await saveDatasource({
       ...current,
       answerRecords,
       datasourceMeta: { ...(current.datasourceMeta || {}), schemaVersion: current.schemaVersion, updatedAt: now },
     });
+    return { state, stats: saveStats(current.answerRecords, answerRecords, promote ? promotable : scoped) };
   });
   return datasourceWriteChain;
 }
@@ -191,6 +236,7 @@ async function datasourceSummary() {
     initializedAt: state.datasourceMeta?.initializedAt || null,
     seededAt: state.datasourceMeta?.seededAt || null,
     learnedChanges,
+    profile: state.profile,
   };
 }
 
@@ -237,6 +283,18 @@ async function correctDatasourceRecord(key, answer) {
         confirmationState: record.confirmationState || 'legacy',
       })),
   };
+}
+
+async function updateDatasourceProfile(profile) {
+  datasourceWriteChain = datasourceWriteChain.catch(() => {}).then(async () => {
+    const current = await getDatasource();
+    const state = createDatasourceState({ ...current, profile, datasourceMeta: {
+      ...(current.datasourceMeta || {}), schemaVersion: current.schemaVersion, updatedAt: new Date().toISOString(),
+    } });
+    return saveDatasource(state);
+  });
+  await datasourceWriteChain;
+  return datasourceSummary();
 }
 
 async function importDatasourceBackup(backup) {
@@ -514,20 +572,21 @@ function pageSnapshot(inspection, pageNumber, pageRecords) {
   };
 }
 
-async function recordPageCapture(run, inspection, pageRecords = []) {
-  await persistLearnedRecords(pageRecords, run);
+async function recordPageCapture(run, inspection, pageRecords = [], { promote = false } = {}) {
+  const saved = await persistLearnedRecords(pageRecords, run, { promote });
   run.answers = upsertAnswerRecords(run.answers, pageRecords);
   run.pages = [
     ...run.pages.filter((page) => page.pageNumber !== run.pageNumber),
     pageSnapshot(inspection, run.pageNumber, pageRecords),
   ].slice(-MAX_PAGES);
   run.audit = auditItems(run.answers);
-  return run;
+  return { run, stats: saved.stats };
 }
 
 async function capturePage(tabId, run, inspection) {
   const response = await sendToApplicationFrame(tabId, run, { type: 'JOB_APP_CAPTURE' });
-  return recordPageCapture(run, inspection, response?.records || []);
+  const captured = await recordPageCapture(run, inspection, response?.records || []);
+  return captured.run;
 }
 
 function navigationIssues(inspection) {
@@ -589,7 +648,7 @@ async function focusFirstProblem(tabId, run, inspection, validation) {
   return first?.label || '';
 }
 
-async function applyPageDecisions(tabId, run, inspection, records, coverMessages, apiKey, model) {
+async function applyPageDecisions(tabId, run, inspection, records, coverMessages, apiKey, model, profile = {}) {
   const currentPageSignature = pageSignature(inspection, run.frame);
   if (run.lastAction === 'next' && run.pageSignature === currentPageSignature) {
     run.status = 'waiting_user';
@@ -602,7 +661,11 @@ async function applyPageDecisions(tabId, run, inspection, records, coverMessages
   run.lastAction = null;
   run.pageSignature = currentPageSignature;
   await saveRun(run);
-  const localDecisions = planDeterministicFill(inspection.fields, records, coverMessages);
+  const employment = profile.employment?.[0];
+  const scopedFields = employment
+    ? inspection.fields.map((field) => field.entityType === 'employment' ? { ...field, employmentId: employment.id } : field)
+    : inspection.fields;
+  const localDecisions = planDeterministicFill(scopedFields, records, coverMessages, profile, inspection.page);
   const localResult = await sendToApplicationFrame(tabId, run, { type: 'JOB_APP_APPLY', decisions: localDecisions, applicationId: run.startedAt });
   if (!localResult?.ok) throw new Error(localResult?.error || 'The page rejected local answers');
 
@@ -677,11 +740,12 @@ async function processPage(tabId, { autoAdvance } = { autoAdvance: false }) {
       return saveRun(run);
     }
 
-    const [records, apiKey, coverMessages, settings] = await Promise.all([
+    const [records, apiKey, coverMessages, settings, datasource] = await Promise.all([
       getRecords(),
       getApiKey(),
       getCoverMessages(),
       getSettings(),
+      getDatasource(),
     ]);
     const discovery = await discoverApplicationFrame(tabId);
     if (discovery.errorCode) return saveRun(pauseForFrame(run, discovery));
@@ -694,6 +758,7 @@ async function processPage(tabId, { autoAdvance } = { autoAdvance: false }) {
       coverMessages,
       apiKey,
       settings.openaiModel,
+      datasource.profile,
     );
     run = processed.run;
     const inspection = processed.inspection;
@@ -856,20 +921,19 @@ async function saveAnswers(tabId) {
     if (!run || !SAVABLE_RUN_STATUSES.has(run.status)) {
       return { ok: false, error: 'The current page is not ready to save answers' };
     }
-    if (run.status === 'answers_saved') return { ok: true, run, savedCount: 0 };
     const discovery = await discoverApplicationFrame(tabId);
     if (discovery.errorCode) return { ok: false, error: discovery.reason, run: await saveRun(pauseForFrame(run, discovery)) };
     updateSelectedFrame(run, discovery);
     const inspection = discovery.inspection;
     const captured = await sendToApplicationFrame(tabId, run, { type: 'JOB_APP_CAPTURE' });
-    const savedCount = (captured.records || []).length;
-    run = await recordPageCapture(run, inspection, captured.records || []);
+    const result = await recordPageCapture(run, inspection, captured.records || [], { promote: true });
+    run = result.run;
     if (run.status === 'ready_for_user_submit') {
       run.status = 'answers_saved';
       run.waitingFor = null;
       run.waitingLabel = null;
     }
-    return { ok: true, run: await saveRun(run), savedCount };
+    return { ok: true, run: await saveRun(run), ...result.stats };
   } catch (error) {
     if (!error.frameDiscovery) throw error;
     return { ok: false, error: error.message, run: await saveRun(pauseForFrame(run, error.frameDiscovery)) };
@@ -931,6 +995,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     'JOB_DATASOURCE_EXPORT',
     'JOB_DATASOURCE_IMPORT',
     'JOB_DATASOURCE_CORRECT',
+    'JOB_DATASOURCE_PROFILE_UPDATE',
   ].includes(message?.type)) return false;
 
   (async () => {
@@ -961,6 +1026,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     }
     if (message.type === 'JOB_DATASOURCE_CORRECT') {
       return { ok: true, datasource: await correctDatasourceRecord(message.key, message.answer) };
+    }
+    if (message.type === 'JOB_DATASOURCE_PROFILE_UPDATE') {
+      return { ok: true, datasource: await updateDatasourceProfile(message.profile || {}) };
     }
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
     const tabId = message.tabId || tab?.id;

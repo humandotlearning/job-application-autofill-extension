@@ -101,6 +101,25 @@ test('does not fall back to another employment entity or shared section', () => 
   ]), null);
 });
 
+test('reuses one saved employer across different site-specific work-history sections', () => {
+  const match = chooseRecord({
+    label: 'Employer name',
+    entityId: 'workday-history-1',
+    entityType: 'employment',
+    employmentId: 'deepsight-ai-labs',
+  }, [{
+    key: 'employer_name_workday_1',
+    question: 'Company',
+    answer: 'DeepSight AI Labs',
+    aliases: ['Employer name', 'Company'],
+    entityId: 'lever-experience-0',
+    entityType: 'employment',
+    employmentId: 'deepsight-ai-labs',
+    sensitivity: 'safe',
+  }]);
+  assert.equal(match?.record.answer, 'DeepSight AI Labs');
+});
+
 test('infers conservative sensitivity for high-impact questions', () => {
   assert.equal(inferSensitivity('Expected CTC'), 'review');
   assert.equal(inferSensitivity('I agree to the privacy policy'), 'legal');

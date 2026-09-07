@@ -606,12 +606,46 @@ function coverMessageDecision(field, coverMessages = []) {
   };
 }
 
-export function planDeterministicFill(fields, records, coverMessages = []) {
+function hiringCompanyDefault(field, profile = {}, page = {}) {
+  const text = normalizeText(`${field.label || ''} ${field.name || ''} ${field.id || ''}`);
+  // Do not turn referrals, professional references, or broad declarations
+  // into company-relationship answers.
+  if (/referr|professional reference|reference contact|conflict of interest/.test(text)) return null;
+  // ATS pages commonly expose the employer in the title ("Acme Careers —
+  // Apply"). Use only that deliberate title shape; a generic page title stays
+  // unresolved rather than receiving a guess.
+  const titleCompany = String(page.title || '').match(/^\s*(.+?)\s+(?:careers?|jobs?)\b/i)?.[1] || '';
+  const company = normalizeText(field.targetCompany || page.company || titleCompany);
+  if (!company) return null;
+  const employer = (profile.employment || []).find((entry) => normalizeText(entry.company) === company);
+  if (/have you (?:ever |previously )?worked (?:at|for|with)|former employee|prior employment/.test(text)) {
+    return employer ? { value: 'Yes', reason: 'Confirmed prior employer' } : { value: 'No', reason: 'No prior employment at this company' };
+  }
+  if (/relative|family member|related to/.test(text)) {
+    return { value: profile.defaults?.relatedToHiringCompany || 'No', reason: 'Profile company-relationship default' };
+  }
+  if (/know (?:anyone|someone)|friends? (?:or )?contacts?|any contacts? (?:at|in)/.test(text)) {
+    return { value: profile.defaults?.knownAtHiringCompany || 'No', reason: 'Profile company-contact default' };
+  }
+  return null;
+}
+
+export function planDeterministicFill(fields, records, coverMessages = [], profile = {}, page = {}) {
   return fields.map((field) => {
     const coverDecision = coverMessageDecision(field, coverMessages);
     if (coverDecision) return coverDecision;
     const match = chooseRecord(field, records);
     if (!match) {
+      const defaultAnswer = hiringCompanyDefault(field, profile, page);
+      if (defaultAnswer) return {
+        fieldId: field.id,
+        action: 'fill',
+        value: defaultAnswer.value,
+        evidenceKeys: [],
+        confidence: 'high',
+        sensitivity: 'review',
+        reason: defaultAnswer.reason,
+      };
       if (['full_name', 'generic_name'].includes(canonicalConcept(field.label))) {
         const first = chooseRecord({ ...field, label: 'First name', autocomplete: '', id: '', name: '', placeholder: '' }, records);
         const last = chooseRecord({ ...field, label: 'Last name', autocomplete: '', id: '', name: '', placeholder: '' }, records);

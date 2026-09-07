@@ -14,6 +14,18 @@ import { planDeterministicFill } from '../src/form-engine.js';
 
 const root = new URL('../', import.meta.url);
 
+test('migrates legacy datasource state to a profile with confirmed employer defaults', () => {
+  const migrated = createDatasourceState({
+    answerRecords: [{ key: 'email', question: 'Email', answer: 'nithin@example.com' }],
+    datasourceMeta: { schemaVersion: 1 },
+  });
+  assert.equal(DATASOURCE_SCHEMA_VERSION, 2);
+  assert.equal(migrated.schemaVersion, 2);
+  assert.deepEqual(migrated.profile.employment.map((entry) => entry.company), ['DeepSight AI Labs']);
+  assert.equal(migrated.profile.defaults.relatedToHiringCompany, 'No');
+  assert.equal(migrated.profile.defaults.knownAtHiringCompany, 'No');
+});
+
 async function readSeed() {
   return JSON.parse(await readFile(new URL('../data/seed-data.json', import.meta.url), 'utf8'));
 }

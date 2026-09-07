@@ -1,7 +1,15 @@
 import { normalizeAnswerRecord, normalizeText, slugify, upsertAnswerRecords } from './core.js';
 
-export const DATASOURCE_SCHEMA_VERSION = 1;
+export const DATASOURCE_SCHEMA_VERSION = 2;
 export const DATASOURCE_FORMAT = 'job-application-autofill-datasource';
+
+export const DEFAULT_PROFILE = Object.freeze({
+  employment: [{ id: 'deepsight-ai-labs', company: 'DeepSight AI Labs' }],
+  defaults: {
+    relatedToHiringCompany: 'No',
+    knownAtHiringCompany: 'No',
+  },
+});
 
 function uniqueStrings(values = []) {
   const seen = new Set();
@@ -29,7 +37,26 @@ export function normalizeCoverMessage(message = {}) {
   };
 }
 
-export function createDatasourceState({ answerRecords = [], coverMessages = [], datasourceMeta = null } = {}) {
+function normalizeProfile(profile = {}) {
+  const employment = Array.isArray(profile.employment) && profile.employment.length
+    ? profile.employment
+      .map((entry) => ({
+        id: slugify(entry?.id || entry?.company),
+        company: String(entry?.company || '').trim(),
+        roles: Array.isArray(entry?.roles) ? entry.roles.filter((role) => role && typeof role === 'object') : [],
+      }))
+      .filter((entry) => entry.id && entry.company)
+    : DEFAULT_PROFILE.employment.map((entry) => ({ ...entry, roles: [] }));
+  return {
+    employment,
+    defaults: {
+      relatedToHiringCompany: profile.defaults?.relatedToHiringCompany === 'Yes' ? 'Yes' : DEFAULT_PROFILE.defaults.relatedToHiringCompany,
+      knownAtHiringCompany: profile.defaults?.knownAtHiringCompany === 'Yes' ? 'Yes' : DEFAULT_PROFILE.defaults.knownAtHiringCompany,
+    },
+  };
+}
+
+export function createDatasourceState({ answerRecords = [], coverMessages = [], datasourceMeta = null, profile = {} } = {}) {
   return {
     schemaVersion: DATASOURCE_SCHEMA_VERSION,
     answerRecords: answerRecords
@@ -38,6 +65,7 @@ export function createDatasourceState({ answerRecords = [], coverMessages = [], 
     coverMessages: coverMessages
       .map(normalizeCoverMessage)
       .filter((message) => message.id && message.body),
+    profile: normalizeProfile(profile),
     datasourceMeta: datasourceMeta ? { ...datasourceMeta, schemaVersion: DATASOURCE_SCHEMA_VERSION } : null,
   };
 }
@@ -112,6 +140,9 @@ export function mergeDatasource(current = {}, imported = {}, updatedAt = new Dat
     schemaVersion: DATASOURCE_SCHEMA_VERSION,
     answerRecords: mergeRecords(existing.answerRecords, incoming.answerRecords),
     coverMessages: mergeCoverMessages(existing.coverMessages, incoming.coverMessages),
+    // A v1 backup has no profile, so it must not reset defaults the applicant
+    // has already confirmed in their installed datasource.
+    profile: imported?.profile ? incoming.profile : existing.profile,
     datasourceMeta: {
       ...(existing.datasourceMeta || incoming.datasourceMeta || {}),
       schemaVersion: DATASOURCE_SCHEMA_VERSION,
@@ -127,6 +158,7 @@ export function serializeDatasourceBackup(state = {}) {
     schemaVersion: DATASOURCE_SCHEMA_VERSION,
     answerRecords: normalized.answerRecords,
     coverMessages: normalized.coverMessages,
+    profile: normalized.profile,
     datasourceMeta: normalized.datasourceMeta,
   };
 }
@@ -134,7 +166,7 @@ export function serializeDatasourceBackup(state = {}) {
 export function parseDatasourceBackup(value) {
   if (!value || typeof value !== 'object') throw new Error('Backup must be a JSON object');
   if (value.format !== DATASOURCE_FORMAT) throw new Error('Backup format is not supported');
-  if (value.schemaVersion !== DATASOURCE_SCHEMA_VERSION) throw new Error('Backup schema version is not supported');
+  if (![1, DATASOURCE_SCHEMA_VERSION].includes(value.schemaVersion)) throw new Error('Backup schema version is not supported');
   if (!Array.isArray(value.answerRecords)) throw new Error('Backup answerRecords must be an array');
   if (!Array.isArray(value.coverMessages)) throw new Error('Backup coverMessages must be an array');
   return serializeDatasourceBackup(value);

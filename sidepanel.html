@@ -73,6 +73,13 @@
         </div>
         <label for="openai-api-key">OpenAI API key <span class="muted">(optional for answer planner)</span></label>
         <input id="openai-api-key" type="password" autocomplete="off" spellcheck="false" placeholder="sk-…">
+        <label for="employer-name">Confirmed employer</label>
+        <input id="employer-name" type="text" autocomplete="organization" value="DeepSight AI Labs">
+        <p class="muted">Only saved employment for cross-site work-history fields.</p>
+        <label for="related-default">Related to hiring company</label>
+        <select id="related-default"><option>No</option><option>Yes</option></select>
+        <label for="known-default">Know someone at hiring company</label>
+        <select id="known-default"><option>No</option><option>Yes</option></select>
         <label for="openai-model">Answer planner model</label>
         <input id="openai-model" type="text" autocomplete="off" spellcheck="false" value="gpt-5.6-terra" placeholder="gpt-5.6-terra">
         <label class="checkbox-row" for="auto-advance-pages">

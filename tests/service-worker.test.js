@@ -671,12 +671,13 @@ test('final save persists answers without any submit message or site submit clic
   await import(`../src/service-worker.js?test=${Date.now()}`);
   const started = await harness.dispatch({ type: 'JOB_RUN_START', tabId: 7 });
   assert.equal(started.run.status, 'ready_for_user_submit');
-  assert.equal(harness.localData.answerRecords.some((record) => record.key === 'github'), true);
+  assert.equal(harness.localData.answerRecords.some((record) => record.key === 'github'), false);
 
   const saved = await harness.dispatch({ type: 'JOB_RUN_SAVE_ANSWERS', tabId: 7 });
   assert.equal(saved.ok, true);
   assert.equal(saved.run.status, 'answers_saved');
   assert.equal(harness.localData.answerRecords.some((record) => record.key === 'github'), true);
+  assert.equal(saved.persisted, 1);
   assert.equal(harness.tabs.get(7).submitCalls, 0);
   assert.equal(harness.tabs.get(7).messages.some((message) => message.type === 'JOB_APP_SUBMIT'), false);
 });
@@ -707,13 +708,14 @@ test('saves manually filled values on an incomplete page without changing its st
 
   assert.equal(saved.ok, true);
   assert.equal(saved.run.status, 'waiting_user');
-  assert.equal(saved.savedCount, 2);
+  assert.equal(saved.savedCount, 1);
+  assert.equal(saved.unresolved, 0);
   assert.equal(harness.localData.answerRecords.some((record) => record.key === 'github'), true);
   assert.equal(harness.tabs.get(7).submitCalls, 0);
   assert.equal(harness.tabs.get(7).messages.some((message) => message.type === 'JOB_APP_SUBMIT'), false);
 });
 
-test('learns user-entered values during the run while excluding provisional autofill values', async () => {
+test('keeps user-entered values as drafts until Save while excluding provisional autofill values', async () => {
   const harness = createHarness({
     pagesByTab: {
       7: {
@@ -731,8 +733,11 @@ test('learns user-entered values during the run while excluding provisional auto
   await import(`../src/service-worker.js?test=${Date.now()}`);
   const started = await harness.dispatch({ type: 'JOB_RUN_START', tabId: 7 });
   assert.equal(started.run.status, 'ready_for_user_submit');
-  assert.equal(harness.localData.answerRecords.some((record) => record.key === 'manual_answer'), true);
+  assert.equal(harness.localData.answerRecords.some((record) => record.key === 'manual_answer'), false);
   assert.equal(harness.localData.answerRecords.some((record) => record.key === 'provisional_answer'), false);
+  const saved = await harness.dispatch({ type: 'JOB_RUN_SAVE_ANSWERS', tabId: 7 });
+  assert.equal(saved.persisted, 1);
+  assert.equal(harness.localData.answerRecords.some((record) => record.key === 'manual_answer'), true);
 });
 
 test('field focus requests target the matching control and tab runs stay isolated', async () => {
@@ -790,7 +795,7 @@ test('old confirm-submit message path is removed', async () => {
   assert.equal(response.unhandled, true);
 });
 
-test('serializes learning across tabs, restores activation, and retains correction history', async () => {
+test('serializes draft capture across tabs without promoting unsaved values', async () => {
   const page = { fields: [{ id: 'full_name', label: 'Full name', type: 'text', required: true }], actions: [{ id: 'action_0', label: 'Submit application', kind: 'submit', type: 'submit' }] };
   const harness = createHarness({ pagesByTab: { 7: { pages: [page] }, 8: { pages: [page] } } });
   await import(`../src/service-worker.js?concurrent=${Date.now()}`);
@@ -801,8 +806,8 @@ test('serializes learning across tabs, restores activation, and retains correcti
   ] }));
   const results = await Promise.all(messages.map((message, index) => harness.dispatch(message, { tab: { id: index + 7 }, frameId: 0 })));
   assert.ok(results.every((result) => result.ok));
-  assert.ok(harness.localData.answerRecords.some((record) => record.key === 'fact_0'));
-  assert.ok(harness.localData.answerRecords.some((record) => record.key === 'fact_1'));
+  assert.equal(harness.localData.answerRecords.some((record) => record.key === 'fact_0'), false);
+  assert.equal(harness.localData.answerRecords.some((record) => record.key === 'fact_1'), false);
   assert.equal(Object.keys(harness.localData.applicationDrafts).length, 2);
   const forbidden = await harness.dispatch(messages[0], { tab: { id: 7 }, frameId: 9 });
   assert.equal(forbidden.ok, false);
@@ -811,13 +816,10 @@ test('serializes learning across tabs, restores activation, and retains correcti
   const restored = await dispatchRestarted({ type: 'JOB_APP_LEARNING_STATUS' }, { tab: { id: 7 }, frameId: 0 });
   assert.equal(restored.applicationId, runs[0].run.startedAt);
   const correction = await dispatchRestarted({ type: 'JOB_DATASOURCE_CORRECT', key: 'fact_0', answer: 'Corrected' });
-  assert.equal(correction.ok, true);
-  const record = harness.localData.answerRecords.find((item) => item.key === 'fact_0');
-  assert.equal(record.answer, 'Corrected');
-  assert.equal(record.history[0].answer, 'Value 0');
+  assert.equal(correction.ok, false);
 });
 
-test('restored provisional values remain provisional until a user edits them', async () => {
+test('restored provisional values remain drafts until a user explicitly saves them', async () => {
   const harness = createHarness({ pagesByTab: { 7: { pages: [{
     fields: [{ id: 'detail', label: 'Detail', type: 'text', currentValue: 'Generated', provenance: 'autofill' }],
     actions: [{ id: 'action_0', label: 'Submit application', kind: 'submit', type: 'submit' }],
@@ -830,6 +832,11 @@ test('restored provisional values remain provisional until a user edits them', a
   message.records[0].answer = 'User correction';
   message.records[0].userEdited = true;
   await harness.dispatch(message, { tab: { id: 7 }, frameId: 0 });
+  assert.equal(harness.localData.answerRecords.some((record) => record.key === 'detail'), false);
+  harness.tabs.get(7).frames[0].pages[0].fields[0].currentValue = 'User correction';
+  harness.tabs.get(7).frames[0].pages[0].fields[0].provenance = 'user';
+  const saved = await harness.dispatch({ type: 'JOB_RUN_SAVE_ANSWERS', tabId: 7 });
+  assert.equal(saved.persisted, 1);
   assert.equal(harness.localData.answerRecords.find((record) => record.key === 'detail').answer, 'User correction');
 });
 

@@ -679,3 +679,19 @@ test('focuses a matching field without changing its value', () => {
   assert.equal(document.querySelector('#name').value, 'Nithin');
   assert.equal(document.activeElement.id, 'name');
 });
+
+test('uses company defaults only for clearly identified employer relationship questions', () => {
+  const profile = {
+    employment: [{ id: 'deepsight-ai-labs', company: 'DeepSight AI Labs' }],
+    defaults: { relatedToHiringCompany: 'No', knownAtHiringCompany: 'No' },
+  };
+  const fields = [
+    { id: 'worked', label: 'Have you worked for this company?', targetCompany: 'Other Co', type: 'radio', options: ['Yes', 'No'] },
+    { id: 'relative', label: 'Do you have a relative at this company?', targetCompany: 'Other Co', type: 'radio', options: ['Yes', 'No'] },
+    { id: 'referral', label: 'Were you referred by a colleague?', targetCompany: 'Other Co', type: 'radio', options: ['Yes', 'No'] },
+    { id: 'prior', label: 'Have you worked for this company?', targetCompany: 'DeepSight AI Labs', type: 'radio', options: ['Yes', 'No'] },
+  ];
+  const decisions = planDeterministicFill(fields, [], [], profile);
+  assert.deepEqual(decisions.map((decision) => decision.value), ['No', 'No', null, 'Yes']);
+  assert.equal(decisions[2].action, 'ask_user');
+});
