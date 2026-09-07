@@ -138,6 +138,52 @@ test('panel shows verbatim evidence with captured-origin Use and Edit approval a
   } finally { harness.cleanup(); }
 });
 
+test('panel hides opaque saved values and directs the applicant to complete the required field', async () => {
+  const opaqueValue = '5ec015e5642301ec004c2eaa25504002';
+  const suggestion = {
+    tabId: 7,
+    frameId: 3,
+    applicationId: 'run-one',
+    pageSignature: 'page-one',
+    field: { id: 'phone_type', handle: 'handle-one' },
+    candidates: [{ sourceKey: 'phone_type', sourceQuestion: 'Phone Device Type', answer: opaqueValue, provenance: 'user', kind: 'draft' }],
+  };
+  const run = {
+    status: 'waiting_user',
+    waitingLabel: 'Phone Device Type',
+    actionRequired: [{ fieldId: 'phone_type', label: 'Phone Device Type', suggestion }],
+    optionalUnresolved: [],
+    reviewRequired: [],
+    audit: [],
+  };
+  const harness = await setupPanel({ run });
+  try {
+    const list = harness.dom.window.document.querySelector('#action-required-list');
+    assert.match(list.textContent, /choose a value for Phone Device Type on the application page/i);
+    assert.doesNotMatch(list.textContent, new RegExp(opaqueValue));
+    assert.equal([...list.querySelectorAll('button')].some((button) => /saved answer|edit and use|approve edited/i.test(button.textContent)), false);
+  } finally { harness.cleanup(); }
+});
+
+test('panel prioritizes a named field over a generic unsupported-widget warning', async () => {
+  const run = {
+    status: 'waiting_user',
+    actionRequired: [
+      { code: 'unsupported_widget', reason: 'Complete the unsupported or inaccessible widget manually' },
+      { fieldId: 'phone_type', label: 'Phone Device Type', reason: 'No validated answer is available' },
+    ],
+    optionalUnresolved: [],
+    reviewRequired: [],
+    audit: [],
+  };
+  const harness = await setupPanel({ run });
+  try {
+    const list = harness.dom.window.document.querySelector('#action-required-list');
+    assert.match(list.textContent, /Phone Device Type/);
+    assert.doesNotMatch(list.textContent, /unsupported or inaccessible widget/i);
+  } finally { harness.cleanup(); }
+});
+
 test('panel renders grouped sections, collapsed details, and status-specific actions', async () => {
   const run = {
     status: 'page_ready',

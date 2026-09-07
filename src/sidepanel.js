@@ -120,6 +120,10 @@ function truncateAnswer(answer, limit = 180) {
   return `${text.slice(0, limit).trimEnd()}…`;
 }
 
+function isOpaqueAnswer(answer) {
+  return /^[a-f\d]{24,}$/i.test(String(answer ?? '').trim());
+}
+
 function answerNode(answer) {
   const text = String(answer ?? '');
   if (text.length <= 180) {
@@ -142,12 +146,14 @@ function itemRow(item, { focus = false, detail = '' } = {}) {
   const row = document.createElement('div');
   row.className = 'result-item';
   const content = document.createElement('div');
+  const hasOpaqueSuggestion = Boolean(item.suggestion?.candidates?.some((candidate) => isOpaqueAnswer(candidate.answer)));
   const label = document.createElement('span');
   label.className = 'result-label';
   label.textContent = item.label || item.question || item.fieldId || 'Field';
   const value = document.createElement('span');
   value.className = 'result-detail';
   if (detail) value.textContent = detail;
+  else if (hasOpaqueSuggestion) value.textContent = `Choose a value for ${label.textContent} on the application page, then click Check again.`;
   else if (item.value || item.answer) value.append(answerNode(item.value ?? item.answer));
   else value.textContent = item.reason || 'Review this field';
   content.append(label, value);
@@ -155,10 +161,11 @@ function itemRow(item, { focus = false, detail = '' } = {}) {
   if (item.suggestion) {
     const origin = item.suggestion;
     for (const candidate of origin.candidates) {
+      if (isOpaqueAnswer(candidate.answer)) continue;
       const evidence = document.createElement('div');
       evidence.className = 'saved-evidence';
       const source = document.createElement('p');
-      source.textContent = `${candidate.sourceQuestion} — ${candidate.provenance}. ${candidate.reason}`;
+      source.textContent = `${candidate.sourceQuestion} — ${candidate.provenance}.${candidate.reason ? ` ${candidate.reason}` : ''}`;
       const editor = document.createElement('textarea');
       editor.value = candidate.answer;
       editor.hidden = true;
@@ -254,7 +261,10 @@ function renderRun(run) {
     return;
   }
 
-  const actionRequired = run.actionRequired || run.unresolved || [];
+  const rawActionRequired = run.actionRequired || run.unresolved || [];
+  const actionRequired = rawActionRequired.some((item) => item.fieldId)
+    ? rawActionRequired.filter((item) => item.fieldId || item.code !== 'unsupported_widget')
+    : rawActionRequired;
   const optionalUnresolved = run.optionalUnresolved || [];
   const reviewRequired = run.reviewRequired || [];
   const audit = run.audit || [];
