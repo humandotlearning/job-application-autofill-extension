@@ -857,7 +857,7 @@ async function guardedDraftField(message, { allowSaveLock = false } = {}) {
   // Never rediscover/reroute a draft operation into another frame.
   const inspected = await sendToFrame(tabId, message.frameId, { type: 'JOB_APP_INSPECT' });
   const field = inspected.inspection?.fields.find((item) => item.id === fieldId);
-  if (!field || field.handle !== message.handle || field.currentValue
+  if (!field || field.handle !== message.handle
     || !sameFieldSnapshot(field, listed)
     || (suggestion?.field && !sameFieldSnapshot(field, {
       handle: suggestion.field.handle,
