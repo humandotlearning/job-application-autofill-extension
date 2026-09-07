@@ -711,7 +711,7 @@ async function applyPageDecisions(tabId, run, inspection, records, coverMessages
       if (!candidates.some(saved => saved.answer === candidate.answer)) candidates.push({ ...candidate, kind: 'draft', reason: 'Previously entered, not yet saved for reuse — explicit approval required' });
     }
     candidates.splice(3);
-    const gated = candidates.length && (decision.action !== 'fill' || field.type === 'textarea' || decision.sensitivity !== 'safe' || inferSensitivity(field.label) !== 'safe');
+    const gated = candidates.length && (decision.action !== 'fill' || field.type === 'textarea' || decision.sensitivity !== 'safe' || inferSensitivity(field.label, field.id) !== 'safe');
     if (gated) {
       run.suggestions[field.id] = { tabId, frameId: run.frame.frameId, applicationId: run.startedAt, pageSignature: currentPageSignature, field, candidates };
       return { ...decision, action: 'ask_user', value: null, reason: 'Relevant saved evidence available — approve an answer before use' };
@@ -797,8 +797,8 @@ async function approveSuggestion(message) {
       || pageSignature(inspected.inspection, run.frame) !== message.pageSignature) throw new Error('Destination changed; check the page again');
     const value = String(message.answer ?? candidate.answer).trim();
     const validation = validateFillValue(field, value);
-    if (!validation.ok || !meaningCompatible(field, source, { numericReview: !(['textarea', 'text'].includes(field.type) && value === candidate.answer) }) || inferSensitivity(field.label) === 'legal' || field.type === 'checkbox') throw new Error(validation.reason || 'This destination requires manual entry');
-    const result = await sendToFrame(tabId, message.frameId, { type: 'JOB_APP_APPLY', applicationId: run.startedAt, decisions: [{ fieldId, handle: field.handle, action: 'fill', value, evidenceKeys: [source.key], sensitivity: inferSensitivity(field.label), confidence: 'high', reason: 'Explicitly approved saved answer' }] });
+    if (!validation.ok || !meaningCompatible(field, source, { numericReview: !(['textarea', 'text'].includes(field.type) && value === candidate.answer) }) || inferSensitivity(field.label, field.id) === 'legal' || field.type === 'checkbox') throw new Error(validation.reason || 'This destination requires manual entry');
+    const result = await sendToFrame(tabId, message.frameId, { type: 'JOB_APP_APPLY', applicationId: run.startedAt, decisions: [{ fieldId, handle: field.handle, action: 'fill', value, evidenceKeys: [source.key], sensitivity: inferSensitivity(field.label, field.id), confidence: 'high', reason: 'Explicitly approved saved answer' }] });
     if (!result?.ok) throw new Error(result?.error || 'Could not apply the answer');
     const verified = await sendToFrame(tabId, message.frameId, { type: 'JOB_APP_INSPECT' });
     if (verified.inspection?.fields.find(item => item.id === fieldId && item.handle === field.handle)?.currentValue !== value) throw new Error('The page did not retain the approved answer');
@@ -869,6 +869,12 @@ async function guardedDraftField(message, { allowSaveLock = false } = {}) {
     }))
     || pageSignature(inspected.inspection, run.frame) !== message.pageSignature) {
     throw new Error('Destination changed; check the page again');
+  }
+  if (field.currentValue) {
+    const validation = await sendToFrame(tabId, message.frameId, { type: 'JOB_APP_VALIDATE' });
+    if (!validation?.validation?.invalid?.some((item) => item.fieldId === fieldId)) {
+      throw new Error('Destination changed; check the page again');
+    }
   }
   return { run, listed, suggestion, field };
 }

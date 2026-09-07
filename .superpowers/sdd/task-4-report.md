@@ -33,3 +33,10 @@ The next planner-gating task must extend the existing approval path for multi-so
 - Manual draft application now classifies sensitivity with both the live field label and field ID. A generic label can no longer bypass the legal-field block when its ID identifies privacy, consent, attestation, or similar legal input.
 - Added a regression case for `privacy_acknowledgement` with the generic label `Response`; it is rejected without page mutation.
 - Re-ran `npm test -- tests/service-worker.test.js`: 31 passing, 0 failing.
+
+## Re-review safety fixes
+
+- A nonempty field value can now be replaced only after a fresh exact-frame validation marks that same field invalid. Valid existing values remain blocked.
+- Deterministic candidate gating and saved-answer approval now classify sensitivity with both the field label and field ID, preventing generic labels from bypassing legal IDs.
+- Added regressions for invalid-value replacement, valid-value blocking, and a generic-label `privacy_acknowledgement` field that must remain gated and cannot be approved.
+- Targeted regressions pass: `node --test --test-name-pattern="manual drafts replace|generic-label legal IDs" tests/service-worker.test.js` — 2 passing.

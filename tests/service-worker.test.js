@@ -1003,6 +1003,34 @@ test('manual drafts reject stale origins and changed destinations before filling
   assert.equal(harness.tabs.get(7).frames[0].pages[0].values?.summary, undefined);
 });
 
+test('manual drafts replace only an invalid existing field value', async () => {
+  const harness = createHarness({ pagesByTab: { 7: { pages: [{
+    page: { title: 'Application', domain: 'example.test' },
+    fields: [
+      { id: 'invalid_summary', handle: 'invalid-h', label: 'Professional summary', type: 'text', required: true, currentValue: 'invalid value' },
+      { id: 'valid_summary', handle: 'valid-h', label: 'Professional summary', type: 'text', required: true, currentValue: 'Retain this answer' },
+    ],
+    invalidFieldIds: ['invalid_summary'],
+    actions: [{ id: 'submit', label: 'Submit application', kind: 'submit', type: 'submit' }],
+  }] } } });
+  await import(`../src/service-worker.js?replace-invalid=${Date.now()}`);
+  const started = await harness.dispatch({ type: 'JOB_RUN_START', tabId: 7 });
+  const repaired = await harness.dispatch({
+    type: 'JOB_RUN_APPLY_DRAFT',
+    ...draftOrigin(started.run, { id: 'invalid_summary', handle: 'invalid-h' }),
+    answer: 'Corrected answer',
+  });
+  assert.equal(repaired.ok, true, repaired.error);
+  assert.equal(harness.tabs.get(7).frames[0].pages[0].values.invalid_summary, 'Corrected answer');
+  const blocked = await harness.dispatch({
+    type: 'JOB_RUN_APPLY_DRAFT',
+    ...draftOrigin(started.run, { id: 'valid_summary', handle: 'valid-h' }),
+    answer: 'Do not replace this',
+  });
+  assert.equal(blocked.ok, false);
+  assert.equal(harness.tabs.get(7).frames[0].pages[0].values?.valid_summary, undefined);
+});
+
 test('manual drafts reject invalid, legal, checkbox, and opaque values without mutation', async () => {
   const harness = createHarness({ pagesByTab: { 7: { pages: [{
     page: { title: 'Application', domain: 'example.test' },
@@ -1048,6 +1076,29 @@ test('draft apply and rewrite requests are accepted only from the extension pane
   assert.equal(apply.ok, false);
   assert.equal(rewrite.ok, false);
   assert.deepEqual(harness.tabs.get(7).frames[0].pages[0].values || {}, {});
+});
+
+test('generic-label legal IDs stay gated and cannot be approved as saved answers', async () => {
+  const harness = createHarness({
+    answerRecords: [{ key: 'privacy_acknowledgement', question: 'Response', answer: 'yes', aliases: ['Response'], type: 'text', sensitivity: 'safe', confirmationState: 'confirmed' }],
+    pagesByTab: { 7: { pages: [{
+      page: { title: 'Application', domain: 'example.test' },
+      fields: [{ id: 'privacy_acknowledgement', handle: 'privacy-h', label: 'Response', type: 'text', required: true }],
+      actions: [{ id: 'submit', label: 'Submit application', kind: 'submit', type: 'submit' }],
+    }] } },
+  });
+  await import(`../src/service-worker.js?generic-legal-id=${Date.now()}`);
+  const started = await harness.dispatch({ type: 'JOB_RUN_START', tabId: 7 });
+  const suggestion = started.run.suggestions?.privacy_acknowledgement;
+  assert.ok(suggestion, 'legal field IDs must require an explicit manual decision');
+  assert.equal(harness.tabs.get(7).frames[0].pages[0].values?.privacy_acknowledgement, undefined);
+  const approval = await harness.dispatch({
+    type: 'JOB_RUN_APPROVE_SUGGESTION',
+    ...draftOrigin(started.run, { id: 'privacy_acknowledgement', handle: 'privacy-h' }),
+    sourceKey: 'privacy_acknowledgement',
+  });
+  assert.equal(approval.ok, false);
+  assert.equal(harness.tabs.get(7).frames[0].pages[0].values?.privacy_acknowledgement, undefined);
 });
 
 test('rewrite uses the selected model and relevant current evidence without mutating the page or datasource', async () => {
