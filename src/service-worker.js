@@ -764,6 +764,7 @@ async function applyPageDecisions(tabId, run, inspection, records, coverMessages
     allDecisions,
     run.reviewRequired,
     appliedReviews,
+    run.pageNumber,
   );
   run.llmError = llmError;
   return {
@@ -913,7 +914,7 @@ async function applyDraft(message) {
   try {
     const { run, field } = await guardedDraftField(message, { allowSaveLock: true });
     const validation = validateFillValue(field, answer);
-    if (!validation.ok || inferSensitivity(field.label) === 'legal' || field.type === 'checkbox') {
+    if (!validation.ok || inferSensitivity(field.label, field.id) === 'legal' || field.type === 'checkbox') {
       throw new Error(validation.ok ? 'This destination requires manual entry' : validation.reason);
     }
     const result = await sendToFrame(tabId, message.frameId, {
@@ -925,7 +926,7 @@ async function applyDraft(message) {
         action: 'fill',
         value: answer,
         evidenceKeys: [],
-        sensitivity: inferSensitivity(field.label),
+        sensitivity: inferSensitivity(field.label, field.id),
         confidence: 'high',
         reason: 'Explicitly entered draft answer',
       }],

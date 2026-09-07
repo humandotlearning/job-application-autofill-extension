@@ -27,3 +27,9 @@
 ## Concern
 
 The next planner-gating task must extend the existing approval path for multi-source planner candidates. This task intentionally leaves approval semantics unchanged and only resolves selected evidence for rewrite.
+
+## Follow-up safety fix
+
+- Manual draft application now classifies sensitivity with both the live field label and field ID. A generic label can no longer bypass the legal-field block when its ID identifies privacy, consent, attestation, or similar legal input.
+- Added a regression case for `privacy_acknowledgement` with the generic label `Response`; it is rejected without page mutation.
+- Re-ran `npm test -- tests/service-worker.test.js`: 31 passing, 0 failing.

@@ -1010,6 +1010,7 @@ test('manual drafts reject invalid, legal, checkbox, and opaque values without m
       { id: 'choice', handle: 'choice-h', label: 'Preferred location', type: 'select', required: true, options: ['Bangalore', 'Remote'] },
       { id: 'short', handle: 'short-h', label: 'Brief answer', type: 'text', required: true, constraints: { minLength: 8 } },
       { id: 'consent', handle: 'consent-h', label: 'Privacy agreement', type: 'text', required: true },
+      { id: 'privacy_acknowledgement', handle: 'generic-legal-h', label: 'Response', type: 'text', required: true },
       { id: 'agree', handle: 'agree-h', label: 'I agree', type: 'checkbox', required: true },
       { id: 'opaque', handle: 'opaque-h', label: 'Reference code', type: 'text', required: true },
     ], actions: [],
@@ -1020,6 +1021,7 @@ test('manual drafts reject invalid, legal, checkbox, and opaque values without m
     [{ id: 'choice', handle: 'choice-h' }, 'Everywhere'],
     [{ id: 'short', handle: 'short-h' }, 'short'],
     [{ id: 'consent', handle: 'consent-h' }, 'yes'],
+    [{ id: 'privacy_acknowledgement', handle: 'generic-legal-h' }, 'yes'],
     [{ id: 'agree', handle: 'agree-h' }, 'yes'],
     [{ id: 'opaque', handle: 'opaque-h' }, 'cards|d20089ff-f389-44ef-9398-eec15ba7b6a4[field1]'],
   ];
