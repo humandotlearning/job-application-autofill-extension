@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { callAnswerPlanner } from '../src/llm.js';
+import { callAnswerPlanner, callAnswerRewriter } from '../src/llm.js';
 
 function createInput() {
   return {
@@ -501,4 +501,68 @@ test('rejects an invented value even when the evidence key exists', async () => 
     }),
     /evidence|transformation/i,
   );
+});
+
+function rewriteResponse(answer) {
+  return createResponse({
+    output: [{ type: 'message', content: [{ type: 'output_text', text: JSON.stringify({ answer }) }] }],
+  });
+}
+
+test('rewriter sends bounded structured data using the configured model', async () => {
+  let request;
+  const result = await callAnswerRewriter({
+    apiKey: 'rewrite-key',
+    question: 'Why do you want this role?',
+    draft: 'I enjoy solving difficult problems.',
+    instruction: 'Make it more concise',
+    records: [{ key: 'motivation', question: 'Motivation', answer: 'I enjoy solving difficult problems.', sensitivity: 'safe' }],
+  }, {
+    model: 'gpt-rewrite-test',
+    fetchImpl: async (url, options) => {
+      request = { url, options };
+      return rewriteResponse('I enjoy solving challenging problems.');
+    },
+  });
+  assert.deepEqual(result, { answer: 'I enjoy solving challenging problems.' });
+  assert.equal(request.url, 'https://api.openai.com/v1/responses');
+  const body = JSON.parse(request.options.body);
+  assert.equal(body.model, 'gpt-rewrite-test');
+  assert.equal(body.store, false);
+  assert.equal(body.text.format.strict, true);
+  const input = JSON.parse(body.input[1].content[0].text);
+  assert.equal(input.question, 'Why do you want this role?');
+  assert.equal(input.draft, 'I enjoy solving difficult problems.');
+  assert.equal(input.instruction, 'Make it more concise');
+  assert.equal(input.records[0].answer, 'I enjoy solving difficult problems.');
+  assert.equal(JSON.stringify(body).includes('rewrite-key'), false);
+});
+
+test('rewriter rejects malformed, empty, and non-OK responses', async () => {
+  await assert.rejects(callAnswerRewriter({ apiKey: 'test', question: 'Q', draft: 'D', instruction: 'I' }, {
+    fetchImpl: async () => createResponse({ output: [{ type: 'message', content: [{ type: 'output_text', text: '{bad' }] }] }),
+  }), /Answer rewrite.*invalid structured JSON/i);
+  await assert.rejects(callAnswerRewriter({ apiKey: 'test', question: 'Q', draft: 'D', instruction: 'I' }, {
+    fetchImpl: async () => rewriteResponse('   '),
+  }), /Answer rewrite.*non-empty/i);
+  await assert.rejects(callAnswerRewriter({ apiKey: 'test', question: 'Q', draft: 'D', instruction: 'I' }, {
+    fetchImpl: async () => createResponse({ error: { message: 'bad request' } }, false, 422, 'Unprocessable Entity'),
+  }), /Answer rewrite.*422.*bad request/i);
+});
+
+test('rewriter aborts timed-out requests and bounds prompt data', async () => {
+  await assert.rejects(callAnswerRewriter({ apiKey: 'test', question: 'Q', draft: 'D', instruction: 'I' }, {
+    timeoutMs: 5,
+    fetchImpl: async (_url, { signal }) => new Promise((_resolve, reject) => signal.addEventListener('abort', () => reject(signal.reason))),
+  }), /Answer rewrite.*timed out|abort/i);
+  let requestBody;
+  await callAnswerRewriter({ apiKey: 'test', question: 'q'.repeat(10000), draft: 'd'.repeat(10000), instruction: 'i'.repeat(10000), records: Array.from({ length: 50 }, (_, i) => ({ key: `k${i}`, question: 'r'.repeat(5000), answer: 'a'.repeat(5000) })) }, {
+    fetchImpl: async (_url, options) => { requestBody = JSON.parse(options.body); return rewriteResponse('ok'); },
+  });
+  const input = JSON.parse(requestBody.input[1].content[0].text);
+  assert.ok(input.question.length < 10000);
+  assert.ok(input.draft.length < 10000);
+  assert.ok(input.instruction.length < 10000);
+  assert.ok(input.records.length < 50);
+  assert.ok(input.records.every((record) => record.question.length < 5000 && record.answer.length < 5000));
 });
