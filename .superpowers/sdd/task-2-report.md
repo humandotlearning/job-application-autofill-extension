@@ -27,3 +27,19 @@ Result: 23 tests passed, 0 failed.
 ## Concerns
 
 - The worker handlers for `JOB_RUN_REWRITE_ANSWER` and `JOB_RUN_APPLY_DRAFT` are intentionally outside this panel-only task. Until the worker task lands, the panel will retain a draft and show the worker's unavailable-action error in a live extension.
+
+## Review fixes
+
+- Removed the hidden legacy direct-approval controls. A saved candidate must now follow **Choose this answer** → **Send to form**.
+- The panel clears a draft only after a successful response includes an updated `run`; incomplete responses retain the draft and show an error.
+- Candidate-backed sends now use `candidateKind`, `sourceKey`, or non-empty `sourceKeys` to select the approval path, and retain plural source keys in the request.
+- Rewrite and apply operations disable the draft and prompt while pending and use a draft revision guard, so a stale response cannot replace or clear a newer edit.
+- Sends retain the original draft text; trimming is limited to empty and opaque-value checks.
+
+### Review-fix verification
+
+```text
+npm test -- tests/sidepanel.test.js
+```
+
+Result: 28 tests passed, 0 failed.

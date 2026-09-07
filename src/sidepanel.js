@@ -60,12 +60,29 @@ function draftKey(origin, fieldId) {
 
 function draftFor(origin, fieldId) {
   const key = draftKey(origin, fieldId);
-  if (!drafts.has(key)) drafts.set(key, { answer: '', sourceKey: null, sourceKeys: [], candidateKind: null, editing: false });
-  return drafts.get(key);
+  if (!drafts.has(key)) {
+    drafts.set(key, {
+      answer: '', sourceKey: null, sourceKeys: [], candidateKind: null, editing: false, revision: 0, pending: null,
+    });
+  }
+  const draft = drafts.get(key);
+  draft.sourceKeys = Array.isArray(draft.sourceKeys) ? draft.sourceKeys : [];
+  draft.revision = Number.isInteger(draft.revision) ? draft.revision : 0;
+  draft.pending = draft.pending || null;
+  return draft;
 }
 
 function clearDraft(origin, fieldId) {
   drafts.delete(draftKey(origin, fieldId));
+}
+
+function hasCandidateOrigin(state) {
+  return Boolean(state.candidateKind || state.sourceKey || state.sourceKeys?.length);
+}
+
+function updateDraftAnswer(state, answer) {
+  state.answer = String(answer ?? '');
+  state.revision += 1;
 }
 
 function discardStaleDrafts(run) {
@@ -353,15 +370,19 @@ function answerWorkspace(item, displayLabel) {
 
   const updateControls = () => {
     const hasAnswer = Boolean(state.answer.trim()) && !isOpaqueIdentifier(state.answer);
+    const pending = Boolean(state.pending);
     textarea.readOnly = Boolean(item.suggestion && !state.editing);
-    edit.disabled = !state.answer.trim();
+    textarea.disabled = pending;
+    prompt.disabled = pending;
+    edit.disabled = pending || !state.answer.trim();
     useEdited.hidden = !state.editing;
-    rewrite.disabled = !state.answer.trim();
-    submitRewrite.disabled = !state.answer.trim() || !prompt.value.trim();
-    send.disabled = !hasAnswer;
+    useEdited.disabled = pending;
+    rewrite.disabled = pending || !state.answer.trim();
+    submitRewrite.disabled = pending || !state.answer.trim() || !prompt.value.trim();
+    send.disabled = pending || !hasAnswer;
   };
   textarea.addEventListener('input', () => {
-    state.answer = textarea.value;
+    updateDraftAnswer(state, textarea.value);
     state.sourceKey = state.sourceKey || null;
     updateControls();
   });
@@ -385,35 +406,58 @@ function answerWorkspace(item, displayLabel) {
   submitRewrite.addEventListener('click', async () => {
     const instruction = prompt.value.trim();
     if (!instruction || !state.answer.trim()) return;
-    const buttons = [edit, useEdited, rewrite, send, submitRewrite];
-    buttons.forEach((button) => { button.disabled = true; });
+    const requestRevision = state.revision;
+    const requestDraft = state.answer;
+    state.pending = 'rewrite';
+    updateControls();
     try {
       const response = await chrome.runtime.sendMessage({ type: 'JOB_RUN_REWRITE_ANSWER', ...origin,
-        fieldId: origin.fieldId, draft: state.answer, sourceKey: state.sourceKey, sourceKeys: state.sourceKeys,
+        fieldId: origin.fieldId, draft: requestDraft, sourceKey: state.sourceKey, sourceKeys: state.sourceKeys,
         question: displayLabel, instruction });
       if (!response?.ok || typeof response.answer !== 'string') throw new Error(response?.error || 'Could not rewrite the answer.');
-      state.answer = response.answer;
+      if (state.revision !== requestRevision) {
+        setStatus('Draft changed while the rewrite was running. Your latest edit was kept.');
+        return;
+      }
+      updateDraftAnswer(state, response.answer);
       state.editing = false;
       textarea.value = state.answer;
       setStatus('Draft rewritten. Review or edit it before sending it to the form.');
     } catch (error) { setStatus(error.message, 'error'); }
-    finally { updateControls(); }
+    finally {
+      if (state.pending === 'rewrite') state.pending = null;
+      updateControls();
+    }
   });
   send.addEventListener('click', async () => {
-    const answer = state.answer.trim();
-    if (!answer || isOpaqueIdentifier(answer)) return;
-    const buttons = [edit, useEdited, rewrite, send, submitRewrite];
-    buttons.forEach((button) => { button.disabled = true; });
+    const answer = state.answer;
+    if (!answer.trim() || isOpaqueIdentifier(answer)) return;
+    const requestRevision = state.revision;
+    const candidateBacked = hasCandidateOrigin(state);
+    state.pending = 'apply';
+    updateControls();
     try {
-      const type = state.sourceKey ? 'JOB_RUN_APPROVE_SUGGESTION' : 'JOB_RUN_APPLY_DRAFT';
+      const type = candidateBacked ? 'JOB_RUN_APPROVE_SUGGESTION' : 'JOB_RUN_APPLY_DRAFT';
       const response = await chrome.runtime.sendMessage({ type, ...origin, fieldId: origin.fieldId, answer,
-        ...(state.sourceKey ? { sourceKey: state.sourceKey, sourceKeys: state.sourceKeys } : {}) });
+        ...(candidateBacked ? {
+          ...(state.sourceKey ? { sourceKey: state.sourceKey } : {}),
+          ...(state.sourceKeys.length ? { sourceKeys: state.sourceKeys } : {}),
+          ...(state.candidateKind ? { candidateKind: state.candidateKind } : {}),
+        } : {}) });
       if (!response?.ok) throw new Error(response?.error || 'Could not send the answer to the form.');
-      clearDraft(origin, origin.fieldId);
-      if (response.run) renderRun(response.run);
-      setStatus('Answer applied and verified. Submission remains manual.');
+      if (!response.run) throw new Error('Could not confirm the updated application state. Your draft was kept.');
+      if (state.revision === requestRevision) clearDraft(origin, origin.fieldId);
+      renderRun(response.run);
+      if (state.revision !== requestRevision) {
+        setStatus('The form received the earlier draft. Your newer edit was kept.');
+      } else {
+        setStatus('Answer applied and verified. Submission remains manual.');
+      }
     } catch (error) { setStatus(error.message, 'error'); }
-    finally { updateControls(); }
+    finally {
+      if (state.pending === 'apply') state.pending = null;
+      updateControls();
+    }
   });
   controls.append(edit, useEdited, rewrite, send);
   workspace.append(workspaceLabel, textarea, controls, promptRow);
@@ -507,7 +551,7 @@ function itemRow(item, { focus = false, detail = '' } = {}) {
       choose.textContent = 'Choose this answer';
       choose.addEventListener('click', () => {
         if (!workspace) return;
-        workspace.state.answer = String(candidate.answer || '');
+        updateDraftAnswer(workspace.state, candidate.answer);
         workspace.state.sourceKey = candidate.sourceKey || null;
         workspace.state.sourceKeys = Array.isArray(candidate.sourceKeys) ? candidate.sourceKeys : (candidate.sourceKey ? [candidate.sourceKey] : []);
         workspace.state.candidateKind = candidate.kind || null;
@@ -518,18 +562,6 @@ function itemRow(item, { focus = false, detail = '' } = {}) {
         setStatus('Saved answer selected. Review or edit it before sending it to the form.');
       });
       evidence.append(source, answerNode(candidate.answer), choose);
-      // Keep legacy controls hidden so older panel clients do not lose their
-      // queued action while the visible workflow requires explicit selection.
-      const legacyUse = document.createElement('button');
-      legacyUse.type = 'button'; legacyUse.hidden = true; legacyUse.textContent = 'Use this saved answer';
-      legacyUse.addEventListener('click', async () => {
-        const origin = fieldOrigin(item);
-        const response = await chrome.runtime.sendMessage({ type: 'JOB_RUN_APPROVE_SUGGESTION', ...origin, fieldId: origin.fieldId, sourceKey: candidate.sourceKey });
-        if (!response?.ok) setStatus(response?.error || 'Could not use the saved answer.', 'error');
-      });
-      const legacyEdit = document.createElement('button');
-      legacyEdit.type = 'button'; legacyEdit.hidden = true; legacyEdit.textContent = 'Edit and use';
-      evidence.append(legacyUse, legacyEdit);
       content.append(evidence);
     }
   }

@@ -140,20 +140,21 @@ async function setupPanel({
   };
 }
 
-test('panel shows verbatim evidence with captured-origin Use and Edit approval actions', async () => {
+test('candidate selection requires an explicit Send to form action', async () => {
   const suggestion = { tabId: 7, frameId: 3, applicationId: 'run-one', pageSignature: 'page-one', field: { id: 'ml', handle: 'handle-one' }, candidates: [{ sourceKey: 'story', sourceQuestion: 'Saved project', answer: 'Synthetic model project narrative.', provenance: 'user', reason: 'Related ML evidence', kind: 'related' }] };
   const harness = await setupPanel({ run: { status: 'waiting_user', actionRequired: [{ fieldId: 'ml', label: 'ML experience', suggestion }], optionalUnresolved: [], reviewRequired: [], audit: [] } });
   try {
     const doc = harness.dom.window.document;
     assert.match(doc.querySelector('#action-required-list').textContent, /Saved project/);
     assert.match(doc.querySelector('#action-required-list').textContent, /Synthetic model project narrative/);
-    const use = [...doc.querySelectorAll('button')].find(button => button.textContent === 'Use this saved answer');
-    assert.ok(use);
-    use.click();
+    const row = doc.querySelector('#action-required-list .result-item');
+    assert.equal([...row.querySelectorAll('button')].some((button) => /use this saved answer|edit and use/i.test(button.textContent)), false);
+    row.querySelector('[data-choose-answer]').click();
+    assert.deepEqual(pageMutationMessages(harness.sentMessages), []);
+    row.querySelector('[data-send-answer]').click();
     await new Promise(resolve => setTimeout(resolve, 0));
     const sent = harness.sentMessages.find(message => message.type === 'JOB_RUN_APPROVE_SUGGESTION');
     assert.equal(sent.tabId, 7); assert.equal(sent.frameId, 3); assert.equal(sent.handle, 'handle-one'); assert.equal(sent.sourceKey, 'story');
-    assert.ok([...doc.querySelectorAll('button')].some(button => button.textContent === 'Edit and use'));
   } finally { harness.cleanup(); }
 });
 
@@ -249,7 +250,8 @@ test('panel hides an opaque source question behind an info button while keeping 
     assert.equal(popover.hidden, false);
     trigger.click();
     assert.equal(popover.hidden, false);
-    assert.deepEqual([...row.querySelectorAll('button')].filter((button) => /Use this saved answer|Edit and use/.test(button.textContent)).map((button) => button.textContent), ['Use this saved answer', 'Edit and use']);
+    assert.equal([...row.querySelectorAll('button')].some((button) => /Use this saved answer|Edit and use/.test(button.textContent)), false);
+    assert.ok(row.querySelector('[data-choose-answer]'));
   } finally { harness.cleanup(); }
 });
 
@@ -653,6 +655,100 @@ test('manual Send to form preserves the draft and reports an apply failure', asy
     assert.equal(mutationMessages[0].answer, '₹25,00,000');
     assert.equal(draft.value, '₹25,00,000');
     assert.match(harness.dom.window.document.querySelector('#status').textContent, /Application page changed/i);
+  } finally { harness.cleanup(); }
+});
+
+test('Send to form keeps the draft and reports an error when the worker omits the updated run', async () => {
+  const run = { status: 'waiting_user', applicationId: 'run-incomplete', pageSignature: 'page-one', actionRequired: [{ fieldId: 'salary', label: 'Expected salary' }], optionalUnresolved: [], reviewRequired: [], audit: [] };
+  const harness = await setupPanel({ run, applyDraftResponse: { ok: true } });
+  try {
+    const row = harness.dom.window.document.querySelector('#action-required-list .result-item');
+    const draft = row.querySelector('[data-answer-draft]');
+    draft.value = '₹25,00,000';
+    draft.dispatchEvent(new harness.dom.window.Event('input', { bubbles: true }));
+    row.querySelector('[data-send-answer]').click();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assert.equal(draft.value, '₹25,00,000');
+    assert.match(harness.dom.window.document.querySelector('#status').textContent, /updated application state|could not confirm/i);
+  } finally { harness.cleanup(); }
+});
+
+test('candidate-backed drafts retain plural source keys when sent for approval', async () => {
+  const suggestion = {
+    tabId: 7, frameId: 3, applicationId: 'run-multi-source', pageSignature: 'page-one', field: { id: 'summary', handle: 'handle-summary' },
+    candidates: [{ sourceKeys: ['project', 'leadership'], sourceQuestion: 'Saved profile evidence', answer: 'Combined evidence answer.', provenance: 'planner', kind: 'planner' }],
+  };
+  const run = { status: 'waiting_user', applicationId: 'run-multi-source', pageSignature: 'page-one', actionRequired: [{ fieldId: 'summary', label: 'Experience question', suggestion }], optionalUnresolved: [], reviewRequired: [], audit: [] };
+  const harness = await setupPanel({ run });
+  try {
+    const row = harness.dom.window.document.querySelector('#action-required-list .result-item');
+    row.querySelector('[data-choose-answer]').click();
+    row.querySelector('[data-send-answer]').click();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const message = harness.sentMessages.find((entry) => entry.type === 'JOB_RUN_APPROVE_SUGGESTION');
+    assert.deepEqual(message.sourceKeys, ['project', 'leadership']);
+    assert.equal(message.candidateKind, 'planner');
+    assert.equal(message.answer, 'Combined evidence answer.');
+  } finally { harness.cleanup(); }
+});
+
+test('Send to form preserves the original draft whitespace', async () => {
+  const run = { status: 'waiting_user', applicationId: 'run-whitespace', pageSignature: 'page-one', actionRequired: [{ fieldId: 'salary', label: 'Expected salary' }], optionalUnresolved: [], reviewRequired: [], audit: [] };
+  const harness = await setupPanel({ run });
+  try {
+    const row = harness.dom.window.document.querySelector('#action-required-list .result-item');
+    const draft = row.querySelector('[data-answer-draft]');
+    draft.value = '  Preserve this exact answer.  ';
+    draft.dispatchEvent(new harness.dom.window.Event('input', { bubbles: true }));
+    row.querySelector('[data-send-answer]').click();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assert.equal(harness.sentMessages.find((entry) => entry.type === 'JOB_RUN_APPLY_DRAFT').answer, '  Preserve this exact answer.  ');
+  } finally { harness.cleanup(); }
+});
+
+test('a delayed rewrite cannot overwrite a newer draft edit', async () => {
+  let resolveRewrite;
+  const rewriteResponse = () => new Promise((resolve) => { resolveRewrite = resolve; });
+  const suggestion = { tabId: 7, frameId: 3, applicationId: 'run-revision', pageSignature: 'page-one', field: { id: 'summary', handle: 'handle-summary' }, candidates: [{ sourceKey: 'story', sourceQuestion: 'Saved story', answer: 'Initial answer.', provenance: 'user', kind: 'related' }] };
+  const run = { status: 'waiting_user', applicationId: 'run-revision', pageSignature: 'page-one', actionRequired: [{ fieldId: 'summary', label: 'Experience question', suggestion }], optionalUnresolved: [], reviewRequired: [], audit: [] };
+  const harness = await setupPanel({ run, rewriteResponse });
+  try {
+    const row = harness.dom.window.document.querySelector('#action-required-list .result-item');
+    row.querySelector('[data-choose-answer]').click();
+    row.querySelector('[data-rewrite-answer]').click();
+    const draft = row.querySelector('[data-answer-draft]');
+    const prompt = row.querySelector('[data-rewrite-prompt]');
+    prompt.value = 'Make it shorter.';
+    prompt.dispatchEvent(new harness.dom.window.Event('input', { bubbles: true }));
+    row.querySelector('[data-submit-rewrite]').click();
+    assert.equal(draft.disabled, true);
+    assert.equal(prompt.disabled, true);
+    draft.value = 'Newer draft typed while waiting.';
+    draft.dispatchEvent(new harness.dom.window.Event('input', { bubbles: true }));
+    resolveRewrite({ ok: true, answer: 'Stale rewritten answer.' });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assert.equal(draft.value, 'Newer draft typed while waiting.');
+  } finally { harness.cleanup(); }
+});
+
+test('a delayed apply cannot clear a newer draft edit', async () => {
+  let resolveApply;
+  const applyDraftResponse = () => new Promise((resolve) => { resolveApply = resolve; });
+  const run = { status: 'waiting_user', applicationId: 'run-apply-revision', pageSignature: 'page-one', actionRequired: [{ fieldId: 'salary', label: 'Expected salary' }], optionalUnresolved: [], reviewRequired: [], audit: [] };
+  const harness = await setupPanel({ run, applyDraftResponse });
+  try {
+    const row = harness.dom.window.document.querySelector('#action-required-list .result-item');
+    const draft = row.querySelector('[data-answer-draft]');
+    draft.value = 'First draft';
+    draft.dispatchEvent(new harness.dom.window.Event('input', { bubbles: true }));
+    row.querySelector('[data-send-answer]').click();
+    assert.equal(draft.disabled, true);
+    draft.value = 'Newer draft';
+    draft.dispatchEvent(new harness.dom.window.Event('input', { bubbles: true }));
+    resolveApply({ ok: true, run });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const latestDraft = harness.dom.window.document.querySelector('[data-answer-draft]');
+    assert.equal(latestDraft.value, 'Newer draft');
   } finally { harness.cleanup(); }
 });
 
