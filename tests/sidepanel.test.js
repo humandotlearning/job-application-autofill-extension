@@ -6,6 +6,16 @@ import { JSDOM } from 'jsdom';
 
 const root = new NodeUrl('../', import.meta.url);
 
+const PAGE_MUTATION_MESSAGE_TYPES = new Set([
+  'JOB_APP_APPLY',
+  'JOB_RUN_APPLY_DRAFT',
+  'JOB_RUN_APPROVE_SUGGESTION',
+]);
+
+function pageMutationMessages(messages) {
+  return messages.filter(({ type }) => PAGE_MUTATION_MESSAGE_TYPES.has(type));
+}
+
 async function loadPanelHtml() {
   const html = await readFile(new NodeUrl('sidepanel.html', root), 'utf8');
   return html.replace(/<link rel="stylesheet"[^>]*>/, '').replace(/<script type="module" src="src\/sidepanel\.js"><\/script>/, '');
@@ -526,7 +536,7 @@ test('answer workspace stays blank until a readable candidate is chosen', async 
     assert.ok(draft);
     assert.equal(draft.value, '');
     assert.equal([...row.querySelectorAll('[data-choose-answer]')].length, 2);
-    assert.equal(harness.sentMessages.some((message) => ['JOB_RUN_APPLY_DRAFT', 'JOB_RUN_APPROVE_SUGGESTION'].includes(message.type)), false);
+    assert.deepEqual(pageMutationMessages(harness.sentMessages), []);
   } finally { harness.cleanup(); }
 });
 
@@ -540,14 +550,14 @@ test('choosing a candidate and editing it changes only the transient draft', asy
     await new Promise((resolve) => setTimeout(resolve, 0));
     const draft = row.querySelector('[data-answer-draft]');
     assert.equal(draft.value, 'Candidate answer verbatim.');
-    assert.equal(harness.sentMessages.some((message) => message.type === 'JOB_RUN_APPROVE_SUGGESTION'), false);
+    assert.deepEqual(pageMutationMessages(harness.sentMessages), []);
     row.querySelector('[data-edit-answer]').click();
     draft.value = 'A freely edited answer.';
     draft.dispatchEvent(new harness.dom.window.Event('input', { bubbles: true }));
     row.querySelector('[data-use-edited-answer]').click();
     await new Promise((resolve) => setTimeout(resolve, 0));
     assert.equal(draft.value, 'A freely edited answer.');
-    assert.equal(harness.sentMessages.some((message) => ['JOB_RUN_APPLY_DRAFT', 'JOB_RUN_APPROVE_SUGGESTION'].includes(message.type)), false);
+    assert.deepEqual(pageMutationMessages(harness.sentMessages), []);
   } finally { harness.cleanup(); }
 });
 
@@ -602,9 +612,11 @@ test('send to form stays disabled until a draft exists and preserves it on apply
     send.click();
     await new Promise((resolve) => setTimeout(resolve, 0));
     const message = harness.sentMessages.find((entry) => entry.type === 'JOB_RUN_APPROVE_SUGGESTION');
+    assert.equal(harness.sentMessages.filter((entry) => entry.type === 'JOB_RUN_APPROVE_SUGGESTION').length, 1);
     assert.equal(message.sourceKey, 'story');
     assert.equal(message.answer, 'Exact answer to send');
     assert.equal(draft.value, 'Exact answer to send');
+    assert.match(harness.dom.window.document.querySelector('#status').textContent, /Page changed/i);
   } finally { harness.cleanup(); }
 });
 
@@ -621,6 +633,26 @@ test('manual draft sends through the guarded apply path with the exact edited an
     const message = harness.sentMessages.find((entry) => entry.type === 'JOB_RUN_APPLY_DRAFT');
     assert.equal(message.fieldId, 'salary');
     assert.equal(message.answer, '₹25,00,000');
+  } finally { harness.cleanup(); }
+});
+
+test('manual Send to form preserves the draft and reports an apply failure', async () => {
+  const run = { status: 'waiting_user', applicationId: 'run-manual-failure', pageSignature: 'page-one', actionRequired: [{ fieldId: 'salary', label: 'Expected salary' }], optionalUnresolved: [], reviewRequired: [], audit: [] };
+  const harness = await setupPanel({ run, applyDraftResponse: { ok: false, error: 'Application page changed' } });
+  try {
+    const row = harness.dom.window.document.querySelector('#action-required-list .result-item');
+    const draft = row.querySelector('[data-answer-draft]');
+    draft.value = '₹25,00,000';
+    draft.dispatchEvent(new harness.dom.window.Event('input', { bubbles: true }));
+    row.querySelector('[data-send-answer]').click();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const mutationMessages = pageMutationMessages(harness.sentMessages);
+    assert.equal(mutationMessages.length, 1);
+    assert.equal(mutationMessages[0].type, 'JOB_RUN_APPLY_DRAFT');
+    assert.equal(mutationMessages[0].fieldId, 'salary');
+    assert.equal(mutationMessages[0].answer, '₹25,00,000');
+    assert.equal(draft.value, '₹25,00,000');
+    assert.match(harness.dom.window.document.querySelector('#status').textContent, /Application page changed/i);
   } finally { harness.cleanup(); }
 });
 
