@@ -15,6 +15,9 @@ async function setupPanel({
   run = null,
   datasource = { answerCount: 3, coverMessageCount: 1 },
   localData = { openaiApiKey: 'sk-test', autoAdvancePages: false },
+  applyDraftResponse = { ok: true, run },
+  approveSuggestionResponse = { ok: true, run },
+  rewriteResponse = { ok: true, answer: 'Rewritten answer.' },
 } = {}) {
   const dom = new JSDOM(await loadPanelHtml(), {
     url: 'https://extension.local/sidepanel.html',
@@ -25,6 +28,7 @@ async function setupPanel({
   const createdUrls = [];
   const revokedUrls = [];
   const clickedDownloads = [];
+  const copyCalls = [];
   const originalCreateElement = dom.window.document.createElement.bind(dom.window.document);
 
   dom.window.document.createElement = function createElement(tagName, options) {
@@ -40,6 +44,7 @@ async function setupPanel({
   globalThis.window = dom.window;
   globalThis.document = dom.window.document;
   Object.defineProperty(globalThis, 'navigator', { value: dom.window.navigator, configurable: true, writable: true });
+  Object.defineProperty(dom.window.navigator, 'clipboard', { value: { writeText: async (value) => copyCalls.push(value) }, configurable: true });
   globalThis.HTMLElement = dom.window.HTMLElement;
   globalThis.HTMLInputElement = dom.window.HTMLInputElement;
   globalThis.Event = dom.window.Event;
@@ -72,6 +77,9 @@ async function setupPanel({
           savedCount: 2,
         };
         if (message.type === 'JOB_RUN_FOCUS_FIELD') return { ok: true, run };
+        if (message.type === 'JOB_RUN_APPLY_DRAFT') return typeof applyDraftResponse === 'function' ? applyDraftResponse(message) : applyDraftResponse;
+        if (message.type === 'JOB_RUN_APPROVE_SUGGESTION') return typeof approveSuggestionResponse === 'function' ? approveSuggestionResponse(message) : approveSuggestionResponse;
+        if (message.type === 'JOB_RUN_REWRITE_ANSWER') return typeof rewriteResponse === 'function' ? rewriteResponse(message) : rewriteResponse;
         if (message.type === 'JOB_DATASOURCE_EXPORT') return { ok: true, backup: '{"schemaVersion":1}' };
         if (message.type === 'JOB_DATASOURCE_IMPORT') return { ok: true, datasource };
         return { ok: true };
@@ -103,6 +111,7 @@ async function setupPanel({
     createdUrls,
     revokedUrls,
     clickedDownloads,
+    copyCalls,
     cleanup() {
       dom.window.close();
       delete globalThis.window;
@@ -160,27 +169,100 @@ test('panel hides opaque saved values and directs the applicant to complete the 
   try {
     const list = harness.dom.window.document.querySelector('#action-required-list');
     assert.match(list.textContent, /choose a value for Phone Device Type on the application page/i);
-    assert.doesNotMatch(list.textContent, new RegExp(opaqueValue));
+    const disclosure = list.querySelector('[data-internal-id]');
+    const popover = disclosure.querySelector('[data-internal-id-popover]');
+    assert.ok(disclosure);
+    assert.ok(popover);
+    assert.equal(popover.hidden, true);
+    assert.equal(popover.querySelector('[data-internal-value]').textContent, opaqueValue);
     assert.equal([...list.querySelectorAll('button')].some((button) => /saved answer|edit and use|approve edited/i.test(button.textContent)), false);
+    disclosure.querySelector('[data-internal-id-trigger]').click();
+    assert.equal(popover.hidden, false);
+    popover.querySelector('[data-copy-internal-id]').click();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assert.deepEqual(harness.copyCalls, [opaqueValue]);
   } finally { harness.cleanup(); }
 });
 
-test('panel prioritizes a named field over a generic unsupported-widget warning', async () => {
+test('panel orders named fields before generic notices and emphasizes each question', async () => {
   const run = {
     status: 'waiting_user',
     actionRequired: [
       { code: 'unsupported_widget', reason: 'Complete the unsupported or inaccessible widget manually' },
-      { fieldId: 'phone_type', label: 'Phone Device Type', reason: 'No validated answer is available' },
+      { fieldId: 'second', label: 'Second question', pageNumber: 2, formOrder: 2, reason: 'No validated answer is available' },
+      { fieldId: 'later', label: 'Later question', pageNumber: 1, formOrder: 2, reason: 'No validated answer is available' },
+      { fieldId: 'first', label: 'First question', pageNumber: 1, formOrder: 0, reason: 'No validated answer is available' },
     ],
-    optionalUnresolved: [],
-    reviewRequired: [],
-    audit: [],
+    optionalUnresolved: [{ fieldId: 'optional', label: 'Optional question', formOrder: 1, reason: 'No validated answer is available' }],
+    reviewRequired: [{ fieldId: 'review', label: 'Review question', formOrder: 1, value: 'Review this', reason: 'Needs review' }],
+    audit: [{ key: 'second', question: 'Second question', answer: 'Second answer', formOrder: 2 }, { key: 'first', question: 'First question', answer: 'First answer', formOrder: 0 }],
   };
   const harness = await setupPanel({ run });
   try {
-    const list = harness.dom.window.document.querySelector('#action-required-list');
-    assert.match(list.textContent, /Phone Device Type/);
-    assert.doesNotMatch(list.textContent, /unsupported or inaccessible widget/i);
+    const doc = harness.dom.window.document;
+    const actionItems = [...doc.querySelectorAll('#action-required-list .result-item')];
+    assert.deepEqual(actionItems.map((item) => item.querySelector('.result-label').textContent), ['First question', 'Later question', 'Second question', 'Field']);
+    assert.equal(actionItems[0].querySelector('.result-label').tagName, 'H3');
+    assert.match(actionItems[0].textContent, /Enter or select an answer.*Check again/i);
+    assert.deepEqual([...doc.querySelectorAll('#optional-list .result-item .result-label')].map((item) => item.textContent), ['Optional question']);
+    assert.deepEqual([...doc.querySelectorAll('#review-list .result-item .result-label')].map((item) => item.textContent), ['Review question']);
+    assert.deepEqual([...doc.querySelectorAll('#audit-list .result-item .result-label')].map((item) => item.textContent), ['First question', 'Second question']);
+  } finally { harness.cleanup(); }
+});
+
+test('panel hides an opaque source question behind an info button while keeping the saved answer usable', async () => {
+  const internalQuestion = 'cards|d20089ff-f389-44ef-9398-eec15ba7b6a4[field1]';
+  const suggestion = {
+    tabId: 7,
+    frameId: 3,
+    applicationId: 'run-one',
+    pageSignature: 'page-one',
+    field: { id: 'ocr', handle: 'handle-one' },
+    candidates: [{ sourceKey: 'ocr', sourceQuestion: internalQuestion, answer: 'Above 6 years experience in AI/ML Engineering', provenance: 'user', reason: 'Related saved evidence', kind: 'related' }],
+  };
+  const run = { status: 'waiting_user', waitingLabel: internalQuestion, actionRequired: [{ fieldId: 'ocr', label: 'AI OCR', formOrder: 0, suggestion }], optionalUnresolved: [], reviewRequired: [], audit: [] };
+  const harness = await setupPanel({ run });
+  try {
+    const row = harness.dom.window.document.querySelector('#action-required-list .result-item');
+    assert.doesNotMatch(harness.dom.window.document.querySelector('#run-hint').textContent, new RegExp(internalQuestion, 'i'));
+    assert.equal(row.querySelector('.result-label').textContent, 'AI OCR');
+    assert.equal(row.querySelector('.result-label').tagName, 'H3');
+    assert.match(row.textContent, /Above 6 years experience/);
+    const disclosure = row.querySelector('[data-internal-id]');
+    assert.ok(disclosure);
+    const popover = disclosure.querySelector('[data-internal-id-popover]');
+    assert.ok(popover);
+    assert.equal(popover.hidden, true);
+    assert.equal(popover.querySelector('[data-internal-value]').textContent, internalQuestion);
+    const trigger = disclosure.querySelector('[data-internal-id-trigger]');
+    trigger.focus();
+    assert.equal(popover.hidden, false);
+    trigger.click();
+    assert.equal(popover.hidden, false);
+    assert.deepEqual([...row.querySelectorAll('button')].filter((button) => /Use this saved answer|Edit and use/.test(button.textContent)).map((button) => button.textContent), ['Use this saved answer', 'Edit and use']);
+  } finally { harness.cleanup(); }
+});
+
+test('panel keeps opaque field labels and audit values behind disclosures', async () => {
+  const internalField = 'cards|d20089ff-f389-44ef-9398-eec15ba7b6a4[field2]';
+  const internalAnswer = '5ec01e56e42301ec004c2eaa25504002';
+  const run = {
+    status: 'page_ready',
+    actionRequired: [{ fieldId: internalField, label: internalField, reason: 'Complete this field manually' }],
+    optionalUnresolved: [],
+    reviewRequired: [],
+    audit: [{ key: internalField, question: internalField, answer: internalAnswer, sensitivity: 'safe' }],
+  };
+  const harness = await setupPanel({ run });
+  try {
+    const doc = harness.dom.window.document;
+    const actionRow = doc.querySelector('#action-required-list .result-item');
+    assert.equal(actionRow.querySelector('.result-label').firstChild.textContent, 'Form question');
+    assert.equal(actionRow.querySelector('[data-internal-id-popover]').hidden, true);
+    const auditRow = doc.querySelector('#audit-list .result-item');
+    assert.match(auditRow.textContent, /internal ID/i);
+    assert.ok([...auditRow.querySelectorAll('[data-internal-id-popover]')].every((popover) => popover.hidden));
+    assert.deepEqual([...auditRow.querySelectorAll('[data-internal-value]')].map((value) => value.textContent), [internalField, internalAnswer]);
   } finally { harness.cleanup(); }
 });
 
@@ -389,6 +471,24 @@ test('panel shows learned changes and sends a user correction to the worker', as
   } finally { harness.cleanup(); }
 });
 
+test('panel keeps opaque learned values out of correction inputs', async () => {
+  const internalQuestion = 'cards|d20089ff-f389-44ef-9398-eec15ba7b6a4[field3]';
+  const internalAnswer = '5ec01e56e42301ec004c2eaa25504002';
+  const harness = await setupPanel({ datasource: {
+    answerCount: 1,
+    coverMessageCount: 0,
+    learnedChanges: [{ key: internalQuestion, question: internalQuestion, answer: internalAnswer, history: [{ answer: internalAnswer }] }],
+  } });
+  try {
+    const list = harness.dom.window.document.querySelector('#learned-change-list');
+    const input = list.querySelector('input');
+    assert.equal(input.value, '');
+    assert.match(input.placeholder, /replace the hidden internal value/i);
+    assert.doesNotMatch(input.getAttribute('aria-label'), new RegExp(internalQuestion, 'i'));
+    assert.ok([...list.querySelectorAll('[data-internal-id-popover]')].every((popover) => popover.hidden));
+  } finally { harness.cleanup(); }
+});
+
 test('confirming one correction preserves other unsaved correction drafts', async () => {
   const datasource = { answerCount: 2, coverMessageCount: 0, learnedChanges: [
     { key: 'city', question: 'City', answer: 'Old city' }, { key: 'country', question: 'Country', answer: 'Old country' },
@@ -405,5 +505,137 @@ test('confirming one correction preserves other unsaved correction drafts', asyn
     document.querySelector('#learned-change-list button').click();
     await new Promise((resolve) => setTimeout(resolve, 0));
     assert.equal(document.querySelectorAll('#learned-change-list input')[1].value, 'New country');
+  } finally { harness.cleanup(); }
+});
+
+test('answer workspace stays blank until a readable candidate is chosen', async () => {
+  const suggestion = {
+    tabId: 7, frameId: 3, applicationId: 'run-draft', pageSignature: 'page-one',
+    field: { id: 'summary', handle: 'handle-summary' },
+    candidates: [
+      { sourceKey: 'one', sourceQuestion: 'Project history', answer: 'First candidate answer.', provenance: 'user', kind: 'related' },
+      { sourceKey: 'two', sourceQuestion: 'Leadership history', answer: 'Second candidate answer.', provenance: 'user', kind: 'related' },
+    ],
+  };
+  const run = { status: 'waiting_user', applicationId: 'run-draft', pageSignature: 'page-one', actionRequired: [{ fieldId: 'summary', label: 'Describe your experience', suggestion }], optionalUnresolved: [], reviewRequired: [], audit: [] };
+  const harness = await setupPanel({ run });
+  try {
+    const row = harness.dom.window.document.querySelector('#action-required-list .result-item');
+    assert.equal(row.querySelector('.result-label').textContent, 'Describe your experience');
+    const draft = row.querySelector('[data-answer-draft]');
+    assert.ok(draft);
+    assert.equal(draft.value, '');
+    assert.equal([...row.querySelectorAll('[data-choose-answer]')].length, 2);
+    assert.equal(harness.sentMessages.some((message) => ['JOB_RUN_APPLY_DRAFT', 'JOB_RUN_APPROVE_SUGGESTION'].includes(message.type)), false);
+  } finally { harness.cleanup(); }
+});
+
+test('choosing a candidate and editing it changes only the transient draft', async () => {
+  const suggestion = { tabId: 7, frameId: 3, applicationId: 'run-edit', pageSignature: 'page-one', field: { id: 'summary', handle: 'handle-summary' }, candidates: [{ sourceKey: 'story', sourceQuestion: 'Saved story', answer: 'Candidate answer verbatim.', provenance: 'user', kind: 'related' }] };
+  const run = { status: 'waiting_user', applicationId: 'run-edit', pageSignature: 'page-one', actionRequired: [{ fieldId: 'summary', label: 'Experience question', suggestion }], optionalUnresolved: [], reviewRequired: [], audit: [] };
+  const harness = await setupPanel({ run });
+  try {
+    const row = harness.dom.window.document.querySelector('#action-required-list .result-item');
+    row.querySelector('[data-choose-answer]').click();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const draft = row.querySelector('[data-answer-draft]');
+    assert.equal(draft.value, 'Candidate answer verbatim.');
+    assert.equal(harness.sentMessages.some((message) => message.type === 'JOB_RUN_APPROVE_SUGGESTION'), false);
+    row.querySelector('[data-edit-answer]').click();
+    draft.value = 'A freely edited answer.';
+    draft.dispatchEvent(new harness.dom.window.Event('input', { bubbles: true }));
+    row.querySelector('[data-use-edited-answer]').click();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assert.equal(draft.value, 'A freely edited answer.');
+    assert.equal(harness.sentMessages.some((message) => ['JOB_RUN_APPLY_DRAFT', 'JOB_RUN_APPROVE_SUGGESTION'].includes(message.type)), false);
+  } finally { harness.cleanup(); }
+});
+
+test('rewrite prompt sends the question context and replaces only the draft', async () => {
+  let shouldFail = false;
+  const suggestion = { tabId: 7, frameId: 3, applicationId: 'run-rewrite', pageSignature: 'page-one', field: { id: 'summary', handle: 'handle-summary' }, candidates: [{ sourceKey: 'story', sourceQuestion: 'Saved story', answer: 'Current draft.', provenance: 'user', kind: 'related' }] };
+  const run = { status: 'waiting_user', applicationId: 'run-rewrite', pageSignature: 'page-one', actionRequired: [{ fieldId: 'summary', label: 'Experience question', suggestion }], optionalUnresolved: [], reviewRequired: [], audit: [] };
+  const harness = await setupPanel({ run, rewriteResponse: (message) => shouldFail ? { ok: false, error: 'Rewrite unavailable' } : { ok: true, answer: 'Rewritten by the configured model.' } });
+  try {
+    const row = harness.dom.window.document.querySelector('#action-required-list .result-item');
+    row.querySelector('[data-choose-answer]').click();
+    row.querySelector('[data-rewrite-answer]').click();
+    const prompt = row.querySelector('[data-rewrite-prompt]');
+    assert.ok(prompt);
+    prompt.value = 'Make this more concise and confident.';
+    prompt.dispatchEvent(new harness.dom.window.Event('input', { bubbles: true }));
+    row.querySelector('[data-submit-rewrite]').click();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const message = harness.sentMessages.find((entry) => entry.type === 'JOB_RUN_REWRITE_ANSWER');
+    assert.equal(message.applicationId, 'run-rewrite');
+    assert.equal(message.pageSignature, 'page-one');
+    assert.equal(message.fieldId, 'summary');
+    assert.equal(message.question, 'Experience question');
+    assert.equal(message.draft, 'Current draft.');
+    assert.equal(message.instruction, 'Make this more concise and confident.');
+    assert.equal(row.querySelector('[data-answer-draft]').value, 'Rewritten by the configured model.');
+    shouldFail = true;
+    row.querySelector('[data-rewrite-answer]').click();
+    prompt.value = 'Try again';
+    row.querySelector('[data-submit-rewrite]').click();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assert.equal(row.querySelector('[data-answer-draft]').value, 'Rewritten by the configured model.');
+    assert.match(harness.dom.window.document.querySelector('#status').textContent, /Rewrite unavailable/i);
+  } finally { harness.cleanup(); }
+});
+
+test('send to form stays disabled until a draft exists and preserves it on apply failure', async () => {
+  const suggestion = { tabId: 7, frameId: 3, applicationId: 'run-send', pageSignature: 'page-one', field: { id: 'summary', handle: 'handle-summary' }, candidates: [{ sourceKey: 'story', sourceQuestion: 'Saved story', answer: 'Candidate answer.', provenance: 'user', kind: 'related' }] };
+  const run = { status: 'waiting_user', applicationId: 'run-send', pageSignature: 'page-one', actionRequired: [{ fieldId: 'summary', label: 'Experience question', suggestion }], optionalUnresolved: [], reviewRequired: [], audit: [] };
+  const harness = await setupPanel({ run, approveSuggestionResponse: { ok: false, error: 'Page changed' } });
+  try {
+    const row = harness.dom.window.document.querySelector('#action-required-list .result-item');
+    const send = row.querySelector('[data-send-answer]');
+    assert.ok(send);
+    assert.equal(send.disabled, true);
+    row.querySelector('[data-choose-answer]').click();
+    row.querySelector('[data-edit-answer]').click();
+    const draft = row.querySelector('[data-answer-draft]');
+    draft.value = 'Exact answer to send';
+    draft.dispatchEvent(new harness.dom.window.Event('input', { bubbles: true }));
+    row.querySelector('[data-use-edited-answer]').click();
+    send.click();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const message = harness.sentMessages.find((entry) => entry.type === 'JOB_RUN_APPROVE_SUGGESTION');
+    assert.equal(message.sourceKey, 'story');
+    assert.equal(message.answer, 'Exact answer to send');
+    assert.equal(draft.value, 'Exact answer to send');
+  } finally { harness.cleanup(); }
+});
+
+test('manual draft sends through the guarded apply path with the exact edited answer', async () => {
+  const run = { status: 'waiting_user', applicationId: 'run-manual', pageSignature: 'page-one', actionRequired: [{ fieldId: 'salary', label: 'Expected salary' }], optionalUnresolved: [], reviewRequired: [], audit: [] };
+  const harness = await setupPanel({ run });
+  try {
+    const row = harness.dom.window.document.querySelector('#action-required-list .result-item');
+    const draft = row.querySelector('[data-answer-draft]');
+    draft.value = '₹25,00,000';
+    draft.dispatchEvent(new harness.dom.window.Event('input', { bubbles: true }));
+    row.querySelector('[data-send-answer]').click();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const message = harness.sentMessages.find((entry) => entry.type === 'JOB_RUN_APPLY_DRAFT');
+    assert.equal(message.fieldId, 'salary');
+    assert.equal(message.answer, '₹25,00,000');
+  } finally { harness.cleanup(); }
+});
+
+test('opaque candidates disclose their value but expose no draft or apply controls', async () => {
+  const opaque = 'cards|d20089ff-f389-44ef-9398-eec15ba7b6a4[field1]';
+  const suggestion = { tabId: 7, frameId: 3, applicationId: 'run-opaque', pageSignature: 'page-one', field: { id: 'device', handle: 'handle-device' }, candidates: [{ sourceKey: 'device', sourceQuestion: 'Device type', answer: opaque, provenance: 'user', kind: 'draft' }] };
+  const run = { status: 'waiting_user', applicationId: 'run-opaque', pageSignature: 'page-one', actionRequired: [{ fieldId: 'device', label: 'Phone device type', suggestion }], optionalUnresolved: [], reviewRequired: [], audit: [] };
+  const harness = await setupPanel({ run });
+  try {
+    const row = harness.dom.window.document.querySelector('#action-required-list .result-item');
+    assert.ok(row.querySelector('[data-internal-id-popover]'));
+    assert.equal(row.querySelector('[data-choose-answer]'), null);
+    assert.equal(row.querySelector('[data-answer-draft]'), null);
+    assert.equal(row.querySelector('[data-edit-answer]'), null);
+    assert.equal(row.querySelector('[data-rewrite-answer]'), null);
+    assert.equal(row.querySelector('[data-send-answer]'), null);
   } finally { harness.cleanup(); }
 });
