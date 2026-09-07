@@ -92,6 +92,42 @@ function labelText(label) {
   return String(copy.textContent || '').replace(/\s+/g, ' ').trim();
 }
 
+function nearbyQuestion(element) {
+  const controls = 'input:not([type="hidden"]),textarea,select,[role="combobox"],button[aria-haspopup="listbox"]';
+  for (let wrapper = element.parentElement, depth = 0; wrapper && depth < 6; wrapper = wrapper.parentElement, depth++) {
+    if (wrapper.matches('form,section,main,body')) break;
+    const peers = [...wrapper.querySelectorAll(controls)].filter(isVisible);
+    if (peers.some(peer => peer !== element && !(element.type === 'radio' && peer.type === 'radio' && peer.name === element.name))) break;
+    const candidates = [...wrapper.querySelectorAll('.application-label .text,h3,h4,[role="heading"],legend,label')]
+      .filter(node => isVisible(node) && !node.contains(element) && !node.querySelector(controls)
+        && !node.matches('[for]') && !node.closest('[role="alert"],.error,.help,.hint')
+        && Boolean(node.compareDocumentPosition(element) & 4));
+    const labels = [...new Set(candidates.map(labelText).filter(text => text && text.length <= 500))];
+    if (labels.length > 1) return '';
+    if (labels.length === 1) return labels[0];
+  }
+  return '';
+}
+
+function questionMetadata(document, element) {
+  const native = [...(element.labels || [])].map(labelText).filter(Boolean).join(' ');
+  if (element.type === 'radio') {
+    const group = element.closest('fieldset,[role="radiogroup"],[role="group"]');
+    const explicit = group && (textFromIds(document, group.getAttribute('aria-labelledby')) || group.getAttribute('aria-label') || group.querySelector(':scope > legend')?.textContent?.trim());
+    if (explicit) return { label: explicit, labelSource: 'group', labelConfidence: 'high' };
+    const peers = radioGroup(document, element);
+    const aria = peer => textFromIds(document, peer.getAttribute('aria-labelledby')) || peer.getAttribute('aria-label') || '';
+    const shared = aria(element);
+    if (shared && peers.length > 1 && peers.every(peer => aria(peer) === shared)) return { label: shared, labelSource: 'shared-aria', labelConfidence: 'high' };
+    const nearby = nearbyQuestion(element);
+    return { label: nearby || element.name || element.id || '', labelSource: nearby ? 'nearby-question' : 'identity', labelConfidence: nearby ? 'high' : 'low' };
+  }
+  const explicit = native || element.getAttribute('aria-label') || textFromIds(document, element.getAttribute('aria-labelledby'));
+  const nearby = !explicit && nearbyQuestion(element);
+  return { label: explicit || nearby || element.getAttribute('placeholder') || element.name || element.id || '',
+    labelSource: explicit ? 'explicit' : nearby ? 'nearby-question' : 'identity', labelConfidence: explicit || nearby ? 'high' : 'low' };
+}
+
 function labelFor(document, element) {
   if (element.type === 'radio') {
     const legend = element.closest('fieldset')?.querySelector('legend')?.textContent?.trim();
@@ -129,12 +165,21 @@ function isVisible(element) {
   return true;
 }
 
+function hasNativeFormAction(element) {
+  // Use the live native type/form owner: missing or invalid button types submit,
+  // and the form attribute can associate a control outside the form subtree.
+  const control = element.closest?.('button, input');
+  return Boolean(control?.form && ['submit', 'reset', 'image'].includes(control.type));
+}
+
 function customWidgetElements(document) {
   return [...document.querySelectorAll(CUSTOM_WIDGET_SELECTOR)]
+    .filter((element) => !hasNativeFormAction(element))
     .filter((element) => inApplication(document, element) && !element.disabled && !element.readOnly)
     .filter((element) => isVisible(element))
     .filter((element) => element.closest('form, main, [role="main"]') || hasNearbyFormControl(element))
-    .filter((element) => element.getAttribute('aria-label') || element.getAttribute('name') || hasNearbyFormControl(element));
+    .filter((element) => element.getAttribute('aria-label') || element.getAttribute('name')
+      || textFromIds(document, element.getAttribute('aria-labelledby')) || associatedLabelText(document, element) || hasNearbyFormControl(element));
 }
 
 function hasNearbyFormControl(element) {
@@ -211,7 +256,7 @@ function customWidgetLabel(document, element) {
   if (associated) return associated;
   const labelledBy = textFromIds(document, element.getAttribute('aria-labelledby'));
   if (labelledBy) return labelledBy;
-  const fieldGroupLabel = nearestFieldGroupLabel(element);
+  const fieldGroupLabel = nearestFieldGroupLabel(element) || nearbyQuestion(element);
   if (fieldGroupLabel) return fieldGroupLabel;
 
   const displayed = customWidgetValue(element);
@@ -235,6 +280,18 @@ function customOptionText(element) {
 
 function customOptionValue(element) {
   return String(element.getAttribute('data-value') || element.getAttribute('value') || '').trim();
+}
+
+function customOptionAliases(option) {
+  const label = customOptionText(option);
+  // SuccessFactors picklists prefix display labels with an ordinal ("4 - Bachelor's degree").
+  const unnumbered = option.closest('.sf-list-select') ? label.replace(/^\d+\s+[-–—]\s+(?=[A-Za-z])/, '') : label;
+  return [label, unnumbered, customOptionValue(option)].filter(Boolean).map(normalizeText);
+}
+
+function matchingCustomOptions(options, value) {
+  const exact = options.filter((option) => [customOptionText(option), customOptionValue(option)].map(normalizeText).includes(value));
+  return exact.length ? exact : options.filter((option) => customOptionAliases(option).includes(value));
 }
 
 function customWidgetOptions(document, element) {
@@ -314,7 +371,7 @@ function fieldValue(document, element) {
   if (element.tagName === 'SELECT') {
     if (element.multiple) return [...element.selectedOptions].filter((option) => option.value).map((option) => option.textContent.trim()).join(', ');
     const selected = element.selectedOptions?.[0];
-    return selected?.value ? selected.textContent.trim() : '';
+    return selected?.value && !selected.disabled ? selected.textContent.trim() : '';
   }
   return String(element.value || '').trim();
 }
@@ -339,7 +396,7 @@ function describeField(document, element, index) {
     multiple: Boolean(element.multiple),
     selectedValues: element.tagName === 'SELECT' ? [...element.selectedOptions].filter((option) => option.value).map((option) => option.value) : [],
     structuredOptions: element.tagName === 'SELECT' ? [...element.options].map((option) => ({ label: option.textContent.trim(), value: option.value, selected: option.selected, disabled: option.disabled })) : [],
-    label: labelFor(document, element),
+    ...questionMetadata(document, element),
     type,
     autocomplete: element.autocomplete || '',
     placeholder: element.getAttribute('placeholder') || '',
@@ -363,6 +420,8 @@ export function collectFieldDescriptors(document) {
       multiple: element.getAttribute('aria-multiselectable') === 'true' || document.getElementById(element.getAttribute('aria-controls'))?.getAttribute('aria-multiselectable') === 'true',
       structuredOptions: customWidgetOptions(document, element).map((option) => ({ label: customOptionText(option), value: customOptionValue(option), selected: option.getAttribute('aria-selected') === 'true', disabled: option.getAttribute('aria-disabled') === 'true' })),
       label: customWidgetLabel(document, element),
+      labelSource: nearbyQuestion(element) === customWidgetLabel(document, element) ? 'nearby-question' : 'custom-widget',
+      labelConfidence: customWidgetLabel(document, element) && ![element.name, element.id].includes(customWidgetLabel(document, element)) ? 'high' : 'low',
       type: 'select',
       widget: 'custom',
       autocomplete: element.getAttribute('autocomplete') || '',
@@ -481,12 +540,15 @@ function setCheckbox(element, answer) {
   return true;
 }
 
-function waitForCustomOptions(document, element, timeoutMs = 750) {
+function waitForCustomOptions(document, element, answer, timeoutMs = 1500) {
   const startedAt = Date.now();
   return new Promise((resolve) => {
     const check = () => {
       const options = customWidgetOptions(document, element);
-      if (options.length || Date.now() - startedAt >= timeoutMs) {
+      const multiple = element.getAttribute('aria-multiselectable') === 'true'
+        || options[0]?.closest('[role="listbox"]')?.getAttribute('aria-multiselectable') === 'true';
+      const requested = multiple ? String(answer).split(/\s*[,;]\s*/).map(normalizeText).filter(Boolean) : [normalizeText(answer)];
+      if ((options.length && requested.every((value) => matchingCustomOptions(options, value).length)) || Date.now() - startedAt >= timeoutMs) {
         resolve(options);
         return;
       }
@@ -497,13 +559,17 @@ function waitForCustomOptions(document, element, timeoutMs = 750) {
 }
 
 async function setCustomChoiceValue(document, element, answer) {
-  element.click();
+  element.focus?.();
+  if (hasNativeFormAction(element)) {
+    return { ok: false, unresolved: true, reason: 'Refusing to activate a native submit/reset control' };
+  }
+  if (element.getAttribute('aria-expanded') !== 'true') element.click();
   const expected = normalizeText(answer);
   if (element.tagName === 'INPUT' && element.getAttribute('aria-autocomplete')) {
     element.__jobApplicationSearchQuery = true;
     setTextValue(element, answer);
   }
-  const options = await waitForCustomOptions(document, element);
+  const options = await waitForCustomOptions(document, element, answer);
   if (!options.length) {
     if (element.tagName === 'INPUT') setTextValue(element, '');
     return { ok: false, unresolved: true, reason: 'The custom widget did not reveal any options' };
@@ -511,19 +577,27 @@ async function setCustomChoiceValue(document, element, answer) {
   const multiple = element.getAttribute('aria-multiselectable') === 'true'
     || options[0]?.closest('[role="listbox"]')?.getAttribute('aria-multiselectable') === 'true';
   const requested = multiple ? String(answer).split(/\s*[,;]\s*/).map(normalizeText).filter(Boolean) : [expected];
-  const matches = requested.map((value) => options.filter((option) => normalizeText(customOptionText(option)) === value
-    || normalizeText(customOptionValue(option)) === value)).flat();
-  if (matches.length !== requested.length || new Set(matches).size !== matches.length) {
+  const candidates = requested.map((value) => matchingCustomOptions(options, value));
+  const matches = candidates.flat();
+  if (candidates.some((options) => options.length !== 1) || new Set(matches).size !== matches.length) {
     return { ok: false, unresolved: true, reason: 'The custom widget does not expose one unique exact option' };
   }
-  for (const match of matches) if (match.getAttribute('aria-selected') !== 'true') match.click();
+  for (const match of matches) {
+    if (match.getAttribute('aria-selected') === 'true') continue;
+    // Recheck after awaiting options and after every preceding selection.
+    if (hasNativeFormAction(match)) {
+      return { ok: false, unresolved: true, reason: 'Refusing to activate a native submit/reset option' };
+    }
+    match.click();
+  }
   await new Promise((resolve) => setTimeout(resolve, 50));
   const backingInput = [...(element.parentElement?.querySelectorAll('input, textarea') || [])].find((input) => input !== element);
+  const acceptedSingleValues = multiple ? [expected] : [...new Set([expected, ...customOptionAliases(matches[0])])];
   if (element.tagName === 'INPUT') {
     const committed = matches.every((option) => option.getAttribute('aria-selected') === 'true')
-      || normalizeText(element.getAttribute('aria-valuetext')) === expected
-      || normalizeText(backingInput?.value || '') === expected
-      || (element.getAttribute('aria-expanded') === 'false' && normalizeText(element.value) === expected);
+      || acceptedSingleValues.includes(normalizeText(element.getAttribute('aria-valuetext')))
+      || acceptedSingleValues.includes(normalizeText(backingInput?.value || ''))
+      || (element.getAttribute('aria-expanded') === 'false' && acceptedSingleValues.includes(normalizeText(element.value)));
     if (!committed) return { ok: false, unresolved: true, reason: 'The searchable widget has no committed selection' };
     delete element.__jobApplicationSearchQuery;
   }
@@ -535,7 +609,7 @@ async function setCustomChoiceValue(document, element, answer) {
   const expectedValues = requested.slice().sort();
   const displayedMatches = multiple
     ? displayedValues.slice().sort().join('|') === expectedValues.slice().sort().join('|')
-    : displayed === expected || backingValue === expected;
+    : acceptedSingleValues.includes(displayed) || acceptedSingleValues.includes(backingValue);
   if (!displayedMatches && backingValue !== expected) {
     return { ok: false, unresolved: true, reason: 'The custom widget did not accept the selected option' };
   }
@@ -693,13 +767,19 @@ export async function applyDecisions(document, decisions = []) {
       addReviewIfNeeded(result, field, decision, field.currentValue);
       continue;
     }
+    if (decision.action !== 'fill') {
+      result.unresolved.push({ fieldId: field.id, label: field.label, reason: decision.reason || 'Unsupported decision action' });
+      continue;
+    }
     const current = field.currentValue;
     if (current && validateFillValue(field, current).ok) {
       result.kept.push({ fieldId: field.id, value: current });
       addReviewIfNeeded(result, field, decision, current);
       continue;
     }
-    const validation = validateFillValue(field, decision.value);
+    // Custom options may be filtered, stale, or loaded only after opening/searching.
+    // Validate their exact match against the live popup in setCustomChoiceValue.
+    const validation = validateFillValue(field.widget === 'custom' ? { ...field, options: [] } : field, decision.value);
     if (!validation.ok) {
       result.failed.push({ fieldId: field.id, label: field.label, value: decision.value, reason: validation.reason });
       continue;
@@ -803,7 +883,7 @@ export function collectAnswerRecords(document) {
   return fields
     .map((field) => {
       const concept = canonicalConcept(field.label || field.id);
-      const baseKey = concept === 'generic_name' ? 'full_name' : concept;
+      const baseKey = concept === 'generic_name' ? 'full_name' : /_compensation$/.test(concept) ? slugify(field.label) : concept;
       const occurrence = (occurrenceByKey.get(baseKey) || 0) + 1;
       occurrenceByKey.set(baseKey, occurrence);
       const repeated = occurrence > 1 || /__\d+$/.test(field.id);
@@ -822,7 +902,7 @@ export function collectAnswerRecords(document) {
         concept: concept === 'generic_name' ? 'full_name' : concept,
         provenance,
         userEdited: Boolean(element?.type === 'radio' ? radioGroup(document, element).some((item) => item.__jobApplicationUserEdited) : element?.__jobApplicationUserEdited),
-        completed: element?.__jobApplicationUserCompleted !== false,
+        completed: field.labelConfidence !== 'low' && element?.__jobApplicationUserCompleted !== false,
         ...(field.entityId ? { entityId: field.entityId } : {}),
         ...(field.entityType ? { entityType: field.entityType } : {}),
         ...(field.section ? { context: field.section } : {}),

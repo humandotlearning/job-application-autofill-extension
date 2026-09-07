@@ -216,6 +216,90 @@ function createHarness({
   };
 }
 
+test('saved narrative and sensitive equivalents wait for scoped approval before any mutation', async () => {
+  const harness = createHarness({ answerRecords: [
+    { key: 'story', question: 'Model deployment project', answer: 'I trained machine learning models and deployed them to production.', confirmationState: 'confirmed', sensitivity: 'safe' },
+    { key: 'current_salary', question: 'Current salary', answer: 'Synthetic explanation', confirmationState: 'confirmed', sensitivity: 'review' },
+  ], pagesByTab: { 7: { pages: [{ page: { title: 'Application', domain: 'example.test' }, fields: [
+    { id: 'ml', handle: 'handle-ml', label: 'Describe your ML experience', type: 'textarea', required: true },
+    { id: 'ctc', handle: 'handle-ctc', label: 'Current CTC', type: 'textarea' },
+  ], actions: [] }] } } });
+  harness.localData.openaiApiKey = 'synthetic-test-key';
+  let plannerCalls = 0;
+  globalThis.fetch = async () => { plannerCalls++; throw new Error('synthetic planner unavailable'); };
+  await import(`../src/service-worker.js?test=reuse-${Date.now()}`);
+  const started = await harness.dispatch({ type: 'JOB_RUN_START', tabId: 7 });
+  assert.equal(plannerCalls, 0, 'AI must not bypass local approval gates');
+  assert.equal(harness.tabs.get(7).frames[0].pages[0].values?.ctc, undefined);
+  const { JSDOM } = await import('jsdom');
+  const { applyDecisions } = await import('../src/form-engine.js');
+  const document = new JSDOM('<label>Current CTC<textarea id="ctc"></textarea></label><label>Describe your ML experience<textarea id="ml"></textarea></label>').window.document;
+  const sentDecisions = harness.tabs.get(7).messages.find(message => message.type === 'JOB_APP_APPLY').decisions;
+  assert.equal(sentDecisions.find(decision => decision.fieldId === 'ctc').action, 'ask_user');
+  assert.equal(sentDecisions.find(decision => decision.fieldId === 'ctc').value, null);
+  await applyDecisions(document, sentDecisions.map(({ handle, ...decision }) => decision));
+  assert.equal(document.querySelector('#ctc').value, '');
+  assert.equal(document.querySelector('#ml').value, '');
+  assert.equal(started.run.suggestions.ml.candidates[0].sourceKey, 'story');
+  assert.equal(started.run.suggestions.ctc.candidates[0].sourceKey, 'current_salary');
+  assert.match(started.run.actionRequired[0].reason, /evidence/i);
+  const suggestion = started.run.suggestions.ctc;
+  const approval = { type: 'JOB_RUN_APPROVE_SUGGESTION', tabId: 7, frameId: suggestion.frameId, applicationId: suggestion.applicationId, fieldId: 'ctc', handle: suggestion.field.handle, pageSignature: suggestion.pageSignature, sourceKey: 'current_salary' };
+  for (const change of [{ tabId: 8 }, { frameId: 9 }, { applicationId: 'old' }, { handle: 'replaced' }]) assert.equal((await harness.dispatch({ ...approval, ...change })).ok, false);
+  const accepted = await harness.dispatch(approval);
+  assert.equal(accepted.ok, true, accepted.error);
+  assert.equal(harness.tabs.get(7).frames[0].pages[0].values.ctc, 'Synthetic explanation');
+  assert.equal(harness.tabs.get(7).nextClicks, 0);
+  assert.equal(harness.tabs.get(7).submitCalls, 0);
+  assert.equal((await harness.dispatch(approval)).ok, false);
+  const learned = harness.localData.answerRecords.find(record => record.key === 'current_salary');
+  assert.ok(learned.aliases.includes('Current CTC'));
+  const narrative = started.run.suggestions.ml;
+  const edited = await harness.dispatch({ ...approval, fieldId: 'ml', handle: narrative.field.handle, sourceKey: 'story', answer: 'I built and deployed synthetic ML models for this project.' });
+  assert.equal(edited.ok, true, edited.error);
+  const newRecord = harness.localData.answerRecords.find(record => record.question === 'Describe your ML experience');
+  assert.deepEqual(newRecord.evidenceKeys, ['story']);
+  assert.equal(harness.localData.answerRecords.find(record => record.key === 'story').aliases.includes('Describe your ML experience'), false);
+});
+
+test('previous application drafts are source-qualified suggestions, not promoted by scanning', async () => {
+  const harness = createHarness({ pagesByTab: { 7: { pages: [{ page: { title: 'Application' }, fields: [{ id: 'notice', handle: 'notice-handle', label: 'Notice period', type: 'textarea', required: true }], actions: [{ id: 'submit', label: 'Submit application', kind: 'submit' }] }] } } });
+  harness.localData.applicationDrafts = { old: { records: [{ key: 'notice', question: 'Notice period', answer: 'Synthetic notice answer', provenance: 'user', completed: true }] }, generated: { records: [{ key: 'notice', question: 'Notice period', answer: 'Generated answer', provenance: 'autofill' }] } };
+  await import(`../src/service-worker.js?test=drafts-${Date.now()}`);
+  const started = await harness.dispatch({ type: 'JOB_RUN_START', tabId: 7 });
+  const suggestion = started.run.suggestions.notice;
+  assert.equal(suggestion.candidates.length, 1);
+  assert.equal(suggestion.candidates[0].sourceKey, 'draft:old:notice');
+  assert.match(suggestion.candidates[0].reason, /Previously entered, not yet saved for reuse/);
+  assert.equal(harness.localData.answerRecords.some(record => record.key === 'notice'), false);
+  const approved = await harness.dispatch({ type: 'JOB_RUN_APPROVE_SUGGESTION', tabId: 7, frameId: 0, applicationId: started.run.startedAt, pageSignature: started.run.pageSignature, fieldId: 'notice', handle: 'notice-handle', sourceKey: 'draft:old:notice' });
+  assert.equal(approved.ok, true, approved.error);
+  assert.equal(harness.localData.answerRecords.find(record => record.question === 'Notice period').answer, 'Synthetic notice answer');
+});
+
+test('optional planner sends bounded relevant evidence and preserves failure diagnostics without retries', async () => {
+  const harness = createHarness({ pagesByTab: { 7: { pages: [{ fields: [{ id: 'unknown', label: 'Describe underwater welding', type: 'text', required: true }], actions: [{ id: 'submit', label: 'Submit application', kind: 'submit' }] }] } } });
+  harness.localData.openaiApiKey = 'synthetic-key';
+  const bodies = [];
+  globalThis.fetch = async (_url, options) => { bodies.push(JSON.parse(options.body)); throw new Error('Synthetic network failure'); };
+  await import(`../src/service-worker.js?test=bounded-${Date.now()}`);
+  const first = await harness.dispatch({ type: 'JOB_RUN_START', tabId: 7 });
+  assert.deepEqual(JSON.parse(bodies[0].input[1].content[0].text).records, []);
+  assert.match(first.run.llmError, /Synthetic network failure/);
+  await harness.dispatch({ type: 'JOB_RUN_CHECK_PAGE', tabId: 7 });
+  assert.equal(bodies.length, 1);
+});
+
+test('reviewed compensation preserves explicit answer units without numeric conversion', async () => {
+  const harness = createHarness({ answerRecords: [{ key: 'current_salary', question: 'Current salary', answer: 'Reported compensation: 18 LPA.', confirmationState: 'confirmed', sensitivity: 'review' }], pagesByTab: { 7: { pages: [{ fields: [{ id: 'ctc', handle: 'ctc-h', label: 'Current CTC', type: 'textarea', required: true }], actions: [{ id: 'submit', label: 'Submit application', kind: 'submit' }] }] } } });
+  await import(`../src/service-worker.js?test=units-${Date.now()}`);
+  const { run } = await harness.dispatch({ type: 'JOB_RUN_START', tabId: 7 });
+  assert.equal(run.suggestions.ctc.candidates[0].kind, 'review');
+  const result = await harness.dispatch({ type: 'JOB_RUN_APPROVE_SUGGESTION', tabId: 7, frameId: 0, applicationId: run.startedAt, pageSignature: run.pageSignature, fieldId: 'ctc', handle: 'ctc-h', sourceKey: 'current_salary' });
+  assert.equal(result.ok, true, result.error);
+  assert.equal(harness.tabs.get(7).frames[0].pages[0].values.ctc, 'Reported compensation: 18 LPA.');
+});
+
 test('selects the application iframe and routes the run to that frame', async () => {
   const harness = createHarness({
     answerRecords: [

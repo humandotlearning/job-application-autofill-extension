@@ -1,3 +1,5 @@
+import { retrieveEvidence } from './retrieval.js';
+import { inferSensitivity, validateFillValue, meaningCompatible } from './core.js';
 import { callAnswerPlanner } from './llm.js';
 import { upsertAnswerRecords, mergeLearnedAnswers, normalizeAnswerRecord } from './core.js';
 import {
@@ -199,6 +201,13 @@ async function persistLearnedRecords(records = [], run = null, { promote = false
 
 async function getRecords() {
   return (await getDatasource()).answerRecords.filter((record) => record.confirmationState !== 'pending' && (!record.alternatives?.length || record.confirmationState === 'confirmed'));
+}
+
+async function draftEvidenceRecords() {
+  const { applicationDrafts } = await chrome.storage.local.get({ applicationDrafts: {} });
+  return Object.entries(applicationDrafts || {}).flatMap(([application, draft]) => (draft.records || [])
+    .filter(record => record.provenance === 'user' && record.completed !== false && record.confirmationState !== 'pending' && !record.alternatives?.length)
+    .map(record => ({ ...record, key: `draft:${application}:${record.key}`, draft: true, confirmationState: 'confirmed' })));
 }
 
 async function getCoverMessages() {
@@ -623,7 +632,7 @@ function categorizeRun(run, inspection, validation, unresolvedResults = []) {
   const unresolvedById = new Map(unresolvedResults.filter((item) => item?.fieldId).map((item) => [item.fieldId, item]));
   const unresolvedFieldsOnPage = inspection.fields
     .filter((field) => !field.currentValue || invalidIds.has(field.id))
-    .map((field) => fieldIssue(field, invalidIds, unresolvedById));
+    .map((field) => ({ ...fieldIssue(field, invalidIds, unresolvedById), ...(run.suggestions?.[field.id] ? { suggestion: run.suggestions[field.id], reason: 'Relevant saved evidence available — approve an answer before use' } : {}) }));
   run.actionRequired = [
     ...navigationIssues(inspection),
     ...unresolvedFieldsOnPage.filter((field) => field.required),
@@ -665,7 +674,23 @@ async function applyPageDecisions(tabId, run, inspection, records, coverMessages
   const scopedFields = employment
     ? inspection.fields.map((field) => field.entityType === 'employment' ? { ...field, employmentId: employment.id } : field)
     : inspection.fields;
-  const localDecisions = planDeterministicFill(scopedFields, records, coverMessages, profile, inspection.page);
+  const draftRecords = await draftEvidenceRecords();
+  run.suggestions = {};
+  const localDecisions = planDeterministicFill(scopedFields, records, coverMessages, profile, inspection.page).map(decision => {
+    const field = scopedFields.find(field => field.id === decision.fieldId);
+    if (!field || field.currentValue) return decision;
+    const candidates = retrieveEvidence(field, records);
+    for (const candidate of retrieveEvidence(field, draftRecords)) {
+      if (!candidates.some(saved => saved.answer === candidate.answer)) candidates.push({ ...candidate, kind: 'draft', reason: 'Previously entered, not yet saved for reuse — explicit approval required' });
+    }
+    candidates.splice(3);
+    const gated = candidates.length && (decision.action !== 'fill' || field.type === 'textarea' || decision.sensitivity !== 'safe' || inferSensitivity(field.label) !== 'safe');
+    if (gated) {
+      run.suggestions[field.id] = { tabId, frameId: run.frame.frameId, applicationId: run.startedAt, pageSignature: currentPageSignature, field, candidates };
+      return { ...decision, action: 'ask_user', value: null, reason: 'Relevant saved evidence available — approve an answer before use' };
+    }
+    return decision;
+  });
   const localResult = await sendToApplicationFrame(tabId, run, { type: 'JOB_APP_APPLY', decisions: localDecisions, applicationId: run.startedAt });
   if (!localResult?.ok) throw new Error(localResult?.error || 'The page rejected local answers');
 
@@ -677,7 +702,7 @@ async function applyPageDecisions(tabId, run, inspection, records, coverMessages
   let appliedReviews = [...(localResult.result?.reviewRequired || [])];
   let unresolvedResults = [...(localResult.result?.unresolved || [])];
   let llmError = null;
-  const remaining = unresolvedFields(currentInspection.fields, currentValidation);
+  const remaining = unresolvedFields(currentInspection.fields, currentValidation).filter(field => !run.suggestions[field.id]);
   const llmPageKey = `${run.pageNumber}:${currentPageSignature}`;
   if (remaining.length && apiKey && !run.llmPages.includes(llmPageKey)) {
     run.llmPages = [...run.llmPages, llmPageKey];
@@ -686,7 +711,7 @@ async function applyPageDecisions(tabId, run, inspection, records, coverMessages
       const llmDecisions = await callAnswerPlanner({
         apiKey,
         fields: remaining,
-        records,
+        records: records.filter(record => remaining.some(field => retrieveEvidence(field, [record]).length)).slice(0, 20),
         page: currentInspection.page,
       }, { model, allowPartial: true });
       const llmResult = await sendToApplicationFrame(tabId, run, {
@@ -719,6 +744,58 @@ async function applyPageDecisions(tabId, run, inspection, records, coverMessages
     inspection: currentInspection,
     validation: currentValidation,
   };
+}
+
+async function approveSuggestion(message) {
+  const { tabId, fieldId } = message;
+  if (!Number.isInteger(tabId) || processingTabs.has(tabId) || saveLocks.has(tabId)) throw new Error('Application is busy or unavailable');
+  saveLocks.add(tabId);
+  try {
+    const run = await getRun(tabId);
+    const suggestion = run?.suggestions?.[fieldId];
+    if (!suggestion || !SAVABLE_RUN_STATUSES.has(run.status) || message.frameId !== run.frame?.frameId
+      || message.frameId !== suggestion.frameId || message.applicationId !== run.startedAt
+      || message.pageSignature !== run.pageSignature || message.handle !== suggestion.field.handle || !message.handle) throw new Error('Stale suggestion; check the page again');
+    const candidate = suggestion.candidates.find(item => item.sourceKey === message.sourceKey);
+    const records = candidate?.kind === 'draft' ? await draftEvidenceRecords() : await getRecords();
+    const source = records.find(item => item.key === candidate?.sourceKey);
+    if (!candidate || !source || source.answer !== candidate.answer
+      || !retrieveEvidence(suggestion.field, records).some(item => item.sourceKey === candidate.sourceKey)) throw new Error('Saved evidence changed; check again');
+    // Never rediscover/reroute an approval into another frame.
+    const inspected = await sendToFrame(tabId, message.frameId, { type: 'JOB_APP_INSPECT' });
+    const field = inspected.inspection?.fields.find(item => item.id === fieldId);
+    if (!field || field.handle !== message.handle || field.currentValue || JSON.stringify(field.options) !== JSON.stringify(suggestion.field.options)
+      || field.label !== suggestion.field.label || field.type !== suggestion.field.type
+      || pageSignature(inspected.inspection, run.frame) !== message.pageSignature) throw new Error('Destination changed; check the page again');
+    const value = String(message.answer ?? candidate.answer).trim();
+    const validation = validateFillValue(field, value);
+    if (!validation.ok || !meaningCompatible(field, source, { numericReview: !(['textarea', 'text'].includes(field.type) && value === candidate.answer) }) || inferSensitivity(field.label) === 'legal' || field.type === 'checkbox') throw new Error(validation.reason || 'This destination requires manual entry');
+    const result = await sendToFrame(tabId, message.frameId, { type: 'JOB_APP_APPLY', applicationId: run.startedAt, decisions: [{ fieldId, handle: field.handle, action: 'fill', value, evidenceKeys: [source.key], sensitivity: inferSensitivity(field.label), confidence: 'high', reason: 'Explicitly approved saved answer' }] });
+    if (!result?.ok) throw new Error(result?.error || 'Could not apply the answer');
+    const verified = await sendToFrame(tabId, message.frameId, { type: 'JOB_APP_INSPECT' });
+    if (verified.inspection?.fields.find(item => item.id === fieldId && item.handle === field.handle)?.currentValue !== value) throw new Error('The page did not retain the approved answer');
+    datasourceWriteChain = datasourceWriteChain.catch(() => {}).then(async () => {
+      const state = await getDatasource();
+      const latest = (candidate.kind === 'draft' ? await draftEvidenceRecords() : state.answerRecords).find(record => record.key === source.key);
+      if (!latest || latest.answer !== source.answer) throw new Error('Evidence changed while applying; answer applied but not learned');
+      const now = new Date().toISOString();
+      const equivalent = candidate.kind === 'equivalent' && value === candidate.answer && field.labelConfidence !== 'low';
+      const answerRecords = equivalent ? state.answerRecords.map(record => record.key === source.key
+        ? { ...record, aliases: [...new Set([...(record.aliases || []), field.label])], updatedAt: now } : record)
+        : mergeLearnedAnswers(state.answerRecords, [{ question: field.label, answer: value, type: field.type, entityId: field.entityId,
+          entityType: field.entityType, evidenceKeys: [source.key], provenance: 'user', completed: true, userEdited: true }], now, { confirm: true });
+      await saveDatasource({ ...state, answerRecords });
+      const readback = await chrome.storage.local.get({ answerRecords: [] });
+      const persisted = equivalent ? readback.answerRecords.find(record => record.key === source.key && record.aliases?.includes(field.label))
+        : readback.answerRecords.find(record => record.question === field.label && record.answer === value && record.evidenceKeys?.includes(source.key));
+      if (!persisted) throw new Error('Answer applied, but reusable save could not be verified');
+    });
+    await datasourceWriteChain;
+    delete run.suggestions[fieldId];
+    const validationResponse = await sendToFrame(tabId, message.frameId, { type: 'JOB_APP_VALIDATE' });
+    categorizeRun(run, verified.inspection, validationResponse.validation || {});
+    return { ok: true, run: await saveRun(run) };
+  } finally { saveLocks.delete(tabId); }
 }
 
 function hasBlockingIssues(run, validation) {
@@ -985,6 +1062,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
 
   if (![
+    'JOB_RUN_APPROVE_SUGGESTION',
     'JOB_RUN_START',
     'JOB_RUN_CHECK_PAGE',
     'JOB_RUN_ADVANCE_PAGE',
@@ -999,6 +1077,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   ].includes(message?.type)) return false;
 
   (async () => {
+    if (message.type === 'JOB_RUN_APPROVE_SUGGESTION') {
+      if (sender?.tab) throw new Error('Approval must originate in the extension panel');
+      return approveSuggestion(message);
+    }
     if (message.type === 'JOB_DATASOURCE_STATE') return { ok: true, datasource: await datasourceSummary() };
     if (message.type === 'JOB_DATASOURCE_EXPORT') return { ok: true, backup: serializeDatasourceBackup(await getDatasource()) };
     if (message.type === 'JOB_DATASOURCE_IMPORT') {

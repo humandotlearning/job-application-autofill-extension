@@ -54,6 +54,12 @@ function createResponse(payload, ok = true, status = 200, statusText = 'OK') {
   };
 }
 
+test('planner copy cannot bypass compensation meaning facets', async () => {
+  await assert.rejects(callAnswerPlanner({ apiKey: 'synthetic-key', fields: [{ id: 'pay', label: 'Expected salary', type: 'text' }], records: [{ key: 'current_salary', question: 'Current salary', answer: 'Synthetic explanation', sensitivity: 'review' }] }, {
+    fetchImpl: async () => plannerResponse([{ fieldId: 'pay', action: 'fill', value: 'Synthetic explanation', evidenceKeys: ['current_salary'], confidence: 'high', sensitivity: 'review', reason: 'copy', transformation: 'copy' }]),
+  }), /allowed transformation/);
+});
+
 test('rejects a non-ASCII API key before constructing a request header', async () => {
   let fetchCalls = 0;
   await assert.rejects(

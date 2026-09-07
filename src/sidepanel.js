@@ -152,6 +152,41 @@ function itemRow(item, { focus = false, detail = '' } = {}) {
   else value.textContent = item.reason || 'Review this field';
   content.append(label, value);
   row.append(content);
+  if (item.suggestion) {
+    const origin = item.suggestion;
+    for (const candidate of origin.candidates) {
+      const evidence = document.createElement('div');
+      evidence.className = 'saved-evidence';
+      const source = document.createElement('p');
+      source.textContent = `${candidate.sourceQuestion} — ${candidate.provenance}. ${candidate.reason}`;
+      const editor = document.createElement('textarea');
+      editor.value = candidate.answer;
+      editor.hidden = true;
+      editor.setAttribute('aria-label', `Edit saved answer for ${item.label}`);
+      const use = document.createElement('button');
+      use.type = 'button'; use.textContent = 'Use this saved answer';
+      const edit = document.createElement('button');
+      edit.type = 'button'; edit.textContent = 'Edit and use';
+      const approve = async (answer) => {
+        use.disabled = edit.disabled = true;
+        try {
+          const response = await chrome.runtime.sendMessage({ type: 'JOB_RUN_APPROVE_SUGGESTION', tabId: origin.tabId, frameId: origin.frameId,
+            applicationId: origin.applicationId, pageSignature: origin.pageSignature, fieldId: origin.field.id, handle: origin.field.handle, sourceKey: candidate.sourceKey, ...(answer != null ? { answer } : {}) });
+          if (!response?.ok) throw new Error(response?.error || 'Could not use the saved answer');
+          if (activeTabId === origin.tabId && response.run) renderRun(response.run);
+          setStatus('Approved answer applied and verified. Submission remains manual.');
+        } catch (error) { setStatus(error.message, 'error'); }
+        finally { use.disabled = edit.disabled = false; }
+      };
+      use.addEventListener('click', () => approve());
+      edit.addEventListener('click', () => {
+        if (editor.hidden) { editor.hidden = false; edit.textContent = 'Approve edited answer'; editor.focus(); }
+        else approve(editor.value);
+      });
+      evidence.append(source, answerNode(candidate.answer), editor, use, edit);
+      content.append(evidence);
+    }
+  }
   if (focus && item.fieldId) {
     const button = document.createElement('button');
     button.type = 'button';

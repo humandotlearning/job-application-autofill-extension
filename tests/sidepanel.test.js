@@ -39,7 +39,7 @@ async function setupPanel({
 
   globalThis.window = dom.window;
   globalThis.document = dom.window.document;
-  globalThis.navigator = dom.window.navigator;
+  Object.defineProperty(globalThis, 'navigator', { value: dom.window.navigator, configurable: true, writable: true });
   globalThis.HTMLElement = dom.window.HTMLElement;
   globalThis.HTMLInputElement = dom.window.HTMLInputElement;
   globalThis.Event = dom.window.Event;
@@ -120,6 +120,23 @@ async function setupPanel({
     },
   };
 }
+
+test('panel shows verbatim evidence with captured-origin Use and Edit approval actions', async () => {
+  const suggestion = { tabId: 7, frameId: 3, applicationId: 'run-one', pageSignature: 'page-one', field: { id: 'ml', handle: 'handle-one' }, candidates: [{ sourceKey: 'story', sourceQuestion: 'Saved project', answer: 'Synthetic model project narrative.', provenance: 'user', reason: 'Related ML evidence', kind: 'related' }] };
+  const harness = await setupPanel({ run: { status: 'waiting_user', actionRequired: [{ fieldId: 'ml', label: 'ML experience', suggestion }], optionalUnresolved: [], reviewRequired: [], audit: [] } });
+  try {
+    const doc = harness.dom.window.document;
+    assert.match(doc.querySelector('#action-required-list').textContent, /Saved project/);
+    assert.match(doc.querySelector('#action-required-list').textContent, /Synthetic model project narrative/);
+    const use = [...doc.querySelectorAll('button')].find(button => button.textContent === 'Use this saved answer');
+    assert.ok(use);
+    use.click();
+    await new Promise(resolve => setTimeout(resolve, 0));
+    const sent = harness.sentMessages.find(message => message.type === 'JOB_RUN_APPROVE_SUGGESTION');
+    assert.equal(sent.tabId, 7); assert.equal(sent.frameId, 3); assert.equal(sent.handle, 'handle-one'); assert.equal(sent.sourceKey, 'story');
+    assert.ok([...doc.querySelectorAll('button')].some(button => button.textContent === 'Edit and use'));
+  } finally { harness.cleanup(); }
+});
 
 test('panel renders grouped sections, collapsed details, and status-specific actions', async () => {
   const run = {

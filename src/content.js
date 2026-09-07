@@ -13,8 +13,9 @@ function notifyNavigation() {
   waitForDocumentSettled(document).then(() => chrome.runtime.sendMessage({ type: 'JOB_APP_NAVIGATED' })).catch(() => {});
 }
 
+const CONTENT_VERSION = 'general-reuse-1';
 if (!globalThis.__jobApplicationAutofillInstalled) {
-  globalThis.__jobApplicationAutofillInstalled = true;
+  globalThis.__jobApplicationAutofillInstalled = CONTENT_VERSION;
   const learning = createLearningSession(document, {
     capture: () => collectAnswerRecords(document),
     send: (message) => chrome.runtime.sendMessage(message),
@@ -26,7 +27,7 @@ if (!globalThis.__jobApplicationAutofillInstalled) {
     try {
       switch (message?.type) {
         case 'JOB_APP_PING':
-          sendResponse({ ok: true });
+          sendResponse({ ok: true, version: CONTENT_VERSION });
           break;
         case 'JOB_APP_INSPECT':
           waitForDocumentSettled(document, { minWaitMs: 150, quietMs: 75 }).then(() => sendResponse({ ok: true, inspection: inspectDocument(document) }))

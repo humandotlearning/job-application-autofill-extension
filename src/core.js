@@ -1,3 +1,5 @@
+import { conceptForNormalized } from './concepts.js';
+
 const AUTOCOMPLETE_KEYS = {
   email: ['email'],
   tel: ['phone', 'phone_number', 'mobile'],
@@ -17,19 +19,7 @@ const AUTOCOMPLETE_KEYS = {
 const GENERIC_NAME_LABELS = new Set(['name', 'your name', 'applicant name', 'candidate name']);
 
 export function canonicalConcept(value = '') {
-  const text = normalizeText(value).replace(/^(?:what is |please enter |enter )?(?:your )/, '').replace(/\blinked in\b/g, 'linkedin').replace(/\bgit hub\b/g, 'github');
-  if (GENERIC_NAME_LABELS.has(text)) return 'generic_name';
-  if (/^(?:first|given|forename) name$/.test(text)) return 'first_name';
-  if (/^(?:last|family) name$|^surname$/.test(text)) return 'last_name';
-  if (/^(?:full|complete|legal) name$/.test(text)) return 'full_name';
-  if (/^(?:preferred name|nickname|preferred first name)$/.test(text)) return 'preferred_name';
-  if (/^(?:dob|date of birth|birth date|birthday)$/.test(text)) return 'date_of_birth';
-  if (/^(?:email|email address|e mail)$/.test(text)) return 'email';
-  if (/^(?:phone|phone number|mobile|mobile number|telephone)$/.test(text)) return 'phone';
-  if (/^(?:github|github profile|github url)$/.test(text)) return 'github_url';
-  if (/^(?:linkedin|linkedin profile|linkedin url)$/.test(text)) return 'linkedin_url';
-  if (/^(?:portfolio|portfolio url|personal website|website)$/.test(text)) return 'portfolio_url';
-  return slugify(text);
+  return conceptForNormalized(normalizeText(value));
 }
 
 const SENSITIVITIES = new Set(['safe', 'review', 'legal']);
@@ -102,6 +92,7 @@ export function normalizeAnswerRecord(record = {}) {
   for (const key of ['id', 'concept', 'entityId', 'entityType', 'employmentId', 'context', 'provenance', 'confirmedAt', 'confirmationState', 'pendingAnswer']) {
     if (record[key] != null && String(record[key]).trim()) normalized[key] = String(record[key]).trim();
   }
+  if (Array.isArray(record.evidenceKeys)) normalized.evidenceKeys = uniqueStrings(record.evidenceKeys);
   if (Array.isArray(record.history) && record.history.length) {
     normalized.history = record.history.map((item) => ({
       answer: String(item?.answer ?? '').trim(),
@@ -140,6 +131,7 @@ function candidateLabels(record) {
 export function recordScopeCompatible(field, record) {
   if (record.confirmationState === 'pending') return false;
   if (record.alternatives?.length && record.confirmationState !== 'confirmed') return false;
+  if (record.employmentId && record.employmentId !== field.employmentId) return false;
   const sameEmployment = Boolean(field.employmentId && record.employmentId && field.employmentId === record.employmentId);
   if (field.entityId && record.entityId && field.entityId !== record.entityId && !sameEmployment) return false;
   if (record.entityId && !field.entityId) return false;
@@ -152,9 +144,45 @@ export function recordScopeCompatible(field, record) {
   return true;
 }
 
+export function meaningCompatible(field, record, { numericReview = true } = {}) {
+  const left = normalizeText(field.label || field.question);
+  const right = normalizeText(record.question || record.key);
+  const fieldConcept = canonicalConcept(field.label || field.question || field.name || field.id || '');
+  const recordConcept = canonicalConcept(record.concept || record.key || record.question);
+  const protectedConcepts = ['first_name', 'last_name', 'full_name', 'preferred_name', 'github_url', 'linkedin_url', 'portfolio_url', 'date_of_birth'];
+  if (protectedConcepts.includes(fieldConcept) && recordConcept !== fieldConcept) return false;
+  const locationGranularity = text => /\bcity\b/.test(text) ? 'city' : /\b(location|address)\b/.test(text) ? 'location' : '';
+  const leftLocation = locationGranularity(left);
+  const rightLocation = locationGranularity(right);
+  if (leftLocation && rightLocation && leftLocation !== rightLocation) return false;
+  const compensation = text => /\b(salary|ctc|compensation|pay)\b/.test(text);
+  if (compensation(left) || compensation(right)) {
+    if (!compensation(left) || !compensation(right)) return false;
+    // Period and monetary scale are independent: LPA is annual *lakhs*.
+    const scale = text => /\b(lpa|lakhs?|lacs?)\b/.test(text) ? 'lakh' : /\bmillions?\b/.test(text) ? 'million' : /\bthousands?\b/.test(text) ? 'thousand' : 'unit';
+    const destinationUnspecified = !/\b(lpa|lakhs?|lacs?|millions?|thousands?|usd|inr|eur|gbp|annual|annually|yearly|monthly|hourly)\b/.test(left);
+    const reviewUnspecified = !numericReview && destinationUnspecified;
+    if (!reviewUnspecified && scale(left) !== scale(right)) return false;
+    const answerScale = scale(normalizeText(record.answer));
+    if (!reviewUnspecified && answerScale !== 'unit' && answerScale !== scale(left)) return false;
+    const facet = (text, pattern) => text.match(pattern)?.[0] || '';
+    for (const pattern of [/\b(current|expected|desired|previous)\b/, /\b(fixed|base|variable|total)\b/, /\b(usd|inr|eur|gbp)\b/, /\b(annual|annually|yearly|monthly|hourly|lpa)\b/]) {
+      const canonical = value => ({ desired: 'expected', base: 'fixed', annually: 'annual', yearly: 'annual', lpa: 'annual' }[value] || value);
+      const a = canonical(facet(left, pattern));
+      const b = canonical(facet(right, pattern));
+      if (a !== b && (a && b || /fixed|variable/.test(a + b))) return false;
+      const amount = String(record.answer).trim().replace(/\b(?:USD|INR|EUR|GBP|LPA|lakhs?|lacs?|millions?|thousands?|annual(?:ly)?|yearly|monthly|hourly|per|annum|year|month|hour)\b/gi, '').replace(/[\p{Sc},\s]/gu, '');
+      if (numericReview && /^[+-]?\d+(?:\.\d+)?$/.test(amount) && a !== b) return false;
+    }
+  }
+  const family = text => /notice/.test(text) ? 'notice' : /start date|date available/.test(text) ? 'date' : /relocat|willing|work in/.test(text) ? 'relocation' : /current location|current city/.test(text) ? 'location' : '';
+  if (family(left) && family(right) && family(left) !== family(right)) return false;
+  return true;
+}
+
 export function chooseRecord(field = {}, records = []) {
   if (!Array.isArray(records) || records.length === 0) return null;
-  records = records.filter((record) => recordScopeCompatible(field, record));
+  records = records.filter((record) => recordScopeCompatible(field, record) && meaningCompatible(field, record));
   const fieldTexts = [field.label, field.name, field.id, field.placeholder]
     .map(normalizeText)
     .filter(Boolean);
@@ -170,7 +198,7 @@ export function chooseRecord(field = {}, records = []) {
   }
   if (fieldConcept) {
     const conceptCandidates = records.filter((record) => String(record.answer ?? '').trim()
-      && canonicalConcept(record.concept || record.key || record.question) === fieldConcept);
+      && [record.concept, record.key, record.question, ...(record.aliases || [])].filter(Boolean).some(label => canonicalConcept(label) === fieldConcept));
     if (conceptCandidates.length > 1 && !unambiguous(conceptCandidates)) return null;
     const conceptMatch = unambiguous(conceptCandidates);
     if (conceptMatch) return { record: conceptMatch, confidence: 'high', score: 1, reason: `concept:${fieldConcept}` };

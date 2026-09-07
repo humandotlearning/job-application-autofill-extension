@@ -1,4 +1,4 @@
-import { canonicalConcept, inferSensitivity, normalizeText, recordScopeCompatible } from './core.js';
+import { canonicalConcept, inferSensitivity, normalizeText, recordScopeCompatible, meaningCompatible } from './core.js';
 
 const RESPONSE_URL = 'https://api.openai.com/v1/responses';
 export const DEFAULT_MODEL = 'gpt-5.6-terra';
@@ -253,7 +253,7 @@ function hasEvidenceForValue(field, value, evidenceKeys, records, transformation
   const fieldConcept = canonicalConcept(field?.label || field?.id || '');
   const protectedConcepts = ['first_name', 'last_name', 'full_name', 'preferred_name', 'generic_name', 'github_url', 'linkedin_url', 'portfolio_url', 'date_of_birth'];
   const evidence = records
-    .filter((record) => evidenceKeys.includes(record.key) && recordScopeCompatible(field, record))
+    .filter((record) => evidenceKeys.includes(record.key) && recordScopeCompatible(field, record) && (protectedConcepts.includes(fieldConcept) || meaningCompatible(field, record)))
     .filter((record) => {
       if (!protectedConcepts.includes(fieldConcept)) return true;
       const concept = canonicalConcept(record.concept || record.question || record.key);

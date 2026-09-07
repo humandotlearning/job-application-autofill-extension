@@ -16,6 +16,87 @@ function makeDocument(html) {
   return new JSDOM(html, { url: 'https://jobs.example.com/apply' }).window.document;
 }
 
+test('fills a custom dropdown identified by a linked label', async () => {
+  const document = makeDocument('<form><label id="country-label" for="country">Country</label><button type="button" id="country" role="combobox" aria-labelledby="country-label" aria-controls="countries">Select one</button><div id="countries" role="listbox"><div role="option">India</div></div></form>');
+  const button = document.getElementById('country');
+  document.querySelector('[role="option"]').onclick = () => { button.textContent = 'India'; };
+  const fields = collectFieldDescriptors(document);
+  assert.equal(fields.length, 1);
+  const result = await applyDecisions(document, planDeterministicFill(fields, [{ key: 'country', answer: 'India', sensitivity: 'safe' }]));
+  assert.equal(result.applied.length, 1);
+  assert.equal(button.textContent, 'India');
+});
+
+test('selects a SuccessFactors numbered degree option through aria-owns', async () => {
+  const document = makeDocument('<main><input id="354:_input" aria-label="Degree" role="combobox" aria-owns="355:_listSelect" aria-expanded="false" placeholder="No Selection"></main>');
+  const input = document.getElementById('354:_input');
+  input.onclick = () => {
+    input.setAttribute('aria-expanded', 'true');
+    const list = document.createElement('ul');
+    list.id = '355:_listSelect';
+    list.className = 'sf-list-select';
+    list.setAttribute('role', 'listbox');
+    list.innerHTML = '<li role="option"><a role="menuitem">No Selection</a></li><li role="option"><a role="menuitem">4 - Bachelor\'s degree</a></li>';
+    list.lastChild.onclick = () => {
+      input.value = "4 - Bachelor's degree";
+      input.setAttribute('aria-expanded', 'false');
+      list.remove();
+    };
+    document.body.append(list);
+  };
+  const result = await applyDecisions(document, [{ fieldId: input.id, action: 'fill', value: "Bachelor's degree", sensitivity: 'safe', confidence: 'high' }]);
+  assert.equal(result.applied.length, 1);
+  assert.equal(input.value, "4 - Bachelor's degree");
+});
+
+test('leaves ambiguous numbered dropdown labels unresolved', async () => {
+  const document = makeDocument('<form><button id="degree" type="button" role="combobox" aria-label="Degree" aria-expanded="true" aria-controls="degrees">Select one</button><ul id="degrees" class="sf-list-select" role="listbox"><li role="option">4 - Bachelor\'s degree</li><li role="option">5 - Bachelor\'s degree</li></ul></form>');
+  let selections = 0;
+  document.querySelectorAll('[role="option"]').forEach((option) => { option.onclick = () => { selections += 1; }; });
+  const result = await applyDecisions(document, [{ fieldId: 'degree', action: 'fill', value: "Bachelor's degree" }]);
+  assert.equal(result.applied.length, 0);
+  assert.equal(result.unresolved.length, 1);
+  assert.equal(selections, 0);
+});
+
+test('uses an already open dropdown without toggling it closed', async () => {
+  const document = makeDocument('<form><button id="country" type="button" role="combobox" aria-label="Country" aria-expanded="true" aria-controls="countries">Select one</button><ul id="countries" role="listbox"><li role="option">India</li></ul></form>');
+  const button = document.getElementById('country');
+  button.onclick = () => { document.getElementById('countries').remove(); };
+  document.querySelector('[role="option"]').onclick = () => { button.textContent = 'India'; };
+  const result = await applyDecisions(document, [{ fieldId: 'country', action: 'fill', value: 'India' }]);
+  assert.equal(result.applied.length, 1);
+  assert.equal(button.textContent, 'India');
+});
+
+test('replaces a disabled native dropdown placeholder with a real selection', async () => {
+  const document = makeDocument('<form><label for="country">Country</label><select id="country"><option disabled selected>Select country</option><option value="IN">India</option></select></form>');
+  const result = await applyDecisions(document, planDeterministicFill(collectFieldDescriptors(document), [{ key: 'country', answer: 'India', sensitivity: 'safe' }]));
+  assert.equal(result.applied.length, 1);
+  assert.equal(document.getElementById('country').value, 'IN');
+});
+
+test('waits for searchable dropdown results even when initial options are present', async () => {
+  const document = makeDocument('<form><input id="country" role="combobox" aria-label="Country" aria-autocomplete="list" aria-controls="countries" aria-expanded="true"><div id="countries" role="listbox"><div role="option">Canada</div></div></form>');
+  const input = document.getElementById('country');
+  input.addEventListener('input', () => {
+    if (input.value !== 'India') return;
+    setTimeout(() => {
+      const list = document.getElementById('countries');
+      list.innerHTML = '<div role="option">India</div>';
+      list.firstChild.onclick = () => {
+        input.value = 'India';
+        input.setAttribute('aria-expanded', 'false');
+        list.remove();
+      };
+    }, 100);
+  }, { once: true });
+  const result = await applyDecisions(document, planDeterministicFill(collectFieldDescriptors(document), [{ key: 'country', answer: 'India', sensitivity: 'safe' }]));
+  assert.equal(result.applied.length, 1);
+  assert.equal(input.getAttribute('aria-expanded'), 'false');
+  assert.equal(collectFieldDescriptors(document)[0].currentValue, 'India');
+});
+
 test('describes supported fields without passwords or hidden inputs', () => {
   const document = makeDocument(`
     <form>
@@ -75,7 +156,7 @@ test('prefers the nearby Workday question label over a placeholder aria-label fo
       <fieldset>
         <legend>Highest Level of Education</legend>
         <div class="workday-field">
-          <button id="education" name="education" aria-haspopup="listbox" aria-label="Select One Required">Select One</button>
+          <button type="button" id="education" name="education" aria-haspopup="listbox" aria-label="Select One Required">Select One</button>
           <input type="text" value="" aria-hidden="true">
         </div>
       </fieldset>
@@ -92,7 +173,7 @@ test('extracts an associated Workday label before its verbose button aria-label'
   const document = makeDocument(`
     <form>
       <label for="degree">Degree</label>
-      <button id="degree" name="degree" aria-haspopup="listbox" aria-label="Degree University or College Diploma; Undergraduate or Bachelor’s Degree Required">Select One</button>
+      <button type="button" id="degree" name="degree" aria-haspopup="listbox" aria-label="Degree University or College Diploma; Undergraduate or Bachelor’s Degree Required">Select One</button>
       <input type="text" value="" aria-hidden="true">
     </form>
   `);
