@@ -52,6 +52,41 @@ let currentRun = null;
 let busy = false;
 let saving = false;
 const correctionDrafts = new Map();
+const drafts = new Map();
+
+function draftKey(origin, fieldId) {
+  return [origin?.applicationId || '', origin?.pageSignature || '', fieldId || ''].join(':');
+}
+
+function draftFor(origin, fieldId) {
+  const key = draftKey(origin, fieldId);
+  if (!drafts.has(key)) drafts.set(key, { answer: '', sourceKey: null, sourceKeys: [], candidateKind: null, editing: false });
+  return drafts.get(key);
+}
+
+function clearDraft(origin, fieldId) {
+  drafts.delete(draftKey(origin, fieldId));
+}
+
+function discardStaleDrafts(run) {
+  const origin = `${run?.applicationId || ''}:${run?.pageSignature || ''}:`;
+  for (const key of drafts.keys()) {
+    if (!run || !key.startsWith(origin)) drafts.delete(key);
+  }
+}
+
+function fieldOrigin(item) {
+  const suggestion = item.suggestion || {};
+  const field = suggestion.field || {};
+  return {
+    tabId: suggestion.tabId ?? activeTabId,
+    frameId: suggestion.frameId ?? item.frameId ?? currentRun?.frameId ?? currentRun?.frame?.id,
+    applicationId: suggestion.applicationId ?? currentRun?.applicationId,
+    pageSignature: suggestion.pageSignature ?? currentRun?.pageSignature,
+    fieldId: field.id ?? item.fieldId,
+    handle: field.handle ?? item.handle,
+  };
+}
 
 function setSaveFeedback(message = '', state = '') {
   elements.saveFeedback.textContent = message;
@@ -85,13 +120,29 @@ function renderLearnedChanges(records) {
     const previous = document.createElement('p');
     previous.className = 'change-history';
     const values = [...new Set([...(record.history || []).map((item) => item.answer), ...(record.alternatives || [])])];
-    previous.textContent = `${record.confirmationState === 'pending' ? 'Needs confirmation. ' : 'Saved locally. '}${record.context || ''}${values.length ? ` Previous or alternate values: ${values.join('; ')}` : ''}`;
+    const readableValues = values.filter((value) => !isOpaqueIdentifier(value));
+    const context = isOpaqueIdentifier(record.context) ? '' : String(record.context || '');
+    previous.textContent = `${record.confirmationState === 'pending' ? 'Needs confirmation. ' : 'Saved locally. '}${context}${readableValues.length ? ` Previous or alternate values: ${readableValues.join('; ')}` : ''}`;
+    const hiddenValues = [...new Set([record.answer, record.pendingAnswer, ...values].filter((value) => isOpaqueIdentifier(value)))];
+    if (hiddenValues.length) {
+      if (previous.textContent && !/\s$/.test(previous.textContent)) previous.append(document.createTextNode(' '));
+      previous.append(document.createTextNode('Internal value hidden: '));
+      hiddenValues.forEach((value, index) => {
+        if (index) previous.append(document.createTextNode(' '));
+        previous.append(internalIdDisclosure(value, 'Internal answer ID'));
+      });
+    }
+    if (!previous.textContent) previous.textContent = 'Saved locally.';
     const correction = document.createElement('div');
     correction.className = 'correction-row';
     const input = document.createElement('input');
-    input.value = correctionDrafts.has(record.key) ? correctionDrafts.get(record.key) : record.pendingAnswer || record.answer;
+    const initialValue = correctionDrafts.has(record.key) ? correctionDrafts.get(record.key) : record.pendingAnswer || record.answer || '';
+    input.value = isOpaqueIdentifier(initialValue) ? '' : String(initialValue);
+    if (isOpaqueIdentifier(initialValue)) input.placeholder = 'Enter a readable answer to replace the hidden internal value';
     input.addEventListener('input', () => correctionDrafts.set(record.key, input.value));
-    input.setAttribute('aria-label', `Correct ${record.question}`);
+    const question = String(record.question || record.key || 'this saved field');
+    const readableQuestion = isOpaqueIdentifier(question) ? 'this saved field' : question;
+    input.setAttribute('aria-label', `Correct ${readableQuestion}`);
     const button = document.createElement('button');
     button.type = 'button';
     button.textContent = 'Confirm value';
@@ -120,8 +171,114 @@ function truncateAnswer(answer, limit = 180) {
   return `${text.slice(0, limit).trimEnd()}…`;
 }
 
-function isOpaqueAnswer(answer) {
-  return /^[a-f\d]{24,}$/i.test(String(answer ?? '').trim());
+function isOpaqueIdentifier(value) {
+  const text = String(value ?? '').trim();
+  const distinctHexCharacters = new Set(text.toLowerCase()).size;
+  const looksLikeHexHash = /^[a-f\d]{24,}$/i.test(text) && (/\d/.test(text) || distinctHexCharacters >= 3);
+  return looksLikeHexHash
+    || /^(?:[a-z][a-z\d_-]*\|)?[a-f\d]{8}-[a-f\d]{4}-[a-f\d]{4}-[a-f\d]{4}-[a-f\d]{12}(?:\[[a-z\d_-]+\])?$/i.test(text);
+}
+
+let internalIdCounter = 0;
+
+function internalIdDisclosure(value, label = 'Internal ID') {
+  const wrapper = document.createElement('span');
+  wrapper.className = 'internal-id';
+  wrapper.dataset.internalId = 'true';
+  const popoverId = `internal-id-${++internalIdCounter}`;
+  const trigger = document.createElement('button');
+  trigger.type = 'button';
+  trigger.className = 'internal-id-trigger';
+  trigger.textContent = 'i';
+  trigger.title = `Show ${label.toLowerCase()}`;
+  trigger.setAttribute('aria-label', `Show ${label.toLowerCase()}`);
+  trigger.setAttribute('aria-expanded', 'false');
+  trigger.setAttribute('aria-controls', popoverId);
+  trigger.dataset.internalIdTrigger = 'true';
+  const popover = document.createElement('span');
+  popover.className = 'internal-id-popover';
+  popover.id = popoverId;
+  popover.hidden = true;
+  popover.setAttribute('role', 'dialog');
+  popover.setAttribute('aria-label', label);
+  popover.dataset.internalIdPopover = 'true';
+  const popoverLabel = document.createElement('span');
+  popoverLabel.className = 'internal-id-label';
+  popoverLabel.textContent = label;
+  const raw = document.createElement('code');
+  raw.className = 'internal-id-value';
+  raw.dataset.internalValue = 'true';
+  raw.textContent = String(value ?? '');
+  const copy = document.createElement('button');
+  copy.type = 'button';
+  copy.className = 'internal-id-copy';
+  copy.textContent = 'Copy ID';
+  copy.dataset.copyInternalId = 'true';
+  copy.addEventListener('click', async () => {
+    try {
+      if (!navigator.clipboard?.writeText) throw new Error('Clipboard unavailable');
+      await navigator.clipboard.writeText(String(value ?? ''));
+      copy.textContent = 'Copied';
+      copy.dataset.state = 'success';
+    } catch {
+      copy.textContent = 'Select ID to copy';
+      copy.dataset.state = 'error';
+    }
+  });
+  popover.append(popoverLabel, raw, copy);
+  const setOpen = (open) => {
+    popover.hidden = !open;
+    trigger.setAttribute('aria-expanded', String(open));
+  };
+  let pointerDown = false;
+  let focusOpened = false;
+  let suppressFocusOpen = false;
+  trigger.addEventListener('pointerdown', () => { pointerDown = true; });
+  trigger.addEventListener('click', () => {
+    // Pointer focus fires before click; avoid opening and immediately closing
+    // the popover in that sequence. Programmatic clicks after focus should
+    // likewise leave a focus-opened disclosure available to inspect.
+    if (pointerDown) {
+      focusOpened = false;
+      setOpen(popover.hidden);
+      pointerDown = false;
+    } else if (focusOpened) {
+      focusOpened = false;
+      setOpen(true);
+    } else setOpen(popover.hidden);
+  });
+  trigger.addEventListener('focus', () => {
+    if (!pointerDown && !suppressFocusOpen) {
+      focusOpened = true;
+      setOpen(true);
+    }
+  });
+  trigger.addEventListener('blur', () => { focusOpened = false; pointerDown = false; });
+  trigger.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape') {
+      focusOpened = false;
+      setOpen(false);
+      suppressFocusOpen = true;
+      trigger.focus();
+      suppressFocusOpen = false;
+    }
+    if (event.key === 'Enter' || event.key === ' ') {
+      event.preventDefault();
+      focusOpened = false;
+      setOpen(popover.hidden);
+    }
+  });
+  popover.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape') {
+      focusOpened = false;
+      setOpen(false);
+      suppressFocusOpen = true;
+      trigger.focus();
+      suppressFocusOpen = false;
+    }
+  });
+  wrapper.append(trigger, popover);
+  return wrapper;
 }
 
 function answerNode(answer) {
@@ -142,66 +299,241 @@ function answerNode(answer) {
   return details;
 }
 
+function answerWorkspace(item, displayLabel) {
+  const origin = fieldOrigin(item);
+  const state = draftFor(origin, origin.fieldId);
+  const workspace = document.createElement('section');
+  workspace.className = 'answer-workspace';
+  const workspaceLabel = document.createElement('label');
+  workspaceLabel.textContent = 'Answer to send to the form';
+  const textarea = document.createElement('textarea');
+  textarea.className = 'answer-draft';
+  textarea.dataset.answerDraft = 'true';
+  textarea.value = state.answer;
+  textarea.placeholder = item.suggestion ? 'Choose a saved answer, or write your own.' : 'Write the answer you want to send to the form.';
+  textarea.setAttribute('aria-label', `Answer for ${displayLabel}`);
+  textarea.readOnly = Boolean(item.suggestion && !state.editing);
+  workspaceLabel.htmlFor = `answer-draft-${draftKey(origin, origin.fieldId)}`;
+  textarea.id = workspaceLabel.htmlFor;
+
+  const controls = document.createElement('div');
+  controls.className = 'answer-workspace-controls';
+  const edit = document.createElement('button');
+  edit.type = 'button';
+  edit.dataset.editAnswer = 'true';
+  edit.textContent = 'Edit';
+  const useEdited = document.createElement('button');
+  useEdited.type = 'button';
+  useEdited.dataset.useEditedAnswer = 'true';
+  useEdited.textContent = 'Use edited answer';
+  useEdited.hidden = !state.editing;
+  const rewrite = document.createElement('button');
+  rewrite.type = 'button';
+  rewrite.dataset.rewriteAnswer = 'true';
+  rewrite.textContent = 'Ask AI to rewrite';
+  const send = document.createElement('button');
+  send.type = 'button';
+  send.dataset.sendAnswer = 'true';
+  send.textContent = 'Send to form';
+  send.className = 'answer-send';
+
+  const promptRow = document.createElement('div');
+  promptRow.className = 'rewrite-prompt-row';
+  promptRow.hidden = true;
+  const prompt = document.createElement('textarea');
+  prompt.dataset.rewritePrompt = 'true';
+  prompt.maxLength = 1000;
+  prompt.placeholder = 'For example: make this more concise and confident.';
+  prompt.setAttribute('aria-label', `Rewrite instruction for ${displayLabel}`);
+  const submitRewrite = document.createElement('button');
+  submitRewrite.type = 'button';
+  submitRewrite.dataset.submitRewrite = 'true';
+  submitRewrite.textContent = 'Rewrite draft';
+  promptRow.append(prompt, submitRewrite);
+
+  const updateControls = () => {
+    const hasAnswer = Boolean(state.answer.trim()) && !isOpaqueIdentifier(state.answer);
+    textarea.readOnly = Boolean(item.suggestion && !state.editing);
+    edit.disabled = !state.answer.trim();
+    useEdited.hidden = !state.editing;
+    rewrite.disabled = !state.answer.trim();
+    submitRewrite.disabled = !state.answer.trim() || !prompt.value.trim();
+    send.disabled = !hasAnswer;
+  };
+  textarea.addEventListener('input', () => {
+    state.answer = textarea.value;
+    state.sourceKey = state.sourceKey || null;
+    updateControls();
+  });
+  edit.addEventListener('click', () => {
+    state.editing = true;
+    textarea.readOnly = false;
+    updateControls();
+    textarea.focus();
+  });
+  useEdited.addEventListener('click', () => {
+    state.answer = textarea.value;
+    state.editing = false;
+    updateControls();
+    setStatus('Edited answer is ready. Send it to the form when you are ready.');
+  });
+  rewrite.addEventListener('click', () => {
+    promptRow.hidden = false;
+    prompt.focus();
+  });
+  prompt.addEventListener('input', updateControls);
+  submitRewrite.addEventListener('click', async () => {
+    const instruction = prompt.value.trim();
+    if (!instruction || !state.answer.trim()) return;
+    const buttons = [edit, useEdited, rewrite, send, submitRewrite];
+    buttons.forEach((button) => { button.disabled = true; });
+    try {
+      const response = await chrome.runtime.sendMessage({ type: 'JOB_RUN_REWRITE_ANSWER', ...origin,
+        fieldId: origin.fieldId, draft: state.answer, sourceKey: state.sourceKey, sourceKeys: state.sourceKeys,
+        question: displayLabel, instruction });
+      if (!response?.ok || typeof response.answer !== 'string') throw new Error(response?.error || 'Could not rewrite the answer.');
+      state.answer = response.answer;
+      state.editing = false;
+      textarea.value = state.answer;
+      setStatus('Draft rewritten. Review or edit it before sending it to the form.');
+    } catch (error) { setStatus(error.message, 'error'); }
+    finally { updateControls(); }
+  });
+  send.addEventListener('click', async () => {
+    const answer = state.answer.trim();
+    if (!answer || isOpaqueIdentifier(answer)) return;
+    const buttons = [edit, useEdited, rewrite, send, submitRewrite];
+    buttons.forEach((button) => { button.disabled = true; });
+    try {
+      const type = state.sourceKey ? 'JOB_RUN_APPROVE_SUGGESTION' : 'JOB_RUN_APPLY_DRAFT';
+      const response = await chrome.runtime.sendMessage({ type, ...origin, fieldId: origin.fieldId, answer,
+        ...(state.sourceKey ? { sourceKey: state.sourceKey, sourceKeys: state.sourceKeys } : {}) });
+      if (!response?.ok) throw new Error(response?.error || 'Could not send the answer to the form.');
+      clearDraft(origin, origin.fieldId);
+      if (response.run) renderRun(response.run);
+      setStatus('Answer applied and verified. Submission remains manual.');
+    } catch (error) { setStatus(error.message, 'error'); }
+    finally { updateControls(); }
+  });
+  controls.append(edit, useEdited, rewrite, send);
+  workspace.append(workspaceLabel, textarea, controls, promptRow);
+  updateControls();
+  return { workspace, state, origin, updateControls };
+}
+
 function itemRow(item, { focus = false, detail = '' } = {}) {
   const row = document.createElement('div');
   row.className = 'result-item';
   const content = document.createElement('div');
-  const hasOpaqueSuggestion = Boolean(item.suggestion?.candidates?.some((candidate) => isOpaqueAnswer(candidate.answer)));
-  const label = document.createElement('span');
+  const candidates = Array.isArray(item.suggestion?.candidates) ? item.suggestion.candidates : [];
+  const readableCandidates = candidates.filter((candidate) => !isOpaqueIdentifier(candidate.answer));
+  const onlyOpaqueSuggestions = candidates.length > 0 && readableCandidates.length === 0;
+  const labelCandidates = [item.label, item.question, item.fieldId].filter(Boolean).map((value) => String(value));
+  const rawLabel = labelCandidates.find((value) => isOpaqueIdentifier(value));
+  const displayLabel = labelCandidates.find((value) => !isOpaqueIdentifier(value)) || (rawLabel ? 'Form question' : 'Field');
+  const itemValue = item.value ?? item.answer;
+  const hasOpaqueValue = isOpaqueIdentifier(itemValue);
+  const fieldAction = focus && item.fieldId
+    ? onlyOpaqueSuggestions
+      ? `Choose a value for ${displayLabel} on the application page, then click Check again.`
+      : hasOpaqueValue
+        ? 'This saved value is an internal ID and cannot be used automatically.'
+        : itemValue
+          ? 'Update this value on the application page, then click Check again.'
+          : 'Enter or select an answer on the application page, then click Check again.'
+    : '';
+  const hasPrimaryDetail = Boolean(detail || onlyOpaqueSuggestions || itemValue || fieldAction);
+  const label = document.createElement('h3');
   label.className = 'result-label';
-  label.textContent = item.label || item.question || item.fieldId || 'Field';
+  label.textContent = displayLabel;
+  if (rawLabel) label.append(document.createTextNode(' '), internalIdDisclosure(rawLabel, 'Internal field ID'));
   const value = document.createElement('span');
   value.className = 'result-detail';
   if (detail) value.textContent = detail;
-  else if (hasOpaqueSuggestion) value.textContent = `Choose a value for ${label.textContent} on the application page, then click Check again.`;
-  else if (item.value || item.answer) value.append(answerNode(item.value ?? item.answer));
-  else value.textContent = item.reason || 'Review this field';
+  else if (onlyOpaqueSuggestions) value.textContent = fieldAction;
+  else if (hasOpaqueValue) {
+    value.append(document.createTextNode(`${fieldAction || 'This saved value is an internal ID and cannot be used automatically.'} `));
+    value.append(internalIdDisclosure(itemValue, 'Internal answer ID'));
+  } else if (itemValue) value.append(answerNode(itemValue));
+  else value.textContent = fieldAction || item.reason || 'Review this field';
   content.append(label, value);
-  row.append(content);
-  if (item.suggestion) {
-    const origin = item.suggestion;
-    for (const candidate of origin.candidates) {
-      if (isOpaqueAnswer(candidate.answer)) continue;
-      const evidence = document.createElement('div');
-      evidence.className = 'saved-evidence';
-      const source = document.createElement('p');
-      source.textContent = `${candidate.sourceQuestion} — ${candidate.provenance}.${candidate.reason ? ` ${candidate.reason}` : ''}`;
-      const editor = document.createElement('textarea');
-      editor.value = candidate.answer;
-      editor.hidden = true;
-      editor.setAttribute('aria-label', `Edit saved answer for ${item.label}`);
-      const use = document.createElement('button');
-      use.type = 'button'; use.textContent = 'Use this saved answer';
-      const edit = document.createElement('button');
-      edit.type = 'button'; edit.textContent = 'Edit and use';
-      const approve = async (answer) => {
-        use.disabled = edit.disabled = true;
-        try {
-          const response = await chrome.runtime.sendMessage({ type: 'JOB_RUN_APPROVE_SUGGESTION', tabId: origin.tabId, frameId: origin.frameId,
-            applicationId: origin.applicationId, pageSignature: origin.pageSignature, fieldId: origin.field.id, handle: origin.field.handle, sourceKey: candidate.sourceKey, ...(answer != null ? { answer } : {}) });
-          if (!response?.ok) throw new Error(response?.error || 'Could not use the saved answer');
-          if (activeTabId === origin.tabId && response.run) renderRun(response.run);
-          setStatus('Approved answer applied and verified. Submission remains manual.');
-        } catch (error) { setStatus(error.message, 'error'); }
-        finally { use.disabled = edit.disabled = false; }
-      };
-      use.addEventListener('click', () => approve());
-      edit.addEventListener('click', () => {
-        if (editor.hidden) { editor.hidden = false; edit.textContent = 'Approve edited answer'; editor.focus(); }
-        else approve(editor.value);
-      });
-      evidence.append(source, answerNode(candidate.answer), editor, use, edit);
-      content.append(evidence);
-    }
+  if (item.reason && hasPrimaryDetail) {
+    const reason = document.createElement('p');
+    reason.className = 'result-reason';
+    reason.textContent = item.reason;
+    content.append(reason);
   }
+  if (fieldAction && itemValue && !hasOpaqueValue && !onlyOpaqueSuggestions) {
+    const nextAction = document.createElement('p');
+    nextAction.className = 'result-next-action';
+    nextAction.textContent = fieldAction;
+    content.append(nextAction);
+  }
+
   if (focus && item.fieldId) {
     const button = document.createElement('button');
     button.type = 'button';
     button.className = 'inline-action';
     button.dataset.fieldId = item.fieldId;
     button.textContent = 'Show on page';
-    row.append(button);
+    content.append(button);
   }
+  const workspace = focus && item.fieldId && !onlyOpaqueSuggestions ? answerWorkspace(item, displayLabel) : null;
+  if (workspace) content.append(workspace.workspace);
+  if (item.suggestion) {
+    for (const candidate of candidates) {
+      const evidence = document.createElement('div');
+      evidence.className = 'saved-evidence';
+      const source = document.createElement('p');
+      source.className = 'saved-evidence-source';
+      const sourceQuestion = String(candidate.sourceQuestion || 'Saved answer');
+      if (isOpaqueIdentifier(sourceQuestion)) {
+        source.append(document.createTextNode(`Saved answer from a previous form — ${candidate.provenance || 'saved record'}. `));
+        source.append(internalIdDisclosure(sourceQuestion, 'Internal source ID'));
+      } else source.textContent = `${sourceQuestion} — ${candidate.provenance || 'saved record'}.`;
+      if (candidate.reason) source.append(document.createTextNode(` ${candidate.reason}`));
+      if (isOpaqueIdentifier(candidate.answer)) {
+        const unavailable = document.createElement('p');
+        unavailable.className = 'result-detail';
+        unavailable.append(document.createTextNode('Saved value is an internal ID and cannot be used automatically. '));
+        unavailable.append(internalIdDisclosure(candidate.answer, 'Internal answer ID'));
+        evidence.append(source, unavailable);
+        content.append(evidence);
+        continue;
+      }
+      const choose = document.createElement('button');
+      choose.type = 'button';
+      choose.dataset.chooseAnswer = 'true';
+      choose.textContent = 'Choose this answer';
+      choose.addEventListener('click', () => {
+        if (!workspace) return;
+        workspace.state.answer = String(candidate.answer || '');
+        workspace.state.sourceKey = candidate.sourceKey || null;
+        workspace.state.sourceKeys = Array.isArray(candidate.sourceKeys) ? candidate.sourceKeys : (candidate.sourceKey ? [candidate.sourceKey] : []);
+        workspace.state.candidateKind = candidate.kind || null;
+        workspace.state.editing = false;
+        const draft = workspace.workspace.querySelector('[data-answer-draft]');
+        draft.value = workspace.state.answer;
+        workspace.updateControls();
+        setStatus('Saved answer selected. Review or edit it before sending it to the form.');
+      });
+      evidence.append(source, answerNode(candidate.answer), choose);
+      // Keep legacy controls hidden so older panel clients do not lose their
+      // queued action while the visible workflow requires explicit selection.
+      const legacyUse = document.createElement('button');
+      legacyUse.type = 'button'; legacyUse.hidden = true; legacyUse.textContent = 'Use this saved answer';
+      legacyUse.addEventListener('click', async () => {
+        const origin = fieldOrigin(item);
+        const response = await chrome.runtime.sendMessage({ type: 'JOB_RUN_APPROVE_SUGGESTION', ...origin, fieldId: origin.fieldId, sourceKey: candidate.sourceKey });
+        if (!response?.ok) setStatus(response?.error || 'Could not use the saved answer.', 'error');
+      });
+      const legacyEdit = document.createElement('button');
+      legacyEdit.type = 'button'; legacyEdit.hidden = true; legacyEdit.textContent = 'Edit and use';
+      evidence.append(legacyUse, legacyEdit);
+      content.append(evidence);
+    }
+  }
+  row.append(content);
   return row;
 }
 
@@ -211,7 +543,25 @@ function renderList(container, items, options = {}) {
     container.append(itemRow({ label: options.emptyLabel || 'None' }, { detail: options.emptyDetail || 'Nothing to review.' }));
     return;
   }
-  for (const item of items) container.append(itemRow(item, options));
+  const ordered = items.map((item, index) => ({ item, index })).sort((left, right) => {
+    const leftGeneric = !left.item.fieldId && !left.item.key && !left.item.question;
+    const rightGeneric = !right.item.fieldId && !right.item.key && !right.item.question;
+    if (leftGeneric !== rightGeneric) return leftGeneric ? 1 : -1;
+    const leftPage = Number.isFinite(left.item.pageNumber) ? left.item.pageNumber : null;
+    const rightPage = Number.isFinite(right.item.pageNumber) ? right.item.pageNumber : null;
+    if (leftPage !== rightPage) {
+      if (leftPage == null) return 1;
+      if (rightPage == null) return -1;
+      return leftPage - rightPage;
+    }
+    const leftOrder = Number.isFinite(left.item.formOrder) ? left.item.formOrder : null;
+    const rightOrder = Number.isFinite(right.item.formOrder) ? right.item.formOrder : null;
+    if (leftOrder != null && rightOrder != null && leftOrder !== rightOrder) return leftOrder - rightOrder;
+    if (leftOrder != null && rightOrder == null) return -1;
+    if (leftOrder == null && rightOrder != null) return 1;
+    return left.index - right.index;
+  });
+  for (const { item } of ordered) container.append(itemRow(item, options));
 }
 
 function setActionVisibility(run) {
@@ -243,6 +593,9 @@ function setActionVisibility(run) {
 }
 
 function renderRun(run) {
+  const previousOrigin = `${currentRun?.applicationId || ''}:${currentRun?.pageSignature || ''}`;
+  const nextOrigin = `${run?.applicationId || ''}:${run?.pageSignature || ''}`;
+  if (previousOrigin !== nextOrigin || !run) discardStaleDrafts(run);
   if (currentRun?.startedAt !== run?.startedAt || currentRun?.pageNumber !== run?.pageNumber || currentRun?.frame?.pathname !== run?.frame?.pathname || !run) {
     setSaveFeedback();
   }
@@ -261,10 +614,7 @@ function renderRun(run) {
     return;
   }
 
-  const rawActionRequired = run.actionRequired || run.unresolved || [];
-  const actionRequired = rawActionRequired.some((item) => item.fieldId)
-    ? rawActionRequired.filter((item) => item.fieldId || item.code !== 'unsupported_widget')
-    : rawActionRequired;
+  const actionRequired = run.actionRequired || run.unresolved || [];
   const optionalUnresolved = run.optionalUnresolved || [];
   const reviewRequired = run.reviewRequired || [];
   const audit = run.audit || [];
@@ -288,8 +638,11 @@ function renderRun(run) {
   renderList(elements.auditList, audit, { detail: '' });
 
   if (run.status === 'waiting_user') {
-    const label = run.waitingLabel ? ` Focus: ${run.waitingLabel}.` : '';
-    elements.runHint.textContent = `Complete the highlighted field or handle the manual step, then check again.${label}`;
+    const waitingLabel = String(run.waitingLabel || '').trim();
+    const visibleWaitingLabel = waitingLabel && !isOpaqueIdentifier(waitingLabel) ? waitingLabel : '';
+    elements.runHint.textContent = visibleWaitingLabel
+      ? `Complete “${visibleWaitingLabel}” on the application page, then click Check again.`
+      : 'Complete the highlighted field or handle the manual step, then click Check again.';
     setStatus(run.llmError ? `Answer planner unavailable: ${run.llmError}` : 'Action is required on the application page.', run.llmError ? 'error' : 'ok');
   } else if (run.status === 'page_ready') {
     elements.runHint.textContent = 'This page is filled and validated. Review it, then continue when you are ready.';
