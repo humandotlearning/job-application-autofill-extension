@@ -1,6 +1,6 @@
 import { retrieveEvidence } from './retrieval.js';
 import { inferSensitivity, validateFillValue, meaningCompatible } from './core.js';
-import { callAnswerPlanner } from './llm.js';
+import { callAnswerPlanner, callAnswerRewriter } from './llm.js';
 import { upsertAnswerRecords, mergeLearnedAnswers, normalizeAnswerRecord } from './core.js';
 import {
   createDatasourceState,
@@ -19,6 +19,8 @@ const ACTIVE_RUN_STATUSES = new Set(['running', 'waiting_user', 'page_ready', 'r
 const SAVABLE_RUN_STATUSES = new Set(['waiting_user', 'page_ready', 'ready_for_user_submit', 'answers_saved']);
 const processingTabs = new Set();
 const saveLocks = new Set();
+const MAX_DRAFT_CHARS = 4_000;
+const MAX_REWRITE_INSTRUCTION_CHARS = 4_000;
 let datasourceWriteChain = Promise.resolve();
 let runWriteChain = Promise.resolve();
 let datasourceInitPromise = null;
@@ -27,6 +29,20 @@ const APPLICATION_TITLE_PATTERN = /\b(?:apply|application|candidate|profile|resu
 const UTILITY_FRAME_PATTERN = /\b(?:search|cookie|job[\s-]?alerts?|talent[\s-]?communities?|subscribe|feedback)\b/i;
 const NO_APPLICATION_FRAME_REASON = 'No unique application form frame was found. Complete the application manually.';
 const AMBIGUOUS_APPLICATION_FRAME_REASON = 'More than one application form frame was found. Complete the application manually.';
+
+function isOpaqueIdentifier(value) {
+  const text = String(value ?? '').trim();
+  const distinctHexCharacters = new Set(text.toLowerCase()).size;
+  return (/^[a-f\d]{24,}$/i.test(text) && (/\d/.test(text) || distinctHexCharacters >= 3))
+    || /^(?:[a-z][a-z\d_-]*\|)?[a-f\d]{8}-[a-f\d]{4}-[a-f\d]{4}-[a-f\d]{4}-[a-f\d]{12}(?:\[[a-z\d_-]+\])?$/i.test(text);
+}
+
+function requiredBoundedText(value, label, maxLength) {
+  if (typeof value !== 'string') throw new Error(`${label} must be text`);
+  if (!value.trim()) throw new Error(`${label} cannot be empty`);
+  if (value.length > maxLength) throw new Error(`${label} is too long`);
+  return value;
+}
 
 async function getRuns() {
   const stored = await chrome.storage.session.get({ [RUN_STORAGE_KEY]: {} });
@@ -446,6 +462,8 @@ function updateSelectedFrame(run, discovery) {
     pathname: discovery.context.pathname,
     domain: discovery.inspection?.page?.domain || '',
   };
+  // Keep this alias for panel versions that predate the nested frame shape.
+  run.frameId = discovery.frameId;
 }
 
 function frameRoutingError(discovery, cause) {
@@ -478,6 +496,7 @@ async function sendToApplicationFrame(tabId, run, message) {
 function pauseForFrame(run, discovery) {
   run.status = 'waiting_user';
   run.frame = null;
+  run.frameId = null;
   run.waitingFor = discovery.errorCode;
   run.waitingLabel = null;
   run.nextAction = null;
@@ -490,6 +509,7 @@ function pauseForFrame(run, discovery) {
 }
 
 function nowRun(tabId) {
+  const startedAt = new Date().toISOString();
   return {
     tabId,
     status: 'running',
@@ -615,10 +635,17 @@ function navigationIssues(inspection) {
   }));
 }
 
-function fieldIssue(field, invalidIds, unresolvedById = new Map()) {
+function fieldIssue(field, invalidIds, unresolvedById = new Map(), pageNumber = null) {
   return {
     fieldId: field.id,
+    handle: field.handle,
     label: field.label || field.id,
+    fieldType: field.type,
+    fieldOptions: field.options || [],
+    fieldConstraints: field.constraints || {},
+    fieldMultiple: Boolean(field.multiple),
+    ...(Number.isFinite(pageNumber) ? { pageNumber } : {}),
+    formOrder: field.formOrder,
     required: Boolean(field.required),
     reason: unresolvedById.get(field.id)?.reason
       || (invalidIds.has(field.id)
@@ -796,6 +823,141 @@ async function approveSuggestion(message) {
     categorizeRun(run, verified.inspection, validationResponse.validation || {});
     return { ok: true, run: await saveRun(run) };
   } finally { saveLocks.delete(tabId); }
+}
+
+function listedRunField(run, fieldId) {
+  return [...(run.actionRequired || []), ...(run.optionalUnresolved || [])]
+    .find((item) => item?.fieldId === fieldId) || null;
+}
+
+function sameFieldSnapshot(field, snapshot = {}) {
+  if (!snapshot || typeof snapshot !== 'object') return true;
+  if (snapshot.handle && field.handle !== snapshot.handle) return false;
+  if (snapshot.label && field.label !== snapshot.label) return false;
+  if (snapshot.fieldType && field.type !== snapshot.fieldType) return false;
+  if (snapshot.fieldOptions && JSON.stringify(field.options || []) !== JSON.stringify(snapshot.fieldOptions)) return false;
+  if (snapshot.fieldConstraints && JSON.stringify(field.constraints || {}) !== JSON.stringify(snapshot.fieldConstraints)) return false;
+  if (snapshot.fieldMultiple != null && Boolean(field.multiple) !== Boolean(snapshot.fieldMultiple)) return false;
+  return true;
+}
+
+async function guardedDraftField(message, { allowSaveLock = false } = {}) {
+  const { tabId, fieldId } = message;
+  if (!Number.isInteger(tabId) || !fieldId || typeof fieldId !== 'string') throw new Error('The application field is unavailable');
+  if (processingTabs.has(tabId) || (!allowSaveLock && saveLocks.has(tabId))) throw new Error('Application is busy or unavailable');
+  const run = await getRun(tabId);
+  const listed = listedRunField(run, fieldId);
+  const suggestion = run?.suggestions?.[fieldId] || null;
+  if (!run || !listed || !SAVABLE_RUN_STATUSES.has(run.status)
+    || message.frameId !== run.frame?.frameId || message.applicationId !== run.startedAt
+    || message.pageSignature !== run.pageSignature || !message.handle || message.handle !== listed.handle) {
+    throw new Error('Stale draft; check the page again');
+  }
+  // Never rediscover/reroute a draft operation into another frame.
+  const inspected = await sendToFrame(tabId, message.frameId, { type: 'JOB_APP_INSPECT' });
+  const field = inspected.inspection?.fields.find((item) => item.id === fieldId);
+  if (!field || field.handle !== message.handle || field.currentValue
+    || !sameFieldSnapshot(field, listed)
+    || (suggestion?.field && !sameFieldSnapshot(field, {
+      handle: suggestion.field.handle,
+      label: suggestion.field.label,
+      fieldType: suggestion.field.type,
+      fieldOptions: suggestion.field.options,
+      fieldConstraints: suggestion.field.constraints,
+      fieldMultiple: suggestion.field.multiple,
+    }))
+    || pageSignature(inspected.inspection, run.frame) !== message.pageSignature) {
+    throw new Error('Destination changed; check the page again');
+  }
+  return { run, listed, suggestion, field };
+}
+
+function sourceKeysFromMessage(message = {}) {
+  return [...new Set([
+    ...(Array.isArray(message.sourceKeys) ? message.sourceKeys : []),
+    message.sourceKey,
+  ].filter((key) => typeof key === 'string' && key))];
+}
+
+function sourceKeysForCandidate(candidate = {}) {
+  return [...new Set([
+    ...(Array.isArray(candidate.sourceKeys) ? candidate.sourceKeys : []),
+    candidate.sourceKey,
+  ].filter((key) => typeof key === 'string' && key))];
+}
+
+function sameKeys(left = [], right = []) {
+  return left.length === right.length && left.every((key) => right.includes(key));
+}
+
+async function rewriteEvidence(suggestion, message) {
+  const requestedKeys = sourceKeysFromMessage(message);
+  if (!requestedKeys.length) return [];
+  const candidate = suggestion?.candidates?.find((item) => sameKeys(sourceKeysForCandidate(item), requestedKeys));
+  if (!candidate) throw new Error('Saved evidence changed; choose an answer again');
+  const records = candidate.kind === 'draft' ? await draftEvidenceRecords() : await getRecords();
+  const relevant = records.filter((record) => requestedKeys.includes(record.key));
+  if (relevant.length !== requestedKeys.length
+    || relevant.some((record) => !retrieveEvidence(suggestion.field, records).some((item) => item.sourceKey === record.key))) {
+    throw new Error('Saved evidence changed; choose an answer again');
+  }
+  return relevant;
+}
+
+async function applyDraft(message) {
+  const answer = requiredBoundedText(message.answer, 'Answer', MAX_DRAFT_CHARS);
+  if (isOpaqueIdentifier(answer)) throw new Error('Internal IDs must be entered manually on the application page');
+  const { tabId } = message;
+  if (!Number.isInteger(tabId) || processingTabs.has(tabId) || saveLocks.has(tabId)) throw new Error('Application is busy or unavailable');
+  saveLocks.add(tabId);
+  try {
+    const { run, field } = await guardedDraftField(message, { allowSaveLock: true });
+    const validation = validateFillValue(field, answer);
+    if (!validation.ok || inferSensitivity(field.label) === 'legal' || field.type === 'checkbox') {
+      throw new Error(validation.ok ? 'This destination requires manual entry' : validation.reason);
+    }
+    const result = await sendToFrame(tabId, message.frameId, {
+      type: 'JOB_APP_APPLY',
+      applicationId: run.startedAt,
+      decisions: [{
+        fieldId: field.id,
+        handle: field.handle,
+        action: 'fill',
+        value: answer,
+        evidenceKeys: [],
+        sensitivity: inferSensitivity(field.label),
+        confidence: 'high',
+        reason: 'Explicitly entered draft answer',
+      }],
+    });
+    if (!result?.ok) throw new Error(result?.error || 'Could not apply the answer');
+    const verified = await sendToFrame(tabId, message.frameId, { type: 'JOB_APP_INSPECT' });
+    if (verified.inspection?.fields.find((item) => item.id === field.id && item.handle === field.handle)?.currentValue !== answer) {
+      throw new Error('The page did not retain the entered answer');
+    }
+    const validationResponse = await sendToFrame(tabId, message.frameId, { type: 'JOB_APP_VALIDATE' });
+    categorizeRun(run, verified.inspection, validationResponse?.validation || {});
+    return { ok: true, run: await saveRun(run) };
+  } finally {
+    saveLocks.delete(tabId);
+  }
+}
+
+async function rewriteAnswer(message) {
+  const draft = requiredBoundedText(message.draft, 'Draft answer', MAX_DRAFT_CHARS);
+  const instruction = requiredBoundedText(message.instruction, 'Rewrite instruction', MAX_REWRITE_INSTRUCTION_CHARS);
+  const { suggestion, field } = await guardedDraftField(message);
+  const apiKey = await getApiKey();
+  if (!apiKey) throw new Error('Add an OpenAI API key before requesting a rewrite');
+  const [settings, records] = await Promise.all([getSettings(), rewriteEvidence(suggestion, message)]);
+  const rewritten = await callAnswerRewriter({
+    apiKey,
+    question: field.label,
+    draft,
+    instruction,
+    records,
+  }, { model: settings.openaiModel });
+  return { ok: true, answer: requiredBoundedText(rewritten.answer, 'Rewritten answer', MAX_DRAFT_CHARS) };
 }
 
 function hasBlockingIssues(run, validation) {
@@ -1063,6 +1225,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
   if (![
     'JOB_RUN_APPROVE_SUGGESTION',
+    'JOB_RUN_APPLY_DRAFT',
+    'JOB_RUN_REWRITE_ANSWER',
     'JOB_RUN_START',
     'JOB_RUN_CHECK_PAGE',
     'JOB_RUN_ADVANCE_PAGE',
@@ -1077,8 +1241,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   ].includes(message?.type)) return false;
 
   (async () => {
-    if (message.type === 'JOB_RUN_APPROVE_SUGGESTION') {
-      if (sender?.tab) throw new Error('Approval must originate in the extension panel');
+    if (['JOB_RUN_APPROVE_SUGGESTION', 'JOB_RUN_APPLY_DRAFT', 'JOB_RUN_REWRITE_ANSWER'].includes(message.type)) {
+      if (sender?.tab) throw new Error('This action must originate in the extension panel');
+      if (message.type === 'JOB_RUN_APPLY_DRAFT') return applyDraft(message);
+      if (message.type === 'JOB_RUN_REWRITE_ANSWER') return rewriteAnswer(message);
       return approveSuggestion(message);
     }
     if (message.type === 'JOB_DATASOURCE_STATE') return { ok: true, datasource: await datasourceSummary() };

@@ -153,6 +153,7 @@ function createHarness({
                 key: field.id,
                 question: field.label,
                 answer: field.currentValue,
+                formOrder: field.formOrder,
                 aliases: [field.label],
                 type: field.type,
                 sensitivity: field.sensitivity || 'safe',
@@ -715,10 +716,10 @@ test('worker categorizes blockers, optional unresolved fields, review items, and
       7: {
         pages: [{
           fields: [
-            { id: 'full_name', label: 'Full name', type: 'text', required: true },
-            { id: 'work_authorization', label: 'Work authorization', type: 'text', required: true },
-            { id: 'portfolio', label: 'Portfolio', type: 'url', required: false },
-            { id: 'cover_letter', label: 'Cover letter', type: 'textarea', required: false, sensitivity: 'review' },
+            { id: 'full_name', label: 'Full name', type: 'text', required: true, formOrder: 0 },
+            { id: 'work_authorization', label: 'Work authorization', type: 'text', required: true, formOrder: 1 },
+            { id: 'portfolio', label: 'Portfolio', type: 'url', required: false, formOrder: 2 },
+            { id: 'cover_letter', label: 'Cover letter', type: 'textarea', required: false, sensitivity: 'review', formOrder: 3 },
           ],
           actions: [{ id: 'action_0', label: 'Submit application', kind: 'submit', type: 'submit' }],
         }],
@@ -734,6 +735,12 @@ test('worker categorizes blockers, optional unresolved fields, review items, and
   assert.equal(started.run.optionalUnresolved.some((item) => item.fieldId === 'portfolio'), true);
   assert.equal(started.run.reviewRequired.some((item) => item.fieldId === 'cover_letter'), true);
   assert.equal(started.run.audit.some((item) => item.key === 'full_name'), true);
+  assert.equal(started.run.actionRequired.find((item) => item.fieldId === 'work_authorization').formOrder, 1);
+  assert.equal(started.run.optionalUnresolved.find((item) => item.fieldId === 'portfolio').formOrder, 2);
+  assert.equal(started.run.reviewRequired.find((item) => item.fieldId === 'cover_letter').formOrder, 3);
+  assert.equal(started.run.reviewRequired.find((item) => item.fieldId === 'cover_letter').pageNumber, 1);
+  assert.equal(started.run.audit.find((item) => item.key === 'full_name').formOrder, 0);
+  assert.equal(started.run.audit.find((item) => item.key === 'full_name').pageNumber, 1);
   assert.equal(harness.tabs.get(7).focusCalls[0], 'work_authorization');
 });
 
@@ -938,4 +945,169 @@ test('reactivates learning after native site navigation within the application',
   assert.equal(harness.sessionData.applicationRun['7'].frame.pathname, '/apply/step2');
   const offsite = await harness.dispatch({ type: 'JOB_APP_LEARNING_STATUS' }, { tab: { id: 7 }, frameId: 0, url: 'https://unrelated.example/apply/step2' });
   assert.equal(offsite.ok, false);
+});
+
+function draftOrigin(run, field) {
+  return {
+    tabId: 7,
+    frameId: run.frame.frameId,
+    applicationId: run.startedAt,
+    pageSignature: run.pageSignature,
+    fieldId: field.id,
+    handle: field.handle,
+  };
+}
+
+test('manual drafts fill only the exact user value and do not promote an answer record', async () => {
+  const harness = createHarness({ pagesByTab: { 7: { pages: [{
+    page: { title: 'Application', domain: 'example.test' },
+    fields: [{ id: 'summary', handle: 'summary-h', label: 'Professional summary', type: 'textarea', required: true }],
+    actions: [{ id: 'submit', label: 'Submit application', kind: 'submit', type: 'submit' }],
+  }] } } });
+  await import(`../src/service-worker.js?manual-draft=${Date.now()}`);
+  const started = await harness.dispatch({ type: 'JOB_RUN_START', tabId: 7 });
+  const recordsBefore = structuredClone(harness.localData.answerRecords);
+  const draftsBefore = structuredClone(harness.localData.applicationDrafts || {});
+  const answer = '  I build reliable data products.  ';
+  const result = await harness.dispatch({ type: 'JOB_RUN_APPLY_DRAFT', ...draftOrigin(started.run, { id: 'summary', handle: 'summary-h' }), answer });
+  assert.equal(result.ok, true, result.error);
+  assert.equal(harness.tabs.get(7).frames[0].pages[0].values.summary, answer);
+  assert.deepEqual(harness.localData.answerRecords, recordsBefore);
+  assert.deepEqual(harness.localData.applicationDrafts || {}, draftsBefore);
+  const fills = harness.tabs.get(7).messages
+    .filter((message) => message.type === 'JOB_APP_APPLY')
+    .flatMap((message) => message.decisions || [])
+    .filter((decision) => decision.action === 'fill' && decision.fieldId === 'summary');
+  assert.equal(fills.length, 1);
+  assert.equal(fills[0].value, answer);
+});
+
+test('manual drafts reject stale origins and changed destinations before filling', async () => {
+  const harness = createHarness({ pagesByTab: { 7: { pages: [{
+    page: { title: 'Application', domain: 'example.test' },
+    fields: [{ id: 'summary', handle: 'summary-h', label: 'Professional summary', type: 'text', required: true }], actions: [{ id: 'submit', label: 'Submit application', kind: 'submit', type: 'submit' }],
+  }] } } });
+  await import(`../src/service-worker.js?manual-stale=${Date.now()}`);
+  const started = await harness.dispatch({ type: 'JOB_RUN_START', tabId: 7 });
+  const origin = draftOrigin(started.run, { id: 'summary', handle: 'summary-h' });
+  for (const stale of [
+    { tabId: 8 }, { frameId: 4 }, { applicationId: 'stale-run' }, { pageSignature: 'stale-page' }, { handle: 'other-handle' },
+  ]) {
+    const result = await harness.dispatch({ type: 'JOB_RUN_APPLY_DRAFT', ...origin, ...stale, answer: 'A safe answer' });
+    assert.equal(result.ok, false);
+  }
+  assert.equal(harness.tabs.get(7).frames[0].pages[0].values?.summary, undefined);
+  harness.tabs.get(7).frames[0].pages[0].fields[0].label = 'Changed question';
+  const changed = await harness.dispatch({ type: 'JOB_RUN_APPLY_DRAFT', ...origin, answer: 'A safe answer' });
+  assert.equal(changed.ok, false);
+  assert.equal(harness.tabs.get(7).frames[0].pages[0].values?.summary, undefined);
+});
+
+test('manual drafts reject invalid, legal, checkbox, and opaque values without mutation', async () => {
+  const harness = createHarness({ pagesByTab: { 7: { pages: [{
+    page: { title: 'Application', domain: 'example.test' },
+    fields: [
+      { id: 'choice', handle: 'choice-h', label: 'Preferred location', type: 'select', required: true, options: ['Bangalore', 'Remote'] },
+      { id: 'short', handle: 'short-h', label: 'Brief answer', type: 'text', required: true, constraints: { minLength: 8 } },
+      { id: 'consent', handle: 'consent-h', label: 'Privacy agreement', type: 'text', required: true },
+      { id: 'agree', handle: 'agree-h', label: 'I agree', type: 'checkbox', required: true },
+      { id: 'opaque', handle: 'opaque-h', label: 'Reference code', type: 'text', required: true },
+    ], actions: [],
+  }] } } });
+  await import(`../src/service-worker.js?manual-invalid=${Date.now()}`);
+  const started = await harness.dispatch({ type: 'JOB_RUN_START', tabId: 7 });
+  const attempts = [
+    [{ id: 'choice', handle: 'choice-h' }, 'Everywhere'],
+    [{ id: 'short', handle: 'short-h' }, 'short'],
+    [{ id: 'consent', handle: 'consent-h' }, 'yes'],
+    [{ id: 'agree', handle: 'agree-h' }, 'yes'],
+    [{ id: 'opaque', handle: 'opaque-h' }, 'cards|d20089ff-f389-44ef-9398-eec15ba7b6a4[field1]'],
+  ];
+  for (const [field, answer] of attempts) {
+    const result = await harness.dispatch({ type: 'JOB_RUN_APPLY_DRAFT', ...draftOrigin(started.run, field), answer });
+    assert.equal(result.ok, false, `${field.id} should be rejected`);
+  }
+  assert.deepEqual(harness.tabs.get(7).frames[0].pages[0].values || {}, {});
+});
+
+test('draft apply and rewrite requests are accepted only from the extension panel', async () => {
+  const harness = createHarness({ pagesByTab: { 7: { pages: [{
+    page: { title: 'Application', domain: 'example.test' },
+    fields: [{ id: 'summary', handle: 'summary-h', label: 'Professional summary', type: 'text', required: true }],
+    actions: [{ id: 'submit', label: 'Submit application', kind: 'submit', type: 'submit' }],
+  }] } } });
+  harness.localData.openaiApiKey = 'synthetic-test-key';
+  await import(`../src/service-worker.js?panel-only=${Date.now()}`);
+  const started = await harness.dispatch({ type: 'JOB_RUN_START', tabId: 7 });
+  const origin = draftOrigin(started.run, { id: 'summary', handle: 'summary-h' });
+  const sender = { tab: { id: 7 }, frameId: 0 };
+  const apply = await harness.dispatch({ type: 'JOB_RUN_APPLY_DRAFT', ...origin, answer: 'A safe answer' }, sender);
+  const rewrite = await harness.dispatch({ type: 'JOB_RUN_REWRITE_ANSWER', ...origin, draft: 'A safe answer', instruction: 'Be concise.' }, sender);
+  assert.equal(apply.ok, false);
+  assert.equal(rewrite.ok, false);
+  assert.deepEqual(harness.tabs.get(7).frames[0].pages[0].values || {}, {});
+});
+
+test('rewrite uses the selected model and relevant current evidence without mutating the page or datasource', async () => {
+  const harness = createHarness({
+    answerRecords: [{ key: 'story', question: 'Project history', answer: 'I delivered a reliable platform.', type: 'textarea', sensitivity: 'safe', confirmationState: 'confirmed' }],
+    pagesByTab: { 7: { pages: [{
+      page: { title: 'Application', domain: 'example.test' },
+      fields: [{ id: 'summary', handle: 'summary-h', label: 'Project history', type: 'textarea', required: true }], actions: [{ id: 'submit', label: 'Submit application', kind: 'submit', type: 'submit' }],
+    }] } },
+  });
+  harness.localData.openaiApiKey = 'synthetic-test-key';
+  harness.localData.openaiModel = 'rewrite-model';
+  const requests = [];
+  globalThis.fetch = async (_url, options) => {
+    requests.push(JSON.parse(options.body));
+    return { ok: true, status: 200, statusText: 'OK', json: async () => ({ output: [{ content: [{ type: 'output_text', text: JSON.stringify({ answer: 'I delivered a dependable platform.' }) }] }] }) };
+  };
+  await import(`../src/service-worker.js?rewrite-ok=${Date.now()}`);
+  const started = await harness.dispatch({ type: 'JOB_RUN_START', tabId: 7 });
+  const origin = draftOrigin(started.run, { id: 'summary', handle: 'summary-h' });
+  const recordsBefore = structuredClone(harness.localData.answerRecords);
+  const valuesBefore = structuredClone(harness.tabs.get(7).frames[0].pages[0].values || {});
+  const result = await harness.dispatch({ type: 'JOB_RUN_REWRITE_ANSWER', ...origin, question: 'Project history', draft: 'I delivered a reliable platform.', instruction: 'Make this more concise.', sourceKey: 'story' });
+  assert.deepEqual(result, { ok: true, answer: 'I delivered a dependable platform.' });
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0].model, 'rewrite-model');
+  const prompt = JSON.parse(requests[0].input[1].content[0].text);
+  assert.equal(prompt.question, 'Project history');
+  assert.equal(prompt.records[0].key, 'story');
+  assert.deepEqual(harness.tabs.get(7).frames[0].pages[0].values || {}, valuesBefore);
+  assert.deepEqual(harness.localData.answerRecords, recordsBefore);
+  assert.equal(JSON.stringify(result).includes('synthetic-test-key'), false);
+});
+
+test('rewrite rejects unsafe requests and model failures without mutating a draft destination', async () => {
+  const harness = createHarness({
+    answerRecords: [{ key: 'story', question: 'Project history', answer: 'I delivered a reliable platform.', type: 'textarea', sensitivity: 'safe', confirmationState: 'confirmed' }],
+    pagesByTab: { 7: { pages: [{ page: { title: 'Application', domain: 'example.test' }, fields: [{ id: 'summary', handle: 'summary-h', label: 'Project history', type: 'textarea', required: true }], actions: [{ id: 'submit', label: 'Submit application', kind: 'submit', type: 'submit' }] }] } },
+  });
+  harness.localData.openaiApiKey = 'synthetic-test-key';
+  await import(`../src/service-worker.js?rewrite-errors=${Date.now()}`);
+  const started = await harness.dispatch({ type: 'JOB_RUN_START', tabId: 7 });
+  const origin = draftOrigin(started.run, { id: 'summary', handle: 'summary-h' });
+  const base = { type: 'JOB_RUN_REWRITE_ANSWER', ...origin, question: 'Project history', draft: 'I delivered a reliable platform.', instruction: 'Make this concise.', sourceKey: 'story' };
+  const valuesBefore = structuredClone(harness.tabs.get(7).frames[0].pages[0].values || {});
+  const recordsBefore = structuredClone(harness.localData.answerRecords);
+  for (const invalid of [
+    { applicationId: 'stale-run' }, { draft: '' }, { instruction: '' }, { draft: 42 }, { instruction: 'x'.repeat(4_001) },
+  ]) {
+    const result = await harness.dispatch({ ...base, ...invalid });
+    assert.equal(result.ok, false);
+  }
+  harness.localData.openaiApiKey = '';
+  const missingKey = await harness.dispatch(base);
+  assert.equal(missingKey.ok, false);
+  harness.localData.openaiApiKey = 'synthetic-test-key';
+  globalThis.fetch = async () => ({ ok: true, status: 200, statusText: 'OK', json: async () => ({ output_text: '{not valid JSON' }) });
+  const malformed = await harness.dispatch(base);
+  assert.equal(malformed.ok, false);
+  globalThis.fetch = async () => { throw new Error('Synthetic network failure'); };
+  const network = await harness.dispatch(base);
+  assert.equal(network.ok, false);
+  assert.deepEqual(harness.tabs.get(7).frames[0].pages[0].values || {}, valuesBefore);
+  assert.deepEqual(harness.localData.answerRecords, recordsBefore);
 });
