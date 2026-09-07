@@ -291,6 +291,117 @@ test('optional planner sends bounded relevant evidence and preserves failure dia
   assert.equal(bodies.length, 1);
 });
 
+test('planner fill candidates wait for explicit review instead of applying to the page', async () => {
+  const plannerAnswer = 'I built and deployed machine learning models to production.';
+  const harness = createHarness({ answerRecords: [{
+    key: 'ml_delivery',
+    question: 'Machine learning delivery project',
+    answer: plannerAnswer,
+    confirmationState: 'confirmed',
+    sensitivity: 'safe',
+  }], pagesByTab: { 7: { pages: [{ fields: [
+    { id: 'ml_experience', handle: 'ml-experience-handle', label: 'Describe your ML deployment experience', type: 'textarea', required: true, currentValue: ' ' },
+  ], actions: [{ id: 'submit', label: 'Submit application', kind: 'submit' }], invalidFieldIds: ['ml_experience'] }] } } });
+  harness.localData.openaiApiKey = 'synthetic-planner-key';
+  globalThis.fetch = async () => ({
+    ok: true,
+    status: 200,
+    statusText: 'OK',
+    json: async () => ({ output_text: JSON.stringify({ decisions: [{
+      fieldId: 'ml_experience', action: 'fill', value: plannerAnswer, evidenceKeys: ['ml_delivery'],
+      confidence: 'high', sensitivity: 'safe', reason: 'Exact saved delivery evidence', transformation: 'copy',
+    }] }) }),
+  });
+  await import(`../src/service-worker.js?planner-pending-${Date.now()}`);
+
+  const started = await harness.dispatch({ type: 'JOB_RUN_START', tabId: 7 });
+
+  assert.equal(started.ok, true, started.error);
+  assert.equal(harness.tabs.get(7).frames[0].pages[0].values?.ml_experience, undefined);
+  const plannerFieldDecisions = harness.tabs.get(7).messages
+    .filter((message) => message.type === 'JOB_APP_APPLY')
+    .flatMap((message) => message.decisions || [])
+    .filter((decision) => decision.fieldId === 'ml_experience');
+  assert.equal(plannerFieldDecisions.some((decision) => decision.action === 'fill'), false);
+  assert.ok(started.run.suggestions, JSON.stringify(started.run));
+  const suggestion = started.run.suggestions.ml_experience;
+  assert.ok(suggestion, JSON.stringify(started.run));
+  assert.equal(started.run.actionRequired.find((item) => item.fieldId === 'ml_experience')?.suggestion, suggestion);
+  assert.equal(suggestion.candidates.length, 1);
+  assert.equal(suggestion.candidates[0].answer, plannerAnswer);
+  assert.deepEqual(suggestion.candidates[0].sourceKeys, ['ml_delivery']);
+  assert.deepEqual(suggestion.candidates[0].sourceAnswers, { ml_delivery: plannerAnswer });
+  assert.equal(suggestion.candidates[0].provenance, 'AI planner');
+
+  // The harness uses a whitespace-only invalid value to exercise the planner
+  // path without allowing the deterministic path to claim the field. Restore
+  // the visibly blank control before the user's explicit Send to form.
+  const page = harness.tabs.get(7).frames[0].pages[0];
+  page.fields[0].currentValue = '';
+  page.invalidFieldIds = [];
+  const approved = await harness.dispatch({
+    type: 'JOB_RUN_APPROVE_SUGGESTION',
+    tabId: 7,
+    frameId: suggestion.frameId,
+    applicationId: suggestion.applicationId,
+    pageSignature: suggestion.pageSignature,
+    fieldId: 'ml_experience',
+    handle: suggestion.field.handle,
+    sourceKey: suggestion.candidates[0].sourceKey,
+    sourceKeys: suggestion.candidates[0].sourceKeys,
+  });
+  assert.equal(approved.ok, true, approved.error);
+  assert.equal(page.values.ml_experience, plannerAnswer);
+  assert.equal(approved.run.suggestions?.ml_experience, undefined);
+});
+
+test('planner candidates preserve every evidence snapshot and reject approval after any source changes', async () => {
+  const plannerAnswer = 'I built and deployed machine learning systems in production.';
+  const harness = createHarness({ answerRecords: [
+    { key: 'ml_project', question: 'Machine learning delivery project', answer: plannerAnswer, confirmationState: 'confirmed', sensitivity: 'safe' },
+    { key: 'ml_production', question: 'Machine learning production evidence', answer: plannerAnswer, confirmationState: 'confirmed', sensitivity: 'safe' },
+  ], pagesByTab: { 7: { pages: [{ fields: [
+    { id: 'ml_experience', handle: 'ml-experience-handle', label: 'Describe your ML deployment experience', type: 'textarea', required: true, currentValue: ' ' },
+  ], actions: [{ id: 'submit', label: 'Submit application', kind: 'submit' }], invalidFieldIds: ['ml_experience'] }] } } });
+  harness.localData.openaiApiKey = 'synthetic-planner-key';
+  globalThis.fetch = async () => ({
+    ok: true,
+    status: 200,
+    statusText: 'OK',
+    json: async () => ({ output_text: JSON.stringify({ decisions: [{
+      fieldId: 'ml_experience', action: 'fill', value: plannerAnswer, evidenceKeys: ['ml_project', 'ml_production'],
+      confidence: 'high', sensitivity: 'safe', reason: 'Saved delivery evidence', transformation: 'copy',
+    }] }) }),
+  });
+  await import(`../src/service-worker.js?planner-sources-${Date.now()}`);
+
+  const started = await harness.dispatch({ type: 'JOB_RUN_START', tabId: 7 });
+  assert.ok(started.run.suggestions, JSON.stringify(started.run));
+  const suggestion = started.run.suggestions.ml_experience;
+  assert.ok(suggestion, JSON.stringify(started.run));
+  const candidate = suggestion.candidates[0];
+  assert.deepEqual(candidate.sourceKeys, ['ml_project', 'ml_production']);
+  assert.deepEqual(candidate.sourceAnswers, { ml_project: plannerAnswer, ml_production: plannerAnswer });
+  assert.equal(harness.tabs.get(7).frames[0].pages[0].values?.ml_experience, undefined);
+
+  harness.localData.answerRecords = harness.localData.answerRecords.map((record) => record.key === 'ml_production'
+    ? { ...record, answer: 'Changed machine learning evidence.' }
+    : record);
+  const rejected = await harness.dispatch({
+    type: 'JOB_RUN_APPROVE_SUGGESTION',
+    tabId: 7,
+    frameId: suggestion.frameId,
+    applicationId: suggestion.applicationId,
+    pageSignature: suggestion.pageSignature,
+    fieldId: 'ml_experience',
+    handle: suggestion.field.handle,
+    sourceKeys: candidate.sourceKeys,
+  });
+  assert.equal(rejected.ok, false);
+  assert.match(rejected.error, /evidence changed/i);
+  assert.equal(harness.tabs.get(7).frames[0].pages[0].values?.ml_experience, undefined);
+});
+
 test('reviewed compensation preserves explicit answer units without numeric conversion', async () => {
   const harness = createHarness({ answerRecords: [{ key: 'current_salary', question: 'Current salary', answer: 'Reported compensation: 18 LPA.', confirmationState: 'confirmed', sensitivity: 'review' }], pagesByTab: { 7: { pages: [{ fields: [{ id: 'ctc', handle: 'ctc-h', label: 'Current CTC', type: 'textarea', required: true }], actions: [{ id: 'submit', label: 'Submit application', kind: 'submit' }] }] } } });
   await import(`../src/service-worker.js?test=units-${Date.now()}`);

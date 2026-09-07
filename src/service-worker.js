@@ -735,20 +735,58 @@ async function applyPageDecisions(tabId, run, inspection, records, coverMessages
     run.llmPages = [...run.llmPages, llmPageKey];
     await saveRun(run);
     try {
+      const plannerRecords = records.filter(record => remaining.some(field => retrieveEvidence(field, [record]).length)).slice(0, 20);
       const llmDecisions = await callAnswerPlanner({
         apiKey,
         fields: remaining,
-        records: records.filter(record => remaining.some(field => retrieveEvidence(field, [record]).length)).slice(0, 20),
+        records: plannerRecords,
         page: currentInspection.page,
       }, { model, allowPartial: true });
-      const llmResult = await sendToApplicationFrame(tabId, run, {
-        type: 'JOB_APP_APPLY',
-        decisions: llmDecisions.decisions.map((decision) => ({ ...decision, handle: remaining.find((field) => field.id === decision.fieldId)?.handle })),
-      });
-      if (!llmResult?.ok) throw new Error(llmResult?.error || 'The page rejected an answer planner value');
-      allDecisions = [...allDecisions, ...llmDecisions.decisions];
-      appliedReviews = [...appliedReviews, ...(llmResult.result?.reviewRequired || [])];
-      unresolvedResults = [...unresolvedResults, ...(llmResult.result?.unresolved || [])];
+      const heldPlannerDecisions = [];
+      for (const decision of llmDecisions.decisions) {
+        const field = remaining.find((item) => item.id === decision.fieldId);
+        if (!field || decision.action !== 'fill') {
+          heldPlannerDecisions.push(decision);
+          continue;
+        }
+        const sourceKeys = [...new Set(decision.evidenceKeys || [])];
+        const sources = sourceKeys.map((key) => plannerRecords.find((record) => record.key === key));
+        if (sources.length !== sourceKeys.length || sources.some((source) => !source)) {
+          throw new Error(`Answer planner evidence is unavailable for ${field.label || field.id}`);
+        }
+        run.suggestions[field.id] = {
+          tabId,
+          frameId: run.frame.frameId,
+          applicationId: run.startedAt,
+          pageSignature: currentPageSignature,
+          field,
+          candidates: [{
+            sourceKey: sourceKeys[0],
+            sourceKeys,
+            sourceAnswers: Object.fromEntries(sources.map((source) => [source.key, source.answer])),
+            sourceQuestion: sources.map((source) => source.question).join(' + '),
+            answer: decision.value,
+            excerpt: String(decision.value).slice(0, 400),
+            provenance: 'AI planner',
+            kind: 'planner',
+            requiresApproval: true,
+            reason: decision.reason,
+            transformation: decision.transformation || null,
+            confidence: decision.confidence,
+            sensitivity: decision.sensitivity,
+          }],
+        };
+        heldPlannerDecisions.push({
+          ...decision,
+          action: 'ask_user',
+          value: null,
+          reason: 'AI-planned answer is ready for review before use',
+        });
+      }
+      // Planner output is a proposed answer, never an automatic fill.  The
+      // candidate is revalidated and applied only through explicit Send to
+      // form in approveSuggestion.
+      allDecisions = [...allDecisions, ...heldPlannerDecisions];
     } catch (error) {
       llmError = error.message;
     }
@@ -784,11 +822,20 @@ async function approveSuggestion(message) {
     if (!suggestion || !SAVABLE_RUN_STATUSES.has(run.status) || message.frameId !== run.frame?.frameId
       || message.frameId !== suggestion.frameId || message.applicationId !== run.startedAt
       || message.pageSignature !== run.pageSignature || message.handle !== suggestion.field.handle || !message.handle) throw new Error('Stale suggestion; check the page again');
-    const candidate = suggestion.candidates.find(item => item.sourceKey === message.sourceKey);
+    const requestedKeys = sourceKeysFromMessage(message);
+    const candidate = suggestion.candidates.find((item) => {
+      const candidateKeys = sourceKeysForCandidate(item);
+      return requestedKeys.length > 0 && sameKeys(candidateKeys, requestedKeys);
+    });
+    const sourceKeys = sourceKeysForCandidate(candidate);
     const records = candidate?.kind === 'draft' ? await draftEvidenceRecords() : await getRecords();
-    const source = records.find(item => item.key === candidate?.sourceKey);
-    if (!candidate || !source || source.answer !== candidate.answer
-      || !retrieveEvidence(suggestion.field, records).some(item => item.sourceKey === candidate.sourceKey)) throw new Error('Saved evidence changed; check again');
+    const sources = sourceKeys.map((key) => records.find((record) => record.key === key));
+    if (!candidate || !sourceKeys.length || sources.some((source) => !source)
+      || sources.some((source) => source.answer !== sourceAnswerSnapshot(candidate, source.key))
+      || sources.some((source) => !retrieveEvidence(suggestion.field, records).some((item) => item.sourceKey === source.key))) {
+      throw new Error('Saved evidence changed; check again');
+    }
+    const source = sources[0];
     // Never rediscover/reroute an approval into another frame.
     const inspected = await sendToFrame(tabId, message.frameId, { type: 'JOB_APP_INSPECT' });
     const field = inspected.inspection?.fields.find(item => item.id === fieldId);
@@ -797,25 +844,31 @@ async function approveSuggestion(message) {
       || pageSignature(inspected.inspection, run.frame) !== message.pageSignature) throw new Error('Destination changed; check the page again');
     const value = String(message.answer ?? candidate.answer).trim();
     const validation = validateFillValue(field, value);
-    if (!validation.ok || !meaningCompatible(field, source, { numericReview: !(['textarea', 'text'].includes(field.type) && value === candidate.answer) }) || inferSensitivity(field.label, field.id) === 'legal' || field.type === 'checkbox') throw new Error(validation.reason || 'This destination requires manual entry');
-    const result = await sendToFrame(tabId, message.frameId, { type: 'JOB_APP_APPLY', applicationId: run.startedAt, decisions: [{ fieldId, handle: field.handle, action: 'fill', value, evidenceKeys: [source.key], sensitivity: inferSensitivity(field.label, field.id), confidence: 'high', reason: 'Explicitly approved saved answer' }] });
+    const sourceCompatible = candidate.kind === 'planner'
+      ? sources.every((item) => retrieveEvidence(field, records).some((evidence) => evidence.sourceKey === item.key))
+      : meaningCompatible(field, source, { numericReview: !(['textarea', 'text'].includes(field.type) && value === candidate.answer) });
+    if (!validation.ok || !sourceCompatible || inferSensitivity(field.label, field.id) === 'legal' || field.type === 'checkbox') throw new Error(validation.reason || 'This destination requires manual entry');
+    const result = await sendToFrame(tabId, message.frameId, { type: 'JOB_APP_APPLY', applicationId: run.startedAt, decisions: [{ fieldId, handle: field.handle, action: 'fill', value, evidenceKeys: sourceKeys, sensitivity: inferSensitivity(field.label, field.id), confidence: 'high', reason: 'Explicitly approved saved answer' }] });
     if (!result?.ok) throw new Error(result?.error || 'Could not apply the answer');
     const verified = await sendToFrame(tabId, message.frameId, { type: 'JOB_APP_INSPECT' });
     if (verified.inspection?.fields.find(item => item.id === fieldId && item.handle === field.handle)?.currentValue !== value) throw new Error('The page did not retain the approved answer');
     datasourceWriteChain = datasourceWriteChain.catch(() => {}).then(async () => {
       const state = await getDatasource();
-      const latest = (candidate.kind === 'draft' ? await draftEvidenceRecords() : state.answerRecords).find(record => record.key === source.key);
-      if (!latest || latest.answer !== source.answer) throw new Error('Evidence changed while applying; answer applied but not learned');
+      const latestRecords = candidate.kind === 'draft' ? await draftEvidenceRecords() : state.answerRecords;
+      const latestSources = sourceKeys.map((key) => latestRecords.find((record) => record.key === key));
+      if (latestSources.some((latest) => !latest || latest.answer !== sourceAnswerSnapshot(candidate, latest.key))) {
+        throw new Error('Evidence changed while applying; answer applied but not learned');
+      }
       const now = new Date().toISOString();
-      const equivalent = candidate.kind === 'equivalent' && value === candidate.answer && field.labelConfidence !== 'low';
+      const equivalent = candidate.kind === 'equivalent' && sourceKeys.length === 1 && value === candidate.answer && field.labelConfidence !== 'low';
       const answerRecords = equivalent ? state.answerRecords.map(record => record.key === source.key
         ? { ...record, aliases: [...new Set([...(record.aliases || []), field.label])], updatedAt: now } : record)
         : mergeLearnedAnswers(state.answerRecords, [{ question: field.label, answer: value, type: field.type, entityId: field.entityId,
-          entityType: field.entityType, evidenceKeys: [source.key], provenance: 'user', completed: true, userEdited: true }], now, { confirm: true });
+          entityType: field.entityType, evidenceKeys: sourceKeys, provenance: 'user', completed: true, userEdited: true }], now, { confirm: true });
       await saveDatasource({ ...state, answerRecords });
       const readback = await chrome.storage.local.get({ answerRecords: [] });
       const persisted = equivalent ? readback.answerRecords.find(record => record.key === source.key && record.aliases?.includes(field.label))
-        : readback.answerRecords.find(record => record.question === field.label && record.answer === value && record.evidenceKeys?.includes(source.key));
+        : readback.answerRecords.find(record => record.question === field.label && record.answer === value && sourceKeys.every((key) => record.evidenceKeys?.includes(key)));
       if (!persisted) throw new Error('Answer applied, but reusable save could not be verified');
     });
     await datasourceWriteChain;
@@ -891,6 +944,18 @@ function sourceKeysForCandidate(candidate = {}) {
     ...(Array.isArray(candidate.sourceKeys) ? candidate.sourceKeys : []),
     candidate.sourceKey,
   ].filter((key) => typeof key === 'string' && key))];
+}
+
+function sourceAnswerSnapshot(candidate = {}, key) {
+  const snapshots = candidate.sourceAnswers;
+  if (snapshots && !Array.isArray(snapshots) && typeof snapshots === 'object'
+    && Object.prototype.hasOwnProperty.call(snapshots, key)) return String(snapshots[key]);
+  if (Array.isArray(snapshots)) {
+    const snapshot = snapshots.find((item) => item?.key === key);
+    if (snapshot && typeof snapshot.answer === 'string') return snapshot.answer;
+  }
+  // Older runs stored a single sourceKey and candidate answer only.
+  return candidate.sourceKey === key ? String(candidate.answer ?? '') : null;
 }
 
 function sameKeys(left = [], right = []) {
