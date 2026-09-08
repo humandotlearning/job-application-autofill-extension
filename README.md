@@ -36,7 +36,7 @@ flowchart TD
     O --> C
     M -->|No, one Submit| P[Ready for user submit]
     P --> Q[User reviews and clicks Submit on the site]
-    Q --> R[User clicks Save answers in the panel]
+    Q --> R[Capture final values locally]
     R --> S[Persist captured values; never submit the site]
 ```
 
@@ -122,7 +122,7 @@ The extension uses the configured answer-planner model (default `gpt-5.6-terra`)
 4. Open a job application and open the extension side panel.
 5. Enter an OpenAI API key if you want unresolved-field assistance. Local deterministic filling works without it.
 6. Click **Fill this page**. Complete any highlighted required fields or manual steps, then click **Check again**.
-7. When a page is ready, review it and click **Continue to next page**. On the final page, review the form and click **Save answers** in the panel; submit only through the application site.
+7. When a page is ready, review it and click **Continue to next page**. On the final page, review the form and submit through the application site; the extension captures the final values automatically. **Save answers** remains available as an optional local checkpoint.
 
 When updating the unpacked extension, preserve unsaved form values before any browser operation. Run `npm run build`, reload the extension card (not the application page), and reopen the panel. The content PING reports version `general-reuse-1`; verify this before using the new feature on an existing page. Reinjecting the same version is tested to preserve values and avoid duplicate listeners. The old boolean installation guard cannot safely dispose legacy listeners: if the old script still responds without the version, stop rather than resetting its guard or reloading an unsaved application. Legacy live hot-upgrade requires separate browser verification; the automated build is not proof that an already-open tab is updated.
 

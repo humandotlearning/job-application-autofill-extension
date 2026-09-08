@@ -1,5 +1,5 @@
 // Learning is enabled only by the worker for the selected application frame.
-export function createLearningSession(document, { capture, send, delayMs = 350 }) {
+export function createLearningSession(document, { capture, send, onFinalSubmit, delayMs = 350 }) {
   let applicationId = null;
   let timer;
   let lastSaved = '';
@@ -24,7 +24,13 @@ export function createLearningSession(document, { capture, send, delayMs = 350 }
     clearTimeout(timer);
     timer = setTimeout(() => { flush().catch(() => {}); }, delayMs);
   }
-  const checkpoint = () => { flush().catch(() => {}); };
+  const checkpoint = (event) => {
+    flush().catch(() => {});
+    if (event?.type !== 'submit' || !applicationId || document.__jobApplicationFilling || typeof onFinalSubmit !== 'function') return;
+    try {
+      Promise.resolve(onFinalSubmit({ applicationId, records: capture(), event })).catch(() => {});
+    } catch (_) {}
+  };
   for (const name of ['input', 'change', 'blur', 'click']) document.addEventListener(name, schedule, true);
   document.addEventListener('submit', checkpoint, true);
   document.addEventListener('visibilitychange', checkpoint, true);

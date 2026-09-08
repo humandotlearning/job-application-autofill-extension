@@ -8,6 +8,7 @@ import {
   collectFieldDescriptors,
   focusField,
   inspectDocument,
+  isFinalApplicationSubmit,
   planDeterministicFill,
   validateDocument,
 } from '../src/form-engine.js';
@@ -15,6 +16,40 @@ import {
 function makeDocument(html) {
   return new JSDOM(html, { url: 'https://jobs.example.com/apply' }).window.document;
 }
+
+test('recognizes only the selected application form final submit', () => {
+  const document = makeDocument(`
+    <form aria-label="Newsletter"><label>Email<input id="newsletter-email"></label><button type="submit">Subscribe</button></form>
+    <form aria-label="Job application"><label>Name<input id="name"></label><button type="submit" id="next-submit">Next</button><button type="submit" id="final-submit">Submit application</button></form>
+  `);
+  const finalForm = document.querySelector('[aria-label="Job application"]');
+  const newsletter = document.querySelector('[aria-label="Newsletter"]');
+
+  assert.equal(isFinalApplicationSubmit(document, { target: finalForm, submitter: document.querySelector('#final-submit') }), true);
+  assert.equal(isFinalApplicationSubmit(document, { target: finalForm, submitter: document.querySelector('#next-submit') }), false);
+  assert.equal(isFinalApplicationSubmit(document, { target: newsletter, submitter: newsletter.querySelector('button') }), false);
+});
+
+test('does not infer a final submit from another unnamed form', () => {
+  const document = makeDocument('<form id="next-form"><button type="submit" id="next">Next</button></form><form id="final-form"><button type="submit">Finish</button></form>');
+  const nextForm = document.querySelector('#next-form');
+
+  assert.equal(isFinalApplicationSubmit(document, { target: nextForm, submitter: document.querySelector('#next') }), false);
+});
+
+test('recognizes a submitter-less submit only when its form has one final control', () => {
+  const document = makeDocument('<form aria-label="Job application"><label>Name<input id="name"></label><button type="submit">Submit application</button></form>');
+
+  assert.equal(isFinalApplicationSubmit(document, { target: document.querySelector('form') }), true);
+});
+
+test('includes external form-associated actions when classifying a submitter-less submit', () => {
+  const withNext = makeDocument('<form id="application" aria-label="Job application"><label>Name<input id="name"></label><button type="submit">Submit application</button></form><button type="submit" form="application">Next</button>');
+  const withFinal = makeDocument('<form id="application" aria-label="Job application"><label>Name<input id="name"></label></form><button type="submit" form="application">Submit application</button>');
+
+  assert.equal(isFinalApplicationSubmit(withNext, { target: withNext.querySelector('form') }), false);
+  assert.equal(isFinalApplicationSubmit(withFinal, { target: withFinal.querySelector('form') }), true);
+});
 
 test('fills a custom dropdown identified by a linked label', async () => {
   const document = makeDocument('<form><label id="country-label" for="country">Country</label><button type="button" id="country" role="combobox" aria-labelledby="country-label" aria-controls="countries">Select one</button><div id="countries" role="listbox"><div role="option">India</div></div></form>');

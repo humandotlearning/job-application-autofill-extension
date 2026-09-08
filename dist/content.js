@@ -1260,6 +1260,17 @@ function actionLabel(element) {
   return String(element.textContent || element.value || element.getAttribute('aria-label') || '').replace(/\s+/g, ' ').trim();
 }
 
+function actionKind(element, label = actionLabel(element)) {
+  const type = String(element.type || '').toLowerCase();
+  const nextLabel = /^(next|continue|save and continue|proceed|review application|next step)\b/i.test(label);
+  const formControl = element.tagName === 'BUTTON' || element.tagName === 'INPUT';
+  return nextLabel
+    ? 'next'
+    : formControl && /\b(submit|apply|finish|complete application|send application)\b/i.test(label)
+      ? 'submit'
+      : 'other';
+}
+
 function collectActions(document) {
   const actions = [];
   const candidates = [...document.querySelectorAll('button, input[type="submit"], input[type="button"], a, [role="button"]')];
@@ -1268,16 +1279,29 @@ function collectActions(document) {
     const label = actionLabel(element);
     if (!label) continue;
     const type = String(element.type || '').toLowerCase();
-    const nextLabel = /^(next|continue|save and continue|proceed|review application|next step)\b/i.test(label);
-    const formControl = element.tagName === 'BUTTON' || element.tagName === 'INPUT';
-    const kind = nextLabel
-      ? 'next'
-        : formControl && /\b(submit|apply|finish|complete application|send application)\b/i.test(label)
-        ? 'submit'
-        : 'other';
+    const kind = actionKind(element, label);
     actions.push({ id: `action_${actions.length}`, label, kind, type: type || element.tagName.toLowerCase() });
   }
   return actions;
+}
+
+function isFinalApplicationSubmit(document, event) {
+  const form = event?.target;
+  if (!form || String(form.tagName || '').toLowerCase() !== 'form') return false;
+  const root = applicationRoot(document);
+  if (root !== document && root !== form) return false;
+  if (root === document && !inApplication(document, form)) return false;
+  const formActions = [...document.querySelectorAll('button, input[type="submit"], input[type="button"]')]
+    .filter((control) => control.form === form && !control.disabled && isVisible(control))
+    .map((control) => actionKind(control));
+  const hasSingleFinalAction = formActions.filter((kind) => kind === 'submit').length === 1;
+  const submitter = event?.submitter;
+  if (submitter) {
+    return submitter.form === form
+      && actionKind(submitter) === 'submit'
+      && hasSingleFinalAction;
+  }
+  return hasSingleFinalAction && !formActions.includes('next');
 }
 
 function pauseReasons(document) {
@@ -1431,7 +1455,7 @@ function waitForDocumentSettled(document, { quietMs = 150, minWaitMs = 400, time
 }
 
 // Learning is enabled only by the worker for the selected application frame.
-function createLearningSession(document, { capture, send, delayMs = 350 }) {
+function createLearningSession(document, { capture, send, onFinalSubmit, delayMs = 350 }) {
   let applicationId = null;
   let timer;
   let lastSaved = '';
@@ -1456,7 +1480,13 @@ function createLearningSession(document, { capture, send, delayMs = 350 }) {
     clearTimeout(timer);
     timer = setTimeout(() => { flush().catch(() => {}); }, delayMs);
   }
-  const checkpoint = () => { flush().catch(() => {}); };
+  const checkpoint = (event) => {
+    flush().catch(() => {});
+    if (event?.type !== 'submit' || !applicationId || document.__jobApplicationFilling || typeof onFinalSubmit !== 'function') return;
+    try {
+      Promise.resolve(onFinalSubmit({ applicationId, records: capture(), event })).catch(() => {});
+    } catch (_) {}
+  };
   for (const name of ['input', 'change', 'blur', 'click']) document.addEventListener(name, schedule, true);
   document.addEventListener('submit', checkpoint, true);
   document.addEventListener('visibilitychange', checkpoint, true);
@@ -1490,6 +1520,15 @@ if (!globalThis.__jobApplicationAutofillInstalled) {
   const learning = createLearningSession(document, {
     capture: () => collectAnswerRecords(document),
     send: (message) => chrome.runtime.sendMessage(message),
+    onFinalSubmit: ({ applicationId, records, event }) => {
+      if (!isFinalApplicationSubmit(document, event)) return null;
+      return chrome.runtime.sendMessage({
+        type: 'JOB_APP_FINAL_SUBMISSION',
+        applicationId,
+        page: inspectDocument(document).page,
+        records,
+      });
+    },
   });
   chrome.runtime.sendMessage({ type: 'JOB_APP_LEARNING_STATUS' }).then((response) => {
     if (response?.applicationId) learning.activate(response.applicationId);

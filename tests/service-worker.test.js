@@ -917,6 +917,136 @@ test('final save persists answers without any submit message or site submit clic
   assert.equal(harness.tabs.get(7).messages.some((message) => message.type === 'JOB_APP_SUBMIT'), false);
 });
 
+test('final site submission saves the supplied snapshot without recapturing or submitting the page', async () => {
+  const harness = createHarness({
+    pagesByTab: {
+      7: {
+        pages: [{
+          fields: [
+            { id: 'full_name', label: 'Full name', type: 'text', required: true },
+            { id: 'portfolio_url', label: 'Portfolio URL', type: 'url', required: false, currentValue: 'https://example.com/nithin' },
+          ],
+          actions: [{ id: 'action_0', label: 'Submit application', kind: 'submit', type: 'submit' }],
+        }],
+      },
+    },
+  });
+
+  await import(`../src/service-worker.js?final-submit=${Date.now()}`);
+  const started = await harness.dispatch({ type: 'JOB_RUN_START', tabId: 7 });
+  const beforeMessages = harness.tabs.get(7).messages.length;
+  const snapshot = {
+    type: 'JOB_APP_FINAL_SUBMISSION',
+    applicationId: started.run.startedAt,
+    page: { title: 'Application', domain: 'jobs.example.com' },
+    records: [
+      { key: 'full_name', question: 'Full name', answer: 'Nithin', type: 'text', sensitivity: 'safe', provenance: 'autofill' },
+      { key: 'portfolio_url', question: 'Portfolio URL', answer: 'https://example.com/nithin', type: 'url', sensitivity: 'safe', provenance: 'user' },
+    ],
+  };
+
+  const rejected = await harness.dispatch({ ...snapshot, applicationId: 'stale-run' }, { tab: { id: 7 }, frameId: 0, url: 'https://jobs.example.com/apply' });
+  const wrongFrame = await harness.dispatch(snapshot, { tab: { id: 7 }, frameId: 1, url: 'https://jobs.example.com/apply' });
+  const saved = await harness.dispatch(snapshot, { tab: { id: 7 }, frameId: 0, url: 'https://jobs.example.com/apply' });
+  const duplicate = await harness.dispatch(snapshot, { tab: { id: 7 }, frameId: 0, url: 'https://jobs.example.com/apply' });
+
+  assert.equal(rejected.ok, false);
+  assert.equal(wrongFrame.ok, false);
+  assert.equal(saved.ok, true);
+  assert.equal(saved.run.status, 'answers_saved');
+  assert.equal(duplicate.ok, true);
+  assert.equal(harness.localData.applicationDrafts[`${7}:${started.run.startedAt}`].records.some((record) => record.key === 'portfolio_url'), true);
+  assert.equal(harness.localData.learningInbox.filter((item) => item.candidate.id === 'portfolio_url').length, 1);
+  assert.equal(harness.tabs.get(7).messages.slice(beforeMessages).some((message) => message.type === 'JOB_APP_CAPTURE'), false);
+  assert.equal(harness.tabs.get(7).submitCalls, 0);
+  assert.equal(harness.tabs.get(7).messages.some((message) => message.type === 'JOB_APP_SUBMIT'), false);
+});
+
+test('final submission waits for a concurrent manual save instead of dropping its snapshot', async () => {
+  const harness = createHarness({
+    pagesByTab: { 7: { pages: [{
+      fields: [{ id: 'full_name', label: 'Full name', type: 'text', required: true }],
+      actions: [{ id: 'action_0', label: 'Submit application', kind: 'submit', type: 'submit' }],
+    }] } },
+  });
+
+  await import(`../src/service-worker.js?final-save-queue=${Date.now()}`);
+  const started = await harness.dispatch({ type: 'JOB_RUN_START', tabId: 7 });
+  const snapshot = {
+    type: 'JOB_APP_FINAL_SUBMISSION',
+    applicationId: started.run.startedAt,
+    page: { title: 'Application', domain: 'jobs.example.com' },
+    records: [{ key: 'full_name', question: 'Full name', answer: 'Nithin', type: 'text', sensitivity: 'safe', provenance: 'user' }],
+  };
+
+  const originalSendMessage = chrome.tabs.sendMessage;
+  let releaseCapture;
+  let captureHeld = false;
+  const captureStarted = new Promise((resolve) => {
+    chrome.tabs.sendMessage = async (tabId, message, options) => {
+      if (message.type === 'JOB_APP_CAPTURE' && !captureHeld) {
+        captureHeld = true;
+        resolve();
+        await new Promise((done) => { releaseCapture = done; });
+      }
+      return originalSendMessage(tabId, message, options);
+    };
+  });
+  const manualSave = harness.dispatch({ type: 'JOB_RUN_SAVE_ANSWERS', tabId: 7 });
+  await captureStarted;
+  const finalSave = harness.dispatch(snapshot, { tab: { id: 7 }, frameId: 0, url: 'https://jobs.example.com/apply' });
+  releaseCapture();
+  const [manual, final] = await Promise.all([manualSave, finalSave]);
+
+  assert.equal(manual.ok, true, manual.error);
+  assert.equal(final.ok, true, final.error);
+  assert.equal(final.skipped, undefined);
+  assert.equal(final.run.status, 'answers_saved');
+});
+
+test('persists an accepted final snapshot when navigation interrupts a manual save', async () => {
+  const harness = createHarness({
+    pagesByTab: { 7: { pages: [{
+      fields: [{ id: 'full_name', label: 'Full name', type: 'text', required: true }],
+      actions: [{ id: 'action_0', label: 'Submit application', kind: 'submit', type: 'submit' }],
+    }] } },
+  });
+
+  await import(`../src/service-worker.js?final-save-navigation=${Date.now()}`);
+  const started = await harness.dispatch({ type: 'JOB_RUN_START', tabId: 7 });
+  const snapshot = {
+    type: 'JOB_APP_FINAL_SUBMISSION',
+    applicationId: started.run.startedAt,
+    page: { title: 'Application', domain: 'jobs.example.com' },
+    records: [{ key: 'full_name', question: 'Full name', answer: 'Edited at submit', type: 'text', sensitivity: 'safe', provenance: 'user' }],
+  };
+
+  const originalSendMessage = chrome.tabs.sendMessage;
+  let releaseCapture;
+  let captureHeld = false;
+  const captureStarted = new Promise((resolve) => {
+    chrome.tabs.sendMessage = async (tabId, message, options) => {
+      if (message.type === 'JOB_APP_CAPTURE' && !captureHeld) {
+        captureHeld = true;
+        resolve();
+        await new Promise((done) => { releaseCapture = done; });
+      }
+      return originalSendMessage(tabId, message, options);
+    };
+  });
+  const manualSave = harness.dispatch({ type: 'JOB_RUN_SAVE_ANSWERS', tabId: 7 });
+  await captureStarted;
+  const finalSave = harness.dispatch(snapshot, { tab: { id: 7 }, frameId: 0, url: 'https://jobs.example.com/apply' });
+  harness.tabs.get(7).frames = [];
+  releaseCapture();
+  const [manual, final] = await Promise.all([manualSave, finalSave]);
+
+  assert.equal(manual.ok, false);
+  assert.equal(final.ok, true, final.error);
+  assert.equal(final.run.status, 'answers_saved');
+  assert.equal(harness.localData.applicationDrafts[`${7}:${started.run.startedAt}`].records.find((record) => record.key === 'full_name').answer, 'Edited at submit');
+});
+
 test('saves manually filled values on an incomplete page without changing its step state', async () => {
   const harness = createHarness({
     pagesByTab: {
