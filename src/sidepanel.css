@@ -56,6 +56,18 @@ button:disabled { cursor: wait; opacity: .55; }
 .saved-evidence button { min-height: 32px; margin: 8px 4px 0 0; padding: 6px 9px; font-size: 11px; }
 .saved-answer-delete-confirmation { display: inline; }
 .answer-workspace { margin-top: 10px; padding: 10px; border: 1px solid var(--accent); border-radius: 10px; background: var(--card-2); }
+.choice-workspace { margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--border); font: 11px/1.5 ui-monospace, SFMono-Regular, Consolas, monospace; }
+.choice-kind { color: #58a6ff; font-size: 10px; font-weight: 800; letter-spacing: .06em; }
+.choice-hint { margin-top: 5px; color: var(--accent); }
+.choice-actions { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 8px; }
+.choice-actions button, .choice-apply-selected { min-height: 26px; padding: 0; border: 0; color: #58a6ff; background: transparent; font: inherit; text-decoration: underline; text-underline-offset: 3px; }
+.choice-actions button[data-choice-apply-suggestion] { color: var(--accent); font-weight: 800; }
+.choice-picker { margin-top: 10px; }
+.choice-filter { margin-bottom: 8px; border-radius: 4px; }
+.choice-options { max-height: 230px; overflow: auto; }
+.choice-option { display: flex; align-items: center; gap: 7px; margin: 0; padding: 4px 0; color: var(--text); font: inherit; }
+.choice-option input { width: auto; margin: 0; accent-color: var(--accent); }
+.choice-apply-selected { margin-top: 9px; color: var(--accent); font-weight: 800; }
 .answer-workspace > label { color: var(--text); font-size: 11px; }
 .answer-workspace textarea { width: 100%; min-height: 88px; padding: 9px; border: 1px solid var(--border); border-radius: 8px; outline: none; resize: vertical; color: var(--text); background: var(--bg); font: 12px/1.45 Inter, ui-sans-serif, system-ui, sans-serif; }
 .answer-workspace textarea:focus { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(215,255,69,.08); }

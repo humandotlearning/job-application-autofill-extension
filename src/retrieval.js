@@ -11,7 +11,7 @@ const EXPERIENCE_TAGS = {
 // actually present in the answer; question wording alone is not evidence.
 function narrativeOverlap(field, record) {
   const query = normalizeText(field.label);
-  if (['radio', 'checkbox', 'select', 'select-one'].includes(field.type)
+  if (['choice', 'radio', 'checkbox', 'select', 'select-one'].includes(field.type)
     || !/\b(describe|experience|tell|example|project)\b/.test(query)
     || inferSensitivity(query) !== 'safe') return [];
   const actions = text => new Set(normalizeText(text).split(' ').map(word => ({ built: 'build', building: 'build', developing: 'develop', developed: 'develop', designing: 'design', designed: 'design', deploying: 'deploy', deployed: 'deploy', leading: 'lead', led: 'lead', managing: 'manage', managed: 'manage', implementing: 'implement', implemented: 'implement' }[word] || word)).filter(word => /^(build|develop|design|deploy|lead|manage|implement)$/.test(word)));

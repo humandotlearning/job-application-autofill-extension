@@ -55,6 +55,7 @@ let busy = false;
 let saving = false;
 const correctionDrafts = new Map();
 const drafts = new Map();
+const openChoicePickers = new Set();
 
 function draftKey(origin, fieldId) {
   return [origin?.applicationId || '', origin?.pageSignature || '', fieldId || ''].join(':');
@@ -499,6 +500,136 @@ function answerWorkspace(item, displayLabel) {
   return { workspace, state, origin, updateControls };
 }
 
+function normalizedChoiceText(value) {
+  return String(value || '').replace(/\s+/g, ' ').trim().toLocaleLowerCase();
+}
+
+function choiceSuggestion(item) {
+  const options = item.choice?.options || [];
+  const candidates = item.suggestion?.candidates || [];
+  for (const candidate of candidates) {
+    const matches = options.filter((option) => normalizedChoiceText(option.label) === normalizedChoiceText(candidate.answer)
+      || normalizedChoiceText(option.value) === normalizedChoiceText(candidate.answer));
+    if (matches.length === 1) return { option: matches[0], answer: candidate.answer, exact: true };
+  }
+  for (const candidate of candidates) {
+    const matches = options.filter((option) => normalizedChoiceText(option.label).startsWith(normalizedChoiceText(candidate.answer)));
+    if (normalizedChoiceText(candidate.answer) && matches.length === 1) return { option: matches[0], answer: candidate.answer, exact: false };
+  }
+  return null;
+}
+
+function choiceWorkspace(item, origin) {
+  const choice = item.choice;
+  const pickerKey = [currentRun?.applicationId || '', currentRun?.pageSignature || '', item.fieldId || ''].join(':');
+  const root = document.createElement('div');
+  root.className = 'choice-workspace';
+  const kind = document.createElement('p');
+  kind.className = 'choice-kind';
+  kind.textContent = `CHOICE · ${choice.multiple ? 'MULTI-SELECT' : 'SELECT ONE'} · ${choice.options.length} OPTIONS`;
+  root.append(kind);
+  const suggestion = choiceSuggestion(item);
+  const liveSelected = new Set(item.selectedOptionKeys || choice.options.filter((option) => option.selected).map((option) => option.key));
+  const selected = new Set(suggestion?.exact ? [suggestion.option.key] : liveSelected);
+  const current = choice.options.filter((option) => liveSelected.has(option.key)).map((option) => option.label);
+  if (suggestion) {
+    const hint = document.createElement('p');
+    hint.className = 'choice-hint';
+    hint.textContent = suggestion.exact ? `→ Saved match will replace selection: ${suggestion.option.label}` : `→ Possible saved match: ${suggestion.option.label}`;
+    root.append(hint);
+  }
+  if (current.length) {
+    const hint = document.createElement('p');
+    hint.className = 'choice-hint';
+    hint.textContent = `✓ Currently selected: ${current.join(', ')}`;
+    root.append(hint);
+  }
+
+  const actions = document.createElement('div');
+  actions.className = 'choice-actions';
+  const picker = document.createElement('div');
+  picker.className = 'choice-picker';
+  picker.hidden = !openChoicePickers.has(pickerKey);
+  const apply = async () => {
+    const response = await chrome.runtime.sendMessage({ type: 'JOB_RUN_APPLY_CHOICE', ...origin, selectedOptionKeys: [...selected] });
+    if (!response?.ok || !response.run) throw new Error(response?.error || 'Could not apply the selected options.');
+    openChoicePickers.delete(pickerKey);
+    renderRun(response.run);
+    setStatus('Selected options applied and verified. Submission remains manual.');
+  };
+  if (suggestion?.exact) {
+    const suggested = document.createElement('button');
+    suggested.type = 'button';
+    suggested.dataset.choiceApplySuggestion = 'true';
+    suggested.textContent = `[ replace with ${suggestion.option.label} ]`;
+    suggested.addEventListener('click', async () => {
+      suggested.disabled = true;
+      try { await apply(); } catch (error) { setStatus(error.message, 'error'); } finally { suggested.disabled = false; }
+    });
+    actions.append(suggested);
+  }
+  const change = document.createElement('button');
+  change.type = 'button';
+  change.textContent = '[ change selection ]';
+  change.addEventListener('click', async () => {
+    if (choice.control === 'custom' && !choice.options.length) {
+      change.disabled = true;
+      try {
+        const response = await chrome.runtime.sendMessage({ type: 'JOB_RUN_LOAD_CHOICE_OPTIONS', ...origin });
+        if (!response?.ok || !response.run) throw new Error(response?.error || 'The dropdown did not reveal any options.');
+        openChoicePickers.add([response.run.applicationId || '', response.run.pageSignature || '', item.fieldId || ''].join(':'));
+        renderRun(response.run);
+      } catch (error) { setStatus(error.message, 'error'); } finally { change.disabled = false; }
+      return;
+    }
+    picker.hidden = !picker.hidden;
+    if (picker.hidden) openChoicePickers.delete(pickerKey); else openChoicePickers.add(pickerKey);
+  });
+  actions.append(change);
+  root.append(actions);
+
+  const filter = document.createElement('input');
+  filter.type = 'search';
+  filter.placeholder = 'Filter options';
+  filter.className = 'choice-filter';
+  filter.hidden = choice.options.length <= 8;
+  const options = document.createElement('div');
+  options.className = 'choice-options';
+  const renderOptions = () => {
+    const query = normalizedChoiceText(filter.value);
+    options.replaceChildren();
+    for (const option of choice.options.filter((option) => !query || normalizedChoiceText(option.label).includes(query))) {
+      const row = document.createElement('label');
+      row.className = 'choice-option';
+      const input = document.createElement('input');
+      input.type = choice.multiple ? 'checkbox' : 'radio';
+      input.name = `choice-${item.fieldId}`;
+      input.checked = selected.has(option.key);
+      input.disabled = option.disabled;
+      input.addEventListener('change', () => {
+        if (!choice.multiple) selected.clear();
+        if (input.checked) selected.add(option.key); else selected.delete(option.key);
+        renderOptions();
+      });
+      row.append(input, document.createTextNode(option.label));
+      options.append(row);
+    }
+  };
+  filter.addEventListener('input', renderOptions);
+  const applySelected = document.createElement('button');
+  applySelected.type = 'button';
+  applySelected.className = 'choice-apply-selected';
+  applySelected.textContent = '[ apply selection ]';
+  applySelected.addEventListener('click', async () => {
+    applySelected.disabled = true;
+    try { await apply(); } catch (error) { setStatus(error.message, 'error'); } finally { applySelected.disabled = false; }
+  });
+  renderOptions();
+  picker.append(filter, options, applySelected);
+  root.append(picker);
+  return root;
+}
+
 function itemRow(item, { focus = false, detail = '' } = {}) {
   const row = document.createElement('div');
   row.className = 'result-item';
@@ -562,9 +693,13 @@ function itemRow(item, { focus = false, detail = '' } = {}) {
     button.textContent = 'Show on page';
     content.append(button);
   }
-  const workspace = focus && item.fieldId && (!onlyOpaqueSuggestions || hasReadableGeneratedDraft)
+  const choiceEditor = focus && item.fieldId && item.choice
+    ? choiceWorkspace(item, origin)
+    : null;
+  const workspace = !choiceEditor && focus && item.fieldId && (!onlyOpaqueSuggestions || hasReadableGeneratedDraft)
     ? answerWorkspace(item, displayLabel)
     : null;
+  if (choiceEditor) content.append(choiceEditor);
   if (workspace) content.append(workspace.workspace);
   if (generated) {
     const drafts = Array.isArray(generated.suggestions) ? generated.suggestions : [];
@@ -640,7 +775,7 @@ function itemRow(item, { focus = false, detail = '' } = {}) {
     draftList.append(regenerate);
     content.insertBefore(draftList, workspace?.workspace || null);
   }
-  if (item.suggestion) {
+  if (item.suggestion && !item.choice) {
     for (const candidate of candidates) {
       const evidence = document.createElement('details');
       evidence.className = 'saved-evidence';

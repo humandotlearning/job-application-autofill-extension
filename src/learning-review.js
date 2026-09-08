@@ -46,7 +46,7 @@ function valueShape(record = {}) {
   if (type === 'tel') return 'phone';
   if (type === 'url') return 'url';
   if (type === 'number' || type === 'range') return 'number';
-  if (['checkbox', 'radio', 'select', 'select one'].includes(type)) return 'choice';
+  if (['choice', 'checkbox', 'radio', 'select', 'select one'].includes(type)) return 'choice';
   return 'short_text';
 }
 

@@ -10,6 +10,7 @@ import {
   inspectDocument,
   isFinalApplicationSubmit,
   planDeterministicFill,
+  revealChoiceOptions,
   validateDocument,
 } from '../src/form-engine.js';
 
@@ -49,6 +50,145 @@ test('includes external form-associated actions when classifying a submitter-les
 
   assert.equal(isFinalApplicationSubmit(withNext, { target: withNext.querySelector('form') }), false);
   assert.equal(isFinalApplicationSubmit(withFinal, { target: withFinal.querySelector('form') }), true);
+});
+
+test('groups a structurally labelled checkbox list into one multi-choice field', () => {
+  const document = makeDocument(`
+    <form>
+      <section id="locations">
+        <h3>Which is your preferred location for this role?</h3>
+        <label><input id="amsterdam" type="checkbox" value="amsterdam"> Amsterdam, Netherlands</label>
+        <label><input id="munich" type="checkbox" value="munich"> Munich, Germany</label>
+        <label><input id="remote" type="checkbox" value="remote"> Remote, Germany</label>
+      </section>
+      <label><input id="retention" type="checkbox"> I agree to future contact</label>
+    </form>
+  `);
+
+  const fields = collectFieldDescriptors(document);
+
+  assert.equal(fields.length, 2);
+  assert.equal(fields[0].label, 'Which is your preferred location for this role?');
+  assert.equal(fields[0].type, 'choice');
+  assert.equal(fields[0].multiple, true);
+  assert.deepEqual(fields[0].choice.options.map((option) => [option.label, option.value, option.selected, option.disabled]), [
+    ['Amsterdam, Netherlands', 'amsterdam', false, false],
+    ['Munich, Germany', 'munich', false, false],
+    ['Remote, Germany', 'remote', false, false],
+  ]);
+  assert.equal(fields[1].id, 'retention');
+  assert.equal(fields[1].type, 'checkbox');
+});
+
+test('groups a checkbox list with a direct question label but not its option labels', () => {
+  const document = makeDocument(`
+    <form>
+      <section>
+        <label class="question">Which locations work for you?</label>
+        <div><label><input id="berlin" type="checkbox"> Berlin, Germany</label></div>
+        <div><label><input id="prague" type="checkbox"> Prague, Czech Republic</label></div>
+      </section>
+    </form>
+  `);
+
+  const fields = collectFieldDescriptors(document);
+
+  assert.equal(fields.length, 1);
+  assert.equal(fields[0].label, 'Which locations work for you?');
+  assert.deepEqual(fields[0].choice.options.map((option) => option.label), ['Berlin, Germany', 'Prague, Czech Republic']);
+});
+
+test('replaces a checkbox choice group using structured option keys', async () => {
+  const document = makeDocument(`
+    <form><section id="locations"><h3>Preferred location</h3>
+      <label><input id="amsterdam" type="checkbox" checked> Amsterdam, Netherlands</label>
+      <label><input id="munich" type="checkbox"> Munich, Germany</label>
+      <label><input id="remote" type="checkbox"> Remote, Germany</label>
+    </section></form>
+  `);
+  const field = collectFieldDescriptors(document)[0];
+  const munich = field.choice.options.find((option) => option.label === 'Munich, Germany');
+
+  const result = await applyDecisions(document, [{
+    fieldId: field.id, handle: field.handle, action: 'select_choice', selectedOptionKeys: [munich.key],
+  }]);
+
+  assert.equal(result.applied.length, 1);
+  assert.equal(document.getElementById('amsterdam').checked, false);
+  assert.equal(document.getElementById('munich').checked, true);
+  assert.equal(document.getElementById('remote').checked, false);
+  assert.equal(collectFieldDescriptors(document)[0].currentValue, 'Munich, Germany');
+});
+
+test('normalizes select, radio, and custom dropdown controls as choices', () => {
+  const document = makeDocument(`
+    <form>
+      <label for="country">Country</label><select id="country"><option value="">Choose</option><option value="DE" selected>Germany</option></select>
+      <fieldset><legend>Work authorization</legend><label><input type="radio" name="authorization" value="yes" checked> Yes</label><label><input type="radio" name="authorization" value="no"> No</label></fieldset>
+      <label for="source">Source</label><button id="source" type="button" role="combobox" aria-controls="sources">Google search</button><div id="sources" role="listbox"><div role="option" aria-selected="true" data-value="google">Google search</div><div role="option" data-value="referral">Referral</div></div>
+    </form>
+  `);
+  const fields = collectFieldDescriptors(document);
+
+  assert.deepEqual(fields.map((field) => [field.type, field.choice.control, field.choice.multiple]), [
+    ['select', 'select', false], ['radio', 'radio', false], ['select', 'custom', false],
+  ]);
+  assert.equal(fields[0].choice.options.find((option) => option.label === 'Germany').selected, true);
+  assert.equal(fields[1].choice.options.find((option) => option.label === 'Yes').selected, true);
+  assert.equal(fields[2].choice.options.find((option) => option.label === 'Google search').selected, true);
+});
+
+test('applies native select and radio choices by option key', async () => {
+  const document = makeDocument(`
+    <form>
+      <label for="country">Country</label><select id="country"><option value="DE" selected>Germany</option><option value="IN">India</option></select>
+      <fieldset><legend>Work authorization</legend><label><input type="radio" name="authorization" value="yes" checked> Yes</label><label><input type="radio" name="authorization" value="no"> No</label></fieldset>
+    </form>
+  `);
+  const [country, authorization] = collectFieldDescriptors(document);
+  const india = country.choice.options.find((option) => option.label === 'India');
+  const no = authorization.choice.options.find((option) => option.label === 'No');
+
+  const result = await applyDecisions(document, [
+    { fieldId: country.id, handle: country.handle, action: 'select_choice', selectedOptionKeys: [india.key] },
+    { fieldId: authorization.id, handle: authorization.handle, action: 'select_choice', selectedOptionKeys: [no.key] },
+  ]);
+
+  assert.equal(result.applied.length, 2);
+  assert.equal(document.getElementById('country').value, 'IN');
+  assert.equal(document.querySelector('input[value="no"]').checked, true);
+});
+
+test('replaces custom multi-select choices by key without splitting comma labels', async () => {
+  const document = makeDocument(`
+    <form><label for="locations">Locations</label><button id="locations" type="button" role="combobox" aria-controls="location-options" aria-multiselectable="true">Amsterdam, Netherlands</button></form>
+    <div id="location-options" role="listbox" aria-multiselectable="true"><div role="option" aria-selected="true">Amsterdam, Netherlands</div><div role="option" aria-selected="false">Munich, Germany</div></div>
+  `);
+  const trigger = document.getElementById('locations');
+  for (const option of document.querySelectorAll('[role="option"]')) option.addEventListener('click', () => {
+    option.setAttribute('aria-selected', option.getAttribute('aria-selected') === 'true' ? 'false' : 'true');
+    trigger.textContent = [...document.querySelectorAll('[role="option"][aria-selected="true"]')].map((item) => item.textContent).join(', ');
+  });
+  const field = collectFieldDescriptors(document)[0];
+  const munich = field.choice.options.find((option) => option.label === 'Munich, Germany');
+
+  const result = await applyDecisions(document, [{ fieldId: field.id, handle: field.handle, action: 'select_choice', selectedOptionKeys: [munich.key] }]);
+
+  assert.equal(result.applied.length, 1);
+  assert.equal(document.querySelector('[role="option"]').getAttribute('aria-selected'), 'false');
+  assert.equal(document.querySelectorAll('[role="option"]')[1].getAttribute('aria-selected'), 'true');
+});
+
+test('reveals custom dropdown options only when explicitly requested', async () => {
+  const document = makeDocument('<form><label for="location">Location</label><button id="location" type="button" role="combobox" aria-controls="location-options">Choose</button><div id="location-options" role="listbox" hidden><div role="option">Munich, Germany</div></div></form>');
+  const trigger = document.getElementById('location');
+  trigger.addEventListener('click', () => { document.getElementById('location-options').hidden = false; trigger.setAttribute('aria-expanded', 'true'); });
+  const field = collectFieldDescriptors(document)[0];
+  assert.deepEqual(field.choice.options, []);
+
+  const revealed = await revealChoiceOptions(document, field.id);
+
+  assert.equal(revealed.choice.options[0].label, 'Munich, Germany');
 });
 
 test('fills a custom dropdown identified by a linked label', async () => {

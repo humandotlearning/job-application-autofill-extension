@@ -26,6 +26,8 @@ async function setupPanel({
   datasource = { answerCount: 3, coverMessageCount: 1 },
   localData = { openaiApiKey: 'sk-test', autoAdvancePages: false },
   applyDraftResponse = { ok: true, run },
+  applyChoiceResponse = { ok: true, run },
+  loadChoiceResponse = { ok: true, run },
   approveSuggestionResponse = { ok: true, run },
   rewriteResponse = { ok: true, answer: 'Rewritten answer.' },
   generateResponse = { ok: true, run },
@@ -89,6 +91,8 @@ async function setupPanel({
         };
         if (message.type === 'JOB_RUN_FOCUS_FIELD') return { ok: true, run };
         if (message.type === 'JOB_RUN_APPLY_DRAFT') return typeof applyDraftResponse === 'function' ? applyDraftResponse(message) : applyDraftResponse;
+        if (message.type === 'JOB_RUN_APPLY_CHOICE') return typeof applyChoiceResponse === 'function' ? applyChoiceResponse(message) : applyChoiceResponse;
+        if (message.type === 'JOB_RUN_LOAD_CHOICE_OPTIONS') return typeof loadChoiceResponse === 'function' ? loadChoiceResponse(message) : loadChoiceResponse;
         if (message.type === 'JOB_RUN_APPROVE_SUGGESTION') return typeof approveSuggestionResponse === 'function' ? approveSuggestionResponse(message) : approveSuggestionResponse;
         if (message.type === 'JOB_RUN_REWRITE_ANSWER') return typeof rewriteResponse === 'function' ? rewriteResponse(message) : rewriteResponse;
         if (message.type === 'JOB_RUN_GENERATE_SUGGESTIONS') return typeof generateResponse === 'function' ? generateResponse(message) : generateResponse;
@@ -141,6 +145,58 @@ async function setupPanel({
     },
   };
 }
+
+test('panel renders a minimal exact choice suggestion and applies its option key', async () => {
+  const choice = {
+    control: 'checkbox', multiple: true, options: [
+      { key: 'option_0_amsterdam', label: 'Amsterdam, Netherlands', value: 'amsterdam', selected: true, disabled: false },
+      { key: 'option_1_munich', label: 'Munich, Germany', value: 'munich', selected: false, disabled: false },
+    ],
+  };
+  const run = {
+    status: 'waiting_user', startedAt: 'run-choice', applicationId: 'run-choice', pageSignature: 'page-choice', frame: { frameId: 0 }, frameId: 0,
+    actionRequired: [{ fieldId: 'locations', handle: 'locations-h', label: 'Preferred location', fieldType: 'choice', required: true, choice, selectedOptionKeys: ['option_0_amsterdam'], fieldOptions: choice.options.map((option) => option.label), fieldConstraints: {}, fieldMultiple: true, suggestion: { field: { id: 'locations', handle: 'locations-h' }, candidates: [{ answer: 'Munich, Germany', sourceKey: 'location' }] } }],
+    optionalUnresolved: [], reviewRequired: [], audit: [],
+  };
+  const harness = await setupPanel({ run });
+  try {
+    const button = document.querySelector('[data-choice-apply-suggestion]');
+    assert.ok(button);
+    assert.match(document.querySelector('#action-required-list').textContent, /CHOICE · MULTI-SELECT/i);
+    assert.match(document.querySelector('#action-required-list').textContent, /Currently selected: Amsterdam, Netherlands/i);
+    assert.match(button.textContent, /replace with Munich, Germany/i);
+    button.click();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const message = harness.sentMessages.find((item) => item.type === 'JOB_RUN_APPLY_CHOICE');
+    assert.deepEqual(message.selectedOptionKeys, ['option_1_munich']);
+  } finally { harness.cleanup(); }
+});
+
+test('opening a delayed custom choice loads options and immediately shows its picker', async () => {
+  const emptyChoice = { control: 'custom', multiple: false, options: [] };
+  const loadedChoice = { control: 'custom', multiple: false, options: [
+    { key: 'option_0_berlin', label: 'Berlin, Germany', value: 'berlin', selected: false, disabled: false },
+    { key: 'option_1_munich', label: 'Munich, Germany', value: 'munich', selected: false, disabled: false },
+  ] };
+  const initial = {
+    status: 'waiting_user', startedAt: 'run-delayed', applicationId: 'run-delayed', pageSignature: 'page-before', frame: { frameId: 0 }, frameId: 0,
+    actionRequired: [{ fieldId: 'location', handle: 'location-h', label: 'Preferred location', fieldType: 'choice', required: true, choice: emptyChoice, selectedOptionKeys: [], fieldOptions: [], fieldConstraints: {}, fieldMultiple: false }],
+    optionalUnresolved: [], reviewRequired: [], audit: [],
+  };
+  const refreshed = {
+    ...initial, pageSignature: 'page-after', actionRequired: [{ ...initial.actionRequired[0], choice: loadedChoice, fieldOptions: loadedChoice.options.map((option) => option.label) }],
+  };
+  const harness = await setupPanel({ run: initial, loadChoiceResponse: { ok: true, run: refreshed } });
+  try {
+    const button = [...document.querySelectorAll('.choice-actions button')].find((item) => /change selection/i.test(item.textContent));
+    button.click();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assert.equal(harness.sentMessages.find((item) => item.type === 'JOB_RUN_LOAD_CHOICE_OPTIONS')?.fieldId, 'location');
+    const picker = document.querySelector('.choice-picker');
+    assert.equal(picker.hidden, false);
+    assert.equal(picker.querySelectorAll('.choice-option').length, 2);
+  } finally { harness.cleanup(); }
+});
 
 test('candidate selection requires an explicit Send to form action', async () => {
   const suggestion = { tabId: 7, frameId: 3, applicationId: 'run-one', pageSignature: 'page-one', field: { id: 'ml', handle: 'handle-one' }, candidates: [{ sourceKey: 'story', sourceQuestion: 'Saved project', answer: 'Synthetic model project narrative.', provenance: 'user', reason: 'Related ML evidence', kind: 'related' }] };

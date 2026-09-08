@@ -755,6 +755,108 @@ function fieldIdentity(element, index, collection = []) {
   return occurrence > 1 ? `${base}__${controlHandle(element)}` : base;
 }
 
+function checkboxChoiceGroup(document, element) {
+  if (element.type !== 'checkbox') return null;
+  for (let container = element.parentElement, depth = 0; container && depth < 5; container = container.parentElement, depth += 1) {
+    if (container.matches('form,main,body')) break;
+    const members = [...container.querySelectorAll('input[type="checkbox"]')]
+      .filter((candidate) => isSupported(candidate) && isVisible(candidate) && inApplication(document, candidate));
+    if (members.length < 2 || !members.includes(element)) continue;
+    const controls = [...container.querySelectorAll('input:not([type="hidden"]),textarea,select')]
+      .filter((candidate) => isSupported(candidate) && isVisible(candidate));
+    if (controls.some((candidate) => candidate.type !== 'checkbox')) continue;
+    const heading = [...container.children].filter((candidate) => {
+      if (candidate.matches('legend,h1,h2,h3,h4,[role="heading"]')) return true;
+      // A direct label without controls is a common hosted-form question wrapper.
+      // Exclude option labels so grouping still requires one unambiguous question.
+      return candidate.tagName === 'LABEL'
+        && !candidate.htmlFor
+        && !candidate.querySelector('input,textarea,select');
+    }).filter(isVisible);
+    if (heading.length !== 1) continue;
+    const label = visibleText(heading[0]);
+    if (!label) continue;
+    if (!(heading[0].compareDocumentPosition(members[0]) & 4)) continue;
+    return { container, members, label };
+  }
+  return null;
+}
+
+function choiceOption(element, index) {
+  const label = optionText(element);
+  const value = String(element.value || label);
+  return {
+    key: choiceOptionKey(index, element.id || element.name || value || label),
+    label,
+    value,
+    selected: Boolean(element.checked),
+    disabled: Boolean(element.disabled),
+  };
+}
+
+function choiceOptionKey(index, identity) {
+  return `option_${index}_${slugify(identity || 'choice')}`;
+}
+
+function normalizedChoiceOption({ label, value, selected, disabled }, index) {
+  return {
+    key: choiceOptionKey(index, value || label),
+    label: String(label || ''),
+    value: String(value || label || ''),
+    selected: Boolean(selected),
+    disabled: Boolean(disabled),
+  };
+}
+
+function choiceMetadata(document, element) {
+  if (element.tagName === 'SELECT') {
+    const options = [...element.options].map((option, index) => normalizedChoiceOption({
+      label: option.textContent.trim(), value: option.value, selected: option.selected, disabled: option.disabled,
+    }, index));
+    return { control: 'select', multiple: Boolean(element.multiple), options };
+  }
+  if (element.type === 'radio') {
+    const options = radioGroup(document, element).map((option, index) => normalizedChoiceOption({
+      label: optionText(option), value: option.value, selected: option.checked, disabled: option.disabled,
+    }, index));
+    return { control: 'radio', multiple: false, options };
+  }
+  if (customWidgetElements(document).includes(element)) {
+    const options = customWidgetOptions(document, element).map((option, index) => normalizedChoiceOption({
+      label: customOptionText(option), value: customOptionValue(option), selected: option.getAttribute('aria-selected') === 'true', disabled: option.getAttribute('aria-disabled') === 'true' || option.disabled,
+    }, index));
+    const multiple = element.getAttribute('aria-multiselectable') === 'true'
+      || customWidgetOptions(document, element)[0]?.closest('[role="listbox"]')?.getAttribute('aria-multiselectable') === 'true';
+    return { control: 'custom', multiple, options };
+  }
+  return null;
+}
+
+function checkboxChoiceDescriptor(document, element, index, group) {
+  const options = group.members.map(choiceOption);
+  const selected = options.filter((option) => option.selected);
+  return {
+    id: fieldIdentity(element, index, formElements(document)),
+    handle: controlHandle(element),
+    multiple: true,
+    selectedOptionKeys: selected.map((option) => option.key),
+    choice: { control: 'checkbox', multiple: true, options },
+    label: group.label,
+    labelSource: 'group',
+    labelConfidence: 'high',
+    helpText: textFromIds(document, element.getAttribute('aria-describedby')).slice(0, 2000),
+    nearbyContext: nearbyQuestion(element).slice(0, 1000),
+    type: 'choice',
+    autocomplete: '',
+    placeholder: '',
+    required: group.members.some((member) => member.required),
+    currentValue: selected.map((option) => option.label).join(', '),
+    options: options.map((option) => option.label),
+    constraints: {},
+    ...fieldContext(element),
+  };
+}
+
 function formElements(document) {
   return [...document.querySelectorAll('input, textarea, select')].filter((element) => isSupported(element) && isVisible(element) && inApplication(document, element));
 }
@@ -762,11 +864,19 @@ function formElements(document) {
 function uniqueFields(document) {
   const fields = [];
   const seenRadioGroups = new Set();
+  const seenCheckboxGroups = new Set();
   for (const [index, element] of formElements(document).entries()) {
     if (element.type === 'radio' && element.name) {
       const group = radioGroup(document, element)[0];
       if (seenRadioGroups.has(group)) continue;
       seenRadioGroups.add(group);
+    }
+    const checkboxGroup = checkboxChoiceGroup(document, element);
+    if (checkboxGroup) {
+      if (seenCheckboxGroups.has(checkboxGroup.container)) continue;
+      seenCheckboxGroups.add(checkboxGroup.container);
+      fields.push({ element: checkboxGroup.members[0], index, checkboxGroup });
+      continue;
     }
     fields.push({ element, index });
   }
@@ -828,12 +938,15 @@ function constraintsFor(element) {
   return constraints;
 }
 
-function describeField(document, element, index) {
+function describeField(document, element, index, checkboxGroup = null) {
+  if (checkboxGroup) return checkboxChoiceDescriptor(document, element, index, checkboxGroup);
   const type = element.tagName === 'SELECT' ? 'select' : element.tagName === 'TEXTAREA' ? 'textarea' : (element.type || 'text');
+  const choice = choiceMetadata(document, element);
   return {
     id: fieldIdentity(element, index, formElements(document)),
     handle: controlHandle(element),
     multiple: Boolean(element.multiple),
+    ...(choice ? { choice, selectedOptionKeys: choice.options.filter((option) => option.selected).map((option) => option.key), multiple: choice.multiple } : {}),
     selectedValues: element.tagName === 'SELECT' ? [...element.selectedOptions].filter((option) => option.value).map((option) => option.value) : [],
     structuredOptions: element.tagName === 'SELECT' ? [...element.options].map((option) => ({ label: option.textContent.trim(), value: option.value, selected: option.selected, disabled: option.disabled })) : [],
     ...questionMetadata(document, element),
@@ -852,14 +965,18 @@ function describeField(document, element, index) {
 
 function collectFieldDescriptors(document) {
   ensureEditTracking(document);
-  const nativeFields = uniqueFields(document).map(({ element, index }) => ({ element, field: describeField(document, element, index) }));
+  const nativeFields = uniqueFields(document).map(({ element, index, checkboxGroup }) => ({ element, field: describeField(document, element, index, checkboxGroup) }));
   const customElements = customWidgetElements(document);
   const customFields = customElements
     .filter((element, index) => !nativeFields.some(({ field }) => field.id === fieldIdentity(element, index, customElements)))
-    .map((element, index) => ({ element, field: {
+    .map((element, index) => {
+      const choice = choiceMetadata(document, element);
+      return { element, field: {
       id: fieldIdentity(element, index, customElements),
       handle: controlHandle(element),
-      multiple: element.getAttribute('aria-multiselectable') === 'true' || document.getElementById(element.getAttribute('aria-controls'))?.getAttribute('aria-multiselectable') === 'true',
+      multiple: choice?.multiple || false,
+      choice,
+      selectedOptionKeys: choice?.options.filter((option) => option.selected).map((option) => option.key) || [],
       structuredOptions: customWidgetOptions(document, element).map((option) => ({ label: customOptionText(option), value: customOptionValue(option), selected: option.getAttribute('aria-selected') === 'true', disabled: option.getAttribute('aria-disabled') === 'true' })),
       label: customWidgetLabel(document, element),
       labelSource: nearbyQuestion(element) === customWidgetLabel(document, element) ? 'nearby-question' : 'custom-widget',
@@ -872,7 +989,8 @@ function collectFieldDescriptors(document) {
       options: fieldOptions(document, element),
       constraints: {},
       ...fieldContext(element),
-    } }));
+    } };
+    });
   const fields = [...nativeFields, ...customFields]
     .sort(({ element: left }, { element: right }) => {
       const position = left.compareDocumentPosition?.(right) || 0;
@@ -989,6 +1107,11 @@ function setCheckbox(element, answer) {
   return true;
 }
 
+function requestedCustomValues(answer, multiple) {
+  if (Array.isArray(answer)) return answer.map(normalizeText).filter(Boolean);
+  return (multiple ? String(answer).split(/\s*[,;]\s*/) : [answer]).map(normalizeText).filter(Boolean);
+}
+
 function waitForCustomOptions(document, element, answer, timeoutMs = 1500) {
   const startedAt = Date.now();
   return new Promise((resolve) => {
@@ -996,7 +1119,7 @@ function waitForCustomOptions(document, element, answer, timeoutMs = 1500) {
       const options = customWidgetOptions(document, element);
       const multiple = element.getAttribute('aria-multiselectable') === 'true'
         || options[0]?.closest('[role="listbox"]')?.getAttribute('aria-multiselectable') === 'true';
-      const requested = multiple ? String(answer).split(/\s*[,;]\s*/).map(normalizeText).filter(Boolean) : [normalizeText(answer)];
+      const requested = requestedCustomValues(answer, multiple);
       if ((options.length && requested.every((value) => matchingCustomOptions(options, value).length)) || Date.now() - startedAt >= timeoutMs) {
         resolve(options);
         return;
@@ -1013,10 +1136,11 @@ async function setCustomChoiceValue(document, element, answer) {
     return { ok: false, unresolved: true, reason: 'Refusing to activate a native submit/reset control' };
   }
   if (element.getAttribute('aria-expanded') !== 'true') element.click();
-  const expected = normalizeText(answer);
+  const searchAnswer = Array.isArray(answer) ? answer[0] : answer;
+  const expected = normalizeText(searchAnswer);
   if (element.tagName === 'INPUT' && element.getAttribute('aria-autocomplete')) {
     element.__jobApplicationSearchQuery = true;
-    setTextValue(element, answer);
+    setTextValue(element, searchAnswer);
   }
   const options = await waitForCustomOptions(document, element, answer);
   if (!options.length) {
@@ -1025,11 +1149,18 @@ async function setCustomChoiceValue(document, element, answer) {
   }
   const multiple = element.getAttribute('aria-multiselectable') === 'true'
     || options[0]?.closest('[role="listbox"]')?.getAttribute('aria-multiselectable') === 'true';
-  const requested = multiple ? String(answer).split(/\s*[,;]\s*/).map(normalizeText).filter(Boolean) : [expected];
+  const requested = requestedCustomValues(answer, multiple);
   const candidates = requested.map((value) => matchingCustomOptions(options, value));
   const matches = candidates.flat();
   if (candidates.some((options) => options.length !== 1) || new Set(matches).size !== matches.length) {
     return { ok: false, unresolved: true, reason: 'The custom widget does not expose one unique exact option' };
+  }
+  if (multiple) {
+    for (const option of options) {
+      if (option.getAttribute('aria-selected') !== 'true' || matches.includes(option)) continue;
+      if (hasNativeFormAction(option)) return { ok: false, unresolved: true, reason: 'Refusing to activate a native submit/reset option' };
+      option.click();
+    }
   }
   for (const match of matches) {
     if (match.getAttribute('aria-selected') === 'true') continue;
@@ -1054,10 +1185,9 @@ async function setCustomChoiceValue(document, element, answer) {
   dispatchFormEvents(element);
   const displayed = normalizeText(fieldValue(document, element));
   const backingValue = normalizeText(backingInput?.value || '');
-  const displayedValues = fieldValue(document, element).split(/\s*[,;]\s*/).map(normalizeText).filter(Boolean);
-  const expectedValues = requested.slice().sort();
   const displayedMatches = multiple
-    ? displayedValues.slice().sort().join('|') === expectedValues.slice().sort().join('|')
+    ? options.filter((option) => option.getAttribute('aria-selected') === 'true').length === matches.length
+      && matches.every((option) => option.getAttribute('aria-selected') === 'true')
     : acceptedSingleValues.includes(displayed) || acceptedSingleValues.includes(backingValue);
   if (!displayedMatches && backingValue !== expected) {
     return { ok: false, unresolved: true, reason: 'The custom widget did not accept the selected option' };
@@ -1074,6 +1204,58 @@ async function fillElement(document, element, answer) {
   if (element.type === 'radio') return { ok: setRadioGroup(document, element, answer) };
   if (element.type === 'checkbox') return { ok: setCheckbox(element, answer) };
   return { ok: setTextValue(element, answer) };
+}
+
+async function setChoiceSelection(document, field, selectedOptionKeys) {
+  if (!field?.choice || !Array.isArray(selectedOptionKeys)) return { ok: false, reason: 'The choice selection is unavailable' };
+  const requested = [...new Set(selectedOptionKeys.filter((key) => typeof key === 'string' && key))];
+  const options = field.choice.options || [];
+  if (requested.length !== selectedOptionKeys.length || requested.some((key) => !options.some((option) => option.key === key))) {
+    return { ok: false, reason: 'The selected options are no longer available' };
+  }
+  if (!field.multiple && requested.length !== 1) return { ok: false, reason: 'Select exactly one option' };
+  const element = elementForField(document, field.id);
+  const expected = new Set(requested);
+  if (field.choice.control === 'checkbox') {
+    const group = element && checkboxChoiceGroup(document, element);
+    if (!group || group.members.length !== options.length) return { ok: false, reason: 'The choice controls changed on the page' };
+    for (const [index, member] of group.members.entries()) {
+      const option = choiceOption(member, index);
+      if (member.disabled && expected.has(option.key) && !member.checked) return { ok: false, reason: 'A selected option is disabled' };
+      const selected = expected.has(option.key);
+      if (member.checked === selected) continue;
+      member.checked = selected;
+      dispatchFormEvents(member);
+    }
+  } else if (field.choice.control === 'select' && element?.tagName === 'SELECT') {
+    const liveOptions = [...element.options];
+    if (liveOptions.length !== options.length) return { ok: false, reason: 'The choice controls changed on the page' };
+    for (const [index, option] of liveOptions.entries()) {
+      const key = normalizedChoiceOption({ label: option.textContent.trim(), value: option.value }, index).key;
+      if (option.disabled && expected.has(key) && !option.selected) return { ok: false, reason: 'A selected option is disabled' };
+      option.selected = expected.has(key);
+    }
+    dispatchFormEvents(element);
+  } else if (field.choice.control === 'radio' && element) {
+    const members = radioGroup(document, element);
+    if (members.length !== options.length) return { ok: false, reason: 'The choice controls changed on the page' };
+    const selected = members.find((member, index) => expected.has(normalizedChoiceOption({ label: optionText(member), value: member.value }, index).key));
+    if (!selected || selected.disabled) return { ok: false, reason: 'The selected option is unavailable' };
+    selected.checked = true;
+    dispatchFormEvents(selected);
+  } else if (field.choice.control === 'custom' && element) {
+    const selected = options.filter((option) => expected.has(option.key));
+    const applied = await setCustomChoiceValue(document, element, selected.map((option) => option.value || option.label));
+    if (!applied.ok) return applied;
+  } else {
+    return { ok: false, reason: 'The choice control is unavailable' };
+  }
+  const refreshed = currentField(document, field.id);
+  if (!refreshed?.choice || refreshed.selectedOptionKeys.length !== requested.length
+    || refreshed.selectedOptionKeys.some((key) => !expected.has(key))) {
+    return { ok: false, reason: 'The page did not retain the selected options' };
+  }
+  return { ok: true };
 }
 
 function elementsForField(document, fieldId) {
@@ -1095,6 +1277,18 @@ function elementForField(document, fieldId) {
 
 function currentField(document, fieldId) {
   return collectFieldDescriptors(document).find((field) => field.id === fieldId) || null;
+}
+
+async function revealChoiceOptions(document, fieldId) {
+  const field = currentField(document, fieldId);
+  if (!field?.choice || field.choice.control !== 'custom') return field;
+  if (field.choice.options.length) return field;
+  const element = elementForField(document, fieldId);
+  if (!element || hasNativeFormAction(element)) return null;
+  element.focus?.();
+  if (element.getAttribute('aria-expanded') !== 'true') element.click();
+  await waitForCustomOptions(document, element, []);
+  return currentField(document, fieldId);
 }
 
 function effectiveSensitivity(field, decision) {
@@ -1206,6 +1400,18 @@ async function applyDecisions(document, decisions = []) {
       continue;
     }
     const element = elementForField(document, decision.fieldId);
+    if (decision.action === 'select_choice') {
+      document.__jobApplicationFilling = true;
+      const fillResult = await setChoiceSelection(document, field, decision.selectedOptionKeys);
+      if (!fillResult.ok) {
+        result.failed.push({ fieldId: field.id, label: field.label, reason: fillResult.reason });
+        continue;
+      }
+      const refreshed = currentField(document, field.id);
+      result.applied.push({ ...decision, field: refreshed, value: refreshed.currentValue });
+      addReviewIfNeeded(result, refreshed, decision, refreshed.currentValue);
+      continue;
+    }
     if (decision.action === 'keep') {
       result.kept.push({ fieldId: field.id, value: field.currentValue });
       addReviewIfNeeded(result, field, decision, field.currentValue);
@@ -1558,6 +1764,11 @@ if (!globalThis.__jobApplicationAutofillInstalled) {
         case 'JOB_APP_FOCUS':
           sendResponse({ ok: focusField(document, message.fieldId) });
           break;
+        case 'JOB_APP_LOAD_CHOICE_OPTIONS':
+          revealChoiceOptions(document, message.fieldId)
+            .then((field) => sendResponse({ ok: Boolean(field), field }))
+            .catch((error) => sendResponse({ ok: false, error: error.message }));
+          return true;
         case 'JOB_APP_CLICK_NEXT':
           learning.flush().then(() => {
             const result = clickAction(document, message.actionId);

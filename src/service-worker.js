@@ -736,6 +736,8 @@ function fieldIssue(field, invalidIds, unresolvedById = new Map(), pageNumber = 
     nearbyContext: field.nearbyContext || '',
     fieldType: field.type,
     fieldOptions: field.options || [],
+    choice: field.choice || null,
+    selectedOptionKeys: field.selectedOptionKeys || [],
     fieldConstraints: field.constraints || {},
     fieldMultiple: Boolean(field.multiple),
     ...(Number.isFinite(pageNumber) ? { pageNumber } : {}),
@@ -752,7 +754,7 @@ function categorizeRun(run, inspection, validation, unresolvedResults = []) {
   const invalidIds = new Set((validation.invalid || []).map((field) => field.fieldId));
   const unresolvedById = new Map(unresolvedResults.filter((item) => item?.fieldId).map((item) => [item.fieldId, item]));
   const unresolvedFieldsOnPage = inspection.fields
-    .filter((field) => !field.currentValue || invalidIds.has(field.id))
+    .filter((field) => !field.currentValue || invalidIds.has(field.id) || (field.choice && run.suggestions?.[field.id]))
     .map((field) => ({
       ...fieldIssue(field, invalidIds, unresolvedById, run.pageNumber),
       ...(run.suggestions?.[field.id] ? { suggestion: run.suggestions[field.id], reason: 'Relevant saved evidence available — approve an answer before use' } : {}),
@@ -816,13 +818,23 @@ async function applyPageDecisions(tabId, run, inspection, records, coverMessages
     if (field.currentValue && invalidFieldIds.has(field.id)) {
       return { ...decision, action: 'keep', value: null, reason: 'The current value does not satisfy the field constraints' };
     }
-    if (field.currentValue) return decision;
-    const candidates = retrieveEvidence(field, records);
+    let candidates = retrieveEvidence(field, records);
     for (const candidate of retrieveEvidence(field, draftRecords)) {
       if (!candidates.some(saved => saved.answer === candidate.answer)) candidates.push({ ...candidate, kind: 'draft', reason: 'Previously entered, not yet saved for reuse — explicit approval required' });
     }
     candidates.splice(3);
-    const gated = candidates.length && (decision.action !== 'fill' || field.type === 'textarea' || decision.sensitivity !== 'safe' || inferSensitivity(field.label, field.id) !== 'safe');
+    if (field.choice && !candidates.length && decision.action === 'fill') {
+      candidates = (decision.evidenceKeys || []).map((key) => records.find((record) => record.key === key)).filter(Boolean)
+        .map((record) => ({ sourceKey: record.key, sourceQuestion: record.question, answer: record.answer, excerpt: record.answer.slice(0, 400), provenance: record.provenance || 'saved record', kind: 'equivalent', requiresApproval: true, reason: 'Saved preference requires confirmation', score: 100 }));
+    }
+    if (field.currentValue) {
+      if (field.choice && decision.action === 'fill' && candidates.length) {
+        run.suggestions[field.id] = { tabId, frameId: run.frame.frameId, applicationId: run.startedAt, pageSignature: currentPageSignature, field, candidates };
+        return { ...decision, action: 'ask_user', value: null, reason: 'Saved preference available — confirm before replacing the current selection' };
+      }
+      return decision;
+    }
+    const gated = candidates.length && (field.choice || decision.action !== 'fill' || field.type === 'textarea' || decision.sensitivity !== 'safe' || inferSensitivity(field.label, field.id) !== 'safe');
     if (gated) {
       run.suggestions[field.id] = { tabId, frameId: run.frame.frameId, applicationId: run.startedAt, pageSignature: currentPageSignature, field, candidates };
       return { ...decision, action: 'ask_user', value: null, reason: 'Relevant saved evidence available — approve an answer before use' };
@@ -1030,12 +1042,13 @@ function sameFieldSnapshot(field, snapshot = {}) {
   if (snapshot.label && field.label !== snapshot.label) return false;
   if (snapshot.fieldType && field.type !== snapshot.fieldType) return false;
   if (snapshot.fieldOptions && JSON.stringify(field.options || []) !== JSON.stringify(snapshot.fieldOptions)) return false;
+  if (snapshot.choice && JSON.stringify(field.choice || null) !== JSON.stringify(snapshot.choice)) return false;
   if (snapshot.fieldConstraints && JSON.stringify(field.constraints || {}) !== JSON.stringify(snapshot.fieldConstraints)) return false;
   if (snapshot.fieldMultiple != null && Boolean(field.multiple) !== Boolean(snapshot.fieldMultiple)) return false;
   return true;
 }
 
-async function guardedDraftField(message, { allowSaveLock = false } = {}) {
+async function guardedDraftField(message, { allowSaveLock = false, allowFilled = false } = {}) {
   const { tabId, fieldId } = message;
   if (!Number.isInteger(tabId) || !fieldId || typeof fieldId !== 'string') throw new Error('The application field is unavailable');
   if (processingTabs.has(tabId) || (!allowSaveLock && saveLocks.has(tabId))) throw new Error('Application is busy or unavailable');
@@ -1063,13 +1076,80 @@ async function guardedDraftField(message, { allowSaveLock = false } = {}) {
     || pageSignature(inspected.inspection, run.frame) !== message.pageSignature) {
     throw new Error('Destination changed; check the page again');
   }
-  if (field.currentValue) {
+  if (field.currentValue && !allowFilled) {
     const validation = await sendToFrame(tabId, message.frameId, { type: 'JOB_APP_VALIDATE' });
     if (!validation?.validation?.invalid?.some((item) => item.fieldId === fieldId)) {
       throw new Error('Destination changed; check the page again');
     }
   }
   return { run, listed, suggestion, field };
+}
+
+async function applyChoice(message) {
+  const selectedOptionKeys = Array.isArray(message.selectedOptionKeys) ? message.selectedOptionKeys : null;
+  if (!selectedOptionKeys || selectedOptionKeys.some((key) => typeof key !== 'string' || !key)) throw new Error('Choose one or more available options');
+  const { tabId } = message;
+  if (!Number.isInteger(tabId) || processingTabs.has(tabId) || saveLocks.has(tabId)) throw new Error('Application is busy or unavailable');
+  saveLocks.add(tabId);
+  try {
+    const { run, field } = await guardedDraftField(message, { allowSaveLock: true, allowFilled: true });
+    const requested = [...new Set(selectedOptionKeys)];
+    const options = field.choice?.options || [];
+    if (!options.length || requested.length !== selectedOptionKeys.length || requested.some((key) => !options.some((option) => option.key === key))) {
+      throw new Error('The available choices changed; check the page again');
+    }
+    if (!field.choice.multiple && requested.length !== 1) throw new Error('Choose exactly one option');
+    if (options.some((option) => requested.includes(option.key) && option.disabled && !option.selected)) throw new Error('A selected option is disabled');
+    const result = await sendToFrame(tabId, message.frameId, {
+      type: 'JOB_APP_APPLY', applicationId: run.startedAt,
+      decisions: [{ fieldId: field.id, handle: field.handle, action: 'select_choice', selectedOptionKeys: requested, sensitivity: 'safe', confidence: 'high', reason: 'Explicitly selected form options' }],
+    });
+    if (!result?.ok) throw new Error(result?.error || 'Could not apply the selected options');
+    const verified = await sendToFrame(tabId, message.frameId, { type: 'JOB_APP_INSPECT' });
+    const updated = verified.inspection?.fields.find((item) => item.id === field.id && item.handle === field.handle);
+    const verifiedKeys = updated?.selectedOptionKeys || [];
+    if (!updated || verifiedKeys.length !== requested.length || verifiedKeys.some((key) => !requested.includes(key))) {
+      throw new Error('The page did not retain the selected options');
+    }
+    const validation = await sendToFrame(tabId, message.frameId, { type: 'JOB_APP_VALIDATE' });
+    categorizeRun(run, verified.inspection, validation?.validation || {});
+    return { ok: true, run: await saveRun(run) };
+  } finally { saveLocks.delete(tabId); }
+}
+
+async function loadChoiceOptions(message) {
+  const { run, listed, field } = await guardedDraftField(message, { allowFilled: true });
+  if (field.choice?.control !== 'custom') throw new Error('This control does not need its options loaded');
+  const response = await sendToFrame(message.tabId, message.frameId, { type: 'JOB_APP_LOAD_CHOICE_OPTIONS', fieldId: field.id });
+  const revealed = response?.field;
+  if (!response?.ok || !revealed || revealed.id !== field.id || revealed.handle !== field.handle
+    || revealed.label !== field.label || revealed.type !== field.type || !revealed.choice?.options?.length) {
+    throw new Error(response?.error || 'The dropdown did not reveal any available options');
+  }
+  // Opening an accessible widget can add options to the live DOM. Re-inspect so
+  // the next guarded operation uses that exact, newly exposed page snapshot.
+  const inspected = await sendToFrame(message.tabId, message.frameId, { type: 'JOB_APP_INSPECT' });
+  const refreshed = inspected?.inspection?.fields.find((item) => item.id === field.id && item.handle === field.handle);
+  if (!refreshed || refreshed.label !== field.label || refreshed.type !== field.type || !refreshed.choice?.options?.length) {
+    throw new Error('The dropdown changed while its choices were loading');
+  }
+  run.pageSignature = pageSignature(inspected.inspection, run.frame);
+  Object.assign(listed, {
+    choice: refreshed.choice,
+    selectedOptionKeys: refreshed.selectedOptionKeys || [],
+    fieldOptions: refreshed.options || [],
+    fieldMultiple: Boolean(refreshed.multiple),
+  });
+  if (run.suggestions?.[field.id]?.field) {
+    Object.assign(run.suggestions[field.id].field, {
+      choice: refreshed.choice,
+      selectedOptionKeys: refreshed.selectedOptionKeys || [],
+      options: refreshed.options || [],
+      multiple: Boolean(refreshed.multiple),
+    });
+    run.suggestions[field.id].pageSignature = run.pageSignature;
+  }
+  return { ok: true, run: await saveRun(run) };
 }
 
 function sourceKeysFromMessage(message = {}) {
@@ -1570,6 +1650,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (![
     'JOB_RUN_APPROVE_SUGGESTION',
     'JOB_RUN_APPLY_DRAFT',
+    'JOB_RUN_APPLY_CHOICE',
+    'JOB_RUN_LOAD_CHOICE_OPTIONS',
     'JOB_RUN_REWRITE_ANSWER',
     'JOB_RUN_GENERATE_SUGGESTIONS',
     'JOB_RUN_START',
@@ -1593,9 +1675,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       if (sender?.tab) throw new Error('This action must originate in the extension panel');
       return updateSavedAnswerFeedback(message, message.type === 'JOB_DATASOURCE_DELETE_ANSWER' ? 'delete' : 'suppress');
     }
-    if (['JOB_RUN_APPROVE_SUGGESTION', 'JOB_RUN_APPLY_DRAFT', 'JOB_RUN_REWRITE_ANSWER', 'JOB_RUN_GENERATE_SUGGESTIONS'].includes(message.type)) {
+    if (['JOB_RUN_APPROVE_SUGGESTION', 'JOB_RUN_APPLY_DRAFT', 'JOB_RUN_APPLY_CHOICE', 'JOB_RUN_LOAD_CHOICE_OPTIONS', 'JOB_RUN_REWRITE_ANSWER', 'JOB_RUN_GENERATE_SUGGESTIONS'].includes(message.type)) {
       if (sender?.tab) throw new Error('This action must originate in the extension panel');
       if (message.type === 'JOB_RUN_APPLY_DRAFT') return applyDraft(message);
+      if (message.type === 'JOB_RUN_APPLY_CHOICE') return applyChoice(message);
+      if (message.type === 'JOB_RUN_LOAD_CHOICE_OPTIONS') return loadChoiceOptions(message);
       if (message.type === 'JOB_RUN_REWRITE_ANSWER') return rewriteAnswer(message);
       if (message.type === 'JOB_RUN_GENERATE_SUGGESTIONS') return generateSuggestions(message);
       return approveSuggestion(message);

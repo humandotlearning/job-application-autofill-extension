@@ -6,6 +6,7 @@ import {
   validateDocument,
   focusField,
   isFinalApplicationSubmit,
+  revealChoiceOptions,
   waitForDocumentSettled,
 } from './form-engine.js';
 import { createLearningSession } from './learning.js';
@@ -58,6 +59,11 @@ if (!globalThis.__jobApplicationAutofillInstalled) {
         case 'JOB_APP_FOCUS':
           sendResponse({ ok: focusField(document, message.fieldId) });
           break;
+        case 'JOB_APP_LOAD_CHOICE_OPTIONS':
+          revealChoiceOptions(document, message.fieldId)
+            .then((field) => sendResponse({ ok: Boolean(field), field }))
+            .catch((error) => sendResponse({ ok: false, error: error.message }));
+          return true;
         case 'JOB_APP_CLICK_NEXT':
           learning.flush().then(() => {
             const result = clickAction(document, message.actionId);

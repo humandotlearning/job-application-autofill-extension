@@ -6,6 +6,7 @@ function createHarness({
   answerRecords = [{ key: 'full_name', question: 'Full name', answer: 'Nithin', aliases: ['Full name'], type: 'text', sensitivity: 'safe', updatedAt: '2025-01-01T00:00:00.000Z' }],
   coverMessages = [],
   pagesByTab = {},
+  onLoadChoiceOptions = null,
 } = {}) {
   const localData = {
     openaiApiKey: '',
@@ -134,8 +135,21 @@ function createHarness({
         state.messageTargets.push({ message, frameId });
         const page = frame.pages[frame.currentPage];
         if (message.type === 'JOB_APP_INSPECT') return { ok: true, inspection: inspectionFor(tabId, frameId) };
+        if (message.type === 'JOB_APP_LOAD_CHOICE_OPTIONS' && onLoadChoiceOptions) {
+          return onLoadChoiceOptions({ tabId, frameId, page, message, inspection: inspectionFor(tabId, frameId) });
+        }
         if (message.type === 'JOB_APP_APPLY') {
           for (const decision of message.decisions || []) {
+            if (decision.action === 'select_choice') {
+              const field = page.fields.find((item) => item.id === decision.fieldId);
+              if (!field?.choice) continue;
+              const selected = new Set(decision.selectedOptionKeys || []);
+              field.choice.options = field.choice.options.map((option) => ({ ...option, selected: selected.has(option.key) }));
+              field.selectedOptionKeys = [...selected];
+              if (!page.values) page.values = {};
+              page.values[decision.fieldId] = field.choice.options.filter((option) => option.selected).map((option) => option.label).join(', ');
+              continue;
+            }
             if (decision.action !== 'fill') continue;
             if (!page.values) page.values = {};
             if (!Object.prototype.hasOwnProperty.call(page.values, decision.fieldId)) page.values[decision.fieldId] = decision.value;
@@ -1288,6 +1302,79 @@ function draftOrigin(run, field) {
     handle: field.handle,
   };
 }
+
+test('choice selections send structured option keys through the guarded apply path', async () => {
+  const choice = {
+    control: 'checkbox', multiple: true, options: [
+      { key: 'option_0_amsterdam', label: 'Amsterdam, Netherlands', value: 'amsterdam', selected: false, disabled: false },
+      { key: 'option_1_munich', label: 'Munich, Germany', value: 'munich', selected: false, disabled: false },
+    ],
+  };
+  const field = { id: 'locations', handle: 'locations-h', label: 'Preferred location', type: 'choice', required: true, multiple: true, choice, selectedOptionKeys: [], currentValue: '', options: choice.options.map((option) => option.label) };
+  const harness = createHarness({ pagesByTab: { 7: { pages: [{
+    page: { title: 'Application', domain: 'example.test' }, fields: [field], actions: [{ id: 'submit', label: 'Submit application', kind: 'submit' }],
+  }] } } });
+  await import(`../src/service-worker.js?choice-apply=${Date.now()}`);
+  const started = await harness.dispatch({ type: 'JOB_RUN_START', tabId: 7 });
+  const result = await harness.dispatch({
+    type: 'JOB_RUN_APPLY_CHOICE', ...draftOrigin(started.run, field), selectedOptionKeys: ['option_1_munich'],
+  });
+
+  assert.equal(result.ok, true, result.error);
+  const decision = harness.tabs.get(7).messages.filter((message) => message.type === 'JOB_APP_APPLY').at(-1).decisions[0];
+  assert.equal(decision.action, 'select_choice');
+  assert.deepEqual(decision.selectedOptionKeys, ['option_1_munich']);
+});
+
+test('revealing delayed custom choices refreshes the guarded page signature before apply', async () => {
+  const field = {
+    id: 'location', handle: 'location-h', label: 'Preferred location', type: 'choice', required: true,
+    multiple: false, choice: { control: 'custom', multiple: false, options: [] }, selectedOptionKeys: [], currentValue: '', options: [],
+  };
+  const revealedOptions = [
+    { key: 'option_0_berlin', label: 'Berlin, Germany', value: 'berlin', selected: false, disabled: false },
+    { key: 'option_1_munich', label: 'Munich, Germany', value: 'munich', selected: false, disabled: false },
+  ];
+  const harness = createHarness({
+    pagesByTab: { 7: { pages: [{ page: { title: 'Application', domain: 'example.test' }, fields: [field], actions: [{ id: 'submit', label: 'Submit application', kind: 'submit' }] }] } },
+    onLoadChoiceOptions: ({ page }) => {
+      page.fields[0].choice = { control: 'custom', multiple: false, options: revealedOptions };
+      page.fields[0].options = revealedOptions.map((option) => option.label);
+      return { ok: true, field: page.fields[0] };
+    },
+  });
+  await import(`../src/service-worker.js?choice-reveal=${Date.now()}`);
+  const started = await harness.dispatch({ type: 'JOB_RUN_START', tabId: 7 });
+  const initialPageSignature = started.run.pageSignature;
+  const load = await harness.dispatch({ type: 'JOB_RUN_LOAD_CHOICE_OPTIONS', ...draftOrigin(started.run, field) });
+
+  assert.equal(load.ok, true, load.error);
+  assert.notEqual(load.run.pageSignature, initialPageSignature);
+  assert.equal(load.run.actionRequired[0].choice.options.length, 2);
+
+  const applied = await harness.dispatch({
+    type: 'JOB_RUN_APPLY_CHOICE', ...draftOrigin(load.run, field), selectedOptionKeys: ['option_1_munich'],
+  });
+  assert.equal(applied.ok, true, applied.error);
+});
+
+test('an existing choice remains reviewable when a saved preference exactly matches another option', async () => {
+  const choice = { control: 'checkbox', multiple: true, options: [
+    { key: 'option_0_amsterdam', label: 'Amsterdam, Netherlands', value: 'amsterdam', selected: true, disabled: false },
+    { key: 'option_1_munich', label: 'Munich, Germany', value: 'munich', selected: false, disabled: false },
+  ] };
+  const field = { id: 'locations', handle: 'locations-h', label: 'Preferred location', type: 'choice', required: true, multiple: true, choice, selectedOptionKeys: ['option_0_amsterdam'], currentValue: 'Amsterdam, Netherlands', options: choice.options.map((option) => option.label) };
+  const harness = createHarness({
+    answerRecords: [{ key: 'location', question: 'Preferred location', answer: 'Munich, Germany', aliases: ['Preferred location'], type: 'choice', sensitivity: 'safe', updatedAt: '2025-01-01T00:00:00.000Z' }],
+    pagesByTab: { 7: { pages: [{ page: { title: 'Application', domain: 'example.test' }, fields: [field], actions: [{ id: 'submit', label: 'Submit application', kind: 'submit' }] }] } },
+  });
+  await import(`../src/service-worker.js?choice-review=${Date.now()}`);
+  const started = await harness.dispatch({ type: 'JOB_RUN_START', tabId: 7 });
+
+  assert.equal(started.run.status, 'waiting_user');
+  assert.equal(started.run.actionRequired[0].fieldId, 'locations');
+  assert.equal(started.run.actionRequired[0].suggestion.candidates[0].answer, 'Munich, Germany');
+});
 
 test('manual drafts fill only the exact user value and do not promote an answer record', async () => {
   const harness = createHarness({ pagesByTab: { 7: { pages: [{
