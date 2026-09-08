@@ -19,8 +19,8 @@ test('migrates legacy datasource state to a profile with confirmed employer defa
     answerRecords: [{ key: 'email', question: 'Email', answer: 'nithin@example.com' }],
     datasourceMeta: { schemaVersion: 1 },
   });
-  assert.equal(DATASOURCE_SCHEMA_VERSION, 2);
-  assert.equal(migrated.schemaVersion, 2);
+  assert.equal(DATASOURCE_SCHEMA_VERSION, 3);
+  assert.equal(migrated.schemaVersion, 3);
   assert.deepEqual(migrated.profile.employment.map((entry) => entry.company), ['DeepSight AI Labs']);
   assert.equal(migrated.profile.defaults.relatedToHiringCompany, 'No');
   assert.equal(migrated.profile.defaults.knownAtHiringCompany, 'No');

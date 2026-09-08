@@ -12,6 +12,7 @@ import {
   shouldSeedDatasource,
 } from './datasource.js';
 import { planDeterministicFill } from './form-engine.js';
+import { buildLearningCandidates, callLearningReviewer } from './learning-review.js';
 
 const RUN_STORAGE_KEY = 'applicationRun';
 const MAX_PAGES = 20;
@@ -135,8 +136,30 @@ async function saveDatasource(state) {
     coverMessages: state.coverMessages,
     datasourceMeta: state.datasourceMeta,
     profile: state.profile,
+    learningInbox: state.learningInbox || [],
   });
   return state;
+}
+
+async function queueLearningReview(records = []) {
+  const current = await getDatasource();
+  const inbox = Array.isArray(current.learningInbox) ? current.learningInbox : [];
+  const candidates = buildLearningCandidates(records).filter(candidate => !current.answerRecords.some(record => record.key === candidate.id) && !inbox.some(item => item.candidate?.id === candidate.id));
+  if (!candidates.length) return { queued: 0, error: '' };
+  const { openaiApiKey, openaiModel } = await chrome.storage.local.get({ openaiApiKey: '', openaiModel: 'gpt-5.6-terra' });
+  let proposals;
+  let error = '';
+  try {
+    proposals = openaiApiKey ? await callLearningReviewer({ apiKey: openaiApiKey, candidates }, { model: openaiModel }) : candidates.map(candidate => ({ candidateId: candidate.id, outcome: 'needs_user_label', canonicalKey: '', displayLabel: '', intent: 'other', valueKind: candidate.valueShape, aliases: [], topicTags: [], scope: candidate.scope, reusePolicy: 'never', confidence: 'low', classifier: { model: '', promptVersion: 'learning-review-v1', classifiedAt: new Date().toISOString() } }));
+  } catch (caught) {
+    error = caught.message;
+    proposals = candidates.map(candidate => ({ candidateId: candidate.id, outcome: 'needs_user_label', canonicalKey: '', displayLabel: '', intent: 'other', valueKind: candidate.valueShape, aliases: [], topicTags: [], scope: candidate.scope, reusePolicy: 'never', confidence: 'low', classifier: { model: openaiModel, promptVersion: 'learning-review-v1', classifiedAt: new Date().toISOString() } }));
+  }
+  const now = new Date().toISOString();
+  const byKey = new Map(records.map(record => [record.key, record]));
+  const learningInbox = [...inbox, ...proposals.map(proposal => ({ id: `learning:${proposal.candidateId}:${Date.now()}`, status: 'pending', candidate: candidates.find(candidate => candidate.id === proposal.candidateId), record: byKey.get(proposal.candidateId), proposal, error, createdAt: now }))];
+  await saveDatasource({ ...current, learningInbox, datasourceMeta: { ...(current.datasourceMeta || {}), schemaVersion: current.schemaVersion, updatedAt: now } });
+  return { queued: proposals.length, error };
 }
 
 function scopeEmploymentRecords(records = [], profile = {}) {
@@ -258,11 +281,25 @@ async function datasourceSummary() {
     schemaVersion: state.schemaVersion,
     answerCount: state.answerRecords.length,
     coverMessageCount: state.coverMessages.length,
+    learningInbox: state.learningInbox || [],
     initializedAt: state.datasourceMeta?.initializedAt || null,
     seededAt: state.datasourceMeta?.seededAt || null,
     learnedChanges,
     profile: state.profile,
   };
+}
+
+async function resolveLearningInbox(id, action) {
+  const state = await getDatasource();
+  const item = state.learningInbox.find(entry => entry.id === id && entry.status === 'pending');
+  if (!item) throw new Error('The learning proposal is no longer available.');
+  let answerRecords = state.answerRecords;
+  if (action === 'approve') {
+    if (item.proposal?.outcome !== 'propose' || !item.record?.answer) throw new Error('Add a clear label before approving this proposal.');
+    answerRecords = upsertAnswerRecords(state.answerRecords, [{ ...item.record, key: item.proposal.canonicalKey, question: item.proposal.displayLabel, aliases: [item.record.question, ...(item.proposal.aliases || [])], concept: item.proposal.canonicalKey, semantic: item.proposal, confirmationState: 'confirmed', confirmedAt: new Date().toISOString() }]);
+  }
+  await saveDatasource({ ...state, answerRecords, learningInbox: state.learningInbox.filter(entry => entry.id !== id), datasourceMeta: { ...(state.datasourceMeta || {}), updatedAt: new Date().toISOString() } });
+  return datasourceSummary();
 }
 
 async function correctDatasourceRecord(key, answer) {
@@ -573,6 +610,8 @@ function reviewItems(fields, decisions, existing = [], appliedReviews = [], page
         sensitivity: decision.sensitivity,
         confidence: decision.confidence,
         reason: decision.reason,
+        formOrder: field.formOrder,
+        pageNumber,
       });
     }
   }
@@ -588,6 +627,8 @@ function reviewItems(fields, decisions, existing = [], appliedReviews = [], page
       sensitivity: item.sensitivity,
       confidence: item.confidence,
       reason: item.reason,
+      formOrder: field.formOrder,
+      pageNumber,
     });
   }
   return [...new Map(items.map((item) => [item.fieldId, item])).values()];
@@ -649,6 +690,7 @@ function pageSnapshot(inspection, pageNumber, pageRecords) {
 }
 
 async function recordPageCapture(run, inspection, pageRecords = [], { promote = false } = {}) {
+  pageRecords = pageRecords.map(record => ({ ...record, pageNumber: run.pageNumber }));
   const saved = await persistLearnedRecords(pageRecords, run, { promote });
   run.answers = upsertAnswerRecords(run.answers, pageRecords);
   run.pages = [
@@ -1359,14 +1401,15 @@ async function saveAnswers(tabId) {
     updateSelectedFrame(run, discovery);
     const inspection = discovery.inspection;
     const captured = await sendToApplicationFrame(tabId, run, { type: 'JOB_APP_CAPTURE' });
-    const result = await recordPageCapture(run, inspection, captured.records || [], { promote: true });
+    const result = await recordPageCapture(run, inspection, captured.records || [], { promote: false });
+    const learning = await queueLearningReview(captured.records || []);
     run = result.run;
     if (run.status === 'ready_for_user_submit') {
       run.status = 'answers_saved';
       run.waitingFor = null;
       run.waitingLabel = null;
     }
-    return { ok: true, run: await saveRun(run), ...result.stats };
+    return { ok: true, run: await saveRun(run), ...result.stats, learningQueued: learning.queued, learningError: learning.error };
   } catch (error) {
     if (!error.frameDiscovery) throw error;
     return { ok: false, error: error.message, run: await saveRun(pauseForFrame(run, error.frameDiscovery)) };
@@ -1433,6 +1476,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     'JOB_DATASOURCE_IMPORT',
     'JOB_DATASOURCE_CORRECT',
     'JOB_DATASOURCE_PROFILE_UPDATE',
+    'JOB_LEARNING_INBOX_RESOLVE',
   ].includes(message?.type)) return false;
 
   (async () => {
@@ -1473,6 +1517,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     }
     if (message.type === 'JOB_DATASOURCE_PROFILE_UPDATE') {
       return { ok: true, datasource: await updateDatasourceProfile(message.profile || {}) };
+    }
+    if (message.type === 'JOB_LEARNING_INBOX_RESOLVE') {
+      if (sender?.tab) throw new Error('This action must originate in the extension panel');
+      return { ok: true, datasource: await resolveLearningInbox(message.id, message.action) };
     }
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
     const tabId = message.tabId || tab?.id;
