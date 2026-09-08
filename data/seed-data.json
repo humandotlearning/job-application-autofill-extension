@@ -1,5 +1,5 @@
 {
-  "schemaVersion": 2,
+  "schemaVersion": 3,
   "seedId": "resume.xlsx",
   "answerRecords": [
     {"key":"linkedin","question":"LinkedIn","answer":"https://www.linkedin.com/in/nithin1357","aliases":["LinkedIn"],"type":"url"},

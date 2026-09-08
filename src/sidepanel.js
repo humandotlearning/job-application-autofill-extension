@@ -11,6 +11,8 @@ const elements = {
   datasourceHint: byId('datasource-hint'),
   learnedChangeCount: byId('learned-change-count'),
   learnedChangeList: byId('learned-change-list'),
+  learningInboxCount: byId('learning-inbox-count'),
+  learningInboxList: byId('learning-inbox-list'),
   exportDatasource: byId('export-datasource'),
   importDatasourceButton: byId('import-datasource-button'),
   importDatasource: byId('import-datasource'),
@@ -122,11 +124,34 @@ function updateDatasourceSummary(datasource = {}) {
   elements.recordCount.textContent = `${answerCount} answer${answerCount === 1 ? '' : 's'}`;
   elements.coverMessageCount.textContent = `${coverMessageCount} cover message${coverMessageCount === 1 ? '' : 's'}`;
   if (datasource.learnedChanges) renderLearnedChanges(datasource.learnedChanges);
+  renderLearningInbox(datasource.learningInbox || []);
   if (datasource.profile) {
     elements.employerName.value = datasource.profile.employment?.[0]?.company || 'DeepSight AI Labs';
     elements.relatedDefault.value = datasource.profile.defaults?.relatedToHiringCompany || 'No';
     elements.knownDefault.value = datasource.profile.defaults?.knownAtHiringCompany || 'No';
   }
+}
+
+function renderLearningInbox(items) {
+  elements.learningInboxCount.textContent = String(items.length);
+  elements.learningInboxList.replaceChildren();
+  for (const item of items) {
+    const row = document.createElement('div');
+    row.className = 'result-item';
+    const label = document.createElement('strong');
+    label.textContent = item.proposal?.displayLabel || item.candidate?.label || 'Needs a friendly field label';
+    const detail = document.createElement('p');
+    detail.className = 'result-detail';
+    detail.textContent = item.proposal?.outcome === 'propose' ? `Tags: ${(item.proposal.topicTags || []).join(', ') || 'none'}. Review before this answer can be suggested.` : 'This field could not be safely classified. It remains a local application draft only.';
+    row.append(label, detail);
+    for (const action of ['approve', 'discard']) {
+      const button = document.createElement('button'); button.type = 'button'; button.textContent = action === 'approve' ? 'Approve for suggestions' : 'Discard'; button.disabled = action === 'approve' && item.proposal?.outcome !== 'propose';
+      button.addEventListener('click', async () => { const response = await chrome.runtime.sendMessage({ type: 'JOB_LEARNING_INBOX_RESOLVE', id: item.id, action }); if (!response?.ok) { setStatus(response?.error || 'Could not update learning proposal.', 'error'); return; } updateDatasourceSummary(response.datasource); setStatus(action === 'approve' ? 'Learning proposal approved.' : 'Learning proposal discarded.'); });
+      row.append(button);
+    }
+    elements.learningInboxList.append(row);
+  }
+  if (!items.length) elements.learningInboxList.textContent = 'No learning proposals waiting for review.';
 }
 
 function renderLearnedChanges(records) {

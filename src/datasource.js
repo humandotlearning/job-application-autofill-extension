@@ -1,6 +1,6 @@
 import { normalizeAnswerRecord, normalizeText, slugify, upsertAnswerRecords } from './core.js';
 
-export const DATASOURCE_SCHEMA_VERSION = 2;
+export const DATASOURCE_SCHEMA_VERSION = 3;
 export const DATASOURCE_FORMAT = 'job-application-autofill-datasource';
 
 export const DEFAULT_PROFILE = Object.freeze({
@@ -56,7 +56,7 @@ function normalizeProfile(profile = {}) {
   };
 }
 
-export function createDatasourceState({ answerRecords = [], coverMessages = [], datasourceMeta = null, profile = {} } = {}) {
+export function createDatasourceState({ answerRecords = [], coverMessages = [], learningInbox = [], datasourceMeta = null, profile = {} } = {}) {
   return {
     schemaVersion: DATASOURCE_SCHEMA_VERSION,
     answerRecords: answerRecords
@@ -65,6 +65,7 @@ export function createDatasourceState({ answerRecords = [], coverMessages = [], 
     coverMessages: coverMessages
       .map(normalizeCoverMessage)
       .filter((message) => message.id && message.body),
+    learningInbox: Array.isArray(learningInbox) ? learningInbox.filter(item => item && typeof item === 'object' && item.id && item.candidate) : [],
     profile: normalizeProfile(profile),
     datasourceMeta: datasourceMeta ? { ...datasourceMeta, schemaVersion: DATASOURCE_SCHEMA_VERSION } : null,
   };
@@ -140,6 +141,7 @@ export function mergeDatasource(current = {}, imported = {}, updatedAt = new Dat
     schemaVersion: DATASOURCE_SCHEMA_VERSION,
     answerRecords: mergeRecords(existing.answerRecords, incoming.answerRecords),
     coverMessages: mergeCoverMessages(existing.coverMessages, incoming.coverMessages),
+    learningInbox: imported?.learningInbox ? incoming.learningInbox : existing.learningInbox,
     // A v1 backup has no profile, so it must not reset defaults the applicant
     // has already confirmed in their installed datasource.
     profile: imported?.profile ? incoming.profile : existing.profile,
@@ -158,6 +160,7 @@ export function serializeDatasourceBackup(state = {}) {
     schemaVersion: DATASOURCE_SCHEMA_VERSION,
     answerRecords: normalized.answerRecords,
     coverMessages: normalized.coverMessages,
+    learningInbox: normalized.learningInbox,
     profile: normalized.profile,
     datasourceMeta: normalized.datasourceMeta,
   };
@@ -166,7 +169,7 @@ export function serializeDatasourceBackup(state = {}) {
 export function parseDatasourceBackup(value) {
   if (!value || typeof value !== 'object') throw new Error('Backup must be a JSON object');
   if (value.format !== DATASOURCE_FORMAT) throw new Error('Backup format is not supported');
-  if (![1, DATASOURCE_SCHEMA_VERSION].includes(value.schemaVersion)) throw new Error('Backup schema version is not supported');
+  if (![1, 2, DATASOURCE_SCHEMA_VERSION].includes(value.schemaVersion)) throw new Error('Backup schema version is not supported');
   if (!Array.isArray(value.answerRecords)) throw new Error('Backup answerRecords must be an array');
   if (!Array.isArray(value.coverMessages)) throw new Error('Backup coverMessages must be an array');
   return serializeDatasourceBackup(value);

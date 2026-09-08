@@ -93,6 +93,7 @@ export function normalizeAnswerRecord(record = {}) {
     if (record[key] != null && String(record[key]).trim()) normalized[key] = String(record[key]).trim();
   }
   if (Array.isArray(record.evidenceKeys)) normalized.evidenceKeys = uniqueStrings(record.evidenceKeys);
+  if (record.semantic && typeof record.semantic === 'object' && !Array.isArray(record.semantic)) normalized.semantic = { ...record.semantic };
   if (Array.isArray(record.history) && record.history.length) {
     normalized.history = record.history.map((item) => ({
       answer: String(item?.answer ?? '').trim(),
@@ -101,6 +102,7 @@ export function normalizeAnswerRecord(record = {}) {
     })).filter((item) => item.answer);
   }
   for (const key of ['userEdited', 'completed']) if (typeof record[key] === 'boolean') normalized[key] = record[key];
+  for (const key of ['formOrder', 'pageNumber']) if (Number.isInteger(record[key])) normalized[key] = record[key];
   if (alternatives.length) normalized.alternatives = alternatives;
   return normalized;
 }
