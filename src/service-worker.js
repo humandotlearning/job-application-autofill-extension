@@ -20,6 +20,7 @@ const ACTIVE_RUN_STATUSES = new Set(['running', 'waiting_user', 'page_ready', 'r
 const SAVABLE_RUN_STATUSES = new Set(['waiting_user', 'page_ready', 'ready_for_user_submit', 'answers_saved']);
 const processingTabs = new Set();
 const saveLocks = new Set();
+const saveOperations = new Map();
 const MAX_DRAFT_CHARS = 4_000;
 const MAX_REWRITE_INSTRUCTION_CHARS = 4_000;
 let datasourceWriteChain = Promise.resolve();
@@ -1434,7 +1435,7 @@ async function updateSavedAnswerFeedback(message, action) {
 
 async function saveAnswers(tabId) {
   if (saveLocks.has(tabId)) return { ok: false, error: 'Answer saving is already in progress' };
-  saveLocks.add(tabId);
+  const finishSave = beginSaveOperation(tabId);
   let run = null;
   try {
     run = await getRun(tabId);
@@ -1446,24 +1447,85 @@ async function saveAnswers(tabId) {
     updateSelectedFrame(run, discovery);
     const inspection = discovery.inspection;
     const captured = await sendToApplicationFrame(tabId, run, { type: 'JOB_APP_CAPTURE' });
-    const result = await recordPageCapture(run, inspection, captured.records || [], { promote: false });
-    const learning = await queueLearningReview(captured.records || []);
-    run = result.run;
-    if (run.status === 'ready_for_user_submit') {
-      run.status = 'answers_saved';
-      run.waitingFor = null;
-      run.waitingLabel = null;
-    }
-    return { ok: true, run: await saveRun(run), ...result.stats, learningQueued: learning.queued, learningError: learning.error };
+    return await saveCapturedAnswers(run, inspection, captured.records || []);
   } catch (error) {
     if (!error.frameDiscovery) throw error;
     return { ok: false, error: error.message, run: await saveRun(pauseForFrame(run, error.frameDiscovery)) };
   } finally {
-    saveLocks.delete(tabId);
+    finishSave();
   }
 }
 
+async function saveCapturedAnswers(run, inspection, records) {
+  const result = await recordPageCapture(run, inspection, records, { promote: false });
+  const learning = await queueLearningReview(records);
+  run = result.run;
+  if (run.status === 'ready_for_user_submit') {
+    run.status = 'answers_saved';
+    run.waitingFor = null;
+    run.waitingLabel = null;
+  }
+  return { ok: true, run: await saveRun(run), ...result.stats, learningQueued: learning.queued, learningError: learning.error };
+}
+
+async function saveFinalSubmission(message, sender) {
+  const tabId = sender?.tab?.id;
+  const frameId = Number.isInteger(sender?.frameId) ? sender.frameId : 0;
+  if (!Number.isInteger(tabId) || !Array.isArray(message.records)) return { ok: false, error: 'The submitted application snapshot is unavailable' };
+  const acceptedRun = await getRun(tabId);
+  if (!matchesFinalSubmission(acceptedRun, message, sender, frameId)) {
+    return { ok: false, error: 'The submitted application is no longer active' };
+  }
+  // A native submit may navigate while a manual checkpoint is still capturing.
+  // Keep the validated state so that capture failure cannot discard this snapshot.
+  const finalRun = structuredClone(acceptedRun);
+  while (saveOperations.has(tabId)) {
+    await saveOperations.get(tabId);
+    const currentRun = await getRun(tabId);
+    if (!currentRun || currentRun.startedAt !== finalRun.startedAt) {
+      return { ok: false, error: 'The submitted application is no longer active' };
+    }
+  }
+  const finishSave = beginSaveOperation(tabId);
+  try {
+    const previousPage = finalRun.pages?.find((page) => page.pageNumber === finalRun.pageNumber);
+    const page = message.page && typeof message.page === 'object' ? message.page : (previousPage?.page || finalRun.jobContext || {});
+    return await saveCapturedAnswers(finalRun, { page }, message.records);
+  } finally {
+    finishSave();
+  }
+}
+
+function matchesFinalSubmission(run, message, sender, frameId) {
+  if (!run || !['ready_for_user_submit', 'answers_saved'].includes(run.status)
+    || run.frame?.frameId !== frameId || message.applicationId !== run.startedAt) return false;
+  if (!sender.url) return true;
+  try {
+    const url = new URL(sender.url);
+    return (!run.frame.domain || url.hostname === run.frame.domain)
+      && (!run.frame.pathname || url.pathname === run.frame.pathname);
+  } catch {
+    return false;
+  }
+}
+
+function beginSaveOperation(tabId) {
+  saveLocks.add(tabId);
+  let resolve;
+  const completion = new Promise((done) => { resolve = done; });
+  saveOperations.set(tabId, completion);
+  return () => {
+    saveLocks.delete(tabId);
+    resolve();
+    if (saveOperations.get(tabId) === completion) saveOperations.delete(tabId);
+  };
+}
+
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (message?.type === 'JOB_APP_FINAL_SUBMISSION') {
+    saveFinalSubmission(message, sender).then(sendResponse).catch((error) => sendResponse({ ok: false, error: error.message }));
+    return true;
+  }
   if (message?.type === 'JOB_APP_LEARN' || message?.type === 'JOB_APP_LEARNING_STATUS') {
     (async () => {
       const tabId = sender?.tab?.id;

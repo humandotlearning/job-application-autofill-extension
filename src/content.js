@@ -5,6 +5,7 @@ import {
   inspectDocument,
   validateDocument,
   focusField,
+  isFinalApplicationSubmit,
   waitForDocumentSettled,
 } from './form-engine.js';
 import { createLearningSession } from './learning.js';
@@ -19,6 +20,15 @@ if (!globalThis.__jobApplicationAutofillInstalled) {
   const learning = createLearningSession(document, {
     capture: () => collectAnswerRecords(document),
     send: (message) => chrome.runtime.sendMessage(message),
+    onFinalSubmit: ({ applicationId, records, event }) => {
+      if (!isFinalApplicationSubmit(document, event)) return null;
+      return chrome.runtime.sendMessage({
+        type: 'JOB_APP_FINAL_SUBMISSION',
+        applicationId,
+        page: inspectDocument(document).page,
+        records,
+      });
+    },
   });
   chrome.runtime.sendMessage({ type: 'JOB_APP_LEARNING_STATUS' }).then((response) => {
     if (response?.applicationId) learning.activate(response.applicationId);

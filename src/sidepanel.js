@@ -848,10 +848,10 @@ function renderRun(run) {
     elements.runHint.textContent = 'This page is filled and validated. Review it, then continue when you are ready.';
     setStatus(`Page ${run.pageNumber || 1} is ready for your approval.`);
   } else if (run.status === 'ready_for_user_submit') {
-    elements.runHint.textContent = 'Review the application and the lists below, then save the captured answers here. This never submits the site form.';
-    setStatus('Final page is ready. Saving answers will not submit the application.');
+    elements.runHint.textContent = 'Review the application and the lists below. Your current values are captured automatically when you submit on the site; Save answers is an optional local checkpoint.';
+    setStatus('Final page is ready. Submission stays manual; final values are captured automatically.');
   } else if (run.status === 'answers_saved') {
-    elements.runHint.textContent = 'Answers are saved locally. Review the application and click Submit on the application site when ready.';
+    elements.runHint.textContent = 'Answers are saved locally. Review the application and click Submit on the application site when ready; current values are captured automatically when you submit.';
     setStatus('Answers saved. Submission remains manual.');
   } else if (run.status === 'running') {
     elements.runHint.textContent = `Filling page ${run.pageNumber || 1}. The panel will stop for your review before navigation.`;

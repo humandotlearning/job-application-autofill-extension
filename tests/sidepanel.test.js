@@ -389,7 +389,7 @@ test('panel persists settings, focuses blockers, and saves answers without any s
     assert.equal(harness.sentMessages.some((message) => message.type === 'JOB_RUN_SAVE_ANSWERS'), true);
     assert.equal(document.querySelector('#run-state').textContent.trim(), 'Answers saved');
     assert.equal(document.querySelector('#submit-instructions').hidden, false);
-    assert.match(document.querySelector('#run-hint').textContent, /click Submit on the application site/i);
+    assert.match(document.querySelector('#run-hint').textContent, /captured automatically when you submit/i);
     assert.doesNotMatch(document.body.textContent, /Confirm & submit/i);
   } finally {
     harness.cleanup();

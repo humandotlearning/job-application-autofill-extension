@@ -837,6 +837,17 @@ function actionLabel(element) {
   return String(element.textContent || element.value || element.getAttribute('aria-label') || '').replace(/\s+/g, ' ').trim();
 }
 
+function actionKind(element, label = actionLabel(element)) {
+  const type = String(element.type || '').toLowerCase();
+  const nextLabel = /^(next|continue|save and continue|proceed|review application|next step)\b/i.test(label);
+  const formControl = element.tagName === 'BUTTON' || element.tagName === 'INPUT';
+  return nextLabel
+    ? 'next'
+    : formControl && /\b(submit|apply|finish|complete application|send application)\b/i.test(label)
+      ? 'submit'
+      : 'other';
+}
+
 function collectActions(document) {
   const actions = [];
   const candidates = [...document.querySelectorAll('button, input[type="submit"], input[type="button"], a, [role="button"]')];
@@ -845,16 +856,29 @@ function collectActions(document) {
     const label = actionLabel(element);
     if (!label) continue;
     const type = String(element.type || '').toLowerCase();
-    const nextLabel = /^(next|continue|save and continue|proceed|review application|next step)\b/i.test(label);
-    const formControl = element.tagName === 'BUTTON' || element.tagName === 'INPUT';
-    const kind = nextLabel
-      ? 'next'
-        : formControl && /\b(submit|apply|finish|complete application|send application)\b/i.test(label)
-        ? 'submit'
-        : 'other';
+    const kind = actionKind(element, label);
     actions.push({ id: `action_${actions.length}`, label, kind, type: type || element.tagName.toLowerCase() });
   }
   return actions;
+}
+
+export function isFinalApplicationSubmit(document, event) {
+  const form = event?.target;
+  if (!form || String(form.tagName || '').toLowerCase() !== 'form') return false;
+  const root = applicationRoot(document);
+  if (root !== document && root !== form) return false;
+  if (root === document && !inApplication(document, form)) return false;
+  const formActions = [...document.querySelectorAll('button, input[type="submit"], input[type="button"]')]
+    .filter((control) => control.form === form && !control.disabled && isVisible(control))
+    .map((control) => actionKind(control));
+  const hasSingleFinalAction = formActions.filter((kind) => kind === 'submit').length === 1;
+  const submitter = event?.submitter;
+  if (submitter) {
+    return submitter.form === form
+      && actionKind(submitter) === 'submit'
+      && hasSingleFinalAction;
+  }
+  return hasSingleFinalAction && !formActions.includes('next');
 }
 
 function pauseReasons(document) {

@@ -15,7 +15,7 @@ This personal unpacked extension fills job-application forms from an answer prof
 - Completed, valid new answers are learned automatically during an activated application. Sensitive answers and conflicting changes require confirmation in the side panel. Extension-generated values remain provisional; captured drafts retain their provenance across reloads. **Save answers** remains a checkpoint.
 - Safe records can be reused automatically. Review and legal records are prefilled but remain visible for final review.
 - Passwords and file inputs are never filled. Resume upload, CAPTCHA, login, inaccessible shadow roots, and ambiguous custom widgets remain manual.
-- The extension never clicks a site Submit control; after saving, you review and submit through the application site yourself.
+- The extension never clicks or blocks a site Submit control. When you submit the detected final application form yourself, it captures the current values locally without delaying the site submission.
 - There is no backend, telemetry, analytics, Google integration, or runtime workbook importer. Edit monitoring is limited to activated application frames.
 
 Removing the extension removes its local Chrome storage. Review the OpenAI account and API-key policies that apply to your use before entering a key.
