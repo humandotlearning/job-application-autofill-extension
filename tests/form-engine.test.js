@@ -27,6 +27,21 @@ test('fills a custom dropdown identified by a linked label', async () => {
   assert.equal(button.textContent, 'India');
 });
 
+test('assigns form order according to DOM position across native and custom fields', () => {
+  const document = makeDocument('<main><label for="name">Name</label><input id="name" value="Ada"><button type="button" id="country" role="combobox" aria-label="Country" aria-controls="countries">India</button><div id="countries" role="listbox"><div role="option">India</div></div><label for="city">City</label><input id="city" value="London"></main>');
+  const fields = collectFieldDescriptors(document);
+  assert.deepEqual(fields.map((field) => [field.label, field.formOrder]), [
+    ['Name', 0],
+    ['Country', 1],
+    ['City', 2],
+  ]);
+  assert.deepEqual(collectAnswerRecords(document).map((record) => [record.question, record.formOrder]), [
+    ['Name', 0],
+    ['Country', 1],
+    ['City', 2],
+  ]);
+});
+
 test('selects a SuccessFactors numbered degree option through aria-owns', async () => {
   const document = makeDocument('<main><input id="354:_input" aria-label="Degree" role="combobox" aria-owns="355:_listSelect" aria-expanded="false" placeholder="No Selection"></main>');
   const input = document.getElementById('354:_input');

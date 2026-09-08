@@ -49,6 +49,8 @@ button:disabled { cursor: wait; opacity: .55; }
 .result-next-action { margin-top: 5px; color: var(--text); font-size: 11px; font-weight: 650; overflow-wrap: anywhere; }
 .inline-action { min-height: 30px; margin-top: 7px; padding: 5px 9px; color: var(--text); background: var(--card-2); font-size: 11px; }
 .saved-evidence { margin-top: 10px; padding: 10px; border: 1px solid var(--border); border-radius: 10px; background: var(--card-2); }
+.saved-evidence summary { cursor: pointer; color: var(--muted); font-size: 11px; font-weight: 700; }
+.saved-evidence[open] summary { margin-bottom: 8px; color: var(--text); }
 .saved-evidence-source { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; font-size: 11px; line-height: 1.35; }
 .saved-evidence .result-detail { color: var(--text); font-size: 12px; line-height: 1.45; }
 .saved-evidence button { min-height: 32px; margin: 8px 4px 0 0; padding: 6px 9px; font-size: 11px; }
@@ -61,7 +63,17 @@ button:disabled { cursor: wait; opacity: .55; }
 .answer-workspace-controls button, .rewrite-prompt-row button { min-height: 32px; margin: 0; padding: 6px 9px; font-size: 11px; }
 .answer-workspace-controls .answer-send { margin-left: auto; border-color: var(--accent); color: var(--accent-ink); background: var(--accent); }
 .rewrite-prompt-row { display: grid; gap: 7px; margin-top: 8px; }
+.rewrite-prompt-row[hidden] { display: none; }
 .rewrite-prompt-row textarea { min-height: 58px; }
+.generated-drafts { display: grid; gap: 7px; margin-top: 10px; }
+.generated-drafts-heading { color: var(--text); font-size: 11px; font-weight: 750; }
+.generated-draft { padding: 9px; border: 1px solid var(--border); border-radius: 9px; background: var(--card-2); color: var(--text); font-size: 12px; line-height: 1.45; overflow-wrap: anywhere; }
+.generated-draft button { min-height: 30px; margin-top: 7px; padding: 5px 8px; color: var(--text); background: transparent; font-size: 11px; }
+.generated-draft button:hover, .generated-draft button:focus-visible { border-color: var(--accent); color: var(--accent-ink); background: var(--accent); }
+.generated-drafts-context { color: var(--warning); font-size: 11px; }
+.job-description-editor { color: var(--muted); font-size: 11px; }
+.job-description-editor summary { cursor: pointer; color: var(--text); font-weight: 700; }
+.job-description-editor textarea { width: 100%; min-height: 96px; margin-top: 7px; padding: 8px; border: 1px solid var(--border); border-radius: 8px; color: var(--text); background: var(--bg); font: 12px/1.45 Inter, ui-sans-serif, system-ui, sans-serif; resize: vertical; }
 .saved-evidence button[data-choose-answer] { border-color: var(--accent); color: var(--accent-ink); background: var(--accent); }
 .internal-id { position: relative; display: inline-flex; align-items: center; vertical-align: middle; }
 .internal-id-trigger { width: 22px; min-height: 22px; margin: 0; padding: 0; border: 1px solid var(--muted); border-radius: 50%; color: var(--text); background: transparent; font-size: 12px; font-weight: 800; line-height: 1; }

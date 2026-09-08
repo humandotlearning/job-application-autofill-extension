@@ -1,0 +1,225 @@
+# Review package: 75306a2..2e295e4
+
+## Commits
+2e295e4 fix: permit only validated invalid draft corrections
+7f41187 fix: guard invalid draft corrections and legal ids
+
+## Files changed
+ .superpowers/sdd/task-4-report.md |  7 ++++++
+ src/service-worker.js             | 14 ++++++++---
+ tests/service-worker.test.js      | 51 +++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 68 insertions(+), 4 deletions(-)
+
+## Diff
+diff --git a/.superpowers/sdd/task-4-report.md b/.superpowers/sdd/task-4-report.md
+index 2a4fe6d..f413072 100644
+--- a/.superpowers/sdd/task-4-report.md
++++ b/.superpowers/sdd/task-4-report.md
+@@ -26,10 +26,17 @@
+ 
+ ## Concern
+ 
+ The next planner-gating task must extend the existing approval path for multi-source planner candidates. This task intentionally leaves approval semantics unchanged and only resolves selected evidence for rewrite.
+ 
+ ## Follow-up safety fix
+ 
+ - Manual draft application now classifies sensitivity with both the live field label and field ID. A generic label can no longer bypass the legal-field block when its ID identifies privacy, consent, attestation, or similar legal input.
+ - Added a regression case for `privacy_acknowledgement` with the generic label `Response`; it is rejected without page mutation.
+ - Re-ran `npm test -- tests/service-worker.test.js`: 31 passing, 0 failing.
++
++## Re-review safety fixes
++
++- A nonempty field value can now be replaced only after a fresh exact-frame validation marks that same field invalid. Valid existing values remain blocked.
++- Deterministic candidate gating and saved-answer approval now classify sensitivity with both the field label and field ID, preventing generic labels from bypassing legal IDs.
++- Added regressions for invalid-value replacement, valid-value blocking, and a generic-label `privacy_acknowledgement` field that must remain gated and cannot be approved.
++- Targeted regressions pass: `node --test --test-name-pattern="manual drafts replace|generic-label legal IDs" tests/service-worker.test.js` — 2 passing.
+diff --git a/src/service-worker.js b/src/service-worker.js
+index fbf0ab9..ad1cb34 100644
+--- a/src/service-worker.js
++++ b/src/service-worker.js
+@@ -704,21 +704,21 @@ async function applyPageDecisions(tabId, run, inspection, records, coverMessages
+   const draftRecords = await draftEvidenceRecords();
+   run.suggestions = {};
+   const localDecisions = planDeterministicFill(scopedFields, records, coverMessages, profile, inspection.page).map(decision => {
+     const field = scopedFields.find(field => field.id === decision.fieldId);
+     if (!field || field.currentValue) return decision;
+     const candidates = retrieveEvidence(field, records);
+     for (const candidate of retrieveEvidence(field, draftRecords)) {
+       if (!candidates.some(saved => saved.answer === candidate.answer)) candidates.push({ ...candidate, kind: 'draft', reason: 'Previously entered, not yet saved for reuse — explicit approval required' });
+     }
+     candidates.splice(3);
+-    const gated = candidates.length && (decision.action !== 'fill' || field.type === 'textarea' || decision.sensitivity !== 'safe' || inferSensitivity(field.label) !== 'safe');
++    const gated = candidates.length && (decision.action !== 'fill' || field.type === 'textarea' || decision.sensitivity !== 'safe' || inferSensitivity(field.label, field.id) !== 'safe');
+     if (gated) {
+       run.suggestions[field.id] = { tabId, frameId: run.frame.frameId, applicationId: run.startedAt, pageSignature: currentPageSignature, field, candidates };
+       return { ...decision, action: 'ask_user', value: null, reason: 'Relevant saved evidence available — approve an answer before use' };
+     }
+     return decision;
+   });
+   const localResult = await sendToApplicationFrame(tabId, run, { type: 'JOB_APP_APPLY', decisions: localDecisions, applicationId: run.startedAt });
+   if (!localResult?.ok) throw new Error(localResult?.error || 'The page rejected local answers');
+ 
+   let refreshed = await sendToApplicationFrame(tabId, run, { type: 'JOB_APP_INSPECT' });
+@@ -790,22 +790,22 @@ async function approveSuggestion(message) {
+     if (!candidate || !source || source.answer !== candidate.answer
+       || !retrieveEvidence(suggestion.field, records).some(item => item.sourceKey === candidate.sourceKey)) throw new Error('Saved evidence changed; check again');
+     // Never rediscover/reroute an approval into another frame.
+     const inspected = await sendToFrame(tabId, message.frameId, { type: 'JOB_APP_INSPECT' });
+     const field = inspected.inspection?.fields.find(item => item.id === fieldId);
+     if (!field || field.handle !== message.handle || field.currentValue || JSON.stringify(field.options) !== JSON.stringify(suggestion.field.options)
+       || field.label !== suggestion.field.label || field.type !== suggestion.field.type
+       || pageSignature(inspected.inspection, run.frame) !== message.pageSignature) throw new Error('Destination changed; check the page again');
+     const value = String(message.answer ?? candidate.answer).trim();
+     const validation = validateFillValue(field, value);
+-    if (!validation.ok || !meaningCompatible(field, source, { numericReview: !(['textarea', 'text'].includes(field.type) && value === candidate.answer) }) || inferSensitivity(field.label) === 'legal' || field.type === 'checkbox') throw new Error(validation.reason || 'This destination requires manual entry');
+-    const result = await sendToFrame(tabId, message.frameId, { type: 'JOB_APP_APPLY', applicationId: run.startedAt, decisions: [{ fieldId, handle: field.handle, action: 'fill', value, evidenceKeys: [source.key], sensitivity: inferSensitivity(field.label), confidence: 'high', reason: 'Explicitly approved saved answer' }] });
++    if (!validation.ok || !meaningCompatible(field, source, { numericReview: !(['textarea', 'text'].includes(field.type) && value === candidate.answer) }) || inferSensitivity(field.label, field.id) === 'legal' || field.type === 'checkbox') throw new Error(validation.reason || 'This destination requires manual entry');
++    const result = await sendToFrame(tabId, message.frameId, { type: 'JOB_APP_APPLY', applicationId: run.startedAt, decisions: [{ fieldId, handle: field.handle, action: 'fill', value, evidenceKeys: [source.key], sensitivity: inferSensitivity(field.label, field.id), confidence: 'high', reason: 'Explicitly approved saved answer' }] });
+     if (!result?.ok) throw new Error(result?.error || 'Could not apply the answer');
+     const verified = await sendToFrame(tabId, message.frameId, { type: 'JOB_APP_INSPECT' });
+     if (verified.inspection?.fields.find(item => item.id === fieldId && item.handle === field.handle)?.currentValue !== value) throw new Error('The page did not retain the approved answer');
+     datasourceWriteChain = datasourceWriteChain.catch(() => {}).then(async () => {
+       const state = await getDatasource();
+       const latest = (candidate.kind === 'draft' ? await draftEvidenceRecords() : state.answerRecords).find(record => record.key === source.key);
+       if (!latest || latest.answer !== source.answer) throw new Error('Evidence changed while applying; answer applied but not learned');
+       const now = new Date().toISOString();
+       const equivalent = candidate.kind === 'equivalent' && value === candidate.answer && field.labelConfidence !== 'low';
+       const answerRecords = equivalent ? state.answerRecords.map(record => record.key === source.key
+@@ -850,33 +850,39 @@ async function guardedDraftField(message, { allowSaveLock = false } = {}) {
+   const listed = listedRunField(run, fieldId);
+   const suggestion = run?.suggestions?.[fieldId] || null;
+   if (!run || !listed || !SAVABLE_RUN_STATUSES.has(run.status)
+     || message.frameId !== run.frame?.frameId || message.applicationId !== run.startedAt
+     || message.pageSignature !== run.pageSignature || !message.handle || message.handle !== listed.handle) {
+     throw new Error('Stale draft; check the page again');
+   }
+   // Never rediscover/reroute a draft operation into another frame.
+   const inspected = await sendToFrame(tabId, message.frameId, { type: 'JOB_APP_INSPECT' });
+   const field = inspected.inspection?.fields.find((item) => item.id === fieldId);
+-  if (!field || field.handle !== message.handle || field.currentValue
++  if (!field || field.handle !== message.handle
+     || !sameFieldSnapshot(field, listed)
+     || (suggestion?.field && !sameFieldSnapshot(field, {
+       handle: suggestion.field.handle,
+       label: suggestion.field.label,
+       fieldType: suggestion.field.type,
+       fieldOptions: suggestion.field.options,
+       fieldConstraints: suggestion.field.constraints,
+       fieldMultiple: suggestion.field.multiple,
+     }))
+     || pageSignature(inspected.inspection, run.frame) !== message.pageSignature) {
+     throw new Error('Destination changed; check the page again');
+   }
++  if (field.currentValue) {
++    const validation = await sendToFrame(tabId, message.frameId, { type: 'JOB_APP_VALIDATE' });
++    if (!validation?.validation?.invalid?.some((item) => item.fieldId === fieldId)) {
++      throw new Error('Destination changed; check the page again');
++    }
++  }
+   return { run, listed, suggestion, field };
+ }
+ 
+ function sourceKeysFromMessage(message = {}) {
+   return [...new Set([
+     ...(Array.isArray(message.sourceKeys) ? message.sourceKeys : []),
+     message.sourceKey,
+   ].filter((key) => typeof key === 'string' && key))];
+ }
+ 
+diff --git a/tests/service-worker.test.js b/tests/service-worker.test.js
+index 775910c..20cbd2d 100644
+--- a/tests/service-worker.test.js
++++ b/tests/service-worker.test.js
+@@ -996,20 +996,48 @@ test('manual drafts reject stale origins and changed destinations before filling
+     const result = await harness.dispatch({ type: 'JOB_RUN_APPLY_DRAFT', ...origin, ...stale, answer: 'A safe answer' });
+     assert.equal(result.ok, false);
+   }
+   assert.equal(harness.tabs.get(7).frames[0].pages[0].values?.summary, undefined);
+   harness.tabs.get(7).frames[0].pages[0].fields[0].label = 'Changed question';
+   const changed = await harness.dispatch({ type: 'JOB_RUN_APPLY_DRAFT', ...origin, answer: 'A safe answer' });
+   assert.equal(changed.ok, false);
+   assert.equal(harness.tabs.get(7).frames[0].pages[0].values?.summary, undefined);
+ });
+ 
++test('manual drafts replace only an invalid existing field value', async () => {
++  const harness = createHarness({ pagesByTab: { 7: { pages: [{
++    page: { title: 'Application', domain: 'example.test' },
++    fields: [
++      { id: 'invalid_summary', handle: 'invalid-h', label: 'Professional summary', type: 'text', required: true, currentValue: 'invalid value' },
++      { id: 'valid_summary', handle: 'valid-h', label: 'Professional summary', type: 'text', required: true, currentValue: 'Retain this answer' },
++    ],
++    invalidFieldIds: ['invalid_summary'],
++    actions: [{ id: 'submit', label: 'Submit application', kind: 'submit', type: 'submit' }],
++  }] } } });
++  await import(`../src/service-worker.js?replace-invalid=${Date.now()}`);
++  const started = await harness.dispatch({ type: 'JOB_RUN_START', tabId: 7 });
++  const repaired = await harness.dispatch({
++    type: 'JOB_RUN_APPLY_DRAFT',
++    ...draftOrigin(started.run, { id: 'invalid_summary', handle: 'invalid-h' }),
++    answer: 'Corrected answer',
++  });
++  assert.equal(repaired.ok, true, repaired.error);
++  assert.equal(harness.tabs.get(7).frames[0].pages[0].values.invalid_summary, 'Corrected answer');
++  const blocked = await harness.dispatch({
++    type: 'JOB_RUN_APPLY_DRAFT',
++    ...draftOrigin(started.run, { id: 'valid_summary', handle: 'valid-h' }),
++    answer: 'Do not replace this',
++  });
++  assert.equal(blocked.ok, false);
++  assert.equal(harness.tabs.get(7).frames[0].pages[0].values?.valid_summary, undefined);
++});
++
+ test('manual drafts reject invalid, legal, checkbox, and opaque values without mutation', async () => {
+   const harness = createHarness({ pagesByTab: { 7: { pages: [{
+     page: { title: 'Application', domain: 'example.test' },
+     fields: [
+       { id: 'choice', handle: 'choice-h', label: 'Preferred location', type: 'select', required: true, options: ['Bangalore', 'Remote'] },
+       { id: 'short', handle: 'short-h', label: 'Brief answer', type: 'text', required: true, constraints: { minLength: 8 } },
+       { id: 'consent', handle: 'consent-h', label: 'Privacy agreement', type: 'text', required: true },
+       { id: 'privacy_acknowledgement', handle: 'generic-legal-h', label: 'Response', type: 'text', required: true },
+       { id: 'agree', handle: 'agree-h', label: 'I agree', type: 'checkbox', required: true },
+       { id: 'opaque', handle: 'opaque-h', label: 'Reference code', type: 'text', required: true },
+@@ -1043,20 +1071,43 @@ test('draft apply and rewrite requests are accepted only from the extension pane
+   const started = await harness.dispatch({ type: 'JOB_RUN_START', tabId: 7 });
+   const origin = draftOrigin(started.run, { id: 'summary', handle: 'summary-h' });
+   const sender = { tab: { id: 7 }, frameId: 0 };
+   const apply = await harness.dispatch({ type: 'JOB_RUN_APPLY_DRAFT', ...origin, answer: 'A safe answer' }, sender);
+   const rewrite = await harness.dispatch({ type: 'JOB_RUN_REWRITE_ANSWER', ...origin, draft: 'A safe answer', instruction: 'Be concise.' }, sender);
+   assert.equal(apply.ok, false);
+   assert.equal(rewrite.ok, false);
+   assert.deepEqual(harness.tabs.get(7).frames[0].pages[0].values || {}, {});
+ });
+ 
++test('generic-label legal IDs stay gated and cannot be approved as saved answers', async () => {
++  const harness = createHarness({
++    answerRecords: [{ key: 'privacy_acknowledgement', question: 'Response', answer: 'yes', aliases: ['Response'], type: 'text', sensitivity: 'safe', confirmationState: 'confirmed' }],
++    pagesByTab: { 7: { pages: [{
++      page: { title: 'Application', domain: 'example.test' },
++      fields: [{ id: 'privacy_acknowledgement', handle: 'privacy-h', label: 'Response', type: 'text', required: true }],
++      actions: [{ id: 'submit', label: 'Submit application', kind: 'submit', type: 'submit' }],
++    }] } },
++  });
++  await import(`../src/service-worker.js?generic-legal-id=${Date.now()}`);
++  const started = await harness.dispatch({ type: 'JOB_RUN_START', tabId: 7 });
++  const suggestion = started.run.suggestions?.privacy_acknowledgement;
++  assert.ok(suggestion, 'legal field IDs must require an explicit manual decision');
++  assert.equal(harness.tabs.get(7).frames[0].pages[0].values?.privacy_acknowledgement, undefined);
++  const approval = await harness.dispatch({
++    type: 'JOB_RUN_APPROVE_SUGGESTION',
++    ...draftOrigin(started.run, { id: 'privacy_acknowledgement', handle: 'privacy-h' }),
++    sourceKey: 'privacy_acknowledgement',
++  });
++  assert.equal(approval.ok, false);
++  assert.equal(harness.tabs.get(7).frames[0].pages[0].values?.privacy_acknowledgement, undefined);
++});
++
+ test('rewrite uses the selected model and relevant current evidence without mutating the page or datasource', async () => {
+   const harness = createHarness({
+     answerRecords: [{ key: 'story', question: 'Project history', answer: 'I delivered a reliable platform.', type: 'textarea', sensitivity: 'safe', confirmationState: 'confirmed' }],
+     pagesByTab: { 7: { pages: [{
+       page: { title: 'Application', domain: 'example.test' },
+       fields: [{ id: 'summary', handle: 'summary-h', label: 'Project history', type: 'textarea', required: true }], actions: [{ id: 'submit', label: 'Submit application', kind: 'submit', type: 'submit' }],
+     }] } },
+   });
+   harness.localData.openaiApiKey = 'synthetic-test-key';
+   harness.localData.openaiModel = 'rewrite-model';

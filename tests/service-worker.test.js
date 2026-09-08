@@ -333,6 +333,12 @@ test('planner fill candidates wait for explicit review instead of applying to th
   assert.deepEqual(suggestion.candidates[0].sourceAnswers, { ml_delivery: plannerAnswer });
   assert.equal(suggestion.candidates[0].provenance, 'AI planner');
 
+  const checked = await harness.dispatch({ type: 'JOB_RUN_CHECK_PAGE', tabId: 7 });
+  const retained = checked.run.suggestions?.ml_experience;
+  assert.ok(retained, JSON.stringify(checked.run));
+  assert.equal(retained.candidates[0].answer, plannerAnswer);
+  assert.deepEqual(retained.candidates[0].sourceKeys, ['ml_delivery']);
+
   // The harness uses a whitespace-only invalid value to exercise the planner
   // path without allowing the deterministic path to claim the field. Restore
   // the visibly blank control before the user's explicit Send to form.
@@ -382,6 +388,7 @@ test('planner candidates preserve every evidence snapshot and reject approval af
   const candidate = suggestion.candidates[0];
   assert.deepEqual(candidate.sourceKeys, ['ml_project', 'ml_production']);
   assert.deepEqual(candidate.sourceAnswers, { ml_project: plannerAnswer, ml_production: plannerAnswer });
+  assert.equal(candidate.transformation, 'copy');
   assert.equal(harness.tabs.get(7).frames[0].pages[0].values?.ml_experience, undefined);
 
   harness.localData.answerRecords = harness.localData.answerRecords.map((record) => record.key === 'ml_production'
@@ -400,6 +407,32 @@ test('planner candidates preserve every evidence snapshot and reject approval af
   assert.equal(rejected.ok, false);
   assert.match(rejected.error, /evidence changed/i);
   assert.equal(harness.tabs.get(7).frames[0].pages[0].values?.ml_experience, undefined);
+
+  harness.localData.answerRecords = harness.localData.answerRecords.map((record) => record.key === 'ml_production'
+    ? { ...record, answer: plannerAnswer }
+    : record);
+  const page = harness.tabs.get(7).frames[0].pages[0];
+  page.fields[0].currentValue = '';
+  page.invalidFieldIds = [];
+  const approved = await harness.dispatch({
+    type: 'JOB_RUN_APPROVE_SUGGESTION',
+    tabId: 7,
+    frameId: suggestion.frameId,
+    applicationId: suggestion.applicationId,
+    pageSignature: suggestion.pageSignature,
+    fieldId: 'ml_experience',
+    handle: suggestion.field.handle,
+    sourceKeys: candidate.sourceKeys,
+  });
+  assert.equal(approved.ok, true, approved.error);
+  const approval = harness.tabs.get(7).messages
+    .filter((message) => message.type === 'JOB_APP_APPLY')
+    .flatMap((message) => message.decisions || [])
+    .findLast((decision) => decision.fieldId === 'ml_experience' && decision.action === 'fill');
+  assert.deepEqual(approval.evidenceKeys, ['ml_project', 'ml_production']);
+  const learned = harness.localData.answerRecords.find((record) => record.question === 'Describe your ML deployment experience');
+  assert.ok(learned);
+  assert.deepEqual(learned.evidenceKeys, ['ml_project', 'ml_production']);
 });
 
 test('reviewed compensation preserves explicit answer units without numeric conversion', async () => {
@@ -1056,6 +1089,40 @@ test('reactivates learning after native site navigation within the application',
   assert.equal(harness.sessionData.applicationRun['7'].frame.pathname, '/apply/step2');
   const offsite = await harness.dispatch({ type: 'JOB_APP_LEARNING_STATUS' }, { tab: { id: 7 }, frameId: 0, url: 'https://unrelated.example/apply/step2' });
   assert.equal(offsite.ok, false);
+});
+
+test('automatic generated drafts use job context and records, and regenerate only for the current field', async () => {
+  const harness = createHarness({ answerRecords: [{ key: 'experience', question: 'Experience', answer: 'Built reliable event processing services.', confirmationState: 'confirmed', sensitivity: 'safe' }], pagesByTab: { 7: { frames: [{ frameId: 0, context: { title: 'Application' }, pages: [{
+    page: { title: 'Apply — Platform Engineer', domain: 'jobs.example.com', role: 'Platform Engineer', jobDescription: 'Build distributed systems.' },
+    fields: [{ id: 'why', handle: 'why-h', label: 'Why are you a good fit for this role?', type: 'textarea', required: true, labelConfidence: 'high' }], actions: [{ id: 'next', label: 'Next', kind: 'next' }],
+  }] }] } } });
+  harness.localData.openaiApiKey = 'synthetic-test-key';
+  const bodies = [];
+  globalThis.fetch = async (_url, options) => {
+    bodies.push(JSON.parse(options.body));
+    const request = JSON.parse(bodies.at(-1).input[1].content[0].text);
+    if (request.fields) return { ok: true, status: 200, statusText: 'OK', json: async () => ({ output_text: JSON.stringify({ decisions: [{ fieldId: 'why', action: 'ask_user', value: null, evidenceKeys: [], confidence: 'low', sensitivity: 'safe', reason: 'Needs a tailored draft', transformation: null }] }) }) };
+    return { ok: true, status: 200, statusText: 'OK', json: async () => ({ output_text: JSON.stringify({ suggestions: [{ answer: 'I built reliable event processing services that match this platform role.', evidenceKeys: ['experience'] }], missingContext: '' }) }) };
+  };
+  await import(`../src/service-worker.js?generated-${Date.now()}`);
+  const started = await harness.dispatch({ type: 'JOB_RUN_START', tabId: 7 });
+  assert.equal(started.ok, true, started.error);
+  assert.equal(started.run.status, 'waiting_user', JSON.stringify(started.run));
+  const generated = started.run.generatedSuggestions.why;
+  assert.equal(started.run.suggestions?.why, undefined, 'an adjacent experience record is context, not a verbatim saved answer');
+  assert.equal(bodies.length, 2, JSON.stringify(started.run));
+  assert.ok(generated, started.run.llmError);
+  assert.equal(generated.suggestions.length, 1);
+  assert.match(JSON.stringify(bodies[1]), /Build distributed systems/);
+  assert.match(JSON.stringify(bodies[1]), /event processing/);
+  assert.deepEqual(harness.tabs.get(7).frames[0].pages[0].values || {}, {});
+  const checked = await harness.dispatch({ type: 'JOB_RUN_CHECK_PAGE', tabId: 7 });
+  assert.equal(bodies.length, 2, 'the same page reuses cached generated drafts');
+  assert.equal(checked.run.generatedSuggestions.why.suggestions.length, 1);
+  const refreshed = await harness.dispatch({ type: 'JOB_RUN_GENERATE_SUGGESTIONS', tabId: 7, frameId: 0, applicationId: started.run.startedAt, pageSignature: started.run.pageSignature, fieldId: 'why', handle: 'why-h', jobDescription: 'Operate a large-scale distributed platform.' });
+  assert.equal(refreshed.ok, true, refreshed.error);
+  assert.equal(refreshed.run.jobContext.jobDescription, 'Operate a large-scale distributed platform.');
+  assert.equal(refreshed.run.generatedSuggestions.why.suggestions.length, 1);
 });
 
 function draftOrigin(run, field) {

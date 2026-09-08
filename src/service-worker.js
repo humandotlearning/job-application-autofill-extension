@@ -1,6 +1,6 @@
 import { retrieveEvidence } from './retrieval.js';
 import { inferSensitivity, validateFillValue, meaningCompatible } from './core.js';
-import { callAnswerPlanner, callAnswerRewriter } from './llm.js';
+import { callAnswerPlanner, callAnswerRewriter, callAnswerSuggestions } from './llm.js';
 import { upsertAnswerRecords, mergeLearnedAnswers, normalizeAnswerRecord } from './core.js';
 import {
   createDatasourceState,
@@ -526,8 +526,13 @@ function nowRun(tabId) {
     waitingLabel: null,
     llmPages: [],
     llmError: null,
-    startedAt: new Date().toISOString(),
-    updatedAt: new Date().toISOString(),
+    generatedSuggestions: {},
+    jobContext: null,
+    startedAt,
+    // This mirrors startedAt so the panel can form a stable transient-draft
+    // key without needing to know the worker's historical field name.
+    applicationId: startedAt,
+    updatedAt: startedAt,
   };
 }
 
@@ -549,7 +554,7 @@ function unresolvedFields(fields, validation = {}) {
   return fields.filter((field) => !field.currentValue || invalidIds.has(field.id));
 }
 
-function reviewItems(fields, decisions, existing = [], appliedReviews = []) {
+function reviewItems(fields, decisions, existing = [], appliedReviews = [], pageNumber = null) {
   const byId = fieldMap(fields);
   const items = [...existing];
   for (const decision of decisions) {
@@ -562,6 +567,8 @@ function reviewItems(fields, decisions, existing = [], appliedReviews = []) {
       items.push({
         fieldId: field.id,
         label: field.label || field.id,
+        ...(Number.isFinite(pageNumber) ? { pageNumber } : {}),
+        formOrder: field.formOrder,
         value: field.currentValue,
         sensitivity: decision.sensitivity,
         confidence: decision.confidence,
@@ -575,6 +582,8 @@ function reviewItems(fields, decisions, existing = [], appliedReviews = []) {
     items.push({
       fieldId: field.id,
       label: field.label || field.id,
+      ...(Number.isFinite(pageNumber) ? { pageNumber } : {}),
+      formOrder: field.formOrder,
       value: field.currentValue,
       sensitivity: item.sensitivity,
       confidence: item.confidence,
@@ -584,13 +593,51 @@ function reviewItems(fields, decisions, existing = [], appliedReviews = []) {
   return [...new Map(items.map((item) => [item.fieldId, item])).values()];
 }
 
-function auditItems(records) {
-  return records.map((record) => ({
+function auditItems(records, pages = []) {
+  const pageRecords = pages.flatMap((page) => (page.values || []).map((record, pageOrder) => ({
+    ...record,
+    pageNumber: page.pageNumber,
+    pageOrder,
+  })));
+  const pageKeys = new Set(pageRecords.map((record) => record.key));
+  const unrepresentedRecords = records.filter((record) => !pageKeys.has(record.key));
+  const source = pageRecords.length ? [...pageRecords, ...unrepresentedRecords] : records;
+  return source.map((record) => ({
     key: record.key,
     question: record.question,
     answer: record.answer,
     sensitivity: record.sensitivity,
+    ...(Number.isFinite(record.formOrder) ? { formOrder: record.formOrder } : {}),
+    ...(Number.isFinite(record.pageNumber) ? { pageNumber: record.pageNumber } : {}),
   }));
+}
+
+function mergeJobContext(previous = {}, next = {}) {
+  const merged = { ...(previous || {}) };
+  for (const key of ['title', 'domain', 'role', 'company', 'jobDescription']) {
+    const value = String(next?.[key] || '').trim();
+    if (value && (key !== 'jobDescription' || value.length > String(merged[key] || '').length)) merged[key] = value;
+  }
+  return merged;
+}
+
+function readableQuestion(field) {
+  const label = String(field?.label || '').trim();
+  return Boolean(label && !isOpaqueIdentifier(label) && field?.labelConfidence !== 'low' && label.length <= 1000);
+}
+
+function profileEvidenceRecords(profile = {}) {
+  const employment = Array.isArray(profile.employment) ? profile.employment : [];
+  return employment.flatMap((entry, index) => {
+    const company = String(entry?.company || '').trim();
+    const roles = Array.isArray(entry?.roles) ? entry.roles : [];
+    const companyRecord = company ? [{ key: `profile:employment:${entry.id || index}`, question: 'Confirmed employer', answer: company, provenance: 'profile', sensitivity: 'safe' }] : [];
+    const roleRecords = roles.map((role, roleIndex) => {
+      const title = String(role?.title || role?.role || '').trim();
+      return title ? { key: `profile:employment:${entry.id || index}:role:${roleIndex}`, question: 'Employment role', answer: `${title}${company ? ` at ${company}` : ''}`, provenance: 'profile', sensitivity: 'safe' } : null;
+    }).filter(Boolean);
+    return [...companyRecord, ...roleRecords];
+  });
 }
 
 function pageSnapshot(inspection, pageNumber, pageRecords) {
@@ -608,7 +655,7 @@ async function recordPageCapture(run, inspection, pageRecords = [], { promote = 
     ...run.pages.filter((page) => page.pageNumber !== run.pageNumber),
     pageSnapshot(inspection, run.pageNumber, pageRecords),
   ].slice(-MAX_PAGES);
-  run.audit = auditItems(run.answers);
+  run.audit = auditItems(run.answers, run.pages);
   return { run, stats: saved.stats };
 }
 
@@ -639,7 +686,11 @@ function fieldIssue(field, invalidIds, unresolvedById = new Map(), pageNumber = 
   return {
     fieldId: field.id,
     handle: field.handle,
-    label: field.label || field.id,
+    label: field.labelConfidence === 'low' ? 'Question needs clarification' : (field.label || field.id),
+    identifiedLabel: field.label || field.id,
+    labelConfidence: field.labelConfidence || (field.label ? 'high' : 'low'),
+    helpText: field.helpText || '',
+    nearbyContext: field.nearbyContext || '',
     fieldType: field.type,
     fieldOptions: field.options || [],
     fieldConstraints: field.constraints || {},
@@ -659,13 +710,17 @@ function categorizeRun(run, inspection, validation, unresolvedResults = []) {
   const unresolvedById = new Map(unresolvedResults.filter((item) => item?.fieldId).map((item) => [item.fieldId, item]));
   const unresolvedFieldsOnPage = inspection.fields
     .filter((field) => !field.currentValue || invalidIds.has(field.id))
-    .map((field) => ({ ...fieldIssue(field, invalidIds, unresolvedById), ...(run.suggestions?.[field.id] ? { suggestion: run.suggestions[field.id], reason: 'Relevant saved evidence available — approve an answer before use' } : {}) }));
+    .map((field) => ({
+      ...fieldIssue(field, invalidIds, unresolvedById, run.pageNumber),
+      ...(run.suggestions?.[field.id] ? { suggestion: run.suggestions[field.id], reason: 'Relevant saved evidence available — approve an answer before use' } : {}),
+      ...(run.generatedSuggestions?.[field.id] ? { generatedSuggestion: run.generatedSuggestions[field.id], reason: 'AI drafts are ready for review before sending' } : {}),
+    }));
   run.actionRequired = [
     ...navigationIssues(inspection),
     ...unresolvedFieldsOnPage.filter((field) => field.required),
   ];
   run.optionalUnresolved = unresolvedFieldsOnPage.filter((field) => !field.required);
-  run.audit = auditItems(run.answers);
+  run.audit = auditItems(run.answers, run.pages);
   return run;
 }
 
@@ -684,7 +739,7 @@ async function focusFirstProblem(tabId, run, inspection, validation) {
   return first?.label || '';
 }
 
-async function applyPageDecisions(tabId, run, inspection, records, coverMessages, apiKey, model, profile = {}) {
+async function applyPageDecisions(tabId, run, inspection, records, coverMessages, apiKey, model, profile = {}, datasourceRevision = '') {
   const currentPageSignature = pageSignature(inspection, run.frame);
   if (run.lastAction === 'next' && run.pageSignature === currentPageSignature) {
     run.status = 'waiting_user';
@@ -695,17 +750,30 @@ async function applyPageDecisions(tabId, run, inspection, records, coverMessages
   }
 
   run.lastAction = null;
+  const pageOrOriginChanged = run.pageSignature !== currentPageSignature;
+  if (pageOrOriginChanged || (run.suggestionDatasourceRevision && run.suggestionDatasourceRevision !== datasourceRevision)) run.generatedSuggestions = {};
+  if (pageOrOriginChanged) run.suggestions = {};
+  else run.suggestions = run.suggestions || {};
   run.pageSignature = currentPageSignature;
+  run.suggestionDatasourceRevision = datasourceRevision;
+  run.jobContext = mergeJobContext(run.jobContext, inspection.page);
   await saveRun(run);
   const employment = profile.employment?.[0];
   const scopedFields = employment
     ? inspection.fields.map((field) => field.entityType === 'employment' ? { ...field, employmentId: employment.id } : field)
     : inspection.fields;
   const draftRecords = await draftEvidenceRecords();
-  run.suggestions = {};
+  const initialValidationResponse = await sendToApplicationFrame(tabId, run, { type: 'JOB_APP_VALIDATE' });
+  const invalidFieldIds = new Set((initialValidationResponse?.validation?.invalid || []).map((field) => field.fieldId));
   const localDecisions = planDeterministicFill(scopedFields, records, coverMessages, profile, inspection.page).map(decision => {
     const field = scopedFields.find(field => field.id === decision.fieldId);
-    if (!field || field.currentValue) return decision;
+    if (!field) return decision;
+    // An existing invalid value must not be silently replaced by deterministic
+    // autofill. Keep it unresolved so planner output can be reviewed first.
+    if (field.currentValue && invalidFieldIds.has(field.id)) {
+      return { ...decision, action: 'keep', value: null, reason: 'The current value does not satisfy the field constraints' };
+    }
+    if (field.currentValue) return decision;
     const candidates = retrieveEvidence(field, records);
     for (const candidate of retrieveEvidence(field, draftRecords)) {
       if (!candidates.some(saved => saved.answer === candidate.answer)) candidates.push({ ...candidate, kind: 'draft', reason: 'Previously entered, not yet saved for reuse — explicit approval required' });
@@ -729,9 +797,12 @@ async function applyPageDecisions(tabId, run, inspection, records, coverMessages
   let appliedReviews = [...(localResult.result?.reviewRequired || [])];
   let unresolvedResults = [...(localResult.result?.unresolved || [])];
   let llmError = null;
+  let plannerFailed = false;
+  let plannerAttempted = false;
   const remaining = unresolvedFields(currentInspection.fields, currentValidation).filter(field => !run.suggestions[field.id]);
   const llmPageKey = `${run.pageNumber}:${currentPageSignature}`;
   if (remaining.length && apiKey && !run.llmPages.includes(llmPageKey)) {
+    plannerAttempted = true;
     run.llmPages = [...run.llmPages, llmPageKey];
     await saveRun(run);
     try {
@@ -789,6 +860,32 @@ async function applyPageDecisions(tabId, run, inspection, records, coverMessages
       allDecisions = [...allDecisions, ...heldPlannerDecisions];
     } catch (error) {
       llmError = error.message;
+      plannerFailed = true;
+    }
+  }
+
+  // Generated drafts are separate from saved-answer approvals. They are shown
+  // for explicit review and never mutate the page or datasource automatically.
+  run.generatedSuggestions = run.generatedSuggestions || {};
+  if (apiKey && plannerAttempted && !plannerFailed) {
+    const suggestionFields = unresolvedFields(currentInspection.fields, currentValidation)
+      .filter(field => !run.suggestions[field.id] && readableQuestion(field));
+    const pageRecords = currentInspection.fields
+      .filter(field => field.currentValue && readableQuestion(field))
+      .map(field => ({ key: `page:${field.id}`, question: field.label, answer: field.currentValue, provenance: 'current application page', sensitivity: 'safe' }));
+    const suggestionRecords = [...records, ...profileEvidenceRecords(profile), ...pageRecords];
+    for (const field of suggestionFields) {
+      try {
+        const generated = await callAnswerSuggestions({ apiKey, field, page: run.jobContext, records: suggestionRecords }, { model });
+        if (generated.suggestions.length || generated.missingContext) {
+          run.generatedSuggestions[field.id] = {
+            tabId, frameId: run.frame.frameId, applicationId: run.startedAt, pageSignature: currentPageSignature,
+            field, suggestions: generated.suggestions, missingContext: generated.missingContext,
+          };
+        }
+      } catch (error) {
+        llmError = llmError || error.message;
+      }
     }
   }
 
@@ -1028,8 +1125,32 @@ async function rewriteAnswer(message) {
     draft,
     instruction,
     records,
+    page: (await getRun(message.tabId))?.jobContext || {},
   }, { model: settings.openaiModel });
   return { ok: true, answer: requiredBoundedText(rewritten.answer, 'Rewritten answer', MAX_DRAFT_CHARS) };
+}
+
+async function generateSuggestions(message) {
+  const jobDescription = message.jobDescription == null ? '' : requiredBoundedText(message.jobDescription, 'Job description', 16_000);
+  const { run, field } = await guardedDraftField(message);
+  if (!readableQuestion(field)) throw new Error('The form question is unclear. Use Show on page and enter the answer manually.');
+  const apiKey = await getApiKey();
+  if (!apiKey) throw new Error('Add an OpenAI API key before generating answer suggestions');
+  const [settings, records, datasource, inspected] = await Promise.all([getSettings(), getRecords(), getDatasource(), sendToFrame(message.tabId, message.frameId, { type: 'JOB_APP_INSPECT' })]);
+  run.jobContext = mergeJobContext(run.jobContext, inspected.inspection?.page);
+  if (jobDescription) run.jobContext.jobDescription = jobDescription;
+  const pageRecords = (inspected.inspection?.fields || [])
+    .filter(item => item.currentValue && readableQuestion(item))
+    .map(item => ({ key: `page:${item.id}`, question: item.label, answer: item.currentValue, provenance: 'current application page', sensitivity: 'safe' }));
+  const generated = await callAnswerSuggestions({ apiKey, field, page: run.jobContext, records: [...records, ...profileEvidenceRecords(datasource.profile), ...pageRecords] }, { model: settings.openaiModel });
+  run.generatedSuggestions = run.generatedSuggestions || {};
+  run.generatedSuggestions[field.id] = {
+    tabId: message.tabId, frameId: message.frameId, applicationId: run.startedAt, pageSignature: run.pageSignature,
+    field, suggestions: generated.suggestions, missingContext: generated.missingContext,
+  };
+  const validation = await sendToFrame(message.tabId, message.frameId, { type: 'JOB_APP_VALIDATE' });
+  categorizeRun(run, inspected.inspection, validation?.validation || {});
+  return { ok: true, run: await saveRun(run) };
 }
 
 function hasBlockingIssues(run, validation) {
@@ -1070,6 +1191,7 @@ async function processPage(tabId, { autoAdvance } = { autoAdvance: false }) {
       apiKey,
       settings.openaiModel,
       datasource.profile,
+      datasource.datasourceMeta?.updatedAt || '',
     );
     run = processed.run;
     const inspection = processed.inspection;
@@ -1299,6 +1421,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     'JOB_RUN_APPROVE_SUGGESTION',
     'JOB_RUN_APPLY_DRAFT',
     'JOB_RUN_REWRITE_ANSWER',
+    'JOB_RUN_GENERATE_SUGGESTIONS',
     'JOB_RUN_START',
     'JOB_RUN_CHECK_PAGE',
     'JOB_RUN_ADVANCE_PAGE',
@@ -1313,10 +1436,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   ].includes(message?.type)) return false;
 
   (async () => {
-    if (['JOB_RUN_APPROVE_SUGGESTION', 'JOB_RUN_APPLY_DRAFT', 'JOB_RUN_REWRITE_ANSWER'].includes(message.type)) {
+    if (['JOB_RUN_APPROVE_SUGGESTION', 'JOB_RUN_APPLY_DRAFT', 'JOB_RUN_REWRITE_ANSWER', 'JOB_RUN_GENERATE_SUGGESTIONS'].includes(message.type)) {
       if (sender?.tab) throw new Error('This action must originate in the extension panel');
       if (message.type === 'JOB_RUN_APPLY_DRAFT') return applyDraft(message);
       if (message.type === 'JOB_RUN_REWRITE_ANSWER') return rewriteAnswer(message);
+      if (message.type === 'JOB_RUN_GENERATE_SUGGESTIONS') return generateSuggestions(message);
       return approveSuggestion(message);
     }
     if (message.type === 'JOB_DATASOURCE_STATE') return { ok: true, datasource: await datasourceSummary() };

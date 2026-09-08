@@ -78,6 +78,23 @@ function ensureEditTracking(document) {
   trackedDocuments.add(document);
 }
 
+export function extractJobContext(document) {
+  const readable = (node, limit = 16000) => {
+    if (!node || !isVisible(node)) return '';
+    const copy = node.cloneNode(true);
+    for (const child of copy.querySelectorAll('script,style,nav,footer,form,input,textarea,select,button,[hidden],[aria-hidden="true"]')) child.remove();
+    return String(copy.textContent || '').replace(/\s+/g, ' ').trim().slice(0, limit);
+  };
+  const description = [...document.querySelectorAll('[itemprop="description"],.job-description,#job-description,[data-testid="job-description"],.posting-page .section-wrapper,.posting-description')]
+    .map(node => readable(node)).filter(Boolean).join('\n').slice(0, 16000);
+  return {
+    title: document.title || '', domain: document.location?.hostname || '',
+    role: readable(document.querySelector('[itemprop="title"],h1'), 300),
+    company: readable(document.querySelector('[itemprop="hiringOrganization"],.company-name'), 300),
+    jobDescription: description,
+  };
+}
+
 function textFromIds(document, ids = '') {
   return String(ids)
     .split(/\s+/)
@@ -397,6 +414,8 @@ function describeField(document, element, index) {
     selectedValues: element.tagName === 'SELECT' ? [...element.selectedOptions].filter((option) => option.value).map((option) => option.value) : [],
     structuredOptions: element.tagName === 'SELECT' ? [...element.options].map((option) => ({ label: option.textContent.trim(), value: option.value, selected: option.selected, disabled: option.disabled })) : [],
     ...questionMetadata(document, element),
+    helpText: textFromIds(document, element.getAttribute('aria-describedby')).slice(0, 2000),
+    nearbyContext: nearbyQuestion(element).slice(0, 1000),
     type,
     autocomplete: element.autocomplete || '',
     placeholder: element.getAttribute('placeholder') || '',
@@ -410,11 +429,11 @@ function describeField(document, element, index) {
 
 export function collectFieldDescriptors(document) {
   ensureEditTracking(document);
-  const nativeFields = uniqueFields(document).map(({ element, index }) => describeField(document, element, index));
+  const nativeFields = uniqueFields(document).map(({ element, index }) => ({ element, field: describeField(document, element, index) }));
   const customElements = customWidgetElements(document);
   const customFields = customElements
-    .filter((element, index) => !nativeFields.some((field) => field.id === fieldIdentity(element, index, customElements)))
-    .map((element, index) => ({
+    .filter((element, index) => !nativeFields.some(({ field }) => field.id === fieldIdentity(element, index, customElements)))
+    .map((element, index) => ({ element, field: {
       id: fieldIdentity(element, index, customElements),
       handle: controlHandle(element),
       multiple: element.getAttribute('aria-multiselectable') === 'true' || document.getElementById(element.getAttribute('aria-controls'))?.getAttribute('aria-multiselectable') === 'true',
@@ -430,8 +449,15 @@ export function collectFieldDescriptors(document) {
       options: fieldOptions(document, element),
       constraints: {},
       ...fieldContext(element),
-    }));
-  const fields = [...nativeFields, ...customFields];
+    } }));
+  const fields = [...nativeFields, ...customFields]
+    .sort(({ element: left }, { element: right }) => {
+      const position = left.compareDocumentPosition?.(right) || 0;
+      if (position & 4) return -1;
+      if (position & 2) return 1;
+      return 0;
+    })
+    .map(({ field }, formOrder) => ({ ...field, formOrder }));
   const groupKey = (field) => `${canonicalConcept(field.label)}:${field.entityId || ''}`;
   const counts = new Map();
   const occurrences = new Map();
@@ -857,7 +883,7 @@ function pauseReasons(document) {
 export function inspectDocument(document) {
   const actions = collectActions(document);
   return {
-    page: { title: document.title || '', domain: document.location?.hostname || '' },
+    page: extractJobContext(document),
     fields: collectFieldDescriptors(document),
     actions,
     pauseReasons: pauseReasons(document),
@@ -896,6 +922,7 @@ export function collectAnswerRecords(document) {
         key: field.entityType && field.entityId ? `${baseKey}__${slugify(field.entityId)}` : repeated ? `${baseKey}__entry_${occurrence}` : baseKey,
         question: field.label || field.id,
         answer: field.currentValue,
+        formOrder: field.formOrder,
         aliases: [field.label, field.id].filter(Boolean),
         type: field.type,
         sensitivity: inferSensitivity(field.label, field.id),

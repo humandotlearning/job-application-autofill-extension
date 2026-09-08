@@ -18,3 +18,9 @@
 
 - The new worker tests cover pending planner proposals, explicit approval, plural evidence snapshots, and rejection when any source changes.
 - Existing local, draft, and equivalent single-source approvals remain covered by the worker suite through the legacy singular-key fallback.
+
+## Follow-up review fixes
+
+- Pending suggestions now survive `Check again` while the page/frame signature is unchanged. They clear only when that origin changes or after verified approval.
+- Multi-source planner coverage now verifies retained transformation metadata, all evidence keys in the approved fill, and all evidence keys on the learned record.
+- Follow-up verification: worker suite 36/36 and full suite 221/221 passing.

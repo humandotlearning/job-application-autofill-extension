@@ -93,7 +93,7 @@ function discardStaleDrafts(run) {
 }
 
 function fieldOrigin(item) {
-  const suggestion = item.suggestion || {};
+  const suggestion = item.suggestion || item.generatedSuggestion || {};
   const field = suggestion.field || {};
   return {
     tabId: suggestion.tabId ?? activeTabId,
@@ -327,7 +327,7 @@ function answerWorkspace(item, displayLabel) {
   textarea.className = 'answer-draft';
   textarea.dataset.answerDraft = 'true';
   textarea.value = state.answer;
-  textarea.placeholder = item.suggestion ? 'Choose a saved answer, or write your own.' : 'Write the answer you want to send to the form.';
+  textarea.placeholder = item.generatedSuggestion ? 'Choose an AI draft, or write your own.' : item.suggestion ? 'Choose a saved answer, or write your own.' : 'Write the answer you want to send to the form.';
   textarea.setAttribute('aria-label', `Answer for ${displayLabel}`);
   textarea.readOnly = Boolean(item.suggestion && !state.editing);
   workspaceLabel.htmlFor = `answer-draft-${draftKey(origin, origin.fieldId)}`;
@@ -472,11 +472,15 @@ function itemRow(item, { focus = false, detail = '' } = {}) {
   const candidates = Array.isArray(item.suggestion?.candidates) ? item.suggestion.candidates : [];
   const readableCandidates = candidates.filter((candidate) => !isOpaqueIdentifier(candidate.answer));
   const onlyOpaqueSuggestions = candidates.length > 0 && readableCandidates.length === 0;
+  const generated = item.generatedSuggestion;
+  const hasReadableGeneratedDraft = Array.isArray(generated?.suggestions)
+    && generated.suggestions.some((suggestion) => !isOpaqueIdentifier(suggestion.answer));
   const labelCandidates = [item.label, item.question, item.fieldId].filter(Boolean).map((value) => String(value));
   const rawLabel = labelCandidates.find((value) => isOpaqueIdentifier(value));
   const displayLabel = labelCandidates.find((value) => !isOpaqueIdentifier(value)) || (rawLabel ? 'Form question' : 'Field');
   const itemValue = item.value ?? item.answer;
   const hasOpaqueValue = isOpaqueIdentifier(itemValue);
+  const unclearQuestion = item.labelConfidence === 'low';
   const fieldAction = focus && item.fieldId
     ? onlyOpaqueSuggestions
       ? `Choose a value for ${displayLabel} on the application page, then click Check again.`
@@ -499,6 +503,7 @@ function itemRow(item, { focus = false, detail = '' } = {}) {
     value.append(document.createTextNode(`${fieldAction || 'This saved value is an internal ID and cannot be used automatically.'} `));
     value.append(internalIdDisclosure(itemValue, 'Internal answer ID'));
   } else if (itemValue) value.append(answerNode(itemValue));
+  else if (unclearQuestion) value.textContent = `${item.nearbyContext ? `Nearby text: ${item.nearbyContext}. ` : ''}Use Show on page to identify this question, then write your answer.`;
   else value.textContent = fieldAction || item.reason || 'Review this field';
   content.append(label, value);
   if (item.reason && hasPrimaryDetail) {
@@ -522,12 +527,90 @@ function itemRow(item, { focus = false, detail = '' } = {}) {
     button.textContent = 'Show on page';
     content.append(button);
   }
-  const workspace = focus && item.fieldId && !onlyOpaqueSuggestions ? answerWorkspace(item, displayLabel) : null;
+  const workspace = focus && item.fieldId && (!onlyOpaqueSuggestions || hasReadableGeneratedDraft)
+    ? answerWorkspace(item, displayLabel)
+    : null;
   if (workspace) content.append(workspace.workspace);
+  if (generated) {
+    const drafts = Array.isArray(generated.suggestions) ? generated.suggestions : [];
+    const draftList = document.createElement('div');
+    draftList.className = 'generated-drafts';
+    const heading = document.createElement('p');
+    heading.className = 'generated-drafts-heading';
+    heading.textContent = drafts.length ? 'Suggested answers' : 'More context needed';
+    draftList.append(heading);
+    for (const suggestion of drafts) {
+      if (isOpaqueIdentifier(suggestion.answer)) continue;
+      const draft = document.createElement('div');
+      draft.className = 'generated-draft';
+      const choose = document.createElement('button');
+      choose.type = 'button';
+      choose.dataset.chooseGeneratedAnswer = 'true';
+      choose.textContent = 'Use this answer';
+      choose.addEventListener('click', () => {
+        if (!workspace) return;
+        updateDraftAnswer(workspace.state, suggestion.answer);
+        workspace.state.sourceKey = null;
+        workspace.state.sourceKeys = [];
+        workspace.state.candidateKind = null;
+        workspace.state.editing = true;
+        workspace.workspace.querySelector('[data-answer-draft]').value = workspace.state.answer;
+        workspace.updateControls();
+        setStatus('AI draft selected. Review or edit it before sending it to the form.');
+      });
+      draft.append(answerNode(suggestion.answer), choose);
+      draftList.append(draft);
+    }
+    if (generated.missingContext) {
+      const context = document.createElement('p');
+      context.className = 'generated-drafts-context';
+      context.textContent = generated.missingContext;
+      draftList.append(context);
+    }
+    const regenerate = document.createElement('button');
+    regenerate.type = 'button';
+    regenerate.className = 'inline-action';
+    regenerate.dataset.generateSuggestions = 'true';
+    regenerate.textContent = drafts.length ? 'Generate again' : 'Generate suggestions';
+    regenerate.addEventListener('click', async () => {
+      if (!workspace) return;
+      const jobDescription = draftList.querySelector('[data-job-description]')?.value.trim();
+      workspace.state.pending = 'generate';
+      workspace.updateControls();
+      regenerate.disabled = true;
+      try {
+        const response = await chrome.runtime.sendMessage({ type: 'JOB_RUN_GENERATE_SUGGESTIONS', ...workspace.origin, jobDescription });
+        if (!response?.ok || !response.run) throw new Error(response?.error || 'Could not generate answer suggestions.');
+        renderRun(response.run);
+        setStatus('New suggestions are ready for review.');
+      } catch (error) { setStatus(error.message, 'error'); }
+      finally {
+        workspace.state.pending = null;
+        workspace.updateControls();
+      }
+    });
+    if (generated.missingContext && !currentRun?.jobContext?.jobDescription) {
+      const details = document.createElement('details');
+      details.className = 'job-description-editor';
+      const summary = document.createElement('summary');
+      summary.textContent = 'Add job description';
+      const input = document.createElement('textarea');
+      input.dataset.jobDescription = 'true';
+      input.maxLength = 16000;
+      input.placeholder = 'Paste the job description to tailor suggestions.';
+      input.setAttribute('aria-label', `Job description for ${displayLabel}`);
+      details.append(summary, input);
+      draftList.append(details);
+    }
+    draftList.append(regenerate);
+    content.insertBefore(draftList, workspace?.workspace || null);
+  }
   if (item.suggestion) {
     for (const candidate of candidates) {
-      const evidence = document.createElement('div');
+      const evidence = document.createElement('details');
       evidence.className = 'saved-evidence';
+      const summary = document.createElement('summary');
+      summary.textContent = 'Saved answer';
       const source = document.createElement('p');
       source.className = 'saved-evidence-source';
       const sourceQuestion = String(candidate.sourceQuestion || 'Saved answer');
@@ -541,7 +624,7 @@ function itemRow(item, { focus = false, detail = '' } = {}) {
         unavailable.className = 'result-detail';
         unavailable.append(document.createTextNode('Saved value is an internal ID and cannot be used automatically. '));
         unavailable.append(internalIdDisclosure(candidate.answer, 'Internal answer ID'));
-        evidence.append(source, unavailable);
+        evidence.append(summary, source, unavailable);
         content.append(evidence);
         continue;
       }
@@ -561,7 +644,7 @@ function itemRow(item, { focus = false, detail = '' } = {}) {
         workspace.updateControls();
         setStatus('Saved answer selected. Review or edit it before sending it to the form.');
       });
-      evidence.append(source, answerNode(candidate.answer), choose);
+      evidence.append(summary, source, answerNode(candidate.answer), choose);
       content.append(evidence);
     }
   }

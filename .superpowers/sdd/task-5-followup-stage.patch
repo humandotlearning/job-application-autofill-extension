@@ -1,0 +1,19 @@
+diff --git a/src/service-worker.js b/src/service-worker.js
+--- a/src/service-worker.js
++++ b/src/service-worker.js
+@@ -750,6 +750,9 @@ async function applyPageDecisions(tabId, run, inspection, records, coverMessages
+   }
+ 
+   run.lastAction = null;
++  const pageOrOriginChanged = run.pageSignature !== currentPageSignature;
++  if (pageOrOriginChanged) run.suggestions = {};
++  else run.suggestions = run.suggestions || {};
+   run.pageSignature = currentPageSignature;
+   await saveRun(run);
+   const employment = profile.employment?.[0];
+@@ -759,7 +762,6 @@ async function applyPageDecisions(tabId, run, inspection, records, coverMessages
+     ? inspection.fields.map((field) => field.entityType === 'employment' ? { ...field, employmentId: employment.id } : field)
+     : inspection.fields;
+   const draftRecords = await draftEvidenceRecords();
+-  run.suggestions = {};
+   const localDecisions = planDeterministicFill(scopedFields, records, coverMessages, profile, inspection.page).map(decision => {

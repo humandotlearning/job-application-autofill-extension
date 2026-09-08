@@ -28,6 +28,7 @@ async function setupPanel({
   applyDraftResponse = { ok: true, run },
   approveSuggestionResponse = { ok: true, run },
   rewriteResponse = { ok: true, answer: 'Rewritten answer.' },
+  generateResponse = { ok: true, run },
 } = {}) {
   const dom = new JSDOM(await loadPanelHtml(), {
     url: 'https://extension.local/sidepanel.html',
@@ -90,6 +91,7 @@ async function setupPanel({
         if (message.type === 'JOB_RUN_APPLY_DRAFT') return typeof applyDraftResponse === 'function' ? applyDraftResponse(message) : applyDraftResponse;
         if (message.type === 'JOB_RUN_APPROVE_SUGGESTION') return typeof approveSuggestionResponse === 'function' ? approveSuggestionResponse(message) : approveSuggestionResponse;
         if (message.type === 'JOB_RUN_REWRITE_ANSWER') return typeof rewriteResponse === 'function' ? rewriteResponse(message) : rewriteResponse;
+        if (message.type === 'JOB_RUN_GENERATE_SUGGESTIONS') return typeof generateResponse === 'function' ? generateResponse(message) : generateResponse;
         if (message.type === 'JOB_DATASOURCE_EXPORT') return { ok: true, backup: '{"schemaVersion":1}' };
         if (message.type === 'JOB_DATASOURCE_IMPORT') return { ok: true, datasource };
         return { ok: true };
@@ -539,6 +541,72 @@ test('answer workspace stays blank until a readable candidate is chosen', async 
     assert.equal(draft.value, '');
     assert.equal([...row.querySelectorAll('[data-choose-answer]')].length, 2);
     assert.deepEqual(pageMutationMessages(harness.sentMessages), []);
+  } finally { harness.cleanup(); }
+});
+
+test('AI suggestions populate an editable draft without inserting it into the form', async () => {
+  const generatedSuggestion = {
+    tabId: 7, frameId: 3, applicationId: 'run-ai', pageSignature: 'page-one',
+    field: { id: 'summary', handle: 'handle-summary' },
+    suggestions: [{ answer: 'I built event processing systems that match this role.', evidenceKeys: ['experience'] }],
+    missingContext: '',
+  };
+  const run = { status: 'waiting_user', applicationId: 'run-ai', pageSignature: 'page-one', actionRequired: [{ fieldId: 'summary', label: 'Why are you a good fit?', generatedSuggestion }], optionalUnresolved: [], reviewRequired: [], audit: [] };
+  const harness = await setupPanel({ run });
+  try {
+    const row = harness.dom.window.document.querySelector('#action-required-list .result-item');
+    assert.equal(row.querySelector('.result-label').textContent, 'Why are you a good fit?');
+    row.querySelector('[data-choose-generated-answer]').click();
+    assert.equal(row.querySelector('[data-answer-draft]').value, 'I built event processing systems that match this role.');
+    assert.deepEqual(pageMutationMessages(harness.sentMessages), []);
+    assert.equal(row.querySelector('[data-answer-draft]').readOnly, false);
+  } finally { harness.cleanup(); }
+});
+
+test('AI suggestions remain selectable when saved evidence is an internal ID', async () => {
+  const suggestion = {
+    tabId: 7, frameId: 3, applicationId: 'run-mixed', pageSignature: 'page-one',
+    field: { id: 'summary', handle: 'handle-summary' },
+    candidates: [{ sourceKey: 'legacy_id', sourceQuestion: 'Legacy response', answer: 'cards|d20089ff-f389-44ef-9398-eec15ba7b6a4[field1]' }],
+  };
+  const generatedSuggestion = {
+    tabId: 7, frameId: 3, applicationId: 'run-mixed', pageSignature: 'page-one',
+    field: { id: 'summary', handle: 'handle-summary' },
+    suggestions: [{ answer: 'I build reliable event processing systems that fit this role.', evidenceKeys: [] }],
+  };
+  const run = {
+    status: 'waiting_user', applicationId: 'run-mixed', pageSignature: 'page-one',
+    actionRequired: [{ fieldId: 'summary', label: 'Why are you a good fit?', suggestion, generatedSuggestion }],
+    optionalUnresolved: [], reviewRequired: [], audit: [],
+  };
+  const harness = await setupPanel({ run });
+  try {
+    const row = harness.dom.window.document.querySelector('#action-required-list .result-item');
+    const draft = row.querySelector('[data-answer-draft]');
+    assert.ok(draft, 'a readable AI suggestion needs an editable answer destination');
+    row.querySelector('[data-choose-generated-answer]').click();
+    assert.equal(draft.value, 'I build reliable event processing systems that fit this role.');
+    row.querySelector('[data-send-answer]').click();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assert.equal(harness.sentMessages.find((message) => message.type === 'JOB_RUN_APPLY_DRAFT')?.answer, draft.value);
+  } finally { harness.cleanup(); }
+});
+
+test('missing job context exposes a compact description editor and regenerates drafts', async () => {
+  const generatedSuggestion = { tabId: 7, frameId: 3, applicationId: 'run-context', pageSignature: 'page-one', field: { id: 'summary', handle: 'handle-summary' }, suggestions: [], missingContext: 'Add the job description.' };
+  const refreshed = { status: 'waiting_user', applicationId: 'run-context', pageSignature: 'page-one', jobContext: { jobDescription: 'Build distributed systems.' }, actionRequired: [{ fieldId: 'summary', label: 'Why this role?', generatedSuggestion: { ...generatedSuggestion, suggestions: [{ answer: 'I have relevant systems experience.', evidenceKeys: [] }], missingContext: '' } }], optionalUnresolved: [], reviewRequired: [], audit: [] };
+  const run = { status: 'waiting_user', applicationId: 'run-context', pageSignature: 'page-one', actionRequired: [{ fieldId: 'summary', label: 'Why this role?', generatedSuggestion }], optionalUnresolved: [], reviewRequired: [], audit: [] };
+  const harness = await setupPanel({ run, generateResponse: { ok: true, run: refreshed } });
+  try {
+    const row = harness.dom.window.document.querySelector('#action-required-list .result-item');
+    const editor = row.querySelector('[data-job-description]');
+    assert.ok(editor);
+    editor.value = 'Build distributed systems.';
+    row.querySelector('[data-generate-suggestions]').click();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const message = harness.sentMessages.find((entry) => entry.type === 'JOB_RUN_GENERATE_SUGGESTIONS');
+    assert.equal(message.jobDescription, 'Build distributed systems.');
+    assert.equal(harness.dom.window.document.querySelector('[data-choose-generated-answer]').textContent, 'Use this answer');
   } finally { harness.cleanup(); }
 });
 

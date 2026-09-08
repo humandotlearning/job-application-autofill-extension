@@ -1,0 +1,372 @@
+# Review package: 2e295e480b3f5c4e22819ca76b3d6720972cc0a9..7aff99c
+
+## Commits
+7aff99c feat: require review before planner answers reach forms
+
+## Files changed
+ .superpowers/sdd/task-5-report.md |  20 +++++++
+ src/service-worker.js             | 105 +++++++++++++++++++++++++++++-------
+ tests/service-worker.test.js      | 111 ++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 216 insertions(+), 20 deletions(-)
+
+## Diff
+diff --git a/.superpowers/sdd/task-5-report.md b/.superpowers/sdd/task-5-report.md
+new file mode 100644
+index 0000000..e60e1bc
+--- /dev/null
++++ b/.superpowers/sdd/task-5-report.md
+@@ -0,0 +1,20 @@
++# Task 5: Planner answers require explicit review
++
++## Completed
++
++- Planner `fill` decisions now become pending candidates in `run.suggestions`; they never reach `JOB_APP_APPLY` during page processing.
++- Each planner candidate retains its answer, every `sourceKey`, immutable source-answer snapshots, transformation, reason, confidence, sensitivity, and `AI planner` provenance.
++- Explicit approval accepts legacy singular keys and plural source keys. It rechecks every source key, answer snapshot, and field relevance before applying a candidate.
++- Approved planner fills carry all evidence keys, and reusable learning keeps all of those keys. Suggestions are removed only after the page retains the approved value.
++
++## Verification
++
++- `npm test -- tests/service-worker.test.js` — 36 passing.
++- `npm test` — 221 passing.
++- `npm run check` — passing.
++- `npm run build` — passing; rebuilt `dist/content.js` is intentionally not part of this task's selective commit.
++
++## Notes
++
++- The new worker tests cover pending planner proposals, explicit approval, plural evidence snapshots, and rejection when any source changes.
++- Existing local, draft, and equivalent single-source approvals remain covered by the worker suite through the legacy singular-key fallback.
+diff --git a/src/service-worker.js b/src/service-worker.js
+index ad1cb34..ac49ebf 100644
+--- a/src/service-worker.js
++++ b/src/service-worker.js
+@@ -728,34 +728,72 @@ async function applyPageDecisions(tabId, run, inspection, records, coverMessages
+   let allDecisions = [...localDecisions];
+   let appliedReviews = [...(localResult.result?.reviewRequired || [])];
+   let unresolvedResults = [...(localResult.result?.unresolved || [])];
+   let llmError = null;
+   const remaining = unresolvedFields(currentInspection.fields, currentValidation).filter(field => !run.suggestions[field.id]);
+   const llmPageKey = `${run.pageNumber}:${currentPageSignature}`;
+   if (remaining.length && apiKey && !run.llmPages.includes(llmPageKey)) {
+     run.llmPages = [...run.llmPages, llmPageKey];
+     await saveRun(run);
+     try {
++      const plannerRecords = records.filter(record => remaining.some(field => retrieveEvidence(field, [record]).length)).slice(0, 20);
+       const llmDecisions = await callAnswerPlanner({
+         apiKey,
+         fields: remaining,
+-        records: records.filter(record => remaining.some(field => retrieveEvidence(field, [record]).length)).slice(0, 20),
++        records: plannerRecords,
+         page: currentInspection.page,
+       }, { model, allowPartial: true });
+-      const llmResult = await sendToApplicationFrame(tabId, run, {
+-        type: 'JOB_APP_APPLY',
+-        decisions: llmDecisions.decisions.map((decision) => ({ ...decision, handle: remaining.find((field) => field.id === decision.fieldId)?.handle })),
+-      });
+-      if (!llmResult?.ok) throw new Error(llmResult?.error || 'The page rejected an answer planner value');
+-      allDecisions = [...allDecisions, ...llmDecisions.decisions];
+-      appliedReviews = [...appliedReviews, ...(llmResult.result?.reviewRequired || [])];
+-      unresolvedResults = [...unresolvedResults, ...(llmResult.result?.unresolved || [])];
++      const heldPlannerDecisions = [];
++      for (const decision of llmDecisions.decisions) {
++        const field = remaining.find((item) => item.id === decision.fieldId);
++        if (!field || decision.action !== 'fill') {
++          heldPlannerDecisions.push(decision);
++          continue;
++        }
++        const sourceKeys = [...new Set(decision.evidenceKeys || [])];
++        const sources = sourceKeys.map((key) => plannerRecords.find((record) => record.key === key));
++        if (sources.length !== sourceKeys.length || sources.some((source) => !source)) {
++          throw new Error(`Answer planner evidence is unavailable for ${field.label || field.id}`);
++        }
++        run.suggestions[field.id] = {
++          tabId,
++          frameId: run.frame.frameId,
++          applicationId: run.startedAt,
++          pageSignature: currentPageSignature,
++          field,
++          candidates: [{
++            sourceKey: sourceKeys[0],
++            sourceKeys,
++            sourceAnswers: Object.fromEntries(sources.map((source) => [source.key, source.answer])),
++            sourceQuestion: sources.map((source) => source.question).join(' + '),
++            answer: decision.value,
++            excerpt: String(decision.value).slice(0, 400),
++            provenance: 'AI planner',
++            kind: 'planner',
++            requiresApproval: true,
++            reason: decision.reason,
++            transformation: decision.transformation || null,
++            confidence: decision.confidence,
++            sensitivity: decision.sensitivity,
++          }],
++        };
++        heldPlannerDecisions.push({
++          ...decision,
++          action: 'ask_user',
++          value: null,
++          reason: 'AI-planned answer is ready for review before use',
++        });
++      }
++      // Planner output is a proposed answer, never an automatic fill.  The
++      // candidate is revalidated and applied only through explicit Send to
++      // form in approveSuggestion.
++      allDecisions = [...allDecisions, ...heldPlannerDecisions];
+     } catch (error) {
+       llmError = error.message;
+     }
+   }
+ 
+   refreshed = await sendToApplicationFrame(tabId, run, { type: 'JOB_APP_INSPECT' });
+   currentInspection = refreshed.inspection;
+   validationResponse = await sendToApplicationFrame(tabId, run, { type: 'JOB_APP_VALIDATE' });
+   currentValidation = validationResponse?.validation || { ok: false, requiredEmpty: [], invalid: [] };
+   run = await capturePage(tabId, run, currentInspection);
+@@ -777,52 +815,67 @@ async function applyPageDecisions(tabId, run, inspection, records, coverMessages
+ async function approveSuggestion(message) {
+   const { tabId, fieldId } = message;
+   if (!Number.isInteger(tabId) || processingTabs.has(tabId) || saveLocks.has(tabId)) throw new Error('Application is busy or unavailable');
+   saveLocks.add(tabId);
+   try {
+     const run = await getRun(tabId);
+     const suggestion = run?.suggestions?.[fieldId];
+     if (!suggestion || !SAVABLE_RUN_STATUSES.has(run.status) || message.frameId !== run.frame?.frameId
+       || message.frameId !== suggestion.frameId || message.applicationId !== run.startedAt
+       || message.pageSignature !== run.pageSignature || message.handle !== suggestion.field.handle || !message.handle) throw new Error('Stale suggestion; check the page again');
+-    const candidate = suggestion.candidates.find(item => item.sourceKey === message.sourceKey);
++    const requestedKeys = sourceKeysFromMessage(message);
++    const candidate = suggestion.candidates.find((item) => {
++      const candidateKeys = sourceKeysForCandidate(item);
++      return requestedKeys.length > 0 && sameKeys(candidateKeys, requestedKeys);
++    });
++    const sourceKeys = sourceKeysForCandidate(candidate);
+     const records = candidate?.kind === 'draft' ? await draftEvidenceRecords() : await getRecords();
+-    const source = records.find(item => item.key === candidate?.sourceKey);
+-    if (!candidate || !source || source.answer !== candidate.answer
+-      || !retrieveEvidence(suggestion.field, records).some(item => item.sourceKey === candidate.sourceKey)) throw new Error('Saved evidence changed; check again');
++    const sources = sourceKeys.map((key) => records.find((record) => record.key === key));
++    if (!candidate || !sourceKeys.length || sources.some((source) => !source)
++      || sources.some((source) => source.answer !== sourceAnswerSnapshot(candidate, source.key))
++      || sources.some((source) => !retrieveEvidence(suggestion.field, records).some((item) => item.sourceKey === source.key))) {
++      throw new Error('Saved evidence changed; check again');
++    }
++    const source = sources[0];
+     // Never rediscover/reroute an approval into another frame.
+     const inspected = await sendToFrame(tabId, message.frameId, { type: 'JOB_APP_INSPECT' });
+     const field = inspected.inspection?.fields.find(item => item.id === fieldId);
+     if (!field || field.handle !== message.handle || field.currentValue || JSON.stringify(field.options) !== JSON.stringify(suggestion.field.options)
+       || field.label !== suggestion.field.label || field.type !== suggestion.field.type
+       || pageSignature(inspected.inspection, run.frame) !== message.pageSignature) throw new Error('Destination changed; check the page again');
+     const value = String(message.answer ?? candidate.answer).trim();
+     const validation = validateFillValue(field, value);
+-    if (!validation.ok || !meaningCompatible(field, source, { numericReview: !(['textarea', 'text'].includes(field.type) && value === candidate.answer) }) || inferSensitivity(field.label, field.id) === 'legal' || field.type === 'checkbox') throw new Error(validation.reason || 'This destination requires manual entry');
+-    const result = await sendToFrame(tabId, message.frameId, { type: 'JOB_APP_APPLY', applicationId: run.startedAt, decisions: [{ fieldId, handle: field.handle, action: 'fill', value, evidenceKeys: [source.key], sensitivity: inferSensitivity(field.label, field.id), confidence: 'high', reason: 'Explicitly approved saved answer' }] });
++    const sourceCompatible = candidate.kind === 'planner'
++      ? sources.every((item) => retrieveEvidence(field, records).some((evidence) => evidence.sourceKey === item.key))
++      : meaningCompatible(field, source, { numericReview: !(['textarea', 'text'].includes(field.type) && value === candidate.answer) });
++    if (!validation.ok || !sourceCompatible || inferSensitivity(field.label, field.id) === 'legal' || field.type === 'checkbox') throw new Error(validation.reason || 'This destination requires manual entry');
++    const result = await sendToFrame(tabId, message.frameId, { type: 'JOB_APP_APPLY', applicationId: run.startedAt, decisions: [{ fieldId, handle: field.handle, action: 'fill', value, evidenceKeys: sourceKeys, sensitivity: inferSensitivity(field.label, field.id), confidence: 'high', reason: 'Explicitly approved saved answer' }] });
+     if (!result?.ok) throw new Error(result?.error || 'Could not apply the answer');
+     const verified = await sendToFrame(tabId, message.frameId, { type: 'JOB_APP_INSPECT' });
+     if (verified.inspection?.fields.find(item => item.id === fieldId && item.handle === field.handle)?.currentValue !== value) throw new Error('The page did not retain the approved answer');
+     datasourceWriteChain = datasourceWriteChain.catch(() => {}).then(async () => {
+       const state = await getDatasource();
+-      const latest = (candidate.kind === 'draft' ? await draftEvidenceRecords() : state.answerRecords).find(record => record.key === source.key);
+-      if (!latest || latest.answer !== source.answer) throw new Error('Evidence changed while applying; answer applied but not learned');
++      const latestRecords = candidate.kind === 'draft' ? await draftEvidenceRecords() : state.answerRecords;
++      const latestSources = sourceKeys.map((key) => latestRecords.find((record) => record.key === key));
++      if (latestSources.some((latest) => !latest || latest.answer !== sourceAnswerSnapshot(candidate, latest.key))) {
++        throw new Error('Evidence changed while applying; answer applied but not learned');
++      }
+       const now = new Date().toISOString();
+-      const equivalent = candidate.kind === 'equivalent' && value === candidate.answer && field.labelConfidence !== 'low';
++      const equivalent = candidate.kind === 'equivalent' && sourceKeys.length === 1 && value === candidate.answer && field.labelConfidence !== 'low';
+       const answerRecords = equivalent ? state.answerRecords.map(record => record.key === source.key
+         ? { ...record, aliases: [...new Set([...(record.aliases || []), field.label])], updatedAt: now } : record)
+         : mergeLearnedAnswers(state.answerRecords, [{ question: field.label, answer: value, type: field.type, entityId: field.entityId,
+-          entityType: field.entityType, evidenceKeys: [source.key], provenance: 'user', completed: true, userEdited: true }], now, { confirm: true });
++          entityType: field.entityType, evidenceKeys: sourceKeys, provenance: 'user', completed: true, userEdited: true }], now, { confirm: true });
+       await saveDatasource({ ...state, answerRecords });
+       const readback = await chrome.storage.local.get({ answerRecords: [] });
+       const persisted = equivalent ? readback.answerRecords.find(record => record.key === source.key && record.aliases?.includes(field.label))
+-        : readback.answerRecords.find(record => record.question === field.label && record.answer === value && record.evidenceKeys?.includes(source.key));
++        : readback.answerRecords.find(record => record.question === field.label && record.answer === value && sourceKeys.every((key) => record.evidenceKeys?.includes(key)));
+       if (!persisted) throw new Error('Answer applied, but reusable save could not be verified');
+     });
+     await datasourceWriteChain;
+     delete run.suggestions[fieldId];
+     const validationResponse = await sendToFrame(tabId, message.frameId, { type: 'JOB_APP_VALIDATE' });
+     categorizeRun(run, verified.inspection, validationResponse.validation || {});
+     return { ok: true, run: await saveRun(run) };
+   } finally { saveLocks.delete(tabId); }
+ }
+ 
+@@ -886,20 +939,32 @@ function sourceKeysFromMessage(message = {}) {
+   ].filter((key) => typeof key === 'string' && key))];
+ }
+ 
+ function sourceKeysForCandidate(candidate = {}) {
+   return [...new Set([
+     ...(Array.isArray(candidate.sourceKeys) ? candidate.sourceKeys : []),
+     candidate.sourceKey,
+   ].filter((key) => typeof key === 'string' && key))];
+ }
+ 
++function sourceAnswerSnapshot(candidate = {}, key) {
++  const snapshots = candidate.sourceAnswers;
++  if (snapshots && !Array.isArray(snapshots) && typeof snapshots === 'object'
++    && Object.prototype.hasOwnProperty.call(snapshots, key)) return String(snapshots[key]);
++  if (Array.isArray(snapshots)) {
++    const snapshot = snapshots.find((item) => item?.key === key);
++    if (snapshot && typeof snapshot.answer === 'string') return snapshot.answer;
++  }
++  // Older runs stored a single sourceKey and candidate answer only.
++  return candidate.sourceKey === key ? String(candidate.answer ?? '') : null;
++}
++
+ function sameKeys(left = [], right = []) {
+   return left.length === right.length && left.every((key) => right.includes(key));
+ }
+ 
+ async function rewriteEvidence(suggestion, message) {
+   const requestedKeys = sourceKeysFromMessage(message);
+   if (!requestedKeys.length) return [];
+   const candidate = suggestion?.candidates?.find((item) => sameKeys(sourceKeysForCandidate(item), requestedKeys));
+   if (!candidate) throw new Error('Saved evidence changed; choose an answer again');
+   const records = candidate.kind === 'draft' ? await draftEvidenceRecords() : await getRecords();
+diff --git a/tests/service-worker.test.js b/tests/service-worker.test.js
+index 20cbd2d..a1a848c 100644
+--- a/tests/service-worker.test.js
++++ b/tests/service-worker.test.js
+@@ -284,20 +284,131 @@ test('optional planner sends bounded relevant evidence and preserves failure dia
+   const bodies = [];
+   globalThis.fetch = async (_url, options) => { bodies.push(JSON.parse(options.body)); throw new Error('Synthetic network failure'); };
+   await import(`../src/service-worker.js?test=bounded-${Date.now()}`);
+   const first = await harness.dispatch({ type: 'JOB_RUN_START', tabId: 7 });
+   assert.deepEqual(JSON.parse(bodies[0].input[1].content[0].text).records, []);
+   assert.match(first.run.llmError, /Synthetic network failure/);
+   await harness.dispatch({ type: 'JOB_RUN_CHECK_PAGE', tabId: 7 });
+   assert.equal(bodies.length, 1);
+ });
+ 
++test('planner fill candidates wait for explicit review instead of applying to the page', async () => {
++  const plannerAnswer = 'I built and deployed machine learning models to production.';
++  const harness = createHarness({ answerRecords: [{
++    key: 'ml_delivery',
++    question: 'Machine learning delivery project',
++    answer: plannerAnswer,
++    confirmationState: 'confirmed',
++    sensitivity: 'safe',
++  }], pagesByTab: { 7: { pages: [{ fields: [
++    { id: 'ml_experience', handle: 'ml-experience-handle', label: 'Describe your ML deployment experience', type: 'textarea', required: true, currentValue: ' ' },
++  ], actions: [{ id: 'submit', label: 'Submit application', kind: 'submit' }], invalidFieldIds: ['ml_experience'] }] } } });
++  harness.localData.openaiApiKey = 'synthetic-planner-key';
++  globalThis.fetch = async () => ({
++    ok: true,
++    status: 200,
++    statusText: 'OK',
++    json: async () => ({ output_text: JSON.stringify({ decisions: [{
++      fieldId: 'ml_experience', action: 'fill', value: plannerAnswer, evidenceKeys: ['ml_delivery'],
++      confidence: 'high', sensitivity: 'safe', reason: 'Exact saved delivery evidence', transformation: 'copy',
++    }] }) }),
++  });
++  await import(`../src/service-worker.js?planner-pending-${Date.now()}`);
++
++  const started = await harness.dispatch({ type: 'JOB_RUN_START', tabId: 7 });
++
++  assert.equal(started.ok, true, started.error);
++  assert.equal(harness.tabs.get(7).frames[0].pages[0].values?.ml_experience, undefined);
++  const plannerFieldDecisions = harness.tabs.get(7).messages
++    .filter((message) => message.type === 'JOB_APP_APPLY')
++    .flatMap((message) => message.decisions || [])
++    .filter((decision) => decision.fieldId === 'ml_experience');
++  assert.equal(plannerFieldDecisions.some((decision) => decision.action === 'fill'), false);
++  assert.ok(started.run.suggestions, JSON.stringify(started.run));
++  const suggestion = started.run.suggestions.ml_experience;
++  assert.ok(suggestion, JSON.stringify(started.run));
++  assert.equal(started.run.actionRequired.find((item) => item.fieldId === 'ml_experience')?.suggestion, suggestion);
++  assert.equal(suggestion.candidates.length, 1);
++  assert.equal(suggestion.candidates[0].answer, plannerAnswer);
++  assert.deepEqual(suggestion.candidates[0].sourceKeys, ['ml_delivery']);
++  assert.deepEqual(suggestion.candidates[0].sourceAnswers, { ml_delivery: plannerAnswer });
++  assert.equal(suggestion.candidates[0].provenance, 'AI planner');
++
++  // The harness uses a whitespace-only invalid value to exercise the planner
++  // path without allowing the deterministic path to claim the field. Restore
++  // the visibly blank control before the user's explicit Send to form.
++  const page = harness.tabs.get(7).frames[0].pages[0];
++  page.fields[0].currentValue = '';
++  page.invalidFieldIds = [];
++  const approved = await harness.dispatch({
++    type: 'JOB_RUN_APPROVE_SUGGESTION',
++    tabId: 7,
++    frameId: suggestion.frameId,
++    applicationId: suggestion.applicationId,
++    pageSignature: suggestion.pageSignature,
++    fieldId: 'ml_experience',
++    handle: suggestion.field.handle,
++    sourceKey: suggestion.candidates[0].sourceKey,
++    sourceKeys: suggestion.candidates[0].sourceKeys,
++  });
++  assert.equal(approved.ok, true, approved.error);
++  assert.equal(page.values.ml_experience, plannerAnswer);
++  assert.equal(approved.run.suggestions?.ml_experience, undefined);
++});
++
++test('planner candidates preserve every evidence snapshot and reject approval after any source changes', async () => {
++  const plannerAnswer = 'I built and deployed machine learning systems in production.';
++  const harness = createHarness({ answerRecords: [
++    { key: 'ml_project', question: 'Machine learning delivery project', answer: plannerAnswer, confirmationState: 'confirmed', sensitivity: 'safe' },
++    { key: 'ml_production', question: 'Machine learning production evidence', answer: plannerAnswer, confirmationState: 'confirmed', sensitivity: 'safe' },
++  ], pagesByTab: { 7: { pages: [{ fields: [
++    { id: 'ml_experience', handle: 'ml-experience-handle', label: 'Describe your ML deployment experience', type: 'textarea', required: true, currentValue: ' ' },
++  ], actions: [{ id: 'submit', label: 'Submit application', kind: 'submit' }], invalidFieldIds: ['ml_experience'] }] } } });
++  harness.localData.openaiApiKey = 'synthetic-planner-key';
++  globalThis.fetch = async () => ({
++    ok: true,
++    status: 200,
++    statusText: 'OK',
++    json: async () => ({ output_text: JSON.stringify({ decisions: [{
++      fieldId: 'ml_experience', action: 'fill', value: plannerAnswer, evidenceKeys: ['ml_project', 'ml_production'],
++      confidence: 'high', sensitivity: 'safe', reason: 'Saved delivery evidence', transformation: 'copy',
++    }] }) }),
++  });
++  await import(`../src/service-worker.js?planner-sources-${Date.now()}`);
++
++  const started = await harness.dispatch({ type: 'JOB_RUN_START', tabId: 7 });
++  assert.ok(started.run.suggestions, JSON.stringify(started.run));
++  const suggestion = started.run.suggestions.ml_experience;
++  assert.ok(suggestion, JSON.stringify(started.run));
++  const candidate = suggestion.candidates[0];
++  assert.deepEqual(candidate.sourceKeys, ['ml_project', 'ml_production']);
++  assert.deepEqual(candidate.sourceAnswers, { ml_project: plannerAnswer, ml_production: plannerAnswer });
++  assert.equal(harness.tabs.get(7).frames[0].pages[0].values?.ml_experience, undefined);
++
++  harness.localData.answerRecords = harness.localData.answerRecords.map((record) => record.key === 'ml_production'
++    ? { ...record, answer: 'Changed machine learning evidence.' }
++    : record);
++  const rejected = await harness.dispatch({
++    type: 'JOB_RUN_APPROVE_SUGGESTION',
++    tabId: 7,
++    frameId: suggestion.frameId,
++    applicationId: suggestion.applicationId,
++    pageSignature: suggestion.pageSignature,
++    fieldId: 'ml_experience',
++    handle: suggestion.field.handle,
++    sourceKeys: candidate.sourceKeys,
++  });
++  assert.equal(rejected.ok, false);
++  assert.match(rejected.error, /evidence changed/i);
++  assert.equal(harness.tabs.get(7).frames[0].pages[0].values?.ml_experience, undefined);
++});
++
+ test('reviewed compensation preserves explicit answer units without numeric conversion', async () => {
+   const harness = createHarness({ answerRecords: [{ key: 'current_salary', question: 'Current salary', answer: 'Reported compensation: 18 LPA.', confirmationState: 'confirmed', sensitivity: 'review' }], pagesByTab: { 7: { pages: [{ fields: [{ id: 'ctc', handle: 'ctc-h', label: 'Current CTC', type: 'textarea', required: true }], actions: [{ id: 'submit', label: 'Submit application', kind: 'submit' }] }] } } });
+   await import(`../src/service-worker.js?test=units-${Date.now()}`);
+   const { run } = await harness.dispatch({ type: 'JOB_RUN_START', tabId: 7 });
+   assert.equal(run.suggestions.ctc.candidates[0].kind, 'review');
+   const result = await harness.dispatch({ type: 'JOB_RUN_APPROVE_SUGGESTION', tabId: 7, frameId: 0, applicationId: run.startedAt, pageSignature: run.pageSignature, fieldId: 'ctc', handle: 'ctc-h', sourceKey: 'current_salary' });
+   assert.equal(result.ok, true, result.error);
+   assert.equal(harness.tabs.get(7).frames[0].pages[0].values.ctc, 'Reported compensation: 18 LPA.');
+ });
+ 
