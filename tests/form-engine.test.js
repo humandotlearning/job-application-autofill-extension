@@ -769,11 +769,13 @@ test('classifies a submit-type Next button as navigation without submitting it',
   assert.equal(inspection.actions[0].kind, 'next');
 });
 
-test('focuses a matching field without changing its value', () => {
+test('focuses and temporarily highlights a matching field and its label without changing its value', () => {
   const document = makeDocument('<form><label for="name">Full name</label><input id="name" value="Nithin"></form>');
   assert.equal(focusField(document, 'name'), true);
   assert.equal(document.querySelector('#name').value, 'Nithin');
   assert.equal(document.activeElement.id, 'name');
+  assert.ok(document.querySelector('#name').classList.contains('job-autofill-focus-highlight'));
+  assert.ok(document.querySelector('label[for="name"]').classList.contains('job-autofill-focus-highlight'));
 });
 
 test('uses company defaults only for clearly identified employer relationship questions', () => {

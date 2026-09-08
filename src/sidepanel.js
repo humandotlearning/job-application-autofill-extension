@@ -221,9 +221,13 @@ function isOpaqueIdentifier(value) {
     || /^(?:[a-z][a-z\d_-]*\|)?[a-f\d]{8}-[a-f\d]{4}-[a-f\d]{4}-[a-f\d]{4}-[a-f\d]{12}(?:\[[a-z\d_-]+\])?$/i.test(text);
 }
 
+function logOpaqueIdentifier(kind, value) {
+  console.debug('[Job Application Autofill] Opaque identifier omitted from panel.', { kind, value: String(value ?? '') });
+}
+
 let internalIdCounter = 0;
 
-function internalIdDisclosure(value, label = 'Internal ID') {
+function legacyInternalIdPopover(value, label = 'Internal ID') {
   const wrapper = document.createElement('span');
   wrapper.className = 'internal-id';
   wrapper.dataset.internalId = 'true';
@@ -321,6 +325,11 @@ function internalIdDisclosure(value, label = 'Internal ID') {
   });
   wrapper.append(trigger, popover);
   return wrapper;
+}
+
+function internalIdDisclosure(value, label = 'Internal ID') {
+  logOpaqueIdentifier(label, value);
+  return document.createDocumentFragment();
 }
 
 function answerNode(answer) {
@@ -494,6 +503,7 @@ function itemRow(item, { focus = false, detail = '' } = {}) {
   const row = document.createElement('div');
   row.className = 'result-item';
   const content = document.createElement('div');
+  const origin = fieldOrigin(item);
   const candidates = Array.isArray(item.suggestion?.candidates) ? item.suggestion.candidates : [];
   const readableCandidates = candidates.filter((candidate) => !isOpaqueIdentifier(candidate.answer));
   const onlyOpaqueSuggestions = candidates.length > 0 && readableCandidates.length === 0;
@@ -510,7 +520,7 @@ function itemRow(item, { focus = false, detail = '' } = {}) {
     ? onlyOpaqueSuggestions
       ? `Choose a value for ${displayLabel} on the application page, then click Check again.`
       : hasOpaqueValue
-        ? 'This saved value is an internal ID and cannot be used automatically.'
+        ? 'This saved value cannot be used automatically.'
         : itemValue
           ? 'Update this value on the application page, then click Check again.'
           : 'Enter or select an answer on the application page, then click Check again.'
@@ -525,7 +535,7 @@ function itemRow(item, { focus = false, detail = '' } = {}) {
   if (detail) value.textContent = detail;
   else if (onlyOpaqueSuggestions) value.textContent = fieldAction;
   else if (hasOpaqueValue) {
-    value.append(document.createTextNode(`${fieldAction || 'This saved value is an internal ID and cannot be used automatically.'} `));
+    value.append(document.createTextNode(`${fieldAction || 'This saved value cannot be used automatically.'} `));
     value.append(internalIdDisclosure(itemValue, 'Internal answer ID'));
   } else if (itemValue) value.append(answerNode(itemValue));
   else if (unclearQuestion) value.textContent = `${item.nearbyContext ? `Nearby text: ${item.nearbyContext}. ` : ''}Use Show on page to identify this question, then write your answer.`;
@@ -635,24 +645,27 @@ function itemRow(item, { focus = false, detail = '' } = {}) {
       const evidence = document.createElement('details');
       evidence.className = 'saved-evidence';
       const summary = document.createElement('summary');
-      summary.textContent = 'Saved answer';
-      const source = document.createElement('p');
-      source.className = 'saved-evidence-source';
       const sourceQuestion = String(candidate.sourceQuestion || 'Saved answer');
       if (isOpaqueIdentifier(sourceQuestion)) {
-        source.append(document.createTextNode(`Saved answer from a previous form — ${candidate.provenance || 'saved record'}. `));
-        source.append(internalIdDisclosure(sourceQuestion, 'Internal source ID'));
-      } else source.textContent = `${sourceQuestion} — ${candidate.provenance || 'saved record'}.`;
-      if (candidate.reason) source.append(document.createTextNode(` ${candidate.reason}`));
+        summary.textContent = 'Saved answer from a previous form';
+        logOpaqueIdentifier('saved answer source', sourceQuestion);
+      } else summary.textContent = `Saved answer from ${sourceQuestion}`;
       if (isOpaqueIdentifier(candidate.answer)) {
         const unavailable = document.createElement('p');
         unavailable.className = 'result-detail';
-        unavailable.append(document.createTextNode('Saved value is an internal ID and cannot be used automatically. '));
-        unavailable.append(internalIdDisclosure(candidate.answer, 'Internal answer ID'));
-        evidence.append(summary, source, unavailable);
+        unavailable.textContent = 'This saved value cannot be used automatically.';
+        logOpaqueIdentifier('saved answer', candidate.answer);
+        evidence.append(summary, unavailable);
         content.append(evidence);
         continue;
       }
+      const answer = document.createElement('p');
+      answer.className = 'saved-evidence-answer';
+      answer.dataset.savedAnswerText = 'true';
+      answer.textContent = candidate.answer;
+      const reason = document.createElement('p');
+      reason.className = 'saved-evidence-reason';
+      reason.textContent = candidate.reason || '';
       const choose = document.createElement('button');
       choose.type = 'button';
       choose.dataset.chooseAnswer = 'true';
@@ -669,7 +682,54 @@ function itemRow(item, { focus = false, detail = '' } = {}) {
         workspace.updateControls();
         setStatus('Saved answer selected. Review or edit it before sending it to the form.');
       });
-      evidence.append(summary, source, answerNode(candidate.answer), choose);
+      evidence.append(summary, answer);
+      if (reason.textContent) evidence.append(reason);
+      evidence.append(choose);
+      const sourceKeys = Array.isArray(candidate.sourceKeys) ? candidate.sourceKeys : [candidate.sourceKey].filter(Boolean);
+      if (candidate.kind !== 'draft' && candidate.kind !== 'planner' && sourceKeys.length === 1) {
+        const dismiss = document.createElement('button');
+        dismiss.type = 'button';
+        dismiss.dataset.dismissSavedAnswer = 'true';
+        dismiss.textContent = 'Not relevant to this question';
+        dismiss.addEventListener('click', async () => {
+          dismiss.disabled = true;
+          try {
+            const response = await chrome.runtime.sendMessage({ type: 'JOB_DATASOURCE_SUPPRESS_ANSWER', tabId: origin.tabId, fieldId: origin.fieldId, sourceKey: candidate.sourceKey });
+            if (!response?.ok) throw new Error(response?.error || 'Could not hide this saved answer.');
+            if (response.run) renderRun(response.run);
+            setStatus('This saved answer will no longer be suggested for this question.');
+          } catch (error) { setStatus(error.message, 'error'); }
+          finally { dismiss.disabled = false; }
+        });
+        const remove = document.createElement('button');
+        remove.type = 'button';
+        remove.dataset.deleteSavedAnswer = 'true';
+        remove.textContent = 'Delete saved answer';
+        const confirmation = document.createElement('span');
+        confirmation.className = 'saved-answer-delete-confirmation';
+        confirmation.hidden = true;
+        const confirm = document.createElement('button');
+        confirm.type = 'button';
+        confirm.dataset.confirmDeleteSavedAnswer = 'true';
+        confirm.textContent = 'Delete permanently';
+        const cancel = document.createElement('button');
+        cancel.type = 'button';
+        cancel.textContent = 'Cancel';
+        remove.addEventListener('click', () => { remove.hidden = true; confirmation.hidden = false; confirm.focus(); });
+        cancel.addEventListener('click', () => { confirmation.hidden = true; remove.hidden = false; });
+        confirm.addEventListener('click', async () => {
+          confirm.disabled = true;
+          try {
+            const response = await chrome.runtime.sendMessage({ type: 'JOB_DATASOURCE_DELETE_ANSWER', tabId: origin.tabId, fieldId: origin.fieldId, sourceKey: candidate.sourceKey });
+            if (!response?.ok) throw new Error(response?.error || 'Could not delete this saved answer.');
+            if (response.run) renderRun(response.run);
+            setStatus('Saved answer deleted.');
+          } catch (error) { setStatus(error.message, 'error'); }
+          finally { confirm.disabled = false; }
+        });
+        confirmation.append(confirm, cancel);
+        evidence.append(dismiss, remove, confirmation);
+      }
       content.append(evidence);
     }
   }

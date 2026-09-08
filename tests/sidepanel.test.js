@@ -160,7 +160,59 @@ test('candidate selection requires an explicit Send to form action', async () =>
   } finally { harness.cleanup(); }
 });
 
-test('panel hides opaque saved values and directs the applicant to complete the required field', async () => {
+test('saved answer card expands once and only copies its answer into the editable draft', async () => {
+  const answer = 'I built and deployed reliable machine-learning systems in production. '.repeat(5).trim();
+  const suggestion = {
+    tabId: 7,
+    frameId: 3,
+    applicationId: 'run-one',
+    pageSignature: 'page-one',
+    field: { id: 'experience', handle: 'handle-one', label: 'Describe your ML experience', type: 'textarea' },
+    candidates: [{ sourceKey: 'deployment_story', sourceQuestion: 'Model deployment project', answer, provenance: 'user', kind: 'related' }],
+  };
+  const harness = await setupPanel({ run: { status: 'waiting_user', actionRequired: [{ fieldId: 'experience', label: 'Describe your ML experience', suggestion }], optionalUnresolved: [], reviewRequired: [], audit: [] } });
+  try {
+    const row = harness.dom.window.document.querySelector('#action-required-list .result-item');
+    const card = row.querySelector('.saved-evidence');
+    assert.equal(card.open, false);
+    assert.equal(card.querySelector('summary').textContent, 'Saved answer from Model deployment project');
+    assert.equal(card.querySelector('[data-saved-answer-text]').textContent, answer);
+    assert.equal(row.querySelectorAll('.answer-details').length, 0);
+    card.open = true;
+    row.querySelector('[data-choose-answer]').click();
+    assert.equal(row.querySelector('[data-answer-draft]').value, answer);
+    assert.deepEqual(pageMutationMessages(harness.sentMessages), []);
+  } finally { harness.cleanup(); }
+});
+
+test('saved answer feedback sends a per-question suppression and requires deletion confirmation', async () => {
+  const suggestion = {
+    tabId: 7,
+    frameId: 3,
+    applicationId: 'run-one',
+    pageSignature: 'page-one',
+    field: { id: 'experience', handle: 'handle-one', label: 'Describe your ML experience', type: 'textarea' },
+    candidates: [{ sourceKey: 'deployment_story', sourceQuestion: 'Model deployment project', answer: 'I deployed production ML systems.', provenance: 'user', kind: 'related' }],
+  };
+  const harness = await setupPanel({ run: { status: 'waiting_user', actionRequired: [{ fieldId: 'experience', label: 'Describe your ML experience', suggestion }], optionalUnresolved: [], reviewRequired: [], audit: [] } });
+  try {
+    const row = harness.dom.window.document.querySelector('#action-required-list .result-item');
+    row.querySelector('[data-dismiss-saved-answer]').click();
+    await new Promise(resolve => setTimeout(resolve, 0));
+    assert.deepEqual(harness.sentMessages.find(message => message.type === 'JOB_DATASOURCE_SUPPRESS_ANSWER'), {
+      type: 'JOB_DATASOURCE_SUPPRESS_ANSWER', tabId: 7, fieldId: 'experience', sourceKey: 'deployment_story',
+    });
+    row.querySelector('[data-delete-saved-answer]').click();
+    assert.ok(row.querySelector('[data-confirm-delete-saved-answer]'));
+    row.querySelector('[data-confirm-delete-saved-answer]').click();
+    await new Promise(resolve => setTimeout(resolve, 0));
+    assert.deepEqual(harness.sentMessages.find(message => message.type === 'JOB_DATASOURCE_DELETE_ANSWER'), {
+      type: 'JOB_DATASOURCE_DELETE_ANSWER', tabId: 7, fieldId: 'experience', sourceKey: 'deployment_story',
+    });
+  } finally { harness.cleanup(); }
+});
+
+test('panel hides opaque saved values without exposing an internal-ID control', async () => {
   const opaqueValue = '5ec015e5642301ec004c2eaa25504002';
   const suggestion = {
     tabId: 7,
@@ -182,18 +234,10 @@ test('panel hides opaque saved values and directs the applicant to complete the 
   try {
     const list = harness.dom.window.document.querySelector('#action-required-list');
     assert.match(list.textContent, /choose a value for Phone Device Type on the application page/i);
-    const disclosure = list.querySelector('[data-internal-id]');
-    const popover = disclosure.querySelector('[data-internal-id-popover]');
-    assert.ok(disclosure);
-    assert.ok(popover);
-    assert.equal(popover.hidden, true);
-    assert.equal(popover.querySelector('[data-internal-value]').textContent, opaqueValue);
+    assert.equal(list.querySelector('[data-internal-id]'), null);
+    assert.equal(list.querySelector('[data-internal-id-popover]'), null);
+    assert.doesNotMatch(list.textContent, new RegExp(opaqueValue, 'i'));
     assert.equal([...list.querySelectorAll('button')].some((button) => /saved answer|edit and use|approve edited/i.test(button.textContent)), false);
-    disclosure.querySelector('[data-internal-id-trigger]').click();
-    assert.equal(popover.hidden, false);
-    popover.querySelector('[data-copy-internal-id]').click();
-    await new Promise((resolve) => setTimeout(resolve, 0));
-    assert.deepEqual(harness.copyCalls, [opaqueValue]);
   } finally { harness.cleanup(); }
 });
 
@@ -223,7 +267,7 @@ test('panel orders named fields before generic notices and emphasizes each quest
   } finally { harness.cleanup(); }
 });
 
-test('panel hides an opaque source question behind an info button while keeping the saved answer usable', async () => {
+test('panel hides an opaque source question without an info button while keeping the saved answer usable', async () => {
   const internalQuestion = 'cards|d20089ff-f389-44ef-9398-eec15ba7b6a4[field1]';
   const suggestion = {
     tabId: 7,
@@ -241,23 +285,15 @@ test('panel hides an opaque source question behind an info button while keeping 
     assert.equal(row.querySelector('.result-label').textContent, 'AI OCR');
     assert.equal(row.querySelector('.result-label').tagName, 'H3');
     assert.match(row.textContent, /Above 6 years experience/);
-    const disclosure = row.querySelector('[data-internal-id]');
-    assert.ok(disclosure);
-    const popover = disclosure.querySelector('[data-internal-id-popover]');
-    assert.ok(popover);
-    assert.equal(popover.hidden, true);
-    assert.equal(popover.querySelector('[data-internal-value]').textContent, internalQuestion);
-    const trigger = disclosure.querySelector('[data-internal-id-trigger]');
-    trigger.focus();
-    assert.equal(popover.hidden, false);
-    trigger.click();
-    assert.equal(popover.hidden, false);
+    assert.equal(row.querySelector('[data-internal-id]'), null);
+    assert.equal(row.querySelector('[data-internal-id-popover]'), null);
+    assert.doesNotMatch(row.textContent, new RegExp(internalQuestion, 'i'));
     assert.equal([...row.querySelectorAll('button')].some((button) => /Use this saved answer|Edit and use/.test(button.textContent)), false);
     assert.ok(row.querySelector('[data-choose-answer]'));
   } finally { harness.cleanup(); }
 });
 
-test('panel keeps opaque field labels and audit values behind disclosures', async () => {
+test('panel keeps opaque field labels and audit values out of the visible panel', async () => {
   const internalField = 'cards|d20089ff-f389-44ef-9398-eec15ba7b6a4[field2]';
   const internalAnswer = '5ec01e56e42301ec004c2eaa25504002';
   const run = {
@@ -272,11 +308,11 @@ test('panel keeps opaque field labels and audit values behind disclosures', asyn
     const doc = harness.dom.window.document;
     const actionRow = doc.querySelector('#action-required-list .result-item');
     assert.equal(actionRow.querySelector('.result-label').firstChild.textContent, 'Form question');
-    assert.equal(actionRow.querySelector('[data-internal-id-popover]').hidden, true);
+    assert.equal(actionRow.querySelector('[data-internal-id-popover]'), null);
     const auditRow = doc.querySelector('#audit-list .result-item');
-    assert.match(auditRow.textContent, /internal ID/i);
-    assert.ok([...auditRow.querySelectorAll('[data-internal-id-popover]')].every((popover) => popover.hidden));
-    assert.deepEqual([...auditRow.querySelectorAll('[data-internal-value]')].map((value) => value.textContent), [internalField, internalAnswer]);
+    assert.doesNotMatch(auditRow.textContent, /internal ID/i);
+    assert.equal(auditRow.querySelector('[data-internal-id-popover]'), null);
+    assert.doesNotMatch(auditRow.textContent, new RegExp(internalAnswer, 'i'));
   } finally { harness.cleanup(); }
 });
 
@@ -820,14 +856,14 @@ test('a delayed apply cannot clear a newer draft edit', async () => {
   } finally { harness.cleanup(); }
 });
 
-test('opaque candidates disclose their value but expose no draft or apply controls', async () => {
+test('opaque candidates stay hidden and expose no draft or apply controls', async () => {
   const opaque = 'cards|d20089ff-f389-44ef-9398-eec15ba7b6a4[field1]';
   const suggestion = { tabId: 7, frameId: 3, applicationId: 'run-opaque', pageSignature: 'page-one', field: { id: 'device', handle: 'handle-device' }, candidates: [{ sourceKey: 'device', sourceQuestion: 'Device type', answer: opaque, provenance: 'user', kind: 'draft' }] };
   const run = { status: 'waiting_user', applicationId: 'run-opaque', pageSignature: 'page-one', actionRequired: [{ fieldId: 'device', label: 'Phone device type', suggestion }], optionalUnresolved: [], reviewRequired: [], audit: [] };
   const harness = await setupPanel({ run });
   try {
     const row = harness.dom.window.document.querySelector('#action-required-list .result-item');
-    assert.ok(row.querySelector('[data-internal-id-popover]'));
+    assert.equal(row.querySelector('[data-internal-id-popover]'), null);
     assert.equal(row.querySelector('[data-choose-answer]'), null);
     assert.equal(row.querySelector('[data-answer-draft]'), null);
     assert.equal(row.querySelector('[data-edit-answer]'), null);

@@ -122,6 +122,15 @@ function normalizeAnswerRecord(record = {}) {
     if (record[key] != null && String(record[key]).trim()) normalized[key] = String(record[key]).trim();
   }
   if (Array.isArray(record.evidenceKeys)) normalized.evidenceKeys = uniqueStrings(record.evidenceKeys);
+  const suppressedFor = uniqueStrings(Array.isArray(record.suppressedFor) ? record.suppressedFor : [])
+    .map((value) => {
+      const [label, type] = String(value).split('|');
+      const normalizedLabel = normalizeText(label);
+      const normalizedType = normalizeText(type);
+      return normalizedLabel && normalizedType ? `${normalizedLabel}|${normalizedType}` : '';
+    })
+    .filter(Boolean);
+  if (suppressedFor.length) normalized.suppressedFor = suppressedFor;
   if (record.semantic && typeof record.semantic === 'object' && !Array.isArray(record.semantic)) normalized.semantic = { ...record.semantic };
   if (Array.isArray(record.history) && record.history.length) {
     normalized.history = record.history.map((item) => ({
@@ -134,6 +143,12 @@ function normalizeAnswerRecord(record = {}) {
   for (const key of ['formOrder', 'pageNumber']) if (Number.isInteger(record[key])) normalized[key] = record[key];
   if (alternatives.length) normalized.alternatives = alternatives;
   return normalized;
+}
+
+function suggestionTargetKey(field = {}) {
+  const label = normalizeText(field.label || field.question || field.id || '');
+  const type = normalizeText(field.type || field.fieldType || 'text') || 'text';
+  return label ? `${label}|${type}` : '';
 }
 
 function tokens(value) {
@@ -1350,8 +1365,32 @@ function collectAnswerRecords(document) {
 function focusField(document, fieldId) {
   const element = elementForField(document, fieldId);
   if (!element) return false;
+  const className = 'job-autofill-focus-highlight';
+  for (const highlighted of document.querySelectorAll(`.${className}`)) highlighted.classList.remove(className);
+  const targets = new Set([element]);
+  for (const label of element.labels || []) targets.add(label);
+  if (element.id) {
+    for (const label of document.querySelectorAll('label')) {
+      if (label.htmlFor === element.id) targets.add(label);
+    }
+  }
+  if (element.type === 'radio' || element.type === 'checkbox') {
+    const group = element.closest('fieldset,[role="radiogroup"],[role="group"]');
+    if (group) targets.add(group);
+  }
+  for (const target of targets) target.classList?.add(className);
+  const styleId = 'job-autofill-focus-highlight-style';
+  if (!document.getElementById(styleId)) {
+    const style = document.createElement('style');
+    style.id = styleId;
+    style.textContent = `.${className}{outline:3px solid #d7ff45!important;outline-offset:4px!important;box-shadow:0 0 0 6px rgba(215,255,69,.28)!important;border-radius:4px!important;}`;
+    document.head?.append(style);
+  }
   element.scrollIntoView?.({ block: 'center', inline: 'nearest' });
   element.focus?.({ preventScroll: true });
+  setTimeout(() => {
+    for (const target of targets) target.classList?.remove(className);
+  }, 4000);
   return true;
 }
 

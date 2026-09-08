@@ -93,6 +93,15 @@ export function normalizeAnswerRecord(record = {}) {
     if (record[key] != null && String(record[key]).trim()) normalized[key] = String(record[key]).trim();
   }
   if (Array.isArray(record.evidenceKeys)) normalized.evidenceKeys = uniqueStrings(record.evidenceKeys);
+  const suppressedFor = uniqueStrings(Array.isArray(record.suppressedFor) ? record.suppressedFor : [])
+    .map((value) => {
+      const [label, type] = String(value).split('|');
+      const normalizedLabel = normalizeText(label);
+      const normalizedType = normalizeText(type);
+      return normalizedLabel && normalizedType ? `${normalizedLabel}|${normalizedType}` : '';
+    })
+    .filter(Boolean);
+  if (suppressedFor.length) normalized.suppressedFor = suppressedFor;
   if (record.semantic && typeof record.semantic === 'object' && !Array.isArray(record.semantic)) normalized.semantic = { ...record.semantic };
   if (Array.isArray(record.history) && record.history.length) {
     normalized.history = record.history.map((item) => ({
@@ -105,6 +114,12 @@ export function normalizeAnswerRecord(record = {}) {
   for (const key of ['formOrder', 'pageNumber']) if (Number.isInteger(record[key])) normalized[key] = record[key];
   if (alternatives.length) normalized.alternatives = alternatives;
   return normalized;
+}
+
+export function suggestionTargetKey(field = {}) {
+  const label = normalizeText(field.label || field.question || field.id || '');
+  const type = normalizeText(field.type || field.fieldType || 'text') || 'text';
+  return label ? `${label}|${type}` : '';
 }
 
 function tokens(value) {

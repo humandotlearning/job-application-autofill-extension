@@ -200,3 +200,13 @@ test('keeps existing records with a safe migration shape', () => {
   assert.equal('source' in record, false);
   assert.equal('status' in record, false);
 });
+
+test('preserves per-question saved-answer suppressions', () => {
+  const record = normalizeAnswerRecord({
+    key: 'ml_story',
+    question: 'Describe ML experience',
+    answer: 'I built and deployed machine learning systems in production.',
+    suppressedFor: ['describe your ml experience|textarea'],
+  });
+  assert.deepEqual(record.suppressedFor, ['describe your ml experience|textarea']);
+});

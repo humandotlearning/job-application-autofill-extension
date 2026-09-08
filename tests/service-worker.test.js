@@ -1013,6 +1013,29 @@ test('field focus requests target the matching control and tab runs stay isolate
   assert.deepEqual(harness.tabs.get(8).focusCalls, []);
 });
 
+test('saved-answer feedback suppresses one destination and deletion removes the selected record', async () => {
+  const harness = createHarness({
+    answerRecords: [
+      { key: 'deployment_story', question: 'Model deployment project', answer: 'I trained machine learning models and deployed them to production.', confirmationState: 'confirmed', sensitivity: 'safe' },
+      { key: 'unwanted_story', question: 'Machine learning project', answer: 'I developed machine learning services for production use.', confirmationState: 'confirmed', sensitivity: 'safe' },
+    ],
+    pagesByTab: { 7: { pages: [{ page: { title: 'Application' }, fields: [{ id: 'ml', handle: 'ml-handle', label: 'Describe your ML experience', type: 'textarea', required: true }], actions: [{ id: 'submit', label: 'Submit application', kind: 'submit' }] }] } },
+  });
+  await import(`../src/service-worker.js?test=saved-answer-feedback-${Date.now()}`);
+  const started = await harness.dispatch({ type: 'JOB_RUN_START', tabId: 7 });
+  assert.ok(started.run.suggestions.ml.candidates.some(candidate => candidate.sourceKey === 'deployment_story'));
+
+  const suppressed = await harness.dispatch({ type: 'JOB_DATASOURCE_SUPPRESS_ANSWER', tabId: 7, fieldId: 'ml', sourceKey: 'deployment_story' });
+  assert.equal(suppressed.ok, true, suppressed.error);
+  assert.deepEqual(harness.localData.answerRecords.find(record => record.key === 'deployment_story').suppressedFor, ['describe your ml experience|textarea']);
+  assert.equal(suppressed.run.suggestions.ml.candidates.some(candidate => candidate.sourceKey === 'deployment_story'), false);
+
+  const deleted = await harness.dispatch({ type: 'JOB_DATASOURCE_DELETE_ANSWER', tabId: 7, fieldId: 'ml', sourceKey: 'unwanted_story' });
+  assert.equal(deleted.ok, true, deleted.error);
+  assert.equal(harness.localData.answerRecords.some(record => record.key === 'unwanted_story'), false);
+  assert.equal(deleted.run.suggestions?.ml?.candidates.some(candidate => candidate.sourceKey === 'unwanted_story') || false, false);
+});
+
 test('old confirm-submit message path is removed', async () => {
   const harness = createHarness({
     pagesByTab: {

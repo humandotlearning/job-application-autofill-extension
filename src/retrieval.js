@@ -1,4 +1,4 @@
-import { canonicalConcept, chooseRecord, normalizeText, recordScopeCompatible, meaningCompatible, inferSensitivity } from './core.js';
+import { canonicalConcept, chooseRecord, normalizeText, recordScopeCompatible, meaningCompatible, inferSensitivity, suggestionTargetKey } from './core.js';
 
 const EXPERIENCE_TAGS = {
   ml: /\b(ml|machine learning|models?|computer vision)\b/,
@@ -28,9 +28,11 @@ function narrativeOverlap(field, record) {
 
 export function retrieveEvidence(field, records = [], { limit = 3 } = {}) {
   const query = normalizeText(field.label);
+  const targetKey = suggestionTargetKey(field);
   const tags = Object.entries(EXPERIENCE_TAGS).filter(([, regex]) => regex.test(query)).map(([tag]) => tag);
   return records.flatMap(record => {
     if (!recordScopeCompatible(field, record) || !meaningCompatible(field, record, { numericReview: false }) || !String(record.answer || '').trim()) return [];
+    if (targetKey && record.suppressedFor?.includes(targetKey)) return [];
     const exact = chooseRecord(field, [record]);
     const equivalent = exact?.score === 1;
     const reviewEquivalent = !equivalent && canonicalConcept(field.label) === canonicalConcept(record.question);

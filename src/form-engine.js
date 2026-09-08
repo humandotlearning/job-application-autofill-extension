@@ -942,8 +942,32 @@ export function collectAnswerRecords(document) {
 export function focusField(document, fieldId) {
   const element = elementForField(document, fieldId);
   if (!element) return false;
+  const className = 'job-autofill-focus-highlight';
+  for (const highlighted of document.querySelectorAll(`.${className}`)) highlighted.classList.remove(className);
+  const targets = new Set([element]);
+  for (const label of element.labels || []) targets.add(label);
+  if (element.id) {
+    for (const label of document.querySelectorAll('label')) {
+      if (label.htmlFor === element.id) targets.add(label);
+    }
+  }
+  if (element.type === 'radio' || element.type === 'checkbox') {
+    const group = element.closest('fieldset,[role="radiogroup"],[role="group"]');
+    if (group) targets.add(group);
+  }
+  for (const target of targets) target.classList?.add(className);
+  const styleId = 'job-autofill-focus-highlight-style';
+  if (!document.getElementById(styleId)) {
+    const style = document.createElement('style');
+    style.id = styleId;
+    style.textContent = `.${className}{outline:3px solid #d7ff45!important;outline-offset:4px!important;box-shadow:0 0 0 6px rgba(215,255,69,.28)!important;border-radius:4px!important;}`;
+    document.head?.append(style);
+  }
   element.scrollIntoView?.({ block: 'center', inline: 'nearest' });
   element.focus?.({ preventScroll: true });
+  setTimeout(() => {
+    for (const target of targets) target.classList?.remove(className);
+  }, 4000);
   return true;
 }
 

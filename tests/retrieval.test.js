@@ -41,3 +41,18 @@ test('related production ML narrative is evidence only, never a qualification', 
   assert.equal(candidates[0].requiresApproval, true);
   assert.deepEqual(retrieveEvidence({ label: 'Pharma Domain experience?', type: 'radio' }, records), []);
 });
+
+test('suppressed saved evidence stays hidden only for its selected destination question', async () => {
+  const { retrieveEvidence } = await import('../src/retrieval.js');
+  const record = {
+    key: 'deployment_story',
+    question: 'Describe a model deployment project',
+    answer: 'I trained machine learning models and deployed computer vision inference into production.',
+    confirmationState: 'confirmed',
+    sensitivity: 'safe',
+    provenance: 'user',
+    suppressedFor: ['describe ml model training experience|textarea'],
+  };
+  assert.deepEqual(retrieveEvidence({ label: 'Describe ML model training experience', type: 'textarea' }, [record]), []);
+  assert.equal(retrieveEvidence({ label: 'Tell us about your experience building ML models', type: 'textarea' }, [record])[0]?.sourceKey, 'deployment_story');
+});

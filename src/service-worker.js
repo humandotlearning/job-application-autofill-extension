@@ -1,5 +1,5 @@
 import { retrieveEvidence } from './retrieval.js';
-import { inferSensitivity, validateFillValue, meaningCompatible } from './core.js';
+import { inferSensitivity, validateFillValue, meaningCompatible, suggestionTargetKey } from './core.js';
 import { callAnswerPlanner, callAnswerRewriter, callAnswerSuggestions } from './llm.js';
 import { upsertAnswerRecords, mergeLearnedAnswers, normalizeAnswerRecord } from './core.js';
 import {
@@ -1387,6 +1387,51 @@ async function focusRunField(tabId, fieldId) {
   }
 }
 
+function removeCandidateFromRun(run, fieldId, sourceKey) {
+  const suggestion = run?.suggestions?.[fieldId];
+  if (!suggestion) return;
+  suggestion.candidates = (suggestion.candidates || []).filter((candidate) => !sourceKeysForCandidate(candidate).includes(sourceKey));
+  if (suggestion.candidates.length) return;
+  delete run.suggestions[fieldId];
+  for (const item of [...(run.actionRequired || []), ...(run.optionalUnresolved || [])]) {
+    if (item?.fieldId !== fieldId) continue;
+    delete item.suggestion;
+    item.reason = 'No validated answer is available';
+  }
+}
+
+async function updateSavedAnswerFeedback(message, action) {
+  const tabId = message.tabId;
+  const fieldId = String(message.fieldId || '');
+  const sourceKey = String(message.sourceKey || '');
+  if (!Number.isInteger(tabId) || !fieldId || !sourceKey) throw new Error('The saved answer is unavailable');
+  const run = await getRun(tabId);
+  const suggestion = run?.suggestions?.[fieldId];
+  const candidate = suggestion?.candidates?.find((item) => item.kind !== 'draft' && item.kind !== 'planner' && sourceKeysForCandidate(item).length === 1 && sourceKeysForCandidate(item)[0] === sourceKey);
+  if (!candidate) throw new Error('The saved answer is no longer available for this field. Check the page again.');
+  const targetKey = suggestionTargetKey(suggestion.field);
+  if (action === 'suppress' && !targetKey) throw new Error('The destination question is unavailable');
+  datasourceWriteChain = datasourceWriteChain.catch(() => {}).then(async () => {
+    const state = await getDatasource();
+    const record = state.answerRecords.find((item) => item.key === sourceKey);
+    if (!record) throw new Error('The saved answer no longer exists.');
+    const now = new Date().toISOString();
+    const answerRecords = action === 'delete'
+      ? state.answerRecords.filter((item) => item.key !== sourceKey)
+      : state.answerRecords.map((item) => item.key === sourceKey
+        ? { ...item, suppressedFor: [...new Set([...(item.suppressedFor || []), targetKey])], updatedAt: now }
+        : item);
+    return saveDatasource({
+      ...state,
+      answerRecords,
+      datasourceMeta: { ...(state.datasourceMeta || {}), schemaVersion: state.schemaVersion, updatedAt: now },
+    });
+  });
+  await datasourceWriteChain;
+  removeCandidateFromRun(run, fieldId, sourceKey);
+  return { ok: true, run: await saveRun(run), datasource: await datasourceSummary() };
+}
+
 async function saveAnswers(tabId) {
   if (saveLocks.has(tabId)) return { ok: false, error: 'Answer saving is already in progress' };
   saveLocks.add(tabId);
@@ -1475,11 +1520,17 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     'JOB_DATASOURCE_EXPORT',
     'JOB_DATASOURCE_IMPORT',
     'JOB_DATASOURCE_CORRECT',
+    'JOB_DATASOURCE_SUPPRESS_ANSWER',
+    'JOB_DATASOURCE_DELETE_ANSWER',
     'JOB_DATASOURCE_PROFILE_UPDATE',
     'JOB_LEARNING_INBOX_RESOLVE',
   ].includes(message?.type)) return false;
 
   (async () => {
+    if (['JOB_DATASOURCE_SUPPRESS_ANSWER', 'JOB_DATASOURCE_DELETE_ANSWER'].includes(message.type)) {
+      if (sender?.tab) throw new Error('This action must originate in the extension panel');
+      return updateSavedAnswerFeedback(message, message.type === 'JOB_DATASOURCE_DELETE_ANSWER' ? 'delete' : 'suppress');
+    }
     if (['JOB_RUN_APPROVE_SUGGESTION', 'JOB_RUN_APPLY_DRAFT', 'JOB_RUN_REWRITE_ANSWER', 'JOB_RUN_GENERATE_SUGGESTIONS'].includes(message.type)) {
       if (sender?.tab) throw new Error('This action must originate in the extension panel');
       if (message.type === 'JOB_RUN_APPLY_DRAFT') return applyDraft(message);
