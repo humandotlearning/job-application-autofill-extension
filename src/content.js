@@ -3,6 +3,7 @@ import {
   clickAction,
   collectAnswerRecords,
   inspectDocument,
+  descriptorForElement,
   validateDocument,
   focusField,
   isFinalApplicationSubmit,
@@ -44,6 +45,14 @@ if (!globalThis.__jobApplicationAutofillInstalled) {
           waitForDocumentSettled(document, { minWaitMs: 150, quietMs: 75 }).then(() => sendResponse({ ok: true, inspection: inspectDocument(document) }))
             .catch((error) => sendResponse({ ok: false, error: error.message }));
           return true;
+        case 'JOB_APP_INSPECT_INLINE': {
+          const inspection = inspectDocument(document);
+          inspection.page.url = document.location.href;
+          const focused = descriptorForElement(document, document.activeElement);
+          sendResponse({ok: true, inspection, focusedFieldId: focused?.id ?? null, focusedHandle: focused?.handle ?? null,
+            rawValue: focused?.rawValue ?? null, editRevision: focused?.editRevision ?? null});
+          break;
+        }
         case 'JOB_APP_APPLY':
           if (message.applicationId) learning.activate(message.applicationId);
           applyDecisions(document, message.decisions || [], {deadline: message.deadline ?? Infinity})

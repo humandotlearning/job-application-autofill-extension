@@ -28,6 +28,7 @@ test('seeds an empty datasource once and preserves edits afterward', async () =>
       },
     },
     runtime: {
+      id: 'test',
       getURL: (path) => `chrome-extension://test/${path}`,
       onMessage: { addListener: (listener) => listeners.push(listener) },
       onInstalled: { addListener: () => {} },
@@ -41,7 +42,7 @@ test('seeds an empty datasource once and preserves edits afterward', async () =>
   };
 
   await import(`../src/service-worker.js?seed-test=${Date.now()}`);
-  const dispatch = (message) => new Promise((resolve) => listeners[0](message, {}, resolve));
+  const dispatch = (message) => new Promise((resolve) => listeners[0](message, {id: 'test', url: 'chrome-extension://test/sidepanel.html'}, resolve));
   const seeded = await dispatch({ type: 'JOB_DATASOURCE_STATE' });
   assert.equal(seeded.ok, true);
   assert.equal(seeded.datasource.answerCount, 36);
@@ -96,6 +97,7 @@ test('migrates legacy pending answers before the datasource is initialized', asy
       },
     },
     runtime: {
+      id: 'test',
       getURL: (path) => `chrome-extension://test/${path}`,
       onMessage: { addListener: (listener) => listeners.push(listener) },
       onInstalled: { addListener: (listener) => { installed = listener; } },
@@ -110,7 +112,7 @@ test('migrates legacy pending answers before the datasource is initialized', asy
 
   await import(`../src/service-worker.js?legacy-test=${Date.now()}`);
   await installed({ reason: 'update' });
-  const dispatch = (message) => new Promise((resolve) => listeners[0](message, {}, resolve));
+  const dispatch = (message) => new Promise((resolve) => listeners[0](message, {id: 'test', url: 'chrome-extension://test/sidepanel.html'}, resolve));
   const state = await dispatch({ type: 'JOB_DATASOURCE_STATE' });
 
   assert.equal(state.ok, true);

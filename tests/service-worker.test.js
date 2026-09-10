@@ -53,6 +53,7 @@ function createHarness({
       required: false,
       currentValue: '',
       ...field,
+      ...(Object.hasOwn(field, 'rawValue') ? {rawValue: Object.hasOwn(valueOverrides, field.id) ? valueOverrides[field.id] : field.rawValue} : {}),
       currentValue: Object.prototype.hasOwnProperty.call(valueOverrides, field.id)
         ? valueOverrides[field.id]
         : (field.currentValue || ''),
@@ -119,9 +120,10 @@ function createHarness({
       },
     },
     runtime: {
+      id: 'test-extension',
       onMessage: { addListener: (listener) => listeners.push(listener) },
       onInstalled: { addListener: () => {} },
-      getURL: () => 'chrome-extension://seed-data.json',
+      getURL: (path = '') => `chrome-extension://test-extension/${path}`,
     },
     tabs: {
       query: async () => [{ id: 7 }],
@@ -137,14 +139,30 @@ function createHarness({
         state.messageTargets.push({ message, frameId });
         const page = frame.pages[frame.currentPage];
         if (message.type === 'JOB_APP_INSPECT') return { ok: true, inspection: inspectionFor(tabId, frameId) };
+        if (message.type === 'JOB_APP_INSPECT_INLINE') {
+          await page.onInlineInspect?.({ page, tabId, frameId });
+          const inspection = inspectionFor(tabId, frameId);
+          inspection.page.url = page.url || frame.context.url || 'https://jobs.example.com/apply';
+          const focused = inspection.fields.find(field => field.id === (page.focusedFieldId === undefined ? inspection.fields[0]?.id : page.focusedFieldId));
+          return { ok: true, inspection, focusedFieldId: focused?.id ?? null, focusedHandle: focused?.handle ?? null,
+            rawValue: focused ? (page.values?.[focused.id] ?? focused.rawValue) : null, editRevision: focused?.editRevision ?? null };
+        }
         if (message.type === 'JOB_APP_APPLY') {
+          await page.beforeApply?.({ page, message, tabId, frameId });
+          const failed = [];
           for (const decision of message.decisions || []) {
             if (decision.action !== 'fill') continue;
+            const field = page.fields.find(field => field.id === decision.fieldId);
+            if ((Object.hasOwn(decision, 'expectedRawValue') && (page.values?.[field.id] ?? field.rawValue) !== decision.expectedRawValue)
+              || (Object.hasOwn(decision, 'expectedEditRevision') && field.editRevision !== decision.expectedEditRevision)) {
+              failed.push({ fieldId: decision.fieldId, reason: 'Destination changed' });
+              continue;
+            }
             if (!page.values) page.values = {};
             if (!Object.prototype.hasOwnProperty.call(page.values, decision.fieldId)) page.values[decision.fieldId] = decision.value;
           }
           page.onApply?.({ page, decisions: message.decisions || [] });
-          return { ok: true, result: { applied: [], kept: [], reviewRequired: [], unresolved: [], failed: [] } };
+          return { ok: true, result: { applied: [], kept: [], reviewRequired: [], unresolved: [], failed } };
         }
         if (message.type === 'JOB_APP_VALIDATE') {
           const validation = await page.onValidate?.({ page, tabId, frameId });
@@ -217,7 +235,7 @@ function createHarness({
     tabs,
     updatedListeners,
     removedListeners,
-    dispatch: async (message, sender = {}) => {
+    dispatch: async (message, sender = { id: 'test-extension', url: 'chrome-extension://test-extension/sidepanel.html' }) => {
       const response=await new Promise(resolve=>{const handled=listeners[0](message,sender,resolve);if(handled===false)resolve({ok:false,unhandled:true});});
       if(waitForAI && response.run && !['JOB_RUN_STATE','JOB_RUN_VALIDATE_PAGE'].includes(message.type)) {
         const until=Date.now()+2000;
@@ -228,6 +246,297 @@ function createHarness({
     },
   };
 }
+
+test('inline lookup works with no run and never fills on focus', async () => {
+  const harness = createHarness({pagesByTab: {7: {pages: [{
+    page: {title: 'Job application', domain: 'jobs.example.com'},
+    fields: [{id: 'name', handle: 'doc-a:name', label: 'Full name',
+      type: 'text', rawValue: '', editRevision: 0}], actions: [],
+  }]}}});
+  await import(`../src/service-worker.js?test=inline-query-${Date.now()}`);
+  const sender = {id: chrome.runtime.id, tab: {id: 7}, frameId: 0,
+    documentId: 'doc-a', url: 'https://jobs.example.com/apply'};
+  const response = await harness.dispatch({type: 'JOB_INLINE_QUERY',
+    fieldId: 'name', handle: 'doc-a:name', requestId: 'query-1'}, sender);
+  assert.equal(response.ok, true, response.error);
+  assert.equal(response.candidates[0].answer, 'Nithin');
+  assert.equal(harness.sessionData.applicationRun?.['7'], undefined);
+  assert.equal(harness.tabs.get(7).messages.some(m => m.type === 'JOB_APP_APPLY'), false);
+  assert.equal(harness.tabs.get(7).nextClicks, 0);
+  assert.equal(harness.tabs.get(7).submitCalls, 0);
+});
+
+const inlineSender = (overrides = {}) => ({ id: 'test-extension', tab: {id: 7}, frameId: 0, documentId: 'doc-a', url: 'https://jobs.example.com/apply', ...overrides });
+const inlineQuery = (overrides = {}) => ({ type: 'JOB_INLINE_QUERY', fieldId: 'name', handle: 'doc-a:name', requestId: 'query-1', ...overrides });
+const inlineAcceptance = (query, overrides = {}) => ({ type: 'JOB_INLINE_ACCEPT', sessionId: query.sessionId, requestId: 'accept-1', candidateId: query.candidates[0].candidateId, acceptanceToken: 'content-token', ...overrides });
+async function inlineHarness({ field = {}, page = {}, ...options } = {}) {
+  const harness = createHarness({pagesByTab: {7: {pages: [{page: {title: 'Job application', domain: 'jobs.example.com'}, fields: [
+    {id: 'name', handle: 'doc-a:name', label: 'Full name', type: 'text', rawValue: '', editRevision: 0, ...field},
+  ], actions: [], ...page}]}}, ...options});
+  await import(`../src/service-worker.js?test=inline-${Date.now()}-${Math.random()}`);
+  return harness;
+}
+
+test('inline saved acceptance resolves worker candidate authority, persists once, and does not create a run', async () => {
+  const harness = await inlineHarness();
+  const query = await harness.dispatch(inlineQuery(), inlineSender());
+  assert.equal(query.ok, true, query.error);
+  const message = inlineAcceptance(query, {answer: 'Forged answer', sourceKey: 'foreign'});
+  const [accepted, duplicate] = await Promise.all([harness.dispatch(message, inlineSender()), harness.dispatch(message, inlineSender())]);
+  assert.equal(accepted.ok, true, accepted.error);
+  assert.equal(duplicate.ok, false);
+  assert.equal(harness.tabs.get(7).frames[0].pages[0].values.name, 'Nithin');
+  const applies = harness.tabs.get(7).messages.filter(message => message.type === 'JOB_APP_APPLY');
+  assert.equal(applies.length, 1);
+  assert.equal(applies[0].applicationId, undefined);
+  assert.equal(applies[0].decisions[0].expectedRawValue, '');
+  assert.equal(applies[0].decisions[0].expectedEditRevision, 0);
+  assert.equal(applies[0].approvalGuard.acceptanceToken, 'content-token');
+  assert.equal(harness.sessionData.applicationRun?.['7'], undefined);
+  assert.deepEqual(harness.sessionData.inlineFieldSessions['7:0'].suggestions, {});
+  assert.equal((await harness.dispatch(message, inlineSender())).ok, false);
+});
+
+test('inline query rejects forged origins and malformed identity before inspection', async () => {
+  const harness = await inlineHarness();
+  for (const change of [{tabId: 8}, {frameId: 1}, {documentId: 'doc-b'}, {url: 'https://evil.test'}, {handle: ''}, {fieldId: 'x'.repeat(1001)}, {requestId: 'x'.repeat(201)}]) {
+    const result = await harness.dispatch(inlineQuery(change), inlineSender());
+    assert.equal(result.ok, false, JSON.stringify(change));
+    assert.match(result.error, /origin|sender|handle|field|request/i);
+  }
+  for (const change of [{id: 'foreign'}, {id: undefined}, {tab: {id: -1}}, {frameId: '0'}, {url: 'file:///apply'}, {url: 'https://evil.test', origin: 'https://jobs.example.com'}]) {
+    assert.equal((await harness.dispatch(inlineQuery(), inlineSender(change))).ok, false);
+  }
+  assert.equal(harness.tabs.get(7).messages.length, 0);
+});
+
+test('inline query excludes manual, legal, choice, utility and nonempty destinations', async () => {
+  for (const field of [{type: 'checkbox'}, {type: 'select'}, {widget: 'custom'}, {type: 'password'}, {type: 'search'}, {label: 'I agree to terms and conditions'}, {labelConfidence: 'low'}, {rawValue: ' '}, {handle: ''}]) {
+    const harness = await inlineHarness({field});
+    assert.equal((await harness.dispatch(inlineQuery(), inlineSender())).ok, false, JSON.stringify(field));
+    assert.equal(harness.tabs.get(7).messages.some(message => message.type === 'JOB_APP_APPLY'), false);
+  }
+  const harness = await inlineHarness({page: {focusedFieldId: null}});
+  assert.equal((await harness.dispatch(inlineQuery(), inlineSender())).ok, false);
+});
+
+test('inline acceptance rejects changed document, descriptor, raw value, revision, URL and evidence', async () => {
+  for (const scenario of ['document', 'handle', 'label', 'constraints', 'raw', 'revision', 'url', 'source-edit', 'source-delete', 'expired']) {
+    const harness = await inlineHarness();
+    const query = await harness.dispatch(inlineQuery(), inlineSender());
+    assert.equal(query.ok, true, query.error);
+    const page = harness.tabs.get(7).frames[0].pages[0];
+    let sender = inlineSender();
+    if (scenario === 'document') sender = inlineSender({documentId: 'doc-b'});
+    if (scenario === 'handle') page.fields[0].handle = 'doc-b:name';
+    if (scenario === 'label') page.fields[0].label = 'Different question';
+    if (scenario === 'constraints') page.fields[0].constraints = {maxLength: 1};
+    if (scenario === 'raw') page.fields[0].rawValue = ' ';
+    if (scenario === 'revision') page.fields[0].editRevision++;
+    if (scenario === 'url') page.url = 'https://jobs.example.com/other';
+    if (scenario === 'source-edit') harness.localData.answerRecords[0].answer = 'Edited';
+    if (scenario === 'source-delete') harness.localData.answerRecords = [];
+    if (scenario === 'expired') harness.sessionData.inlineFieldSessions['7:0'].expiresAt = Date.now() - 1;
+    const result = await harness.dispatch(inlineAcceptance(query), sender);
+    assert.equal(result.ok, false, scenario);
+    assert.equal(harness.tabs.get(7).messages.some(message => message.type === 'JOB_APP_APPLY'), false, scenario);
+  }
+});
+
+test('inline worker-to-content race rejects type-then-erase immediately before write', async () => {
+  const harness = await inlineHarness({page: {beforeApply: ({page}) => { page.fields[0].editRevision++; }}});
+  const query = await harness.dispatch(inlineQuery(), inlineSender());
+  assert.equal(query.ok, true, query.error);
+  const before = JSON.stringify(harness.localData.answerRecords);
+  const result = await harness.dispatch(inlineAcceptance(query), inlineSender());
+  assert.equal(result.ok, false);
+  assert.equal(harness.tabs.get(7).frames[0].pages[0].values?.name, undefined);
+  assert.equal(JSON.stringify(harness.localData.answerRecords), before);
+});
+
+test('inline save failure reports applied but not saved and does not repeat the DOM write', async () => {
+  const harness = await inlineHarness();
+  const query = await harness.dispatch(inlineQuery(), inlineSender());
+  assert.equal(query.ok, true, query.error);
+  chrome.storage.local.set = async () => { throw new Error('storage unavailable'); };
+  const result = await harness.dispatch(inlineAcceptance(query), inlineSender());
+  assert.equal(result.ok, false);
+  assert.match(result.error, /applied.*not.*sav/i);
+  assert.equal(harness.tabs.get(7).frames[0].pages[0].values.name, 'Nithin');
+  assert.equal((await harness.dispatch(inlineAcceptance(query), inlineSender())).ok, false);
+  assert.equal(harness.tabs.get(7).messages.filter(message => message.type === 'JOB_APP_APPLY').length, 1);
+});
+
+test('inline sessions isolate identical field IDs in two frames and preserve unrelated live run', async () => {
+  const pages = handle => [{page: {title: 'Job application', domain: 'jobs.example.com'}, fields: [{id: 'name', handle, label: 'Full name', type: 'text', rawValue: '', editRevision: 0}], actions: []}];
+  const harness = await inlineHarness({pagesByTab: {7: {frames: [{frameId: 0, pages: pages('doc-a:name')}, {frameId: 2, pages: pages('doc-b:name')}]}}});
+  harness.sessionData.applicationRun = {'7': {tabId: 7, startedAt: 'other-run', status: 'waiting_user', frame: {frameId: 9}, revision: 23, suggestions: {foreign: {}}}};
+  const runBefore = JSON.stringify(harness.sessionData.applicationRun);
+  const [first, second] = await Promise.all([
+    harness.dispatch(inlineQuery(), inlineSender()),
+    harness.dispatch(inlineQuery({handle: 'doc-b:name'}), inlineSender({frameId: 2, documentId: 'doc-b'})),
+  ]);
+  assert.equal(first.ok, true, first.error);
+  assert.equal(second.ok, true, second.error);
+  assert.notEqual(first.sessionId, second.sessionId);
+  assert.equal((await harness.dispatch(inlineAcceptance(first), inlineSender({frameId: 2, documentId: 'doc-b'}))).ok, false);
+  assert.equal((await harness.dispatch(inlineAcceptance(second), inlineSender({frameId: 2, documentId: 'doc-b'}))).ok, true);
+  assert.equal(harness.tabs.get(7).frames[0].pages[0].values?.name, undefined);
+  assert.equal(JSON.stringify(harness.sessionData.applicationRun), runBefore);
+});
+
+test('all existing management and run endpoints require a trusted extension panel sender', async () => {
+  const harness = await inlineHarness();
+  const routes = ['JOB_RUN_APPROVE_SUGGESTION', 'JOB_RUN_APPLY_DRAFT', 'JOB_RUN_REWRITE_ANSWER', 'JOB_RUN_GENERATE_SUGGESTIONS', 'JOB_RUN_START', 'JOB_RUN_CHECK_PAGE', 'JOB_RUN_ADVANCE_PAGE', 'JOB_RUN_FOCUS_FIELD', 'JOB_RUN_SAVE_ANSWERS', 'JOB_RUN_VALIDATE_PAGE', 'JOB_RUN_RETRY_AI', 'JOB_RUN_SELECT_EMPLOYMENT', 'JOB_RUN_SEARCH_ANSWERS', 'JOB_RUN_STATE', 'JOB_DATASOURCE_STATE', 'JOB_DATASOURCE_EXPORT', 'JOB_DATASOURCE_IMPORT', 'JOB_DATASOURCE_CORRECT', 'JOB_DATASOURCE_SUPPRESS_ANSWER', 'JOB_DATASOURCE_DELETE_ANSWER', 'JOB_DATASOURCE_PROFILE_UPDATE', 'JOB_LEARNING_INBOX_RESOLVE'];
+  for (const type of routes) {
+    const result = await harness.dispatch({type, tabId: 7}, inlineSender());
+    assert.equal(result.ok, false, type);
+    assert.match(result.error, /extension panel/, type);
+  }
+  for (const sender of [{}, {id: 'foreign', url: chrome.runtime.getURL('sidepanel.html')}, {id: chrome.runtime.id, url: 'https://evil.test'}]) {
+    assert.equal((await harness.dispatch({type: 'JOB_DATASOURCE_STATE'}, sender)).ok, false);
+  }
+  assert.equal((await harness.dispatch({type: 'JOB_DATASOURCE_STATE'})).ok, true);
+  assert.equal((await harness.dispatch({type: 'JOB_RUN_STATE', tabId: 7})).ok, true);
+});
+
+test('inline acceptance rejects optional forged destination fields and unsupported numeric controls', async () => {
+  for (const overrides of [{handle: 'other'}, {fieldId: 'other'}, {applicationId: 'foreign'}, {pageSignature: 'foreign'}, {handle: 'x'.repeat(1001)}]) {
+    const harness = await inlineHarness();
+    const query = await harness.dispatch(inlineQuery(), inlineSender());
+    assert.equal(query.ok, true, query.error);
+    const response = await harness.dispatch(inlineAcceptance(query, overrides), inlineSender());
+    assert.equal(response.ok, false, JSON.stringify(overrides));
+    assert.equal(harness.tabs.get(7).messages.some(message => message.type === 'JOB_APP_APPLY'), false);
+  }
+  const harness = await inlineHarness({field: {type: 'number'}});
+  const response = await harness.dispatch(inlineQuery(), inlineSender());
+  assert.equal(response.ok, false);
+  assert.match(response.error, /manual/);
+});
+
+test('inline rechecks source evidence after the final asynchronous destination guard', async () => {
+  const harness = await inlineHarness();
+  const query = await harness.dispatch(inlineQuery(), inlineSender());
+  assert.equal(query.ok, true, query.error);
+  let inspections = 0;
+  harness.tabs.get(7).frames[0].pages[0].onInlineInspect = () => {
+    if (++inspections === 2) harness.localData.answerRecords[0].answer = 'Changed during approval';
+  };
+  const response = await harness.dispatch(inlineAcceptance(query), inlineSender());
+  assert.equal(response.ok, false);
+  assert.equal(harness.tabs.get(7).messages.some(message => message.type === 'JOB_APP_APPLY'), false);
+});
+
+test('inline cancellation and lifecycle events revoke sessions without losing other frames', async () => {
+  for (const event of ['cancel', 'navigation', 'loading', 'removed', 'start']) {
+    const harness = await inlineHarness();
+    const query = await harness.dispatch(inlineQuery(), inlineSender());
+    assert.equal(query.ok, true, query.error);
+    harness.sessionData.inlineFieldSessions['7:2'] = {...structuredClone(harness.sessionData.inlineFieldSessions['7:0']), sessionId: 'second-frame', frameId: 2, documentId: 'second-document'};
+    if (event === 'cancel') {
+      const cancel = {type: 'JOB_INLINE_CANCEL', sessionId: query.sessionId, requestId: 'cancel-1'};
+      assert.equal((await harness.dispatch(cancel, inlineSender({documentId: 'foreign'}))).ok, false);
+      assert.equal((await harness.dispatch(cancel, inlineSender())).ok, true);
+    }
+    if (event === 'navigation') await harness.dispatch({type: 'JOB_APP_NAVIGATED'}, inlineSender());
+    if (event === 'loading') harness.updatedListeners[0](7, {status: 'loading'});
+    if (event === 'removed') harness.removedListeners[0](7);
+    if (event === 'start') await harness.dispatch({type: 'JOB_RUN_START', tabId: 7});
+    const response = await harness.dispatch(inlineAcceptance(query), inlineSender());
+    assert.equal(response.ok, false, event);
+    assert.equal(harness.sessionData.inlineFieldSessions['7:0'], undefined, event);
+    assert.equal(Boolean(harness.sessionData.inlineFieldSessions['7:2']), ['cancel', 'navigation'].includes(event));
+  }
+});
+
+test('inline concurrent queries commit only the newest request and navigation revokes pending lookup', async () => {
+  for (const invalidate of ['query', 'navigation']) {
+    const harness = await inlineHarness();
+    let started;
+    let release;
+    const inspected = new Promise(resolve => {started = resolve;});
+    const gate = new Promise(resolve => {release = resolve;});
+    let inspections = 0;
+    harness.tabs.get(7).frames[0].pages[0].onInlineInspect = async () => {if (++inspections === 1) {started(); await gate;}};
+    const old = harness.dispatch(inlineQuery(), inlineSender());
+    await inspected;
+    let current;
+    if (invalidate === 'query') current = await harness.dispatch(inlineQuery({requestId: 'query-2'}), inlineSender());
+    else await harness.dispatch({type: 'JOB_APP_NAVIGATED'}, inlineSender());
+    release();
+    assert.equal((await old).ok, false);
+    if (current) {
+      assert.equal(current.ok, true, current.error);
+      assert.equal(harness.sessionData.inlineFieldSessions['7:0'].sessionId, current.sessionId);
+      assert.equal(current.requestId, 'query-2');
+    } else assert.equal(harness.sessionData.inlineFieldSessions['7:0'], undefined);
+  }
+});
+
+test('inline completed sessions survive worker restart and foreign pending generation is interrupted', async () => {
+  const harness = await inlineHarness();
+  const query = await harness.dispatch(inlineQuery(), inlineSender());
+  assert.equal(query.ok, true, query.error);
+  const session = harness.sessionData.inlineFieldSessions['7:0'];
+  session.generation = {status: 'pending', requestId: 'foreign-generation'};
+  session.workerId = 'foreign-worker';
+  harness.listeners.length = 0;
+  await import(`../src/service-worker.js?test=inline-restart-${Date.now()}`);
+  const response = await harness.dispatch(inlineAcceptance(query), inlineSender());
+  assert.equal(response.ok, true, response.error);
+  assert.equal(harness.sessionData.inlineFieldSessions['7:0'].generation.status, 'interrupted');
+});
+
+test('inline compatible run acceptance uses real learning identity and refreshes current run without overwriting concurrent changes', async () => {
+  const harness = await inlineHarness({field: {label: 'Current CTC', type: 'textarea'},
+    answerRecords: [{key: 'current_salary', question: 'Current salary', answer: 'Synthetic explanation', confirmationState: 'confirmed', sensitivity: 'review'}],
+    page: {actions: [{id: 'submit', label: 'Submit application', kind: 'submit'}]}});
+  const started = await harness.dispatch({type: 'JOB_RUN_START', tabId: 7});
+  assert.equal(started.ok, true, started.error);
+  const query = await harness.dispatch(inlineQuery(), inlineSender());
+  assert.equal(query.ok, true, query.error);
+  assert.equal(harness.sessionData.inlineFieldSessions['7:0'].attachedRun.applicationId, started.run.startedAt);
+  harness.tabs.get(7).frames[0].pages[0].beforeApply = () => {
+    harness.sessionData.applicationRun['7'] = {...harness.sessionData.applicationRun['7'], concurrentMarker: 'preserve this', revision: 500};
+  };
+  const response = await harness.dispatch(inlineAcceptance(query), inlineSender());
+  assert.equal(response.ok, true, response.error);
+  assert.equal(harness.tabs.get(7).messages.filter(message => message.type === 'JOB_APP_APPLY').at(-1).applicationId, started.run.startedAt);
+  assert.equal(harness.sessionData.applicationRun['7'].concurrentMarker, 'preserve this');
+  assert.ok(harness.sessionData.applicationRun['7'].revision > 500);
+  assert.equal(harness.sessionData.applicationRun['7'].suggestions.name, undefined);
+  assert.equal(harness.tabs.get(7).nextClicks, 0);
+  assert.equal(harness.tabs.get(7).submitCalls, 0);
+});
+
+test('inline unresolved employment asks to choose employer instead of borrowing another frame mapping', async () => {
+  const harness = await inlineHarness({field: {label: 'Job title', entityType: 'employment', entityId: 'work-1'}});
+  harness.localData.profile = {employment: [{id: 'employer-a', company: 'Company A'}, {id: 'employer-b', company: 'Company B'}]};
+  harness.sessionData.applicationRun = {'7': {tabId: 7, startedAt: 'other', status: 'waiting_user', frame: {frameId: 9}, employmentMappings: {'work-1': 'employer-a'}}};
+  const query = await harness.dispatch(inlineQuery(), inlineSender());
+  assert.equal(query.ok, true, query.error);
+  assert.deepEqual(query.candidates, []);
+  assert.match(query.error, /Choose the employer/);
+  assert.equal(harness.sessionData.inlineFieldSessions['7:0'].attachedRun, null);
+});
+
+test('inline compatible run attachment uses the live field identity without requiring a listed run field', async () => {
+  const harness = await inlineHarness({field: {label: 'Current CTC', type: 'textarea'},
+    answerRecords: [{key: 'current_salary', question: 'Current salary', answer: 'Synthetic explanation', confirmationState: 'confirmed', sensitivity: 'review'}],
+    page: {actions: [{id: 'submit', label: 'Submit application', kind: 'submit'}]}});
+  const started = await harness.dispatch({type: 'JOB_RUN_START', tabId: 7});
+  const run = harness.sessionData.applicationRun['7'];
+  run.suggestions = {};
+  run.generatedSuggestions = {};
+  run.actionRequired = [];
+  run.optionalUnresolved = [];
+  const query = await harness.dispatch(inlineQuery(), inlineSender());
+  assert.equal(query.ok, true, query.error);
+  assert.equal(harness.sessionData.inlineFieldSessions['7:0'].attachedRun?.applicationId, started.run.startedAt);
+  const response = await harness.dispatch(inlineAcceptance(query), inlineSender());
+  assert.equal(response.ok, true, response.error);
+});
 
 test('saved narrative and sensitive equivalents wait for scoped approval before any mutation', async () => {
   const harness = createHarness({ answerRecords: [

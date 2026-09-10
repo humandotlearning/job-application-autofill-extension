@@ -28,6 +28,9 @@ const MAX_DRAFT_CHARS = 4_000;
 const MAX_REWRITE_INSTRUCTION_CHARS = 4_000;
 let datasourceWriteChain = Promise.resolve();
 let runWriteChain = Promise.resolve();
+const INLINE_STORAGE_KEY = 'inlineFieldSessions';
+const INLINE_TTL_MS = 10 * 60 * 1000;
+let inlineWriteChain = Promise.resolve();
 let datasourceInitPromise = null;
 
 const APPLICATION_TITLE_PATTERN = /\b(?:apply|application|candidate|profile|resume|experience|education)\b/i;
@@ -927,6 +930,192 @@ async function approveSuggestion(message) {
   } finally { saveLocks.delete(tabId); }
 }
 
+function inlineOrigin(message, sender) {
+  if (!chrome.runtime.id || sender?.id !== chrome.runtime.id || !Number.isInteger(sender?.tab?.id) || sender.tab.id < 0
+    || !Number.isInteger(sender.frameId) || sender.frameId < 0) throw new Error('Invalid inline sender');
+  let url;
+  try { url = new URL(sender.url); } catch { throw new Error('Invalid inline sender URL'); }
+  if (!['http:', 'https:'].includes(url.protocol) || (sender.origin && sender.origin !== url.origin)) throw new Error('Invalid inline sender origin');
+  const origin = {tabId: sender.tab.id, frameId: sender.frameId, documentId: sender.documentId ?? null, url: sender.url};
+  if (origin.documentId !== null) requiredBoundedText(origin.documentId, 'Document ID', 200);
+  for (const key of Object.keys(origin)) {
+    if (Object.hasOwn(message, key) && message[key] !== origin[key]) throw new Error('Inline origin does not match the sender');
+  }
+  requiredBoundedText(message.requestId, 'Request ID', 200);
+  for (const key of ['fieldId', 'handle']) if (Object.hasOwn(message, key)) requiredBoundedText(message[key], `Field ${key}`, 1000);
+  if (message.type === 'JOB_INLINE_QUERY') {
+    if (Object.hasOwn(message, 'applicationId') || Object.hasOwn(message, 'pageSignature')) throw new Error('Inline query origin must come from the sender');
+    requiredBoundedText(message.fieldId, 'Field ID', 1000);
+    requiredBoundedText(message.handle, 'Field handle', 1000);
+  } else {
+    requiredBoundedText(message.sessionId, 'Session ID', 200);
+    if (message.type === 'JOB_INLINE_ACCEPT') {
+      requiredBoundedText(message.candidateId, 'Candidate ID', 200);
+      requiredBoundedText(message.acceptanceToken, 'Acceptance token', 200);
+    }
+  }
+  return origin;
+}
+
+function writeInlineSessions(change) {
+  const operation = inlineWriteChain.catch(() => {}).then(async () => {
+    const stored = await chrome.storage.session.get({[INLINE_STORAGE_KEY]: {}});
+    const sessions = stored[INLINE_STORAGE_KEY] || {};
+    for (const [key, session] of Object.entries(sessions)) {
+      if (!(session.expiresAt > Date.now())) { delete sessions[key]; continue; }
+      if (session.generation?.status === 'pending' && session.workerId !== WORKER_ID) {
+        session.generation = {...session.generation, status: 'interrupted', error: 'The previous operation was interrupted. Try again.'};
+        session.workerId = WORKER_ID;
+      }
+    }
+    const result = change(sessions);
+    await chrome.storage.session.set({[INLINE_STORAGE_KEY]: sessions});
+    return result;
+  });
+  inlineWriteChain = operation;
+  return operation;
+}
+
+function mutateInlineSession(tabId, frameId, sessionId, change) {
+  return writeInlineSessions(sessions => {
+    const key = `${tabId}:${frameId}`;
+    const current = sessions[key];
+    if (sessionId && current?.sessionId !== sessionId) throw new Error('Inline session expired or changed. Focus the field again.');
+    const next = change(current || null);
+    if (next === false) return null;
+    if (next === null) { delete sessions[key]; return null; }
+    const result = {...(next || current), revision: (current?.revision || 0) + 1, expiresAt: Date.now() + INLINE_TTL_MS, workerId: WORKER_ID};
+    sessions[key] = result;
+    return result;
+  });
+}
+
+function invalidateInlineSessions(tabId, frameId = null) {
+  return writeInlineSessions(sessions => {
+    for (const [key, session] of Object.entries(sessions)) {
+      if (session.tabId === tabId && (frameId === null || session.frameId === frameId)) delete sessions[key];
+    }
+  });
+}
+
+function inlineReply(session, requestId, extra = {}) {
+  return {ok: true, sessionId: session.sessionId, requestId, field: session.field,
+    candidates: session.suggestions?.[session.field?.id]?.candidates || [],
+    generatedSuggestion: session.generatedSuggestions?.[session.field?.id] || null, ...extra};
+}
+
+function compatibleInlineRun(run, inspection, field, frameId) {
+  if (!run || !SAVABLE_RUN_STATUSES.has(run.status) || run.frame?.frameId !== frameId
+    || pageSignature(inspection, run.frame) !== run.pageSignature) return null;
+  const prior = run.suggestions?.[field.id]?.field || run.generatedSuggestions?.[field.id]?.field;
+  if (!(prior ? field.handle === prior.handle && sameFieldSnapshot(field, aiFieldSnapshot(prior))
+    : run.fieldStates?.[field.id]?.handle === field.handle)) return null;
+  return run;
+}
+
+async function inspectInlineDestination(origin, {fieldId, handle, requireFocus = true}) {
+  const response = await sendToFrame(origin.tabId, origin.frameId, {type: 'JOB_APP_INSPECT_INLINE', fieldId, handle, requireFocus});
+  const inspection = response?.inspection;
+  const field = inspection?.fields?.find(field => field.id === fieldId && field.handle === handle);
+  if (!response?.ok || !field || inspection.page?.url !== origin.url
+    || (requireFocus && (response.focusedFieldId !== fieldId || response.focusedHandle !== handle))
+    || field.rawValue !== '' || !Number.isInteger(field.editRevision) || field.editRevision < 0
+    || (requireFocus && (response.rawValue !== field.rawValue || response.editRevision !== field.editRevision))) {
+    throw new Error('Inline destination changed. Focus an empty field again.');
+  }
+  if (!readableQuestion(field) || !['text', 'textarea', 'email', 'tel', 'url'].includes(field.type)
+    || field.widget || field.multiple || inferSensitivity(field.label, field.id) === 'legal') {
+    throw new Error('This destination requires manual entry');
+  }
+  return {inspection, field};
+}
+
+async function scopeInlineField(origin, inspection, field) {
+  const [run, datasource] = await Promise.all([getRun(origin.tabId), getDatasource()]);
+  const compatible = compatibleInlineRun(run, inspection, field, origin.frameId);
+  const context = {pageSignature: compatible?.pageSignature || pageSignature(inspection), employmentMappings: {...(compatible?.employmentMappings || {})}};
+  const scoped = resolveEmploymentFields(context, inspection.fields, datasource.profile).find(item => item.id === field.id && item.handle === field.handle);
+  return {field: scoped, attachedRun: compatible ? {applicationId: compatible.startedAt, frameId: origin.frameId, pageSignature: compatible.pageSignature} : null};
+}
+
+async function queryInlineField(message, sender) {
+  const origin = inlineOrigin(message, sender);
+  if (processingTabs.has(origin.tabId) || saveLocks.has(origin.tabId)) throw new Error('Application is busy or unavailable');
+  // Reserve first: a later focus query or navigation must revoke this operation even while inspection awaits.
+  const reserved = await mutateInlineSession(origin.tabId, origin.frameId, null, () => ({...origin,
+    sessionId: crypto.randomUUID(), field: null, suggestions: {}, generatedSuggestions: {},
+    generation: {status: 'idle', requestId: crypto.randomUUID()}, attachedRun: null, panelRequested: false}));
+  const {inspection, field} = await inspectInlineDestination(origin, message);
+  const scoped = await scopeInlineField(origin, inspection, field);
+  const [records, drafts] = await Promise.all([getRecords(), draftEvidenceRecords()]);
+  const candidates = scoped.field.entityUnresolved ? [] : savedFieldCandidates(scoped.field, records, drafts);
+  const current = await inspectInlineDestination(origin, message);
+  if (pageSignature(current.inspection) !== pageSignature(inspection) || !sameFieldSnapshot(current.field, aiFieldSnapshot(field))
+    || current.field.editRevision !== field.editRevision) throw new Error('Inline destination changed. Focus the field again.');
+  const session = await mutateInlineSession(origin.tabId, origin.frameId, reserved.sessionId, currentSession => {
+    const savedCandidates = candidates.map(candidate => ({...candidate, candidateId: `${currentSession.revision + 1}:${crypto.randomUUID()}`}));
+    const signature = pageSignature(inspection);
+    return {...currentSession, field: scoped.field, pageSignature: signature, jobContext: inspection.page,
+      attachedRun: scoped.attachedRun, suggestions: {[field.id]: {...origin, applicationId: scoped.attachedRun?.applicationId || reserved.sessionId,
+        pageSignature: signature, field: scoped.field, candidates: savedCandidates}}};
+  });
+  return inlineReply(session, message.requestId, scoped.field.entityUnresolved ? {error: 'Choose the employer for this work-history section'} : {});
+}
+
+async function guardInlineField(message, sender, {requireFocus = true} = {}) {
+  const origin = inlineOrigin(message, sender);
+  const session = await writeInlineSessions(sessions => sessions[`${origin.tabId}:${origin.frameId}`]);
+  if (!session || session.sessionId !== message.sessionId || !session.field
+    || Object.keys(origin).some(key => session[key] !== origin[key])) throw new Error('Inline session expired or destination changed');
+  const destination = {fieldId: session.field.id, handle: session.field.handle, pageSignature: session.pageSignature,
+    applicationId: session.attachedRun?.applicationId || session.sessionId};
+  if (Object.keys(destination).some(key => Object.hasOwn(message, key) && message[key] !== destination[key])) throw new Error('Inline destination origin does not match the session');
+  const {inspection, field} = await inspectInlineDestination(origin, {fieldId: session.field.id, handle: session.field.handle, requireFocus});
+  if (pageSignature(inspection) !== session.pageSignature || !sameFieldSnapshot(field, aiFieldSnapshot(session.field))
+    || field.editRevision !== session.field.editRevision || field.rawValue !== session.field.rawValue) throw new Error('Inline destination changed');
+  const scoped = await scopeInlineField(origin, inspection, field);
+  if (scoped.field.entityUnresolved || ['entityId', 'entityType', 'employmentId'].some(key => scoped.field[key] !== session.field[key])) {
+    throw new Error('Choose the employer for this work-history section');
+  }
+  if (session.attachedRun && JSON.stringify(scoped.attachedRun) !== JSON.stringify(session.attachedRun)) throw new Error('The application changed. Focus the field again.');
+  const latest = await writeInlineSessions(sessions => sessions[`${origin.tabId}:${origin.frameId}`]);
+  if (!latest || latest.sessionId !== session.sessionId || latest.revision !== session.revision) throw new Error('Inline session changed');
+  return {session: latest, inspection, field: scoped.field};
+}
+
+async function acceptInlineField(message, sender) {
+  const origin = inlineOrigin(message, sender);
+  if (processingTabs.has(origin.tabId) || saveLocks.has(origin.tabId)) throw new Error('Application is busy or unavailable');
+  saveLocks.add(origin.tabId);
+  let session;
+  let result;
+  try {
+    ({session} = await guardInlineField(message, sender, {requireFocus: false}));
+    const suggestion = session.suggestions?.[session.field.id];
+    const candidate = suggestion?.candidates.find(item => item.candidateId === message.candidateId);
+    if (!candidate) throw new Error('Inline candidate expired. Focus the field again.');
+    // Only worker-stored candidate keys/answers authorize the shared reviewed write.
+    const approval = {sourceKeys: sourceKeysForCandidate(candidate)};
+    await reviewedCandidate(suggestion, approval);
+    const guarded = await guardInlineField(message, sender, {requireFocus: false});
+    if (guarded.session.revision !== session.revision) throw new Error('Inline session changed');
+    // A fresh approval object avoids reusing the preflight evidence cache across the awaited guard.
+    await applyReviewedField({tabId: origin.tabId, frameId: origin.frameId, applicationId: session.attachedRun?.applicationId,
+      field: guarded.field, suggestion, message: {sourceKeys: sourceKeysForCandidate(candidate)},
+      approvalGuard: {expectedRawValue: session.field.rawValue, expectedEditRevision: session.field.editRevision, acceptanceToken: message.acceptanceToken}});
+    result = inlineReply(session, message.requestId, {candidates: [], generatedSuggestion: null});
+  } finally {
+    try {
+      if (session) await mutateInlineSession(origin.tabId, origin.frameId, session.sessionId, current => ({...current, suggestions: {}, generatedSuggestions: {}})).catch(() => {});
+    } finally { saveLocks.delete(origin.tabId); }
+  }
+  if (session.attachedRun) await validatePageOnly(origin.tabId);
+  return result;
+}
+
+// Completed suggestions survive worker suspension; foreign pending jobs cannot silently succeed.
+writeInlineSessions(() => null).catch(() => {});
+
 function listedRunField(run, fieldId) {
   return [...(run.actionRequired || []), ...(run.optionalUnresolved || [])]
     .find((item) => item?.fieldId === fieldId) || null;
@@ -1053,6 +1242,7 @@ async function applyReviewedField({ tabId, frameId, applicationId, field, sugges
   const result = await sendToFrame(tabId, frameId, {
     type: 'JOB_APP_APPLY',
     applicationId,
+    ...(approvalGuard ? {approvalGuard} : {}),
     decisions: [{
       fieldId: field.id,
       handle: field.handle,
@@ -1092,7 +1282,7 @@ async function applyReviewedField({ tabId, frameId, applicationId, field, sugges
         : readback.answerRecords.find((record) => record.question === field.label && record.answer === value && sourceKeys.every((key) => record.evidenceKeys?.includes(key)));
       if (!persisted) throw new Error('Answer applied, but reusable save could not be verified');
     });
-    await datasourceWriteChain;
+    await datasourceWriteChain.catch(error => { throw new Error(`Answer applied, but not saved: ${error.message}`); });
   }
   const validationResponse = await sendToFrame(tabId, frameId, { type: 'JOB_APP_VALIDATE' });
   return { inspection: verified.inspection, validation: validationResponse?.validation || {}, value };
@@ -1313,6 +1503,7 @@ async function processPage(tabId, { autoAdvance } = { autoAdvance: false }) {
 }
 
 async function startRun(tabId) {
+  await invalidateInlineSessions(tabId);
   const current = await getRun(tabId);
   if (current && ACTIVE_RUN_STATUSES.has(current.status)) {
     if (current.status !== 'running') return current;
@@ -1514,6 +1705,21 @@ function beginSaveOperation(tabId) {
 }
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (['JOB_INLINE_QUERY', 'JOB_INLINE_ACCEPT', 'JOB_INLINE_CANCEL'].includes(message?.type)) {
+    (async () => {
+      if (message.type === 'JOB_INLINE_QUERY') return queryInlineField(message, sender);
+      if (message.type === 'JOB_INLINE_ACCEPT') return acceptInlineField(message, sender);
+      const origin = inlineOrigin(message, sender);
+      const session = await writeInlineSessions(sessions => sessions[`${origin.tabId}:${origin.frameId}`]);
+      if (!session || session.sessionId !== message.sessionId || Object.keys(origin).some(key => session[key] !== origin[key])) throw new Error('Inline session expired or destination changed');
+      await mutateInlineSession(origin.tabId, origin.frameId, message.sessionId, () => null);
+      return inlineReply(session, message.requestId, {candidates: [], generatedSuggestion: null});
+    })().then(sendResponse).catch(error => sendResponse({ok: false,
+      sessionId: typeof message.sessionId === 'string' && message.sessionId.length <= 200 ? message.sessionId : null,
+      requestId: typeof message.requestId === 'string' && message.requestId.length <= 200 ? message.requestId : null,
+      field: null, candidates: [], generatedSuggestion: null, error: error.message}));
+    return true;
+  }
   if (message?.type === 'JOB_APP_REVALIDATE') {
     (async()=>{
       const tabId=sender?.tab?.id;const run=Number.isInteger(tabId)?await getRun(tabId):null;
@@ -1557,6 +1763,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message?.type === 'JOB_APP_NAVIGATED') {
     const tabId = sender?.tab?.id;
     (async () => {
+      if (Number.isInteger(tabId)) await invalidateInlineSessions(tabId, Number.isInteger(sender.frameId) ? sender.frameId : 0);
       const run = tabId ? await getRun(tabId) : null;
       const senderFrameId = Number.isInteger(sender?.frameId) ? sender.frameId : 0;
       if (run?.status !== 'running' || run.lastAction !== 'next') return { ok: true, run };
@@ -1593,12 +1800,14 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   ].includes(message?.type)) return false;
 
   (async () => {
+    if (!chrome.runtime.id || sender?.id !== chrome.runtime.id || sender?.tab
+      || typeof sender?.url !== 'string' || !sender.url.startsWith(`chrome-extension://${chrome.runtime.id}/`)) {
+      throw new Error('This action must originate in the extension panel');
+    }
     if (['JOB_DATASOURCE_SUPPRESS_ANSWER', 'JOB_DATASOURCE_DELETE_ANSWER'].includes(message.type)) {
-      if (sender?.tab) throw new Error('This action must originate in the extension panel');
       return updateSavedAnswerFeedback(message, message.type === 'JOB_DATASOURCE_DELETE_ANSWER' ? 'delete' : 'suppress');
     }
     if (['JOB_RUN_APPROVE_SUGGESTION', 'JOB_RUN_APPLY_DRAFT', 'JOB_RUN_REWRITE_ANSWER', 'JOB_RUN_GENERATE_SUGGESTIONS'].includes(message.type)) {
-      if (sender?.tab) throw new Error('This action must originate in the extension panel');
       if (message.type === 'JOB_RUN_APPLY_DRAFT') return applyDraft(message);
       if (message.type === 'JOB_RUN_REWRITE_ANSWER') return rewriteAnswer(message);
       if (message.type === 'JOB_RUN_GENERATE_SUGGESTIONS') return generateSuggestions(message);
@@ -1636,13 +1845,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       return { ok: true, datasource: await updateDatasourceProfile(message.profile || {}) };
     }
     if (message.type === 'JOB_LEARNING_INBOX_RESOLVE') {
-      if (sender?.tab) throw new Error('This action must originate in the extension panel');
       return { ok: true, datasource: await resolveLearningInbox(message.id, message.action) };
     }
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
     const tabId = message.tabId || tab?.id;
     if (!tabId) throw new Error('No active browser tab was found');
-    if (['JOB_RUN_VALIDATE_PAGE', 'JOB_RUN_RETRY_AI', 'JOB_RUN_SELECT_EMPLOYMENT', 'JOB_RUN_SEARCH_ANSWERS'].includes(message.type) && sender?.tab) throw new Error('This action must originate in the extension panel');
     if (message.type === 'JOB_RUN_VALIDATE_PAGE') return { ok: true, run: await validatePageOnly(tabId) };
     if (message.type === 'JOB_RUN_RETRY_AI') { await scheduleAi(tabId, { retry: true }); return { ok: true, run: await getRun(tabId) }; }
     if (message.type === 'JOB_RUN_SELECT_EMPLOYMENT') return selectEmployment(message);
@@ -1660,6 +1867,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 });
 
 chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
+  if (changeInfo.url || ['loading', 'complete'].includes(changeInfo.status)) invalidateInlineSessions(tabId).catch(() => {});
   if (changeInfo.status !== 'complete') return;
   getRun(tabId)
     .then(async (run) => {
@@ -1672,7 +1880,10 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
     .catch(() => {});
 });
 
-chrome.tabs.onRemoved.addListener((tabId) => removeRun(tabId).catch(() => {}));
+chrome.tabs.onRemoved.addListener((tabId) => {
+  invalidateInlineSessions(tabId).catch(() => {});
+  removeRun(tabId).catch(() => {});
+});
 
 chrome.runtime.onInstalled.addListener(async () => {
   await chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true });
