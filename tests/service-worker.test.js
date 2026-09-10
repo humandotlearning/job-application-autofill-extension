@@ -452,6 +452,91 @@ test('inline generation reuses completed panel snapshots and deduplicates same-f
   }
 });
 
+test('inline Generate defers to same-field background work queued behind the planner', async () => {
+  const harness = await inlineHarness({waitForAI: false, field: {id: 'why', handle: 'doc-a:why', label: 'Why are you a good fit?', type: 'textarea', required: true},
+    page: {actions: [{id: 'submit', kind: 'submit', label: 'Submit application'}]}});
+  harness.localData.openaiApiKey = 'synthetic-test-key';
+  let releasePlanner, draftCalls = 0;
+  globalThis.fetch = async (_url, options) => {
+    const request = JSON.parse(JSON.parse(options.body).input[1].content[0].text);
+    if (request.fields) return new Promise(resolve => {releasePlanner = () => resolve({ok: true, json: async () => ({output_text: JSON.stringify({decisions: []})})});});
+    draftCalls++;
+    return generatedResponse([], 'Add relevant experience.');
+  };
+  await harness.dispatch({type: 'JOB_RUN_START', tabId: 7});
+  await waitUntil(() => Boolean(releasePlanner));
+  const query = await harness.dispatch(inlineQuery({fieldId: 'why', handle: 'doc-a:why'}), inlineSender());
+  let generated;
+  try { generated = await harness.dispatch(inlineGeneration(query), inlineSender()); }
+  finally { releasePlanner(); }
+  await waitUntil(() => harness.sessionData.applicationRun['7'].aiOperations.planner.status === 'completed');
+  assert.equal(draftCalls, 1, 'planner release must not dispatch a second draft request for the inline field');
+  assert.equal(generated.ok, true, generated.error);
+  assert.equal(generated.error, 'This answer is already being prepared');
+  const cached = await harness.dispatch(inlineGeneration(query, 'generate-after-planner'), inlineSender());
+  assert.equal(cached.generatedSuggestion.missingContext, 'Add relevant experience.');
+  assert.equal(draftCalls, 1);
+});
+
+test('queued draft ownership keeps two background fields concurrent and blocks a third queued field only', async () => {
+  const harness = await inlineHarness({waitForAI: false, field: {id: 'why1', handle: 'doc-a:why1', label: 'Why are you a good fit?', type: 'textarea', required: true}});
+  const page = harness.tabs.get(7).frames[0].pages[0];
+  for (const id of ['why2', 'why3', 'optional']) page.fields.push({id, handle: `doc-a:${id}`, label: 'Why does this role interest you?', type: 'textarea', required: id !== 'optional', rawValue: '', editRevision: 0});
+  harness.localData.openaiApiKey = 'synthetic-test-key';
+  const releases = new Map();
+  const calls = [];
+  globalThis.fetch = async (_url, options) => {
+    const request = JSON.parse(JSON.parse(options.body).input[1].content[0].text);
+    if (request.fields) return {ok: true, json: async () => ({output_text: JSON.stringify({decisions: []})})};
+    calls.push(request.field.id);
+    if (request.field.id === 'why1' || request.field.id === 'why2') return new Promise(resolve => {releases.set(request.field.id, () => resolve(generatedResponse([], 'Add relevant experience.')));});
+    return generatedResponse([], 'Add relevant experience.');
+  };
+  await harness.dispatch({type: 'JOB_RUN_START', tabId: 7});
+  await waitUntil(() => releases.size === 2);
+  let generated, optional;
+  try {
+    assert.deepEqual(calls, ['why1', 'why2'], 'existing two-consumer concurrency is preserved');
+    page.focusedFieldId = 'why3';
+    const query = await harness.dispatch(inlineQuery({fieldId: 'why3', handle: 'doc-a:why3'}), inlineSender());
+    generated = await harness.dispatch(inlineGeneration(query), inlineSender());
+    page.focusedFieldId = 'optional';
+    const other = await harness.dispatch(inlineQuery({fieldId: 'optional', handle: 'doc-a:optional', requestId: 'optional-query'}), inlineSender());
+    optional = await harness.dispatch(inlineGeneration(other), inlineSender());
+  } finally { for (const release of releases.values()) release(); }
+  await waitUntil(() => harness.sessionData.applicationRun['7'].aiOperations.planner.status === 'completed');
+  assert.equal(calls.filter(id => id === 'why3').length, 1);
+  assert.equal(generated.error, 'This answer is already being prepared');
+  assert.equal(optional.ok, true, optional.error);
+  assert.equal(calls.filter(id => id === 'optional').length, 1, 'unrelated inline field can generate while background work is pending');
+});
+
+test('background retry does not dispatch a draft for a field already owned by inline Generate', async () => {
+  const harness = await inlineHarness({waitForAI: false, field: {id: 'why', handle: 'doc-a:why', label: 'Why are you a good fit?', type: 'textarea', required: true},
+    page: {actions: [{id: 'submit', kind: 'submit', label: 'Submit application'}]}});
+  await harness.dispatch({type: 'JOB_RUN_START', tabId: 7});
+  harness.localData.openaiApiKey = 'synthetic-test-key';
+  let releaseInline, draftCalls = 0;
+  globalThis.fetch = async (_url, options) => {
+    const request = JSON.parse(JSON.parse(options.body).input[1].content[0].text);
+    if (request.fields) return {ok: true, json: async () => ({output_text: JSON.stringify({decisions: []})})};
+    draftCalls++;
+    if (draftCalls === 1) return new Promise(resolve => {releaseInline = () => resolve(generatedResponse([], 'Add relevant experience.'));});
+    return generatedResponse([], 'Add relevant experience.');
+  };
+  const query = await harness.dispatch(inlineQuery({fieldId: 'why', handle: 'doc-a:why'}), inlineSender());
+  const pending = harness.dispatch(inlineGeneration(query), inlineSender());
+  await waitUntil(() => Boolean(releaseInline));
+  const run = harness.sessionData.applicationRun['7'];
+  run.aiOperations = {planner: {status: 'failed'}, 'suggestion:why': {status: 'failed'}};
+  try {
+    await harness.dispatch({type: 'JOB_RUN_RETRY_AI', tabId: 7});
+    await waitUntil(() => harness.sessionData.applicationRun['7'].aiOperations.planner.status === 'completed');
+  } finally { releaseInline(); }
+  assert.equal((await pending).ok, true);
+  assert.equal(draftCalls, 1, 'the inline owner remains the only draft provider request');
+});
+
 test('unrelated background work stays pending through inline query and apply, then rejects changed page evidence', async () => {
   const harness = await inlineHarness({waitForAI: false, field: {label: 'Current CTC', type: 'textarea'},
     answerRecords: [{key: 'current_salary', question: 'Current salary', answer: 'Synthetic explanation', sensitivity: 'review'}]});

@@ -32,6 +32,8 @@ const INLINE_STORAGE_KEY = 'inlineFieldSessions';
 const INLINE_TTL_MS = 10 * 60 * 1000;
 let inlineWriteChain = Promise.resolve();
 const inlineSessionAuthorities = new Map();
+// Reserve individual draft destinations, including work queued behind the planner.
+const draftFieldOwners = new Map();
 let datasourceInitPromise = null;
 
 const APPLICATION_TITLE_PATTERN = /\b(?:apply|application|candidate|profile|resume|experience|education)\b/i;
@@ -1138,6 +1140,20 @@ function inlineJobContext(session, inspection, run) {
   return mergeJobContext(mergeJobContext({}, run?.jobContext || session.jobContext), inspection.page);
 }
 
+function draftFieldKey(tabId, frameId, field) {
+  return JSON.stringify([tabId, frameId, field.id, field.handle, field.rawValue, field.editRevision]);
+}
+
+function claimDraftField(key, owner) {
+  if (draftFieldOwners.has(key)) return false;
+  draftFieldOwners.set(key, owner);
+  return true;
+}
+
+function releaseDraftField(key, owner) {
+  if (draftFieldOwners.get(key) === owner) draftFieldOwners.delete(key);
+}
+
 async function currentInlineDestination(session, snapshot) {
   try {
     const origin = {tabId: session.tabId, frameId: session.frameId, documentId: session.documentId, url: session.url};
@@ -1180,13 +1196,16 @@ async function generateInlineField(message, sender) {
   }
   const apiKey = reusable ? null : await getApiKey(settings.aiProvider);
   if (!reusable && !apiKey) throw new Error(`Add a ${settings.aiProvider === 'fireworks' ? 'Fireworks' : 'OpenAI'} API key before generating answer suggestions`);
-  const pending = await mutateInlineSession(origin.tabId, origin.frameId, session.sessionId, current => {
-    if (processingTabs.has(origin.tabId) || saveLocks.has(origin.tabId)) throw new Error('Fill is in progress');
-    if (current.generation.status === 'pending' || current.revision !== session.revision) return false;
-    return {...current, generation: {status: 'pending', requestId: message.requestId}};
-  });
-  if (!pending) return inlineReply(session, message.requestId, {error: 'This answer is already being prepared'});
+  const draftKey = draftFieldKey(origin.tabId, origin.frameId, field), owner = crypto.randomUUID();
+  if (!reusable && !claimDraftField(draftKey, owner)) return inlineReply(session, message.requestId, {error: 'This answer is already being prepared'});
+  let pending;
   try {
+    pending = await mutateInlineSession(origin.tabId, origin.frameId, session.sessionId, current => {
+      if (processingTabs.has(origin.tabId) || saveLocks.has(origin.tabId)) throw new Error('Fill is in progress');
+      if (current.generation.status === 'pending' || current.revision !== session.revision) return false;
+      return {...current, generation: {status: 'pending', requestId: message.requestId}};
+    });
+    if (!pending) return inlineReply(session, message.requestId, {error: 'This answer is already being prepared'});
     if (!(await currentInlineDestination(pending, snapshot))) throw new Error('The page or supporting evidence changed. Generate again.');
     const generated = reusable ? cached : await generateFieldDrafts({field, inspection, jobContext, datasource, records: datasource.answerRecords, settings, apiKey});
     if (!(await currentInlineDestination(pending, snapshot))) throw new Error('The page or supporting evidence changed. Generate again.');
@@ -1201,11 +1220,13 @@ async function generateInlineField(message, sender) {
     if (!committed) throw new Error('Inline session changed. Generate again.');
     return inlineReply(committed, message.requestId);
   } catch (error) {
-    await mutateInlineSession(origin.tabId, origin.frameId, pending.sessionId, current => {
+    if (pending) await mutateInlineSession(origin.tabId, origin.frameId, pending.sessionId, current => {
       if (current.workerId !== WORKER_ID || current.generation.status !== 'pending' || current.revision !== pending.revision || current.generation.requestId !== message.requestId) return false;
       return {...current, generation: {status: 'failed', requestId: message.requestId, error: error.message}};
     }).catch(() => {});
     throw error;
+  } finally {
+    releaseDraftField(draftKey, owner);
   }
 }
 
@@ -2216,12 +2237,16 @@ async function scheduleAi(tabId,{retry=false}={}) {
     current.aiOperations[operationKey]={status:'pending',cacheKey:fingerprint,id,workerId:WORKER_ID};
     current.progress='preparing_suggestions'; current.llmError=null;
   });
-  const job=prepareAi(tabId,snapshot,plannerFields,suggestionFields,fields,datasource,apiKey).catch(async error=>{
+  const ownedSuggestionFields=suggestionFields.filter(field=>claimDraftField(draftFieldKey(tabId,snapshot.frameId,field),id));
+  const job=prepareAi(tabId,snapshot,plannerFields,ownedSuggestionFields,fields,datasource,apiKey).catch(async error=>{
     await mutateRun(tabId,current=>{
       if(current.aiOperations?.[operationKey]?.id!==id) return false;
       current.aiOperations[operationKey].status='failed';current.aiOperations[operationKey].error=error.message;current.llmError=error.message;current.progress='ready';
     });
-  }).finally(()=>{ if(backgroundJobs.get(tabId)===job) backgroundJobs.delete(tabId); });
+  }).finally(()=>{
+    for(const field of ownedSuggestionFields) releaseDraftField(draftFieldKey(tabId,snapshot.frameId,field),id);
+    if(backgroundJobs.get(tabId)===job) backgroundJobs.delete(tabId);
+  });
   backgroundJobs.set(tabId,job);
 }
 
@@ -2264,11 +2289,12 @@ async function prepareAi(tabId,snapshot,plannerFields,suggestionFields,allFields
   }
   const pageRecords=allFields.filter(field=>field.currentValue && readableQuestion(field)).map(field=>({key:`page:${field.id}`,question:field.label,answer:field.currentValue,provenance:'current application page',sensitivity:inferSensitivity(field.label,field.id),entityId:field.entityId,entityType:field.entityType}));
   const evidence=[...datasource.answerRecords,...profileEvidenceRecords(datasource.profile),...pageRecords];
+  for(const field of suggestionFields) if(proposed.has(field.id)) releaseDraftField(draftFieldKey(tabId,snapshot.frameId,field),snapshot.id);
   const tasks=suggestionFields.filter(field=>!proposed.has(field.id)).sort((a,b)=>Number(a.type==='textarea')-Number(b.type==='textarea'));
   let index=0;
   const consume=async()=>{while(index<tasks.length){
     const field=tasks[index++]; const key=`suggestion:${field.id}`;
-    if(!(await currentAiDestination(tabId,snapshot,field))) continue;
+    if(!(await currentAiDestination(tabId,snapshot,field))) {releaseDraftField(draftFieldKey(tabId,snapshot.frameId,field),snapshot.id);continue;}
     await mutateRun(tabId,current=>{if(current.aiOperations?.[snapshot.operationKey]?.id!==snapshot.id)return false;current.aiOperations[key]={status:'pending',workerId:WORKER_ID,id:snapshot.id,cacheKey:snapshot.cacheKey};});
     try {
       const generated=await callAnswerSuggestions({apiKey,field,page:snapshot.jobContext,records:rankSuggestionEvidence(field,evidence,{limit:40})},{provider,model});
@@ -2284,6 +2310,7 @@ async function prepareAi(tabId,snapshot,plannerFields,suggestionFields,allFields
       });
       await validatePageOnly(tabId);
     } catch(error) {await mutateRun(tabId,current=>{if(current.aiOperations?.[key]?.id!==snapshot.id)return false;current.aiOperations[key].status='failed';current.aiOperations[key].error=error.message;current.llmError=error.message;});}
+    finally {releaseDraftField(draftFieldKey(tabId,snapshot.frameId,field),snapshot.id);}
   }};
   await Promise.all([consume(),consume()]);
   await mutateRun(tabId,current=>{
