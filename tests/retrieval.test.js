@@ -1,6 +1,32 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
+test('saved field candidates keep saved evidence first and add distinct completed drafts', async () => {
+  const { savedFieldCandidates } = await import('../src/retrieval.js');
+  const field = { label: 'Preferred work location', type: 'text' };
+  const saved = [
+    { key: 'a_remote', question: 'Preferred work location', answer: 'Remote', confirmationState: 'confirmed', sensitivity: 'safe' },
+    { key: 'b_bangalore', question: 'Preferred work location', answer: 'Bangalore', confirmationState: 'confirmed', sensitivity: 'safe' },
+  ];
+  const drafts = [
+    { key: 'draft:remote', question: 'Preferred work location', answer: 'Remote', confirmationState: 'confirmed', completed: true, sensitivity: 'safe' },
+    { key: 'draft:a_hyderabad', question: 'Preferred work location', answer: 'Hyderabad', confirmationState: 'confirmed', completed: true, sensitivity: 'safe' },
+    { key: 'draft:chennai', question: 'Preferred work location', answer: 'Chennai', confirmationState: 'confirmed', completed: true, sensitivity: 'safe' },
+    { key: 'draft:pending', question: 'Unrelated question', answer: 'Pending answer', confirmationState: 'pending', completed: true, sensitivity: 'safe' },
+    { key: 'cards|d20089ff-f389-44ef-9398-eec15ba7b6a4[field1]', question: 'Preferred work location', answer: 'Opaque answer', confirmationState: 'confirmed', completed: true, sensitivity: 'safe' },
+    { key: 'draft:incompatible', question: 'Describe a different experience', answer: 'Built unrelated services for a different domain.', confirmationState: 'confirmed', completed: true, sensitivity: 'safe' },
+  ];
+
+  const candidates = savedFieldCandidates(field, saved, drafts);
+
+  assert.deepEqual(candidates.map((candidate) => candidate.answer), ['Remote', 'Bangalore', 'Hyderabad']);
+  assert.equal(candidates[0].kind, 'equivalent');
+  assert.equal(candidates[2].kind, 'draft');
+  assert.equal(candidates[2].provenance, 'saved record');
+  assert.equal(candidates[2].reason, 'Previously entered, not yet saved for reuse — explicit approval required');
+  assert.equal(candidates.some((candidate) => candidate.answer === 'Pending answer' || candidate.answer === 'Opaque answer' || candidate.answer === 'Built unrelated services for a different domain.'), false);
+});
+
 test('unspecified compensation units expose verbatim LPA evidence only for review', async () => {
   const { retrieveEvidence } = await import('../src/retrieval.js');
   const { chooseRecord } = await import('../src/core.js');

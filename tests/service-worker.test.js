@@ -1536,6 +1536,51 @@ test('manual drafts fill only the exact user value and do not promote an answer 
   assert.equal(fills[0].value, answer);
 });
 
+test('reviewed fills wait for DOM retention and generated drafts do not write reusable records', async () => {
+  const retained = createHarness({ answerRecords: [{
+    key: 'profile_statement', question: 'Profile statement', answer: 'I delivered reliable data products.', aliases: [], confirmationState: 'confirmed', sensitivity: 'safe', type: 'textarea',
+  }], pagesByTab: { 7: { pages: [{
+    page: { title: 'Application', domain: 'example.test' },
+    fields: [{ id: 'profile', handle: 'profile-h', label: 'Profile statement', type: 'textarea', required: true }],
+    actions: [{ id: 'submit', label: 'Submit application', kind: 'submit' }],
+    onApply: ({ page }) => { delete page.values.profile; },
+  }] } } });
+  await import(`../src/service-worker.js?retention-before-save=${Date.now()}`);
+  const started = await retained.dispatch({ type: 'JOB_RUN_START', tabId: 7 });
+  const suggestion = started.run.suggestions?.profile;
+  assert.ok(suggestion, JSON.stringify(started.run));
+  const beforeRetentionFailure = structuredClone(retained.localData.answerRecords);
+  const failed = await retained.dispatch({
+    type: 'JOB_RUN_APPROVE_SUGGESTION', tabId: 7, frameId: suggestion.frameId,
+    applicationId: suggestion.applicationId, pageSignature: suggestion.pageSignature,
+    fieldId: 'profile', handle: suggestion.field.handle, sourceKey: 'profile_statement',
+  });
+  assert.equal(failed.ok, false);
+  assert.match(failed.error, /did not retain/i);
+  assert.deepEqual(retained.localData.answerRecords, beforeRetentionFailure);
+
+  const drafts = createHarness({ pagesByTab: { 7: { pages: [{
+    page: { title: 'Application', domain: 'example.test' },
+    fields: [{ id: 'summary', handle: 'summary-h', label: 'Why are you a good fit?', type: 'textarea', required: true }], actions: [{ id: 'submit', label: 'Submit application', kind: 'submit' }],
+  }] } } });
+  await import(`../src/service-worker.js?generated-draft-apply=${Date.now()}`);
+  const draftRun = await drafts.dispatch({ type: 'JOB_RUN_START', tabId: 7 });
+  drafts.localData.openaiApiKey = 'synthetic-test-key';
+  globalThis.fetch = async () => ({
+    ok: true, status: 200, statusText: 'OK',
+    json: async () => ({ output_text: JSON.stringify({ suggestions: [{ answer: 'I build reliable systems that fit this role.', evidenceKeys: [] }], missingContext: '' }) }),
+  });
+  const generated = await drafts.dispatch({ type: 'JOB_RUN_GENERATE_SUGGESTIONS', ...draftOrigin(draftRun.run, { id: 'summary', handle: 'summary-h' }) });
+  assert.equal(generated.ok, true, generated.error);
+  const recordsBeforeDraft = structuredClone(drafts.localData.answerRecords);
+  const applied = await drafts.dispatch({
+    type: 'JOB_RUN_APPLY_DRAFT', ...draftOrigin(generated.run, { id: 'summary', handle: 'summary-h' }),
+    answer: generated.run.generatedSuggestions.summary.suggestions[0].answer,
+  });
+  assert.equal(applied.ok, true, applied.error);
+  assert.deepEqual(drafts.localData.answerRecords, recordsBeforeDraft);
+});
+
 test('manual drafts reject stale origins and changed destinations before filling', async () => {
   const harness = createHarness({ pagesByTab: { 7: { pages: [{
     page: { title: 'Application', domain: 'example.test' },

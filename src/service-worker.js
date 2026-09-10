@@ -1,4 +1,4 @@
-import { retrieveEvidence, searchEvidence, selectPlannerEvidence, rankSuggestionEvidence } from './retrieval.js';
+import { retrieveEvidence, savedFieldCandidates, searchEvidence, selectPlannerEvidence, rankSuggestionEvidence } from './retrieval.js';
 import { inferSensitivity, isOpaqueIdentifier, validateFillValue, meaningCompatible, suggestionTargetKey } from './core.js';
 import { callAnswerPlanner, callAnswerRewriter, callAnswerSuggestions, DEFAULT_FIREWORKS_MODEL, DEFAULT_OPENAI_MODEL, DEFAULT_PROVIDER } from './llm.js';
 import { upsertAnswerRecords, mergeLearnedAnswers, normalizeAnswerRecord } from './core.js';
@@ -23,6 +23,7 @@ const backgroundJobs = new Map();
 const WORKER_ID = `${Date.now()}:${Math.random()}`;
 const saveLocks = new Set();
 const saveOperations = new Map();
+const reviewedCandidateCache = new WeakMap();
 const MAX_DRAFT_CHARS = 4_000;
 const MAX_REWRITE_INSTRUCTION_CHARS = 4_000;
 let datasourceWriteChain = Promise.resolve();
@@ -850,11 +851,7 @@ async function applyPageDecisions(tabId, run, inspection, records, coverMessages
         return { ...decision, action: 'keep', value: null, reason: 'The current value does not satisfy the field constraints' };
       }
       if (String(field.currentValue || '').trim()) return decision;
-      const candidates = retrieveEvidence(field, records);
-      for (const candidate of retrieveEvidence(field, draftRecords)) {
-        if (!candidates.some(saved => saved.answer === candidate.answer)) candidates.push({ ...candidate, kind: 'draft', reason: 'Previously entered, not yet saved for reuse — explicit approval required' });
-      }
-      candidates.splice(3);
+      const candidates = savedFieldCandidates(field, records, draftRecords);
       const choiceMapping = choiceEvidenceNeedsPlanner(field, candidates);
       const gated = candidates.length && !choiceMapping && (decision.action !== 'fill' || decision.disposition !== 'autofill' || field.type === 'textarea' || decision.sensitivity !== 'safe' || inferSensitivity(field.label, field.id) !== 'safe');
       if (gated) {
@@ -914,62 +911,18 @@ async function approveSuggestion(message) {
     if (!suggestion || !SAVABLE_RUN_STATUSES.has(run.status) || message.frameId !== run.frame?.frameId
       || message.frameId !== suggestion.frameId || message.applicationId !== run.startedAt
       || message.pageSignature !== run.pageSignature || message.handle !== suggestion.field.handle || !message.handle) throw new Error('Stale suggestion; check the page again');
-    const requestedKeys = sourceKeysFromMessage(message);
-    const candidate = suggestion.candidates.find((item) => {
-      const candidateKeys = sourceKeysForCandidate(item);
-      return requestedKeys.length > 0 && sameKeys(candidateKeys, requestedKeys);
-    });
-    const sourceKeys = sourceKeysForCandidate(candidate);
-    const records = candidate?.kind === 'draft' ? await draftEvidenceRecords() : await getRecords();
-    const sources = sourceKeys.map((key) => records.find((record) => record.key === key));
-    const compatibleEvidence = candidate?.kind === 'planner'
-      ? rankSuggestionEvidence(suggestion.field, records, {limit: records.length})
-      : retrieveEvidence(suggestion.field, records, {limit: records.length});
-    if (!candidate || !sourceKeys.length || sources.some((source) => !source)
-      || sources.some((source) => source.answer !== sourceAnswerSnapshot(candidate, source.key))
-      || sources.some((source) => !compatibleEvidence.some((item) => (item.sourceKey || item.key) === source.key))) {
-      throw new Error('Saved evidence changed; check again');
-    }
-    const source = sources[0];
+    await reviewedCandidate(suggestion, message);
     // Never rediscover/reroute an approval into another frame.
     const inspected = await sendToFrame(tabId, message.frameId, { type: 'JOB_APP_INSPECT' });
     const field = resolveEmploymentFields(run, inspected.inspection?.fields || [], (await getDatasource()).profile).find(item => item.id === fieldId);
     if (!field || field.handle !== message.handle || field.currentValue || JSON.stringify(field.options) !== JSON.stringify(suggestion.field.options)
       || field.label !== suggestion.field.label || field.type !== suggestion.field.type
       || pageSignature(inspected.inspection, run.frame) !== message.pageSignature) throw new Error('Destination changed; check the page again');
-    const value = String(message.answer ?? candidate.answer).trim();
-    const validation = validateFillValue(field, value);
-    const sourceCompatible = candidate.kind === 'planner'
-      ? sources.every((item) => compatibleEvidence.some((evidence) => (evidence.sourceKey || evidence.key) === item.key))
-      : meaningCompatible(field, source, { numericReview: !(['textarea', 'text'].includes(field.type) && value === candidate.answer) });
-    if (!validation.ok || !sourceCompatible || inferSensitivity(field.label, field.id) === 'legal' || field.type === 'checkbox') throw new Error(validation.reason || 'This destination requires manual entry');
-    const result = await sendToFrame(tabId, message.frameId, { type: 'JOB_APP_APPLY', applicationId: run.startedAt, decisions: [{ fieldId, handle: field.handle, action: 'fill', approved: true, value, evidenceKeys: sourceKeys, sensitivity: inferSensitivity(field.label, field.id), confidence: 'high', reason: 'Explicitly approved saved answer' }] });
-    if (!result?.ok) throw new Error(result?.error || 'Could not apply the answer');
-    const verified = await sendToFrame(tabId, message.frameId, { type: 'JOB_APP_INSPECT' });
-    if (verified.inspection?.fields.find(item => item.id === fieldId && item.handle === field.handle)?.currentValue !== value) throw new Error('The page did not retain the approved answer');
-    datasourceWriteChain = datasourceWriteChain.catch(() => {}).then(async () => {
-      const state = await getDatasource();
-      const latestRecords = candidate.kind === 'draft' ? await draftEvidenceRecords() : state.answerRecords;
-      const latestSources = sourceKeys.map((key) => latestRecords.find((record) => record.key === key));
-      if (latestSources.some((latest) => !latest || latest.answer !== sourceAnswerSnapshot(candidate, latest.key))) {
-        throw new Error('Evidence changed while applying; answer applied but not learned');
-      }
-      const now = new Date().toISOString();
-      const equivalent = candidate.kind === 'equivalent' && sourceKeys.length === 1 && value === candidate.answer && field.labelConfidence !== 'low';
-      const answerRecords = equivalent ? state.answerRecords.map(record => record.key === source.key
-        ? { ...record, aliases: [...new Set([...(record.aliases || []), field.label])], updatedAt: now } : record)
-        : mergeLearnedAnswers(state.answerRecords, [{ question: field.label, answer: value, type: field.type, entityId: field.entityId,
-          entityType: field.entityType, evidenceKeys: sourceKeys, provenance: 'user', completed: true, userEdited: true }], now, { confirm: true });
-      await saveDatasource({ ...state, answerRecords });
-      const readback = await chrome.storage.local.get({ answerRecords: [] });
-      const persisted = equivalent ? readback.answerRecords.find(record => record.key === source.key && record.aliases?.includes(field.label))
-        : readback.answerRecords.find(record => record.question === field.label && record.answer === value && sourceKeys.every((key) => record.evidenceKeys?.includes(key)));
-      if (!persisted) throw new Error('Answer applied, but reusable save could not be verified');
+    const applied = await applyReviewedField({
+      tabId, frameId: message.frameId, applicationId: run.startedAt, field, suggestion, message, approvalGuard: null,
     });
-    await datasourceWriteChain;
     delete run.suggestions[fieldId];
-    const validationResponse = await sendToFrame(tabId, message.frameId, { type: 'JOB_APP_VALIDATE' });
-    categorizeRun(run, verified.inspection, validationResponse.validation || {});
+    categorizeRun(run, applied.inspection, applied.validation);
     return { ok: true, run: await saveRun(run) };
   } finally { saveLocks.delete(tabId); }
 }
@@ -1057,6 +1010,94 @@ function sameKeys(left = [], right = []) {
   return left.length === right.length && left.every((key) => right.includes(key));
 }
 
+async function reviewedCandidate(suggestion, message) {
+  const cached = reviewedCandidateCache.get(message);
+  if (cached?.suggestion === suggestion) return cached.result;
+  const requestedKeys = sourceKeysFromMessage(message);
+  const candidate = suggestion.candidates.find((item) => {
+    const candidateKeys = sourceKeysForCandidate(item);
+    return requestedKeys.length > 0 && sameKeys(candidateKeys, requestedKeys);
+  });
+  const sourceKeys = sourceKeysForCandidate(candidate);
+  const records = candidate?.kind === 'draft' ? await draftEvidenceRecords() : await getRecords();
+  const sources = sourceKeys.map((key) => records.find((record) => record.key === key));
+  const compatibleEvidence = candidate?.kind === 'planner'
+    ? rankSuggestionEvidence(suggestion.field, records, {limit: records.length})
+    : retrieveEvidence(suggestion.field, records, {limit: records.length});
+  if (!candidate || !sourceKeys.length || sources.some((source) => !source)
+    || sources.some((source) => source.answer !== sourceAnswerSnapshot(candidate, source.key))
+    || sources.some((source) => !compatibleEvidence.some((item) => (item.sourceKey || item.key) === source.key))) {
+    throw new Error('Saved evidence changed; check again');
+  }
+  const result = { candidate, sourceKeys, sources, compatibleEvidence };
+  reviewedCandidateCache.set(message, { suggestion, result });
+  return result;
+}
+
+async function applyReviewedField({ tabId, frameId, applicationId, field, suggestion, message, approvalGuard }) {
+  let candidate = null;
+  let sourceKeys = [];
+  let sources = [];
+  let compatibleEvidence = [];
+  if (suggestion) {
+    ({ candidate, sourceKeys, sources, compatibleEvidence } = await reviewedCandidate(suggestion, message));
+  }
+  const value = candidate ? String(message.answer ?? candidate.answer).trim() : String(message.answer);
+  const validation = validateFillValue(field, value);
+  const sourceCompatible = !candidate || (candidate.kind === 'planner'
+    ? sources.every((item) => compatibleEvidence.some((evidence) => (evidence.sourceKey || evidence.key) === item.key))
+    : meaningCompatible(field, sources[0], { numericReview: !(['textarea', 'text'].includes(field.type) && value === candidate.answer) }));
+  if (!validation.ok || !sourceCompatible || inferSensitivity(field.label, field.id) === 'legal' || field.type === 'checkbox') {
+    throw new Error(validation.ok ? 'This destination requires manual entry' : validation.reason);
+  }
+  const result = await sendToFrame(tabId, frameId, {
+    type: 'JOB_APP_APPLY',
+    applicationId,
+    decisions: [{
+      fieldId: field.id,
+      handle: field.handle,
+      action: 'fill',
+      approved: true,
+      value,
+      evidenceKeys: sourceKeys,
+      sensitivity: inferSensitivity(field.label, field.id),
+      confidence: 'high',
+      reason: candidate ? 'Explicitly approved saved answer' : 'Explicitly entered draft answer',
+      ...(approvalGuard || {}),
+    }],
+  });
+  if (!result?.ok) throw new Error(result?.error || 'Could not apply the answer');
+  const verified = await sendToFrame(tabId, frameId, { type: 'JOB_APP_INSPECT' });
+  if (verified.inspection?.fields.find((item) => item.id === field.id && item.handle === field.handle)?.currentValue !== value) {
+    throw new Error(candidate ? 'The page did not retain the approved answer' : 'The page did not retain the entered answer');
+  }
+  if (candidate) {
+    const source = sources[0];
+    datasourceWriteChain = datasourceWriteChain.catch(() => {}).then(async () => {
+      const state = await getDatasource();
+      const latestRecords = candidate.kind === 'draft' ? await draftEvidenceRecords() : state.answerRecords;
+      const latestSources = sourceKeys.map((key) => latestRecords.find((record) => record.key === key));
+      if (latestSources.some((latest) => !latest || latest.answer !== sourceAnswerSnapshot(candidate, latest.key))) {
+        throw new Error('Evidence changed while applying; answer applied but not learned');
+      }
+      const now = new Date().toISOString();
+      const equivalent = candidate.kind === 'equivalent' && sourceKeys.length === 1 && value === candidate.answer && field.labelConfidence !== 'low';
+      const answerRecords = equivalent ? state.answerRecords.map((record) => record.key === source.key
+        ? { ...record, aliases: [...new Set([...(record.aliases || []), field.label])], updatedAt: now } : record)
+        : mergeLearnedAnswers(state.answerRecords, [{ question: field.label, answer: value, type: field.type, entityId: field.entityId,
+          entityType: field.entityType, evidenceKeys: sourceKeys, provenance: 'user', completed: true, userEdited: true }], now, { confirm: true });
+      await saveDatasource({ ...state, answerRecords });
+      const readback = await chrome.storage.local.get({ answerRecords: [] });
+      const persisted = equivalent ? readback.answerRecords.find((record) => record.key === source.key && record.aliases?.includes(field.label))
+        : readback.answerRecords.find((record) => record.question === field.label && record.answer === value && sourceKeys.every((key) => record.evidenceKeys?.includes(key)));
+      if (!persisted) throw new Error('Answer applied, but reusable save could not be verified');
+    });
+    await datasourceWriteChain;
+  }
+  const validationResponse = await sendToFrame(tabId, frameId, { type: 'JOB_APP_VALIDATE' });
+  return { inspection: verified.inspection, validation: validationResponse?.validation || {}, value };
+}
+
 async function rewriteEvidence(suggestion, message) {
   const requestedKeys = sourceKeysFromMessage(message);
   if (!requestedKeys.length) return [];
@@ -1079,32 +1120,10 @@ async function applyDraft(message) {
   saveLocks.add(tabId);
   try {
     const { run, field } = await guardedDraftField(message, { allowSaveLock: true });
-    const validation = validateFillValue(field, answer);
-    if (!validation.ok || inferSensitivity(field.label, field.id) === 'legal' || field.type === 'checkbox') {
-      throw new Error(validation.ok ? 'This destination requires manual entry' : validation.reason);
-    }
-    const result = await sendToFrame(tabId, message.frameId, {
-      type: 'JOB_APP_APPLY',
-      applicationId: run.startedAt,
-      decisions: [{
-        fieldId: field.id,
-        handle: field.handle,
-        action: 'fill',
-        approved: true,
-        value: answer,
-        evidenceKeys: [],
-        sensitivity: inferSensitivity(field.label, field.id),
-        confidence: 'high',
-        reason: 'Explicitly entered draft answer',
-      }],
+    const applied = await applyReviewedField({
+      tabId, frameId: message.frameId, applicationId: run.startedAt, field, suggestion: null, message: { ...message, answer }, approvalGuard: null,
     });
-    if (!result?.ok) throw new Error(result?.error || 'Could not apply the answer');
-    const verified = await sendToFrame(tabId, message.frameId, { type: 'JOB_APP_INSPECT' });
-    if (verified.inspection?.fields.find((item) => item.id === field.id && item.handle === field.handle)?.currentValue !== answer) {
-      throw new Error('The page did not retain the entered answer');
-    }
-    const validationResponse = await sendToFrame(tabId, message.frameId, { type: 'JOB_APP_VALIDATE' });
-    categorizeRun(run, verified.inspection, validationResponse?.validation || {});
+    categorizeRun(run, applied.inspection, applied.validation);
     return { ok: true, run: await saveRun(run) };
   } finally {
     saveLocks.delete(tabId);
@@ -1130,6 +1149,18 @@ async function rewriteAnswer(message) {
   return { ok: true, answer: requiredBoundedText(rewritten.answer, 'Rewritten answer', MAX_DRAFT_CHARS) };
 }
 
+async function generateFieldDrafts({ field, inspection, jobContext, datasource, records, settings, apiKey }) {
+  const pageRecords = (inspection?.fields || [])
+    .filter((item) => item.currentValue && readableQuestion(item))
+    .map((item) => ({ key: `page:${item.id}`, question: item.label, answer: item.currentValue, provenance: 'current application page', sensitivity: inferSensitivity(item.label, item.id) }));
+  return callAnswerSuggestions({
+    apiKey,
+    field,
+    page: jobContext,
+    records: rankSuggestionEvidence(field, [...records, ...profileEvidenceRecords(datasource.profile), ...pageRecords], {limit:40}),
+  }, { provider: settings.aiProvider, model: settings.aiModel });
+}
+
 async function generateSuggestions(message) {
   const jobDescription = message.jobDescription == null || (typeof message.jobDescription === 'string' && !message.jobDescription.trim())
     ? ''
@@ -1143,10 +1174,7 @@ async function generateSuggestions(message) {
   const jobContext = mergeJobContext(run.jobContext, inspected.inspection?.page);
   if (jobDescription) jobContext.jobDescription = jobDescription;
   const snapshot = suggestionRequestSnapshot(run, field, inspected.inspection, datasource, settings, jobContext);
-  const pageRecords = (inspected.inspection?.fields || [])
-    .filter(item => item.currentValue && readableQuestion(item))
-    .map(item => ({ key: `page:${item.id}`, question: item.label, answer: item.currentValue, provenance: 'current application page', sensitivity: inferSensitivity(item.label, item.id) }));
-  const generated = await callAnswerSuggestions({ apiKey, field, page: jobContext, records: rankSuggestionEvidence(field, [...records, ...profileEvidenceRecords(datasource.profile), ...pageRecords], {limit:40}) }, { provider: settings.aiProvider, model: settings.aiModel });
+  const generated = await generateFieldDrafts({ field, inspection: inspected.inspection, jobContext, datasource, records, settings, apiKey });
   const validation = await sendToFrame(message.tabId, message.frameId, { type: 'JOB_APP_VALIDATE' });
   const current = await currentSuggestionDestination(message.tabId, snapshot);
   if (!current) throw new Error('The page or supporting evidence changed. Generate again.');
