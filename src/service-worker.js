@@ -31,6 +31,7 @@ let runWriteChain = Promise.resolve();
 const INLINE_STORAGE_KEY = 'inlineFieldSessions';
 const INLINE_TTL_MS = 10 * 60 * 1000;
 let inlineWriteChain = Promise.resolve();
+const inlineSessionAuthorities = new Map();
 let datasourceInitPromise = null;
 
 const APPLICATION_TITLE_PATTERN = /\b(?:apply|application|candidate|profile|resume|experience|education)\b/i;
@@ -423,8 +424,9 @@ async function ensureContentScripts(tabId, frameIds) {
   }
 }
 
-async function sendToFrame(tabId, frameId, message) {
+async function sendToFrame(tabId, frameId, message, assertAuthority) {
   const targetFrameId = Number.isInteger(frameId) ? frameId : 0;
+  assertAuthority?.();
   try {
     return await chrome.tabs.sendMessage(tabId, message, { frameId: targetFrameId });
   } catch {
@@ -432,6 +434,7 @@ async function sendToFrame(tabId, frameId, message) {
       target: { tabId, frameIds: [targetFrameId] },
       files: ['dist/content.js'],
     });
+    assertAuthority?.();
     return chrome.tabs.sendMessage(tabId, message, { frameId: targetFrameId });
   }
 }
@@ -969,6 +972,11 @@ function writeInlineSessions(change) {
       }
     }
     const result = change(sessions);
+    // Mirror only revocable authority, so apply can check synchronously after its last await.
+    inlineSessionAuthorities.clear();
+    for (const [key, session] of Object.entries(sessions)) {
+      inlineSessionAuthorities.set(key, {sessionId: session.sessionId, revision: session.revision, expiresAt: session.expiresAt});
+    }
     await chrome.storage.session.set({[INLINE_STORAGE_KEY]: sessions});
     return result;
   });
@@ -1102,6 +1110,12 @@ async function acceptInlineField(message, sender) {
     // A fresh approval object avoids reusing the preflight evidence cache across the awaited guard.
     await applyReviewedField({tabId: origin.tabId, frameId: origin.frameId, applicationId: session.attachedRun?.applicationId,
       field: guarded.field, suggestion, message: {sourceKeys: sourceKeysForCandidate(candidate)},
+      assertAuthority: () => {
+        const current = inlineSessionAuthorities.get(`${origin.tabId}:${origin.frameId}`);
+        if (!current || current.sessionId !== session.sessionId || current.revision !== session.revision || !(current.expiresAt > Date.now())) {
+          throw new Error('Inline session expired or revoked before applying');
+        }
+      },
       approvalGuard: {expectedRawValue: session.field.rawValue, expectedEditRevision: session.field.editRevision, acceptanceToken: message.acceptanceToken}});
     result = inlineReply(session, message.requestId, {candidates: [], generatedSuggestion: null});
   } finally {
@@ -1223,7 +1237,7 @@ async function reviewedCandidate(suggestion, message) {
   return result;
 }
 
-async function applyReviewedField({ tabId, frameId, applicationId, field, suggestion, message, approvalGuard }) {
+async function applyReviewedField({ tabId, frameId, applicationId, field, suggestion, message, approvalGuard, assertAuthority }) {
   let candidate = null;
   let sourceKeys = [];
   let sources = [];
@@ -1255,7 +1269,7 @@ async function applyReviewedField({ tabId, frameId, applicationId, field, sugges
       reason: candidate ? 'Explicitly approved saved answer' : 'Explicitly entered draft answer',
       ...(approvalGuard || {}),
     }],
-  });
+  }, assertAuthority);
   if (!result?.ok) throw new Error(result?.error || 'Could not apply the answer');
   const verified = await sendToFrame(tabId, frameId, { type: 'JOB_APP_INSPECT' });
   if (verified.inspection?.fields.find((item) => item.id === field.id && item.handle === field.handle)?.currentValue !== value) {

@@ -428,6 +428,77 @@ test('inline rechecks source evidence after the final asynchronous destination g
   assert.equal(harness.tabs.get(7).messages.some(message => message.type === 'JOB_APP_APPLY'), false);
 });
 
+for (const revocation of ['JOB_INLINE_CANCEL', 'JOB_RUN_START']) {
+  test(`inline ${revocation} during final evidence read prevents apply dispatch`, {timeout: 5000}, async () => {
+    const harness = await inlineHarness();
+    const query = await harness.dispatch(inlineQuery(), inlineSender());
+    assert.equal(query.ok, true, query.error);
+    let inspections = 0;
+    let readsAfterFinalInspection = 0;
+    let entered;
+    let resume;
+    const waiting = new Promise(resolve => {entered = resolve;});
+    const gate = new Promise(resolve => {resume = resolve;});
+    harness.tabs.get(7).frames[0].pages[0].onInlineInspect = () => {inspections++;};
+    const getLocal = chrome.storage.local.get;
+    chrome.storage.local.get = async defaults => {
+      // The final guard first scopes the live field; its next evidence read is inside applyReviewedField.
+      if (inspections === 2 && Object.hasOwn(defaults, 'answerRecords') && ++readsAfterFinalInspection === 2) {
+        entered();
+        await gate;
+      }
+      return getLocal(defaults);
+    };
+    const accepting = harness.dispatch(inlineAcceptance(query), inlineSender());
+    await waiting;
+    let revoked;
+    if (revocation === 'JOB_INLINE_CANCEL') {
+      revoked = await harness.dispatch({type: revocation, sessionId: query.sessionId, requestId: 'cancel-final-read'}, inlineSender());
+      assert.equal(revoked.ok, true, revoked.error);
+    } else {
+      let invalidated;
+      const invalidation = new Promise(resolve => {invalidated = resolve;});
+      const setSession = chrome.storage.session.set;
+      chrome.storage.session.set = async values => {
+        await setSession(values);
+        if (values.inlineFieldSessions && !values.inlineFieldSessions['7:0']) invalidated();
+      };
+      revoked = harness.dispatch({type: revocation, tabId: 7});
+      await invalidation;
+    }
+    assert.equal(harness.sessionData.inlineFieldSessions['7:0'], undefined);
+    resume();
+    assert.equal((await revoked).ok, true);
+    const response = await accepting;
+    assert.equal(harness.tabs.get(7).messages.some(message => message.type === 'JOB_APP_APPLY'), false);
+    assert.equal(response.ok, false);
+    assert.match(response.error, /session|expired|revok|changed/i);
+    assert.equal(harness.tabs.get(7).frames[0].pages[0].values?.name, undefined);
+  });
+}
+
+test('inline cancellation during content reinjection prevents apply retry dispatch', async () => {
+  const harness = await inlineHarness();
+  const query = await harness.dispatch(inlineQuery(), inlineSender());
+  assert.equal(query.ok, true, query.error);
+  const sendMessage = chrome.tabs.sendMessage;
+  let failed = false;
+  chrome.tabs.sendMessage = async (tabId, message, options) => {
+    if (message.type === 'JOB_APP_APPLY' && !failed) {failed = true; throw new Error('Content receiver unavailable');}
+    return sendMessage(tabId, message, options);
+  };
+  const executeScript = chrome.scripting.executeScript;
+  chrome.scripting.executeScript = async details => {
+    const cancelled = await harness.dispatch({type: 'JOB_INLINE_CANCEL', sessionId: query.sessionId, requestId: 'cancel-retry'}, inlineSender());
+    assert.equal(cancelled.ok, true, cancelled.error);
+    return executeScript(details);
+  };
+  const response = await harness.dispatch(inlineAcceptance(query), inlineSender());
+  assert.equal(failed, true);
+  assert.equal(harness.tabs.get(7).messages.some(message => message.type === 'JOB_APP_APPLY'), false);
+  assert.equal(response.ok, false);
+});
+
 test('inline cancellation and lifecycle events revoke sessions without losing other frames', async () => {
   for (const event of ['cancel', 'navigation', 'loading', 'removed', 'start']) {
     const harness = await inlineHarness();
