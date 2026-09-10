@@ -109,7 +109,7 @@ test('content script keeps the message channel open for asynchronous widget sele
     readFile(new URL('dist/content.js', root), 'utf8'),
   ]);
   assert.match(engine, /export async function applyDecisions/);
-  assert.match(content, /applyDecisions\(document, message\.decisions \|\| \[\], \{deadline: message\.deadline \?\? Infinity\}\)\s*\.then/);
+  assert.match(content, /applyDecisions\(document, message\.decisions \|\| \[\], \{deadline: message\.deadline \?\? Infinity,\s*beforeFill: args => inline\.beforeFill\(\{\.\.\.args, acceptanceToken: message\.approvalGuard\?\.acceptanceToken\}\)\}\)\s*\.then/);
   assert.match(content, /return true;/);
   assert.match(bundle, /CUSTOM_WIDGET_SELECTOR|button\[aria-haspopup="listbox"\]/);
   assert.match(bundle, /unique exact option/);

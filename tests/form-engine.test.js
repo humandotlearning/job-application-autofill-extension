@@ -36,6 +36,20 @@ test('an approved stale text decision cannot replace typing', async () => {
   assert.equal(result.failed.length, 1);
 });
 
+test('beforeFill receives the live field, element and decision at the write boundary', async () => {
+  const document = makeDocument('<label>Name<input id="name"></label>');
+  const input = document.querySelector('input');
+  const field = descriptorForElement(document, input);
+  const decision = {fieldId: field.id, handle: field.handle, action: 'fill', approved: true, value: 'Ada', sensitivity: 'safe', confidence: 'high'};
+  let received;
+  await applyDecisions(document, [decision], {beforeFill: args => {received = args; return false;}});
+  assert.equal(received?.element, input);
+  assert.equal(received?.field.handle, field.handle);
+  assert.equal(received?.decision, decision);
+  assert.equal(input.value, '');
+  document.defaultView.close();
+});
+
 test('tracks native text snapshots across edits and node replacement', () => {
   const cases = [
     { name: 'type then erase', html: '<label>Name<input id="name"></label>', edit(input) { input.value = 'Ada'; input.dispatchEvent(new input.ownerDocument.defaultView.Event('input', { bubbles: true })); input.value = ''; input.dispatchEvent(new input.ownerDocument.defaultView.Event('input', { bubbles: true })); }, revision: 2, rawValue: '', currentValue: '' },
@@ -777,6 +791,19 @@ test('ambiguous application forms require a focused form before extraction', () 
   assert.equal(collectFieldDescriptors(document).length, 0);
   document.querySelector('#two').focus();
   assert.deepEqual(collectFieldDescriptors(document).map((field) => field.id), ['two']);
+});
+
+test('a connected inline popup anchor disambiguates forms and never overrides real page focus', () => {
+  const document = makeDocument('<form aria-label="Job application"><label>Name<input id="one"></label></form><form aria-label="Job application"><label>Name<input id="two"></label></form><div id="popup" tabindex="-1"></div>');
+  const one = document.querySelector('#one');
+  document.querySelector('#popup').focus();
+  document.__jobApplicationInlineFocusAnchor = one;
+  assert.deepEqual(collectFieldDescriptors(document).map(field => field.id), ['one']);
+  document.querySelector('#two').focus();
+  assert.deepEqual(collectFieldDescriptors(document).map(field => field.id), ['two']);
+  document.querySelector('#popup').focus(); one.remove();
+  assert.equal(collectFieldDescriptors(document).length, 0);
+  document.defaultView.close();
 });
 
 test('application validation respects framework aria-invalid errors', () => {

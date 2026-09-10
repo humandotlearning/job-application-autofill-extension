@@ -54,3 +54,42 @@ test('classic content listener inspects the live focused descriptor and exact ra
   assert.equal(utility.rawValue, null);
   dom.window.close();
 });
+
+test('reinjected bundle installs one inline popup and guards reviewed writes while popup owns focus', async () => {
+  const bundle = await readFile(new URL('../dist/content.js', import.meta.url), 'utf8');
+  const dom = new JSDOM('<form aria-label="Job application"><label>Name<input id="name"></label></form><form aria-label="Job application"><label>Name<input id="other"></label></form>', {url: 'https://jobs.example.com/apply', pretendToBeVisual: true});
+  const document = dom.window.document;
+  const listeners = []; const messages = [];
+  const context = createContext({document, setTimeout, clearTimeout, console, chrome: {runtime: {
+    sendMessage: async message => {
+      messages.push(message);
+      if (message.type === 'JOB_INLINE_ACCEPT') return new Promise(() => {});
+      return {ok: true, sessionId: 's1', requestId: message.requestId, candidates: [{candidateId: 'c1', answer: 'Ada', sourceQuestion: 'Name', requiresApproval: true}]};
+    }, onMessage: {addListener: listener => listeners.push(listener)},
+  }}});
+  new Script(bundle).runInContext(context); new Script(bundle).runInContext(context);
+  const dispatch = message => new Promise(resolve => listeners[0](message, {}, resolve));
+  const input = document.querySelector('input'); input.focus(); input.click();
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.equal(messages.filter(m => m.type === 'JOB_INLINE_QUERY').length, 1);
+  assert.equal(document.querySelectorAll('[data-job-inline-autofill]').length, 1);
+  const key = (key, options = {}, target = input) => target.dispatchEvent(new dom.window.KeyboardEvent('keydown', {key, bubbles: true, composed: true, cancelable: true, ...options}));
+  key('ArrowDown', {altKey: true});
+  const state = await dispatch({type: 'JOB_APP_INSPECT_INLINE'});
+  assert.equal(state.focusedHandle, state.inspection.fields[0].handle);
+  const root = document.querySelector('[data-job-inline-autofill]').shadowRoot;
+  key('ArrowDown', {}, root.activeElement);
+  [...root.querySelectorAll('button')].find(node => node.textContent === 'Use and save reviewed answer').click();
+  const acceptanceToken = messages.find(m => m.type === 'JOB_INLINE_ACCEPT').acceptanceToken;
+  const field = state.inspection.fields[0];
+  const decisions = [{fieldId: field.id, handle: field.handle, action: 'fill', approved: true, value: 'Ada', sensitivity: 'safe', confidence: 'high', expectedRawValue: '', expectedEditRevision: 0}];
+  const wrongToken = await dispatch({type: 'JOB_APP_APPLY', decisions, approvalGuard: {acceptanceToken: 'invalid'}});
+  assert.equal(wrongToken.result.applied.length, 0);
+  assert.equal(input.value, '');
+  // A mismatched token must not consume the legitimate pending approval.
+  const applied = await dispatch({type: 'JOB_APP_APPLY', decisions, approvalGuard: {acceptanceToken}});
+  assert.equal(applied.result.applied.length, 1);
+  assert.equal(input.value, 'Ada');
+  assert.equal(listeners.length, 1);
+  dom.window.close();
+});

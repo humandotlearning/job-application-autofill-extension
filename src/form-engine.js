@@ -44,7 +44,9 @@ function applicationRoot(document) {
     return { form, score };
   }).sort((a, b) => b.score - a.score);
   if (candidates[0]?.score > 0 && candidates[0].score === candidates[1]?.score) {
-    const focused = document.activeElement?.closest?.('form');
+    const inlineAnchor = document.__jobApplicationInlineFocusAnchor;
+    const focused = document.activeElement?.closest?.('form')
+      || (inlineAnchor?.isConnected && inlineAnchor.ownerDocument === document ? inlineAnchor.closest('form') : null);
     return candidates.some((candidate) => candidate.form === focused && candidate.score === candidates[0].score) ? focused : document.createDocumentFragment();
   }
   return candidates[0]?.score > 0 && candidates[0].score > (candidates[1]?.score ?? -1) ? candidates[0].form : document;
@@ -987,7 +989,7 @@ export async function applyDecisions(document, decisions = [], { deadline = Infi
     const hasExpectedEditRevision = Object.hasOwn(decision, 'expectedEditRevision');
     const rawValueMatches = !hasExpectedRawValue || String(element?.value ?? '') === String(decision.expectedRawValue);
     const editRevisionMatches = !hasExpectedEditRevision || (element?.__jobApplicationEditRevision || 0) === decision.expectedEditRevision;
-    if (!beforeFill() || !rawValueMatches || !editRevisionMatches) {
+    if (!beforeFill({field, element, decision}) || !rawValueMatches || !editRevisionMatches) {
       result.failed.push({ fieldId: field.id, reason: 'The field changed before the answer could be applied' });
       continue;
     }
