@@ -1,7 +1,10 @@
 const byId = (id) => document.getElementById(id);
 const elements = {
+  provider: byId('ai-provider'),
+  fireworksApiKey: byId('fireworks-api-key'),
+  openaiApiKey: byId('openai-api-key'),
   apiKey: byId('openai-api-key'),
-  apiModel: byId('openai-model'),
+  apiModel: byId('ai-model'),
   autoAdvance: byId('auto-advance-pages'),
   employerName: byId('employer-name'),
   relatedDefault: byId('related-default'),
@@ -942,9 +945,16 @@ async function focusField(fieldId) {
 async function refresh() {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
   activeTabId = tab?.id || null;
-  const stored = await chrome.storage.local.get({ answerRecords: [], openaiApiKey: '', openaiModel: 'gpt-5.6-terra', autoAdvancePages: false });
-  elements.apiKey.value = stored.openaiApiKey || '';
-  elements.apiModel.value = stored.openaiModel || 'gpt-5.6-terra';
+  const stored = await chrome.storage.local.get({ answerRecords: [], openaiApiKey: '', fireworksApiKey: '', aiProvider: '', aiModel: '', openaiModel: 'gpt-5.6-terra', autoAdvancePages: false });
+  const provider = stored.aiProvider === 'openai' || stored.aiProvider === 'fireworks'
+    ? stored.aiProvider
+    : (stored.openaiApiKey ? 'openai' : 'fireworks');
+  const defaultModel = provider === 'fireworks' ? 'accounts/fireworks/models/glm-5p3-flash' : 'gpt-5.6-terra';
+  elements.provider.value = provider;
+  elements.provider.selectedIndex = provider === 'openai' ? 1 : 0;
+  elements.fireworksApiKey.value = stored.fireworksApiKey || '';
+  elements.openaiApiKey.value = stored.openaiApiKey || '';
+  elements.apiModel.value = stored.aiModel || (provider === 'openai' ? stored.openaiModel : '') || defaultModel;
   elements.autoAdvance.checked = Boolean(stored.autoAdvancePages);
   updateDatasourceSummary({ answerCount: stored.answerRecords.length });
   const datasourceResponse = await chrome.runtime.sendMessage({ type: 'JOB_DATASOURCE_STATE' });
@@ -992,16 +1002,27 @@ async function importDatasource(file) {
   }
 }
 
-async function saveApiKey() {
-  await chrome.storage.local.set({ openaiApiKey: elements.apiKey.value.trim() });
-  setStatus(elements.apiKey.value.trim() ? 'API key saved in trusted extension storage.' : 'API key cleared. Local answers still work.');
+async function saveApiKey(input, storageKey, providerLabel) {
+  const value = input.value.trim();
+  await chrome.storage.local.set({ [storageKey]: value });
+  setStatus(value ? `${providerLabel} API key saved in trusted extension storage.` : `${providerLabel} API key cleared. Local answers still work.`);
 }
 
 async function saveModel() {
-  const model = elements.apiModel.value.trim() || 'gpt-5.6-terra';
+  const model = elements.apiModel.value.trim() || (elements.provider.value === 'fireworks' ? 'accounts/fireworks/models/glm-5p3-flash' : 'gpt-5.6-terra');
   elements.apiModel.value = model;
-  await chrome.storage.local.set({ openaiModel: model });
+  await chrome.storage.local.set({ aiModel: model, ...(elements.provider.value === 'openai' ? { openaiModel: model } : {}) });
   setStatus(`Answer planner model saved: ${model}.`);
+}
+
+async function saveProvider() {
+  const provider = elements.provider.value === 'openai' ? 'openai' : 'fireworks';
+  const defaultModel = provider === 'fireworks' ? 'accounts/fireworks/models/glm-5p3-flash' : 'gpt-5.6-terra';
+  const currentModel = elements.apiModel.value.trim();
+  const previousDefault = provider === 'fireworks' ? 'gpt-5.6-terra' : 'accounts/fireworks/models/glm-5p3-flash';
+  if (!currentModel || currentModel === previousDefault) elements.apiModel.value = defaultModel;
+  await chrome.storage.local.set({ aiProvider: provider, aiModel: elements.apiModel.value.trim() || defaultModel });
+  setStatus(`${provider === 'fireworks' ? 'Fireworks' : 'OpenAI'} is now the active provider.`);
 }
 
 async function saveSettings() {
@@ -1027,9 +1048,12 @@ async function saveProfile() {
   } catch (error) { setStatus(error.message, 'error'); }
 }
 
-elements.apiKey.addEventListener('change', saveApiKey);
-elements.apiKey.addEventListener('blur', saveApiKey);
-elements.apiKey.addEventListener('input', saveApiKey);
+for (const [input, key, label] of [[elements.fireworksApiKey, 'fireworksApiKey', 'Fireworks'], [elements.openaiApiKey, 'openaiApiKey', 'OpenAI']]) {
+  input.addEventListener('change', () => saveApiKey(input, key, label));
+  input.addEventListener('blur', () => saveApiKey(input, key, label));
+  input.addEventListener('input', () => saveApiKey(input, key, label));
+}
+elements.provider.addEventListener('change', saveProvider);
 elements.apiModel.addEventListener('change', saveModel);
 elements.apiModel.addEventListener('blur', saveModel);
 elements.autoAdvance.addEventListener('change', saveSettings);

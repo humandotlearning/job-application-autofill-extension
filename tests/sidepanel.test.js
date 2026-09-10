@@ -405,6 +405,30 @@ test('panel persists settings, focuses blockers, and saves answers without any s
   }
 });
 
+test('panel defaults to Fireworks and persists its key and selected model', async () => {
+  const harness = await setupPanel({ localData: { fireworksApiKey: '', aiProvider: '', aiModel: '', openaiApiKey: '', autoAdvancePages: false } });
+  try {
+    const { document, Event } = harness.dom.window;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    assert.equal(document.querySelector('#ai-provider').options[0].value, 'fireworks');
+    const provider = document.querySelector('#ai-provider');
+    provider.value = 'fireworks';
+    provider.dispatchEvent(new Event('change', { bubbles: true }));
+    const key = document.querySelector('#fireworks-api-key');
+    key.value = 'fw-live';
+    key.dispatchEvent(new Event('input', { bubbles: true }));
+    const model = document.querySelector('#ai-model');
+    model.value = 'accounts/fireworks/models/other-model';
+    model.dispatchEvent(new Event('change', { bubbles: true }));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assert.equal(harness.localData.fireworksApiKey, 'fw-live');
+    assert.equal(harness.localData.aiProvider, 'fireworks');
+    assert.equal(harness.localData.aiModel, 'accounts/fireworks/models/other-model');
+  } finally {
+    harness.cleanup();
+  }
+});
+
 test('panel exposes and saves the phone device profile default', async () => {
   const harness = await setupPanel({
     datasource: { answerCount: 3, coverMessageCount: 1, profile: { employment: [{ company: 'Example' }], defaults: { relatedToHiringCompany: 'No', knownAtHiringCompany: 'No', phoneDeviceType: 'Mobile' } } },

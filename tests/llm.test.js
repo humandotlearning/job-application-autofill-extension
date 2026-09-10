@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { callAnswerPlanner, callAnswerRewriter, callAnswerSuggestions } from '../src/llm.js';
+import { callAnswerPlanner, callAnswerRewriter, callAnswerSuggestions, DEFAULT_FIREWORKS_MODEL, DEFAULT_PROVIDER } from '../src/llm.js';
 
 function createInput() {
   return {
@@ -180,6 +180,33 @@ test('uses an explicitly configured model when provided', async () => {
     },
   });
   assert.equal(requestBody.model, 'gpt-luna-test');
+});
+
+test('uses Fireworks chat completions with the default provider and model', async () => {
+  let request;
+  const result = await callAnswerPlanner({ ...createInput(), apiKey: 'fireworks-test-key' }, {
+    fetchImpl: async (url, options) => {
+      request = { url, options };
+      return createResponse({ choices: [{ message: { content: JSON.stringify({ decisions: [
+        { fieldId: 'full_name', action: 'ask_user', value: null, evidenceKeys: [], confidence: 'low', sensitivity: 'safe', reason: 'Review', transformation: null },
+        { fieldId: 'portfolio', action: 'ask_user', value: null, evidenceKeys: [], confidence: 'low', sensitivity: 'safe', reason: 'Review', transformation: null },
+      ] }) } }] });
+    },
+    provider: DEFAULT_PROVIDER,
+  });
+
+  assert.equal(DEFAULT_PROVIDER, 'fireworks');
+  assert.equal(DEFAULT_FIREWORKS_MODEL, 'accounts/fireworks/models/glm-5p3-flash');
+  assert.equal(request.url, 'https://api.fireworks.ai/inference/v1/chat/completions');
+  assert.equal(request.options.headers.Authorization, 'Bearer fireworks-test-key');
+  const body = JSON.parse(request.options.body);
+  assert.equal(body.model, DEFAULT_FIREWORKS_MODEL);
+  assert.equal(body.max_tokens, 131072);
+  assert.equal(body.top_k, 40);
+  assert.equal(body.response_format.type, 'json_object');
+  assert.equal(body.messages[0].role, 'system');
+  assert.equal(body.messages[1].role, 'user');
+  assert.deepEqual(result.decisions.map(({ fieldId }) => fieldId), ['full_name', 'portfolio']);
 });
 
 test('rejects non-2xx responses', async () => {

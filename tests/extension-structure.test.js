@@ -31,7 +31,10 @@ test('manifest loads the content script before the side panel starts a run', asy
 test('side panel contains the guided workflow, review groups, and settings controls', async () => {
   const html = await readFile(new URL('sidepanel.html', root), 'utf8');
   assert.match(html, /id="openai-api-key"/);
-  assert.match(html, /id="openai-model"/);
+  assert.match(html, /id="fireworks-api-key"/);
+  assert.match(html, /id="ai-provider"/);
+  assert.match(html, /id="ai-model"/);
+  assert.match(html, /accounts\/fireworks\/models\/glm-5p3-flash/);
   assert.match(html, /id="auto-advance-pages"/);
   assert.match(html, /id="export-datasource"/);
   assert.match(html, /id="import-datasource-button"/);
@@ -123,6 +126,9 @@ test('side panel script wires grouped results, focus controls, and persisted pag
   assert.match(panel, /JOB_RUN_FOCUS_FIELD/);
   assert.match(panel, /autoAdvancePages/);
   assert.match(panel, /openaiModel/);
+  assert.match(panel, /fireworksApiKey/);
+  assert.match(panel, /aiProvider/);
+  assert.match(panel, /aiModel/);
   assert.match(panel, /JOB_RUN_SAVE_ANSWERS/);
   assert.doesNotMatch(panel, /JOB_RUN_CONFIRM_SUBMIT|JOB_RUN_CONTINUE|confirm-submit/i);
   assert.match(panel, /answer-details/);

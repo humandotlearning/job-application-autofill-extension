@@ -1532,3 +1532,29 @@ test('rewrite rejects unsafe requests and model failures without mutating a draf
   assert.deepEqual(harness.tabs.get(7).frames[0].pages[0].values || {}, valuesBefore);
   assert.deepEqual(harness.localData.answerRecords, recordsBefore);
 });
+
+test('worker uses the selected Fireworks key and default model for planner requests', async () => {
+  const harness = createHarness({
+    pagesByTab: { 7: { pages: [{ fields: [{ id: 'unknown', label: 'Describe underwater welding', type: 'text', required: true }], actions: [{ id: 'submit', label: 'Submit application', kind: 'submit' }] }] } },
+  });
+  harness.localData.aiProvider = 'fireworks';
+  harness.localData.fireworksApiKey = 'synthetic-fireworks-key';
+  const requests = [];
+  globalThis.fetch = async (url, options) => {
+    const body = JSON.parse(options.body);
+    requests.push({ url, body, authorization: options.headers.Authorization });
+    const prompt = body.messages[1].content;
+    const payload = prompt.includes('"fields"')
+      ? { decisions: [{ fieldId: 'unknown', action: 'ask_user', value: null, evidenceKeys: [], confidence: 'low', sensitivity: 'safe', reason: 'No evidence', transformation: null }] }
+      : { suggestions: [], missingContext: 'No evidence' };
+    return { ok: true, status: 200, statusText: 'OK', json: async () => ({ choices: [{ message: { content: JSON.stringify(payload) } }] }) };
+  };
+  await import(`../src/service-worker.js?fireworks-default=${Date.now()}`);
+  const started = await harness.dispatch({ type: 'JOB_RUN_START', tabId: 7 });
+  assert.equal(started.ok, true, started.error);
+  assert.equal(requests[0].url, 'https://api.fireworks.ai/inference/v1/chat/completions');
+  assert.equal(requests[0].authorization, 'Bearer synthetic-fireworks-key');
+  assert.equal(requests[0].body.model, 'accounts/fireworks/models/glm-5p3-flash');
+  assert.equal(requests[0].body.messages.length, 2);
+  assert.equal(harness.localData.openaiApiKey, '');
+});
