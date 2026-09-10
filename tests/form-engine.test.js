@@ -4,6 +4,7 @@ import { JSDOM } from 'jsdom';
 
 import {
   applyDecisions,
+  descriptorForElement,
   collectAnswerRecords,
   collectFieldDescriptors,
   focusField,
@@ -16,6 +17,76 @@ import {
 function makeDocument(html) {
   return new JSDOM(html, { url: 'https://jobs.example.com/apply' }).window.document;
 }
+
+test('an approved stale text decision cannot replace typing', async () => {
+  const document = makeDocument('<label>Full name<input id="name"></label>');
+  const input = document.querySelector('input');
+  const field = descriptorForElement(document, input);
+  const decision = {
+    fieldId: field.id, handle: field.handle, action: 'fill', approved: true,
+    value: 'Synthetic Name', evidenceKeys: ['full_name'],
+    sensitivity: 'safe', confidence: 'high', reason: 'Reviewed answer',
+    expectedRawValue: field.rawValue, expectedEditRevision: field.editRevision,
+  };
+  input.value = 'My new typing';
+  input.dispatchEvent(new document.defaultView.Event('input', { bubbles: true }));
+  const result = await applyDecisions(document, [decision]);
+  assert.equal(input.value, 'My new typing');
+  assert.equal(result.applied.length, 0);
+  assert.equal(result.failed.length, 1);
+});
+
+test('tracks native text snapshots across edits and node replacement', () => {
+  const cases = [
+    { name: 'type then erase', html: '<label>Name<input id="name"></label>', edit(input) { input.value = 'Ada'; input.dispatchEvent(new input.ownerDocument.defaultView.Event('input', { bubbles: true })); input.value = ''; input.dispatchEvent(new input.ownerDocument.defaultView.Event('input', { bubbles: true })); }, revision: 2, rawValue: '', currentValue: '' },
+    { name: 'whitespace only input', html: '<label>Name<input id="name"></label>', edit(input) { input.value = '  '; input.dispatchEvent(new input.ownerDocument.defaultView.Event('input', { bubbles: true })); }, revision: 1, rawValue: '  ', currentValue: '' },
+  ];
+  for (const testCase of cases) {
+    const document = makeDocument(testCase.html);
+    const input = document.querySelector('input');
+    descriptorForElement(document, input);
+    testCase.edit(input);
+    const field = descriptorForElement(document, input);
+    assert.equal(field.rawValue, testCase.rawValue, testCase.name);
+    assert.equal(field.currentValue, testCase.currentValue, testCase.name);
+    assert.equal(field.editRevision, testCase.revision, testCase.name);
+  }
+
+  const document = makeDocument('<label>Name<input id="name"></label>');
+  const oldInput = document.querySelector('input');
+  const oldField = descriptorForElement(document, oldInput);
+  oldInput.replaceWith(oldInput.cloneNode(true));
+  const newInput = document.querySelector('input');
+  assert.equal(descriptorForElement(document, oldInput), null);
+  assert.notEqual(descriptorForElement(document, newInput).handle, oldField.handle);
+});
+
+test('does not describe hidden, disabled, read-only, or custom controls as native text', () => {
+  const document = makeDocument(`
+    <input id="hidden" type="hidden"><input id="disabled" disabled><input id="readonly" readonly>
+    <button id="custom" type="button" role="combobox" aria-label="Country">Choose</button>
+  `);
+  assert.equal(descriptorForElement(document, document.querySelector('#hidden')), null);
+  assert.equal(descriptorForElement(document, document.querySelector('#disabled')), null);
+  assert.equal(descriptorForElement(document, document.querySelector('#readonly')), null);
+  assert.equal(Object.hasOwn(descriptorForElement(document, document.querySelector('#custom')), 'rawValue'), false);
+});
+
+test('applies a text decision with matching preconditions and rejects beforeFill without events', async () => {
+  const document = makeDocument('<label>Name<input id="name"></label>');
+  const input = document.querySelector('input');
+  const field = descriptorForElement(document, input);
+  const events = [];
+  input.addEventListener('input', () => events.push('input'));
+  input.addEventListener('change', () => events.push('change'));
+  const decision = { fieldId: field.id, handle: field.handle, action: 'fill', approved: true, value: 'Ada', sensitivity: 'safe', confidence: 'high', reason: 'Reviewed answer', expectedRawValue: '', expectedEditRevision: 0 };
+  const applied = await applyDecisions(document, [decision]);
+  assert.equal(applied.applied.length, 1);
+  input.value = '';
+  const rejected = await applyDecisions(document, [{ ...decision, expectedRawValue: 'Ada', expectedEditRevision: descriptorForElement(document, input).editRevision }], { beforeFill: () => false });
+  assert.equal(rejected.failed[0].reason, 'The field changed before the answer could be applied');
+  assert.deepEqual(events, ['input', 'change']);
+});
 
 test('recognizes only the selected application form final submit', () => {
   const document = makeDocument(`

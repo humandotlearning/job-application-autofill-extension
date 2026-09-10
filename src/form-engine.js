@@ -70,6 +70,9 @@ function ensureEditTracking(document) {
       delete element.__jobApplicationSearchQuery;
     }
     if (event.type === 'blur' && !element.__jobApplicationUserEdited) return;
+    if (event.type === 'input' || event.type === 'change') {
+      element.__jobApplicationEditRevision = (element.__jobApplicationEditRevision || 0) + 1;
+    }
     delete element.__jobApplicationCommittedLabel;
     element.__jobApplicationUserEdited = true;
     element.__jobApplicationUserCompleted = event.type !== 'input';
@@ -410,7 +413,7 @@ function constraintsFor(element) {
 
 function describeField(document, element, index) {
   const type = element.tagName === 'SELECT' ? 'select' : element.tagName === 'TEXTAREA' ? 'textarea' : (element.type || 'text');
-  return {
+  const descriptor = {
     id: fieldIdentity(element, index, formElements(document)),
     handle: controlHandle(element),
     multiple: Boolean(element.multiple),
@@ -428,6 +431,11 @@ function describeField(document, element, index) {
     constraints: constraintsFor(element),
     ...fieldContext(element),
   };
+  if (element.tagName === 'TEXTAREA' || (element.tagName === 'INPUT' && !['checkbox', 'radio'].includes(String(element.type || '').toLowerCase()))) {
+    descriptor.rawValue = String(element.value ?? '');
+    descriptor.editRevision = element.__jobApplicationEditRevision || 0;
+  }
+  return descriptor;
 }
 
 export function collectFieldDescriptors(document) {
@@ -471,6 +479,12 @@ export function collectFieldDescriptors(document) {
     occurrences.set(key, occurrence);
     return counts.get(key) > 1 ? { ...field, entityId: `${field.entityId || 'entry'}-${occurrence}` } : field;
   });
+}
+
+export function descriptorForElement(document, element) {
+  if (!element || element.ownerDocument !== document || !element.isConnected) return null;
+  const handle = controlHandle(element);
+  return collectFieldDescriptors(document).find((field) => field.handle === handle) || null;
 }
 
 function dispatchFormEvents(element) {
@@ -924,7 +938,7 @@ export function planDeterministicFill(fields, records, coverMessages = [], profi
   });
 }
 
-export async function applyDecisions(document, decisions = [], { deadline = Infinity } = {}) {
+export async function applyDecisions(document, decisions = [], { deadline = Infinity, beforeFill = () => true } = {}) {
   const result = { applied: [], kept: [], reviewRequired: [], unresolved: [], failed: [] };
   for (const decision of decisions) {
     try {
@@ -967,6 +981,14 @@ export async function applyDecisions(document, decisions = [], { deadline = Infi
     const validation = validateFillValue(field.widget === 'custom' ? { ...field, options: [] } : field, decision.value);
     if (!validation.ok) {
       result.failed.push({ fieldId: field.id, label: field.label, value: decision.value, reason: validation.reason });
+      continue;
+    }
+    const hasExpectedRawValue = Object.hasOwn(decision, 'expectedRawValue');
+    const hasExpectedEditRevision = Object.hasOwn(decision, 'expectedEditRevision');
+    const rawValueMatches = !hasExpectedRawValue || String(element?.value ?? '') === String(decision.expectedRawValue);
+    const editRevisionMatches = !hasExpectedEditRevision || (element?.__jobApplicationEditRevision || 0) === decision.expectedEditRevision;
+    if (!beforeFill() || !rawValueMatches || !editRevisionMatches) {
+      result.failed.push({ fieldId: field.id, reason: 'The field changed before the answer could be applied' });
       continue;
     }
     document.__jobApplicationFilling = true;
