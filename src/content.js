@@ -14,12 +14,13 @@ function notifyNavigation() {
   waitForDocumentSettled(document).then(() => chrome.runtime.sendMessage({ type: 'JOB_APP_NAVIGATED' })).catch(() => {});
 }
 
-const CONTENT_VERSION = 'general-reuse-1';
+const CONTENT_VERSION = 'reliable-review-1';
 if (!globalThis.__jobApplicationAutofillInstalled) {
   globalThis.__jobApplicationAutofillInstalled = CONTENT_VERSION;
   const learning = createLearningSession(document, {
     capture: () => collectAnswerRecords(document),
     send: (message) => chrome.runtime.sendMessage(message),
+    onRevalidate: ({applicationId}) => chrome.runtime.sendMessage({type:'JOB_APP_REVALIDATE',applicationId}),
     onFinalSubmit: ({ applicationId, records, event }) => {
       if (!isFinalApplicationSubmit(document, event)) return null;
       return chrome.runtime.sendMessage({
@@ -45,7 +46,7 @@ if (!globalThis.__jobApplicationAutofillInstalled) {
           return true;
         case 'JOB_APP_APPLY':
           if (message.applicationId) learning.activate(message.applicationId);
-          applyDecisions(document, message.decisions || [])
+          applyDecisions(document, message.decisions || [], {deadline: message.deadline ?? Infinity})
             .then((result) => sendResponse({ ok: true, result }))
             .catch((error) => sendResponse({ ok: false, error: error.message }));
           return true;

@@ -1,5 +1,6 @@
 import {
   chooseRecord,
+  decideDisposition,
   canonicalConcept,
   inferSensitivity,
   isOpaqueIdentifier,
@@ -586,7 +587,7 @@ function waitForCustomOptions(document, element, answer, timeoutMs = 1500) {
   });
 }
 
-async function setCustomChoiceValue(document, element, answer) {
+async function setCustomChoiceValue(document, element, answer, deadline = Infinity) {
   element.focus?.();
   if (hasNativeFormAction(element)) {
     return { ok: false, unresolved: true, reason: 'Refusing to activate a native submit/reset control' };
@@ -599,7 +600,7 @@ async function setCustomChoiceValue(document, element, answer) {
     element.__jobApplicationSearchQuery = true;
     setTextValue(element, answer);
   }
-  const options = await waitForCustomOptions(document, element, answer);
+  const options = await waitForCustomOptions(document, element, answer, Math.max(0, Math.min(1500, deadline - Date.now())));
   if (!options.length) {
     if (element.tagName === 'INPUT') setTextValue(element, '');
     return { ok: false, unresolved: true, reason: 'The custom widget did not reveal any options' };
@@ -613,6 +614,7 @@ async function setCustomChoiceValue(document, element, answer) {
     return { ok: false, unresolved: true, reason: 'The custom widget does not expose one unique exact option' };
   }
   for (const match of matches) {
+    if (Date.now() >= deadline) return { ok: false, unresolved: true, reason: 'Autofill deadline reached' };
     if (match.getAttribute('aria-selected') === 'true') continue;
     // Recheck after awaiting options and after every preceding selection.
     if (hasNativeFormAction(match)) {
@@ -651,11 +653,11 @@ async function setCustomChoiceValue(document, element, answer) {
   return { ok: true };
 }
 
-async function fillElement(document, element, answer) {
+async function fillElement(document, element, answer, deadline = Infinity) {
   if (!element) return { ok: false, reason: 'The field control is no longer available' };
   element.__jobApplicationAutofillValue = String(answer);
   delete element.__jobApplicationUserEdited;
-  if (customWidgetElements(document).includes(element)) return setCustomChoiceValue(document, element, answer);
+  if (customWidgetElements(document).includes(element)) return setCustomChoiceValue(document, element, answer, deadline);
   if (element.tagName === 'SELECT') return { ok: setSelectValue(element, answer) };
   if (element.type === 'radio') return { ok: setRadioGroup(document, element, answer) };
   if (element.type === 'checkbox') return { ok: setCheckbox(element, answer) };
@@ -855,12 +857,12 @@ function hiringCompanyDefault(field, profile = {}, page = {}) {
   if (!employers.length) return null;
   const employer = employers.find((entry) => company === entry || ` ${text} `.includes(` ${entry} `));
   if (/have you (?:ever |previously )?(?:worked (?:at|for|with)|been employed (?:at|by|with))|former employee|prior employment/.test(text)) {
-    return employer ? { value: 'Yes', reason: 'Confirmed prior employer' } : { value: 'No', reason: 'No prior employment at this company' };
+    return employer ? { value: 'Yes', reason: 'Saved prior employer; confirm relationship' } : null;
   }
-  if (/relative|family member|related to/.test(text)) {
+  if (/relative|family member|related to/.test(text) && profile.defaultsConfirmation?.relatedToHiringCompany === 'confirmed') {
     return { value: profile.defaults?.relatedToHiringCompany || 'No', reason: 'Profile company-relationship default' };
   }
-  if (/know (?:anyone|someone)|friends? (?:or )?contacts?|any contacts? (?:at|in)/.test(text)) {
+  if (/know (?:anyone|someone)|friends? (?:or )?contacts?|any contacts? (?:at|in)/.test(text) && profile.defaultsConfirmation?.knownAtHiringCompany === 'confirmed') {
     return { value: profile.defaults?.knownAtHiringCompany || 'No', reason: 'Profile company-contact default' };
   }
   return null;
@@ -909,14 +911,24 @@ export function planDeterministicFill(fields, records, coverMessages = [], profi
       confidence: usableMatch.confidence === 'exact' ? 'high' : usableMatch.confidence,
       sensitivity: usableMatch.record.sensitivity || inferSensitivity(field.label, field.id),
       reason: usableMatch.reason,
+      matchKind: usableMatch.score === 1 ? (usableMatch.reason.startsWith('concept:') ? 'concept' : 'exact') : 'fuzzy',
     };
-  }).map((decision, index) => ({ ...decision, handle: fields[index].handle }));
+  }).map((decision, index) => {
+    const sources = (decision.evidenceKeys || []).map(key => records.find(record => record.key === key)).filter(Boolean);
+    const decorated = { ...decision, handle: fields[index].handle,
+      confirmationState: sources.length && sources.every(record => record.confirmationState === 'confirmed') ? 'confirmed' : 'unconfirmed',
+      reusePolicy: sources.some(record => (record.semantic?.reusePolicy || record.reusePolicy) === 'never') ? 'never' : sources.some(record => (record.semantic?.reusePolicy || record.reusePolicy) === 'review_only') ? 'review_only' : 'allowed',
+      matchKind: decision.matchKind || (decision.transformation ? 'derived' : 'exact'),
+    };
+    return { ...decorated, ...decideDisposition(decorated, fields[index]) };
+  });
 }
 
-export async function applyDecisions(document, decisions = []) {
+export async function applyDecisions(document, decisions = [], { deadline = Infinity } = {}) {
   const result = { applied: [], kept: [], reviewRequired: [], unresolved: [], failed: [] };
   for (const decision of decisions) {
     try {
+    if (Date.now() >= deadline) { result.unresolved.push({ fieldId: decision.fieldId, reason: 'Autofill deadline reached' }); continue; }
     const field = currentField(document, decision.fieldId);
     if (!field || (decision.handle && decision.handle !== field.handle)) {
       result.failed.push({ fieldId: decision.fieldId, reason: 'Field is no longer on the page' });
@@ -938,9 +950,16 @@ export async function applyDecisions(document, decisions = []) {
       continue;
     }
     const current = field.currentValue;
-    if (current && validateFillValue(field, current).ok) {
+    if (current && decision.approved !== true) {
       result.kept.push({ fieldId: field.id, value: current });
       addReviewIfNeeded(result, field, decision, current);
+      continue;
+    }
+    const policy = decideDisposition(decision, field);
+    if (policy.disposition !== 'autofill') {
+      const issue = { ...decision, field, sensitivity: effectiveSensitivity(field, decision), reason: policy.reason, disposition: policy.disposition };
+      if (policy.disposition === 'review') result.reviewRequired.push(issue);
+      else result.unresolved.push({ ...issue, fieldId: field.id, label: field.label });
       continue;
     }
     // Custom options may be filtered, stale, or loaded only after opening/searching.
@@ -951,8 +970,18 @@ export async function applyDecisions(document, decisions = []) {
       continue;
     }
     document.__jobApplicationFilling = true;
-    const fillResult = await fillElement(document, element, decision.value);
-    await new Promise((resolve) => setTimeout(resolve, 25));
+    const fillResult = await fillElement(document, element, decision.value, deadline);
+    const immediateValue = fieldValue(document, element);
+    await waitForDocumentSettled(document, { quietMs: 75, minWaitMs: 120, timeoutMs: Math.max(0, Math.min(400, deadline - Date.now())) });
+    const retained = fieldValue(document, element);
+    const expected = field.type === 'checkbox' ? (/^(yes|true|checked)$/i.test(String(decision.value)) ? 'Yes' : 'No') : String(decision.value).trim();
+    const valuesEqual = (left, right) => field.multiple
+      ? left.split(/\s*[,;]\s*/).sort().join('|') === right.split(/\s*[,;]\s*/).sort().join('|')
+      : left === right;
+    if (fillResult?.ok && (!valuesEqual(retained, field.widget === 'custom' ? immediateValue : expected) || !currentField(document, field.id) || currentField(document, field.id).handle !== field.handle)) {
+      result.failed.push({ fieldId: field.id, reason: 'The control did not retain the exact approved value after settling' });
+      continue;
+    }
     if (!element.isConnected || !checkValiditySafely(element) || (field.widget !== 'custom' && !fieldValue(document, element))) {
       result.failed.push({ fieldId: field.id, reason: 'The control did not retain a valid value' });
       continue;

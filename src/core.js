@@ -1,4 +1,4 @@
-import { conceptForNormalized } from './concepts.js';
+import { conceptForNormalized, CONCEPT_REGISTRY } from './concepts.js';
 
 const AUTOCOMPLETE_KEYS = {
   email: ['email'],
@@ -27,6 +27,11 @@ export function isOpaqueIdentifier(value) {
 
 export function canonicalConcept(value = '') {
   return conceptForNormalized(normalizeText(value));
+}
+
+function recordConceptFor(record) {
+  const candidates = [record.concept, record.key, record.question].filter(Boolean).map(canonicalConcept);
+  return candidates.find(concept => Object.hasOwn(CONCEPT_REGISTRY, concept)) || canonicalConcept(record.question || record.key);
 }
 
 const SENSITIVITIES = new Set(['safe', 'review', 'legal']);
@@ -96,7 +101,7 @@ export function normalizeAnswerRecord(record = {}) {
     sensitivity,
     updatedAt,
   };
-  for (const key of ['id', 'concept', 'entityId', 'entityType', 'employmentId', 'context', 'provenance', 'confirmedAt', 'confirmationState', 'pendingAnswer']) {
+  for (const key of ['id', 'concept', 'entityId', 'entityType', 'employmentId', 'context', 'provenance', 'confirmedAt', 'confirmationState', 'pendingAnswer', 'reusePolicy']) {
     if (record[key] != null && String(record[key]).trim()) normalized[key] = String(record[key]).trim();
   }
   if (Array.isArray(record.evidenceKeys)) normalized.evidenceKeys = uniqueStrings(record.evidenceKeys);
@@ -153,6 +158,8 @@ function candidateLabels(record) {
 }
 
 export function recordScopeCompatible(field, record) {
+  if (record.semantic?.reusePolicy === 'never' || record.reusePolicy === 'never') return false;
+  if (record.suppressedFor?.includes(suggestionTargetKey(field))) return false;
   if (record.confirmationState === 'pending') return false;
   if (record.alternatives?.length && record.confirmationState !== 'confirmed') return false;
   if (record.employmentId && record.employmentId !== field.employmentId) return false;
@@ -172,7 +179,7 @@ export function meaningCompatible(field, record, { numericReview = true } = {}) 
   const left = normalizeText(field.label || field.question);
   const right = normalizeText(record.question || record.key);
   const fieldConcept = canonicalConcept(field.label || field.question || field.name || field.id || '');
-  const recordConcept = canonicalConcept(record.concept || record.key || record.question);
+  const recordConcept = recordConceptFor(record);
   const phoneConcepts = new Set(['phone_number', 'phone_extension', 'phone_country_code', 'phone_device_type']);
   if (phoneConcepts.has(fieldConcept) || phoneConcepts.has(recordConcept)) return fieldConcept === recordConcept;
   const protectedConcepts = ['first_name', 'last_name', 'full_name', 'preferred_name', 'github_url', 'linkedin_url', 'portfolio_url', 'date_of_birth'];
@@ -221,7 +228,7 @@ export function chooseRecord(field = {}, records = []) {
   const fieldConcept = canonicalConcept(field.label || field.name || field.id || '');
   const unambiguous = (candidates) => new Set(candidates.map((record) => String(record.answer).trim())).size === 1 ? candidates[0] : null;
   if (fieldConcept === 'generic_name') {
-    const fullName = unambiguous(records.filter((record) => canonicalConcept(record.concept || record.key || record.question) === 'full_name' && String(record.answer ?? '').trim()));
+    const fullName = unambiguous(records.filter((record) => recordConceptFor(record) === 'full_name' && String(record.answer ?? '').trim()));
     return fullName ? { record: fullName, confidence: 'high', score: 1, reason: 'generic-name:full_name' } : null;
   }
   if (fieldConcept) {
@@ -235,7 +242,7 @@ export function chooseRecord(field = {}, records = []) {
     let candidates = records.filter((record) => preferredKeys.includes(slugify(record.key)) && String(record.answer ?? '').trim());
     if (autocompleteToken === 'url') {
       const compatible = records.filter((record) => {
-        const concept = canonicalConcept(record.key || record.question);
+        const concept = recordConceptFor(record);
         return String(record.answer ?? '').trim()
           && (concept === fieldConcept || candidateLabels(record).some((candidate) => fieldLabel.includes(normalizeText(candidate))));
       });
@@ -250,7 +257,7 @@ export function chooseRecord(field = {}, records = []) {
   const bestByRecord = new Map();
   for (const record of records) {
     if (!String(record.answer ?? '').trim()) continue;
-    const recordConcept = canonicalConcept(record.concept || record.key || record.question);
+    const recordConcept = recordConceptFor(record);
     if (['first_name', 'last_name', 'full_name', 'preferred_name', 'github_url', 'linkedin_url', 'portfolio_url', 'date_of_birth'].includes(fieldConcept)
       && recordConcept !== fieldConcept) continue;
     if (fieldConcept && fieldConcept !== 'generic_name' && fieldConcept !== slugify(field.label || field.name || field.id || '')
@@ -326,15 +333,31 @@ export function validateFillValue(field = {}, value) {
   return { ok: true, reason: 'valid' };
 }
 
+export function decideDisposition(decision = {}, field = {}) {
+  const manual = reason => ({ disposition: 'manual', reason });
+  const review = reason => ({ disposition: 'review', reason });
+  const sensitivity = inferSensitivity(field.label || field.question, `${field.name || ''} ${field.id || ''}`);
+  if (field.labelConfidence === 'low') return manual('Field meaning is unclear');
+  if (field.entityUnresolved) return manual('Employment identity is unresolved');
+  if (sensitivity === 'legal' || decision.sensitivity === 'legal') return manual('Legal and consent answers require manual entry');
+  if (decision.reusePolicy === 'never' || decision.semantic?.reusePolicy === 'never') return manual('Source prohibits reuse');
+  if (decision.action === 'ask_user' || decision.value == null || !String(decision.value).trim() || decision.compatible === false || decision.conflicting) return manual('Missing, conflicting, or incompatible evidence');
+  if (decision.confirmationState === 'pending') return manual('Saved answer has a pending conflict');
+  if (decision.approved === true) return { disposition: 'autofill', reason: 'Explicitly approved answer' };
+  if (decision.reusePolicy === 'review_only' || decision.semantic?.reusePolicy === 'review_only') return review('Source requires review on every reuse');
+  if (sensitivity !== 'safe' || decision.sensitivity !== 'safe') return review('Sensitive answer requires approval');
+  if (normalizeText(field.type) === 'textarea' || String(decision.value).length > 240 || /describe|tell us|why.*(?:join|company|work)|motivat/.test(normalizeText(field.label))) return review('Narrative answer requires approval');
+  if (decision.confirmationState !== 'confirmed') return review('Saved answer is not confirmed');
+  if (!['exact', 'concept'].includes(decision.matchKind) || decision.confidence !== 'high') return review('Match requires explicit approval');
+  return { disposition: 'autofill', reason: 'Unique confirmed compatible short fact' };
+}
+
 export function shouldReviewDecision(decision = {}, field = {}) {
-  return decision.sensitivity !== 'safe'
-    || decision.confidence !== 'high'
-    || normalizeText(field.type) === 'textarea'
-    || String(decision.value ?? '').length > 240;
+  return decideDisposition(decision, field).disposition !== 'autofill';
 }
 
 export function shouldAutofill(record = {}) {
-  return String(record.answer ?? '').trim() !== '' && record.sensitivity === 'safe';
+  return decideDisposition({ value: record.answer, sensitivity: record.sensitivity, confirmationState: record.confirmationState, reusePolicy: record.semantic?.reusePolicy || record.reusePolicy, matchKind: 'exact', confidence: 'high' }, { label: record.question, type: record.type }).disposition === 'autofill';
 }
 
 export function upsertAnswerRecords(existing = [], incoming = [], updatedAt = new Date().toISOString()) {

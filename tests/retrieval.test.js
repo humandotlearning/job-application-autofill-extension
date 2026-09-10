@@ -71,3 +71,16 @@ test('retrieves a human-readable saved answer for reviewed choice mapping', asyn
   assert.equal(candidates[0]?.kind, 'choice_mapping');
   assert.equal(candidates[0]?.requiresApproval, true);
 });
+
+test('saved-answer search is not capped by the three recommendation slots', async () => {
+  const { searchEvidence } = await import('../src/retrieval.js');
+  const records = ['First', 'Second', 'Third', 'Fourth'].map((answer, index) => ({
+    key: `tool_${index}`,
+    question: 'Preferred tool',
+    answer,
+    confirmationState: 'confirmed',
+    sensitivity: 'safe',
+  }));
+  const candidates = searchEvidence({ label: 'Preferred tool', type: 'text' }, records, { limit: 20 });
+  assert.deepEqual(candidates.map((candidate) => candidate.answer), ['First', 'Second', 'Third', 'Fourth']);
+});

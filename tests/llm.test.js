@@ -201,12 +201,30 @@ test('uses Fireworks chat completions with the default provider and model', asyn
   assert.equal(request.options.headers.Authorization, 'Bearer fireworks-test-key');
   const body = JSON.parse(request.options.body);
   assert.equal(body.model, DEFAULT_FIREWORKS_MODEL);
-  assert.equal(body.max_tokens, 131072);
+  assert.equal(body.max_tokens, 512);
   assert.equal(body.top_k, 40);
-  assert.equal(body.response_format.type, 'json_object');
+  assert.equal(body.response_format.type, 'json_schema');
+  assert.deepEqual(body.response_format.json_schema.schema, body.response_format.json_schema.schema);
+  assert.match(body.messages[0].content, /JSON schema/);
+  assert.match(body.messages[0].content, /evidenceKeys/);
   assert.equal(body.messages[0].role, 'system');
   assert.equal(body.messages[1].role, 'user');
   assert.deepEqual(result.decisions.map(({ fieldId }) => fieldId), ['full_name', 'portfolio']);
+});
+
+test('Fireworks rewrite uses the shared strict schema and bounded token budget', async () => {
+  let body;
+  await callAnswerRewriter({ apiKey: 'test', question: 'Why?', draft: 'Because.' }, {
+    provider: 'fireworks',
+    fetchImpl: async (_url, options) => {
+      body = JSON.parse(options.body);
+      return createResponse({ choices: [{ message: { content: JSON.stringify({ answer: 'Because.' }) } }] });
+    },
+  });
+  assert.equal(body.max_tokens, 1024);
+  assert.equal(body.response_format.type, 'json_schema');
+  assert.equal(body.response_format.json_schema.name, 'answer_rewriter');
+  assert.deepEqual(body.response_format.json_schema.schema.required, ['answer']);
 });
 
 test('rejects non-2xx responses', async () => {

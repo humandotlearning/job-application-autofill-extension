@@ -1,6 +1,6 @@
 # Job Application Autofill
 
-A personal Manifest V3 Chrome extension that fills job forms quickly from a local answer profile, asks an OpenAI model only about unresolved fields, and learns from values you explicitly save after review.
+A personal Manifest V3 Chrome extension that reads rendered application forms, fills uniquely confirmed safe short answers from a local profile, and offers optional AI assistance through Fireworks or OpenAI. Sensitive, narrative, fuzzy, and AI-proposed answers require review; final submission stays on the application site.
 
 ## Saved-answer reuse
 
@@ -12,7 +12,7 @@ Confirmed semantic-equivalent reuse adds an alias to its stable source. Edited o
 
 Compensation current/expected, component, currency, period and scale are protected. A generic free-text CTC field can offer an intact LPA explanation for approval; it does not guess units, convert numbers, or infer fixed/variable splits. Explicit incompatible units remain blocked.
 
-Optional AI receives at most 20 locally relevant records, not the whole answer library. Fields already waiting on local saved-evidence approval are not sent to AI. Generated synthesis is not supported by the copy/transformation schema.
+The AI planner receives at most 20 locally selected records. Fields already waiting on saved-evidence approval are excluded from planning. A separate suggestion generator can compose drafts; the planner itself supports only evidence-backed copying and constrained transformations.
 
 ## Runtime flow
 
@@ -21,12 +21,12 @@ flowchart TD
     A[Fill application] --> B[Service worker creates applicationRun]
     B --> C[Inspect visible supported fields]
     C --> D[Deterministic local matching]
-    D --> E[Fill validated high-confidence answers]
+    D --> E[Apply local decisions and report review items]
     E --> F{Fields still empty or invalid?}
     F -->|No| G[Rescan and validate page]
-    F -->|Yes| H[One Responses API batch]
-    H --> I[Strict JSON decisions]
-    I --> J[Validate type, options, pattern, length, bounds]
+    F -->|Yes| H[AI planner and optional generated drafts]
+    H --> I[Review proposal in side panel]
+    I --> J[User approves; validate destination and fill locally]
     J --> G
     G --> K{Manual pause?}
     K -->|Required/invalid, upload, CAPTCHA, login, unresolved custom widget| L[Focus first issue and wait]
@@ -40,7 +40,7 @@ flowchart TD
     R --> S[Persist captured values; never submit the site]
 ```
 
-The page receives field descriptors and validated decisions, never the API key. The model cannot execute selectors or click controls.
+The content script reads the rendered DOM, not a remote form-schema API or screenshots. It extracts labels, ARIA metadata, nearby questions, options, values, constraints, and section context. Local code writes values and dispatches form events. The model cannot execute selectors or click controls; the content script never receives the API key.
 
 ### Generic custom controls
 
@@ -55,7 +55,7 @@ sequenceDiagram
     participant Page as Content script
     participant Profile as chrome.storage.local
     participant Run as chrome.storage.session
-    participant OpenAI as OpenAI Responses API
+    participant OpenAI as Selected AI provider
 
     Panel->>Worker: Fill this page
     Worker->>Run: status=running, keyed by tab
@@ -66,14 +66,16 @@ sequenceDiagram
     Page-->>Worker: applied, kept, failed, reviewRequired
     Worker->>OpenAI: unresolved descriptors + local records only
     OpenAI-->>Worker: strict FillDecision JSON
-    Worker->>Page: apply validated decisions
+    Worker->>Run: hold AI proposals for review
+    Panel->>Worker: approve answer for this live field
+    Worker->>Page: validate destination, apply and read back
     Worker->>Page: capture final values before navigation
     Worker->>Run: page snapshots, blockers, review, audit
     Panel->>Worker: Continue to next page (explicit approval)
     Worker->>Page: click one validated Next/Continue
-    Panel->>Worker: Save answers (final page only)
+    Panel->>Worker: Save answers (local checkpoint)
     Worker->>Page: inspect, validate, and capture again
-    Worker->>Profile: upsert saved values and aliases
+    Worker->>Profile: capture drafts and queue eligible learning proposals
 ```
 
 Embedded application forms are supported. When a tab contains multiple frames,
@@ -88,15 +90,14 @@ frame can be identified, the run pauses for manual completion.
 flowchart LR
     A[Activate an application] --> B[Capture edits and navigation checkpoints]
     B --> C[Persist drafts with provenance and entity scope]
-    C --> D{Completed user fact?}
-    D -->|Safe and unambiguous| E[Learn automatically]
-    D -->|Sensitive or conflicting| F[Confirm in side panel]
-    D -->|Generated or incomplete| G[Keep provisional draft]
-    E --> H[(Chrome local storage)]
-    F --> H
+    C --> D[Save checkpoint or observed final submit]
+    D --> E[Classify eligible new user answers with AI or request manual labeling]
+    E --> F[Learning inbox: explicit approval]
+    F --> H[(Reusable local answers)]
+    C --> G[Generated or incomplete values remain drafts]
 ```
 
-Learning activates with **Fill this page**. Edits are debounced into application drafts; they are not automatically promoted into the reusable profile. **Save answers** or a saved-evidence approval is the explicit checkpoint. Provisional autofill and unreliable question labels remain ineligible for automatic confirmation. Datasource writes are serialized across tabs, and scoped legacy records and backups preserve separate entries and alternatives.
+Learning activates with **Fill this page**. Edits are debounced into local application drafts, not automatically promoted into the reusable profile. **Save answers** and observed final submission capture drafts and queue eligible new user answers in the learning inbox. Approving a learning proposal creates a reusable record. Approving saved evidence can separately save a reviewed equivalent alias or edited answer. Capturing a submit event does not prove the employer accepted the application. Scoped records and backups preserve separate entries and alternatives.
 
 The initial profile is bundled separately in `data/seed-data.json`, extracted from `resume.xlsx`, and imported only when the live datasource is empty. The live `answerRecords`, cover-message templates, and datasource metadata are stored in `chrome.storage.local`; extension updates never replace them. The side panel provides JSON export and non-destructive import for backups.
 
@@ -104,13 +105,23 @@ The workbook seed contains the profile links from `Sheet1`, answered rows from `
 
 ## Data sent to the model
 
-At most one request is made per page, and only when local answers do not cover it. The request contains:
+AI has four separate roles; a page can cause multiple requests:
+
+| Role | Input | Result |
+| --- | --- | --- |
+| Planner | Unresolved descriptors, title/domain, up to 20 selected records | Evidence-backed proposal requiring approval |
+| Suggestions | One question, job context, up to 40 readable records | Up to three composed drafts for review |
+| Rewrite | Draft, user instruction, job context, up to 20 records | Revised draft, never a direct page mutation |
+| Learning reviewer | Up to 10 eligible new user-answer candidates | Labels, aliases and reuse metadata for inbox approval |
+
+Depending on the operation, requests contain:
 
 - page title and hostname;
 - visible field descriptors: label, type, autocomplete, current value, options, required state, and HTML constraints;
 - local learned answer records: canonical key, question, answer, aliases, type, and sensitivity.
+- For suggestions and rewriting: extracted role, company, job description, and relevant candidate facts. Personal answer text can be transmitted.
 
-It does not contain raw HTML, hidden inputs, passwords, cookies, URLs with query strings, or the API key. The model must use evidence from the supplied records and return `ask_user` when evidence is missing or ambiguous. Failed API calls fall back to local fills and a manual pause.
+Raw HTML, hidden/password inputs, cookies, and file contents are not collected for AI. Page context uses hostname rather than the application URL; answer text can contain user-supplied URLs. The key is sent only as authentication to the chosen provider, not in the prompt or to the page. Evidence-reference validation does not prove every generated narrative claim is true; review drafts before using them.
 
 The extension uses the configured AI provider and answer-planner model. Fireworks is the default provider with model `accounts/fireworks/models/glm-5p3-flash`; OpenAI remains available as an alternative. Fireworks requests use the OpenAI-compatible Chat Completions endpoint and JSON output mode. The provider, model ID, and provider-specific API keys are held in trusted `chrome.storage.local` and read only by the extension side panel/service worker.
 
@@ -124,7 +135,9 @@ The extension uses the configured AI provider and answer-planner model. Firework
 6. Click **Fill this page**. Complete any highlighted required fields or manual steps, then click **Check again**.
 7. When a page is ready, review it and click **Continue to next page**. On the final page, review the form and submit through the application site; the extension captures the final values automatically. **Save answers** remains available as an optional local checkpoint.
 
-When updating the unpacked extension, preserve unsaved form values before any browser operation. Run `npm run build`, reload the extension card (not the application page), and reopen the panel. The content PING reports version `general-reuse-1`; verify this before using the new feature on an existing page. Reinjecting the same version is tested to preserve values and avoid duplicate listeners. The old boolean installation guard cannot safely dispose legacy listeners: if the old script still responds without the version, stop rather than resetting its guard or reloading an unsaved application. Legacy live hot-upgrade requires separate browser verification; the automated build is not proof that an already-open tab is updated.
+Navigation is manual by default. The **Auto-advance pages** setting permits one validated Next action when the page is ready. It never enables final submission.
+
+When updating the unpacked extension, preserve unsaved form values before any browser operation. Run `npm run build`, reload the extension card (not the application page), and reopen the panel. The content PING reports version `reliable-review-1`; verify this before using the new feature on an existing page. Reinjecting the same version is tested to preserve values and avoid duplicate listeners. The old boolean installation guard cannot safely dispose legacy listeners: if the old script still responds without the version, stop rather than resetting its guard or reloading an unsaved application. Legacy live hot-upgrade requires separate browser verification; the automated build is not proof that an already-open tab is updated.
 
 Activated applications incrementally extend the local profile. Later equivalent questions reuse compatible confirmed answers. First, full, last, and preferred names remain distinct; full names can be composed from unambiguous first and last names. Ambiguous dates, unsupported transformations, conflicting records, and unmatched employment or education entities remain unresolved for review.
 

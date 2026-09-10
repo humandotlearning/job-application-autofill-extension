@@ -164,7 +164,7 @@ export async function callLearningReviewer({ apiKey, candidates = [] }, { fetchI
     const selectedProvider = provider === 'fireworks' ? 'fireworks' : 'openai';
     const selectedModel = String(model || (selectedProvider === 'fireworks' ? DEFAULT_FIREWORKS_MODEL : DEFAULT_OPENAI_MODEL)).trim();
     const request = selectedProvider === 'fireworks'
-      ? { url: FIREWORKS_CHAT_URL, body: { model: selectedModel, max_tokens: 131072, top_k: 40, presence_penalty: 0, frequency_penalty: 0, messages: [{ role: 'system', content: systemText }, { role: 'user', content: userText }], response_format: { type: 'json_object' } } }
+      ? { url: FIREWORKS_CHAT_URL, body: { model: selectedModel, max_tokens: 3000, top_k: 40, presence_penalty: 0, frequency_penalty: 0, messages: [{ role: 'system', content: `${systemText}\nReturn JSON matching this JSON schema exactly: ${JSON.stringify(REVIEW_SCHEMA)}` }, { role: 'user', content: userText }], response_format: { type: 'json_schema', json_schema: { name: 'learning_review', strict: true, schema: REVIEW_SCHEMA } } } }
       : { url: OPENAI_RESPONSE_URL, body: { model: selectedModel, store: false, reasoning: { effort: 'low' }, max_output_tokens: 3000, instructions: systemText, input: [{ role: 'user', content: [{ type: 'input_text', text: userText }] }], text: { format: { type: 'json_schema', name: 'learning_review', strict: true, schema: REVIEW_SCHEMA } } } };
     const response = await fetchImpl(request.url, { method: 'POST', signal: controller.signal, headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${String(apiKey).trim()}` }, body: JSON.stringify(request.body) });
     if (!response.ok) throw new Error(`Learning review failed (${response.status})`);

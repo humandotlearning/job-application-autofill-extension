@@ -26,6 +26,8 @@ const elements = {
   advancePage: byId('advance-page'),
   saveAnswers: byId('save-answers'),
   saveFeedback: byId('save-feedback'),
+  employmentChoices: byId('employment-choices'),
+  retryAi: byId('retry-ai'),
   runState: byId('run-state'),
   runHint: byId('run-hint'),
   actionRequiredCard: byId('action-required-card'),
@@ -57,6 +59,8 @@ let activeTabId = null;
 let currentRun = null;
 let busy = false;
 let saving = false;
+let currentProfile = null;
+let runRevision = 0;
 const correctionDrafts = new Map();
 const drafts = new Map();
 
@@ -69,12 +73,16 @@ function draftFor(origin, fieldId) {
   if (!drafts.has(key)) {
     drafts.set(key, {
       answer: '', sourceKey: null, sourceKeys: [], candidateKind: null, editing: false, revision: 0, pending: null,
+      rewriteInstruction: '', searchQuery: '', jobDescription: '',
     });
   }
   const draft = drafts.get(key);
   draft.sourceKeys = Array.isArray(draft.sourceKeys) ? draft.sourceKeys : [];
   draft.revision = Number.isInteger(draft.revision) ? draft.revision : 0;
   draft.pending = draft.pending || null;
+  draft.rewriteInstruction = String(draft.rewriteInstruction || '');
+  draft.searchQuery = String(draft.searchQuery || '');
+  draft.jobDescription = String(draft.jobDescription || '');
   return draft;
 }
 
@@ -103,7 +111,7 @@ function fieldOrigin(item) {
   const field = suggestion.field || {};
   return {
     tabId: suggestion.tabId ?? activeTabId,
-    frameId: suggestion.frameId ?? item.frameId ?? currentRun?.frameId ?? currentRun?.frame?.id,
+    frameId: suggestion.frameId ?? item.frameId ?? currentRun?.frame?.frameId ?? currentRun?.frameId,
     applicationId: suggestion.applicationId ?? currentRun?.applicationId,
     pageSignature: suggestion.pageSignature ?? currentRun?.pageSignature,
     fieldId: field.id ?? item.fieldId,
@@ -130,10 +138,11 @@ function updateDatasourceSummary(datasource = {}) {
   if (datasource.learnedChanges) renderLearnedChanges(datasource.learnedChanges);
   renderLearningInbox(datasource.learningInbox || []);
   if (datasource.profile) {
+    currentProfile = structuredClone(datasource.profile);
     elements.employerName.value = datasource.profile.employment?.[0]?.company || 'DeepSight AI Labs';
-    elements.relatedDefault.value = datasource.profile.defaults?.relatedToHiringCompany || 'No';
-    elements.knownDefault.value = datasource.profile.defaults?.knownAtHiringCompany || 'No';
-    elements.phoneDeviceDefault.value = datasource.profile.defaults?.phoneDeviceType || 'Mobile';
+    elements.relatedDefault.value = datasource.profile.defaults?.relatedToHiringCompany || 'Unknown';
+    elements.knownDefault.value = datasource.profile.defaults?.knownAtHiringCompany || 'Unknown';
+    elements.phoneDeviceDefault.value = datasource.profile.defaults?.phoneDeviceType || 'Unknown';
   }
 }
 
@@ -337,7 +346,7 @@ function internalIdDisclosure(value, label = 'Internal ID') {
   return document.createDocumentFragment();
 }
 
-function answerNode(answer) {
+function answerNode(answer, detailKey = '') {
   const text = String(answer ?? '');
   if (text.length <= 180) {
     const span = document.createElement('span');
@@ -346,6 +355,7 @@ function answerNode(answer) {
   }
   const details = document.createElement('details');
   details.className = 'answer-details';
+  if (detailKey) details.dataset.panelDetail = detailKey;
   const summary = document.createElement('summary');
   summary.textContent = `${truncateAnswer(text)} (show full)`;
   const full = document.createElement('div');
@@ -353,6 +363,10 @@ function answerNode(answer) {
   full.textContent = text;
   details.append(summary, full);
   return details;
+}
+
+function panelDetailKey(origin, kind, suffix = '') {
+  return [origin.applicationId || '', origin.pageSignature || '', origin.fieldId || '', kind, suffix].join(':');
 }
 
 function answerWorkspace(item, displayLabel) {
@@ -378,11 +392,6 @@ function answerWorkspace(item, displayLabel) {
   edit.type = 'button';
   edit.dataset.editAnswer = 'true';
   edit.textContent = 'Edit';
-  const useEdited = document.createElement('button');
-  useEdited.type = 'button';
-  useEdited.dataset.useEditedAnswer = 'true';
-  useEdited.textContent = 'Use edited answer';
-  useEdited.hidden = !state.editing;
   const rewrite = document.createElement('button');
   rewrite.type = 'button';
   rewrite.dataset.rewriteAnswer = 'true';
@@ -398,6 +407,7 @@ function answerWorkspace(item, displayLabel) {
   promptRow.hidden = true;
   const prompt = document.createElement('textarea');
   prompt.dataset.rewritePrompt = 'true';
+  prompt.value = state.rewriteInstruction;
   prompt.maxLength = 1000;
   prompt.placeholder = 'For example: make this more concise and confident.';
   prompt.setAttribute('aria-label', `Rewrite instruction for ${displayLabel}`);
@@ -414,8 +424,6 @@ function answerWorkspace(item, displayLabel) {
     textarea.disabled = pending;
     prompt.disabled = pending;
     edit.disabled = pending || !state.answer.trim();
-    useEdited.hidden = !state.editing;
-    useEdited.disabled = pending;
     rewrite.disabled = pending || !state.answer.trim();
     submitRewrite.disabled = pending || !state.answer.trim() || !prompt.value.trim();
     send.disabled = pending || !hasAnswer;
@@ -431,17 +439,14 @@ function answerWorkspace(item, displayLabel) {
     updateControls();
     textarea.focus();
   });
-  useEdited.addEventListener('click', () => {
-    state.answer = textarea.value;
-    state.editing = false;
-    updateControls();
-    setStatus('Edited answer is ready. Send it to the form when you are ready.');
-  });
   rewrite.addEventListener('click', () => {
     promptRow.hidden = false;
     prompt.focus();
   });
-  prompt.addEventListener('input', updateControls);
+  prompt.addEventListener('input', () => {
+    state.rewriteInstruction = prompt.value;
+    updateControls();
+  });
   submitRewrite.addEventListener('click', async () => {
     const instruction = prompt.value.trim();
     if (!instruction || !state.answer.trim()) return;
@@ -468,7 +473,7 @@ function answerWorkspace(item, displayLabel) {
       updateControls();
     }
   });
-  send.addEventListener('click', async () => {
+  const applyAnswer = async () => {
     const answer = state.answer;
     if (!answer.trim() || isOpaqueIdentifier(answer)) return;
     const requestRevision = state.revision;
@@ -497,11 +502,12 @@ function answerWorkspace(item, displayLabel) {
       if (state.pending === 'apply') state.pending = null;
       updateControls();
     }
-  });
-  controls.append(edit, useEdited, rewrite, send);
+  };
+  send.addEventListener('click', applyAnswer);
+  controls.append(edit, rewrite, send);
   workspace.append(workspaceLabel, textarea, controls, promptRow);
   updateControls();
-  return { workspace, state, origin, updateControls };
+  return { workspace, state, origin, updateControls, applyAnswer };
 }
 
 function itemRow(item, { focus = false, detail = '' } = {}) {
@@ -542,7 +548,7 @@ function itemRow(item, { focus = false, detail = '' } = {}) {
   else if (hasOpaqueValue) {
     value.append(document.createTextNode(`${fieldAction || 'This saved value cannot be used automatically.'} `));
     value.append(internalIdDisclosure(itemValue, 'Internal answer ID'));
-  } else if (itemValue) value.append(answerNode(itemValue));
+  } else if (itemValue) value.append(answerNode(itemValue, panelDetailKey(origin, 'value')));
   else if (unclearQuestion) value.textContent = `${item.nearbyContext ? `Nearby text: ${item.nearbyContext}. ` : ''}Use Show on page to identify this question, then write your answer.`;
   else value.textContent = fieldAction || item.reason || 'Review this field';
   content.append(label, value);
@@ -571,6 +577,38 @@ function itemRow(item, { focus = false, detail = '' } = {}) {
     ? answerWorkspace(item, displayLabel)
     : null;
   if (workspace) content.append(workspace.workspace);
+  if (workspace) {
+    const search = document.createElement('div');
+    search.className = 'answer-search';
+    const query = document.createElement('input');
+    query.dataset.searchQuery = 'true';
+    query.placeholder = 'Search saved answers';
+    query.value = workspace.state.searchQuery;
+    const button = document.createElement('button');
+    button.type = 'button'; button.dataset.searchAnswers = 'true'; button.textContent = 'Search';
+    const results = document.createElement('div');
+    button.addEventListener('click', async () => {
+      button.disabled = true;
+      try {
+        const response = await chrome.runtime.sendMessage({ type: 'JOB_RUN_SEARCH_ANSWERS', ...origin, fieldId: origin.fieldId, query: workspace.state.searchQuery.trim() });
+        if (!response?.ok) throw new Error(response?.error || 'Could not search saved answers.');
+        results.replaceChildren();
+        for (const candidate of response.candidates || []) {
+          if (isOpaqueIdentifier(candidate.answer)) continue;
+          const choice = document.createElement('button'); choice.type = 'button'; choice.dataset.searchResult = 'true'; choice.textContent = candidate.answer;
+          choice.addEventListener('click', () => {
+            updateDraftAnswer(workspace.state, candidate.answer); workspace.state.sourceKey = candidate.sourceKey || null;
+            workspace.state.sourceKeys = candidate.sourceKeys || (candidate.sourceKey ? [candidate.sourceKey] : []); workspace.state.candidateKind = candidate.kind || null;
+            workspace.state.editing = true; workspace.workspace.querySelector('[data-answer-draft]').value = candidate.answer; workspace.updateControls();
+          });
+          results.append(choice);
+        }
+        if (!results.children.length) results.textContent = 'No saved answers found.';
+      } catch (error) { setStatus(error.message, 'error'); } finally { button.disabled = false; }
+    });
+    query.addEventListener('input', () => { workspace.state.searchQuery = query.value; });
+    search.append(query, button, results); content.append(search);
+  }
   if (generated) {
     const drafts = Array.isArray(generated.suggestions) ? generated.suggestions : [];
     const draftList = document.createElement('div');
@@ -596,9 +634,25 @@ function itemRow(item, { focus = false, detail = '' } = {}) {
         workspace.state.editing = true;
         workspace.workspace.querySelector('[data-answer-draft]').value = workspace.state.answer;
         workspace.updateControls();
-        setStatus('AI draft selected. Review or edit it before sending it to the form.');
+        void workspace.applyAnswer();
       });
-      draft.append(answerNode(suggestion.answer), choose);
+      const editDraft = document.createElement('button');
+      editDraft.type = 'button';
+      editDraft.dataset.editGeneratedAnswer = 'true';
+      editDraft.textContent = 'Edit';
+      editDraft.addEventListener('click', () => {
+        if (!workspace) return;
+        updateDraftAnswer(workspace.state, suggestion.answer);
+        workspace.state.sourceKey = null;
+        workspace.state.sourceKeys = [];
+        workspace.state.candidateKind = null;
+        workspace.state.editing = true;
+        const draftInput = workspace.workspace.querySelector('[data-answer-draft]');
+        draftInput.value = workspace.state.answer;
+        workspace.updateControls();
+        draftInput.focus();
+      });
+      draft.append(answerNode(suggestion.answer, panelDetailKey(origin, 'generated', String(draftList.children.length))), choose, editDraft);
       draftList.append(draft);
     }
     if (generated.missingContext) {
@@ -614,15 +668,19 @@ function itemRow(item, { focus = false, detail = '' } = {}) {
     regenerate.textContent = drafts.length ? 'Generate again' : 'Generate suggestions';
     regenerate.addEventListener('click', async () => {
       if (!workspace) return;
-      const jobDescription = draftList.querySelector('[data-job-description]')?.value.trim();
+      const jobDescription = String(draftList.querySelector('[data-job-description]')?.value ?? workspace.state.jobDescription).trim();
+      workspace.state.jobDescription = jobDescription;
+      const actionRevision = runRevision;
       workspace.state.pending = 'generate';
       workspace.updateControls();
       regenerate.disabled = true;
       try {
         const response = await chrome.runtime.sendMessage({ type: 'JOB_RUN_GENERATE_SUGGESTIONS', ...workspace.origin, jobDescription });
         if (!response?.ok || !response.run) throw new Error(response?.error || 'Could not generate answer suggestions.');
-        renderRun(response.run);
-        setStatus('New suggestions are ready for review.');
+        if (canRenderActionResponse(response.run, actionRevision)) {
+          renderRun(response.run);
+          setStatus('New suggestions are ready for review.');
+        } else setStatus('The page changed while suggestions were prepared. Check the page again.', 'error');
       } catch (error) { setStatus(error.message, 'error'); }
       finally {
         workspace.state.pending = null;
@@ -632,13 +690,16 @@ function itemRow(item, { focus = false, detail = '' } = {}) {
     if (generated.missingContext && !currentRun?.jobContext?.jobDescription) {
       const details = document.createElement('details');
       details.className = 'job-description-editor';
+      details.dataset.panelDetail = panelDetailKey(origin, 'job-description');
       const summary = document.createElement('summary');
       summary.textContent = 'Add job description';
       const input = document.createElement('textarea');
       input.dataset.jobDescription = 'true';
+      input.value = workspace.state.jobDescription;
       input.maxLength = 16000;
       input.placeholder = 'Paste the job description to tailor suggestions.';
       input.setAttribute('aria-label', `Job description for ${displayLabel}`);
+      input.addEventListener('input', () => { workspace.state.jobDescription = input.value; });
       details.append(summary, input);
       draftList.append(details);
     }
@@ -649,6 +710,7 @@ function itemRow(item, { focus = false, detail = '' } = {}) {
     for (const candidate of candidates) {
       const evidence = document.createElement('details');
       evidence.className = 'saved-evidence';
+      evidence.dataset.panelDetail = panelDetailKey(origin, 'evidence', candidate.sourceKey || String(candidates.indexOf(candidate)));
       const summary = document.createElement('summary');
       const sourceQuestion = String(candidate.sourceQuestion || 'Saved answer');
       if (isOpaqueIdentifier(sourceQuestion)) {
@@ -674,7 +736,7 @@ function itemRow(item, { focus = false, detail = '' } = {}) {
       const choose = document.createElement('button');
       choose.type = 'button';
       choose.dataset.chooseAnswer = 'true';
-      choose.textContent = 'Choose this answer';
+      choose.textContent = 'Use answer';
       choose.addEventListener('click', () => {
         if (!workspace) return;
         updateDraftAnswer(workspace.state, candidate.answer);
@@ -685,11 +747,27 @@ function itemRow(item, { focus = false, detail = '' } = {}) {
         const draft = workspace.workspace.querySelector('[data-answer-draft]');
         draft.value = workspace.state.answer;
         workspace.updateControls();
-        setStatus('Saved answer selected. Review or edit it before sending it to the form.');
+        void workspace.applyAnswer();
+      });
+      const editCandidate = document.createElement('button');
+      editCandidate.type = 'button';
+      editCandidate.dataset.editCandidate = 'true';
+      editCandidate.textContent = 'Edit';
+      editCandidate.addEventListener('click', () => {
+        if (!workspace) return;
+        updateDraftAnswer(workspace.state, candidate.answer);
+        workspace.state.sourceKey = candidate.sourceKey || null;
+        workspace.state.sourceKeys = Array.isArray(candidate.sourceKeys) ? candidate.sourceKeys : (candidate.sourceKey ? [candidate.sourceKey] : []);
+        workspace.state.candidateKind = candidate.kind || null;
+        workspace.state.editing = true;
+        const draft = workspace.workspace.querySelector('[data-answer-draft]');
+        draft.value = workspace.state.answer;
+        workspace.updateControls();
+        draft.focus();
       });
       evidence.append(summary, answer);
       if (reason.textContent) evidence.append(reason);
-      evidence.append(choose);
+      evidence.append(choose, editCandidate);
       const sourceKeys = Array.isArray(candidate.sourceKeys) ? candidate.sourceKeys : [candidate.sourceKey].filter(Boolean);
       if (candidate.kind !== 'draft' && candidate.kind !== 'planner' && sourceKeys.length === 1) {
         const dismiss = document.createElement('button');
@@ -777,12 +855,12 @@ function setActionVisibility(run) {
     button.disabled = busy || status === 'running';
   }
   elements.primaryAction.hidden = false;
-  elements.checkPage.hidden = status !== 'page_ready';
+  elements.checkPage.hidden = !['waiting_user', 'page_ready'].includes(status);
   // The primary action carries the state-specific Continue/Save copy. Keep the
   // secondary row focused on the safe, repeatable “Check again” action.
   elements.advancePage.hidden = true;
-  elements.saveAnswers.hidden = !['waiting_user', 'page_ready'].includes(status);
-  elements.saveAnswers.textContent = saving ? 'Saving…' : 'Save filled values';
+  elements.saveAnswers.hidden = !['waiting_user', 'page_ready', 'ready_for_user_submit', 'answers_saved'].includes(status);
+  elements.saveAnswers.textContent = saving ? 'Saving…' : (['ready_for_user_submit', 'answers_saved'].includes(status) ? 'Save draft checkpoint' : 'Save filled values');
   elements.saveAnswers.setAttribute('aria-busy', String(saving));
   elements.secondaryActions.hidden = !hasRun || (elements.checkPage.hidden && elements.advancePage.hidden && elements.saveAnswers.hidden);
   if (!hasRun) {
@@ -790,14 +868,50 @@ function setActionVisibility(run) {
     return;
   }
   if (status === 'running') elements.primaryAction.textContent = 'Filling this page…';
-  else if (status === 'waiting_user') elements.primaryAction.textContent = 'Check again';
+  else if (status === 'waiting_user') elements.primaryAction.textContent = 'Fix first issue';
   else if (status === 'page_ready') elements.primaryAction.textContent = 'Continue to next page';
-  else if (status === 'ready_for_user_submit') elements.primaryAction.textContent = saving ? 'Saving…' : 'Save answers';
-  else if (status === 'answers_saved') elements.primaryAction.textContent = 'Start another application';
+  else if (['ready_for_user_submit', 'answers_saved'].includes(status)) elements.primaryAction.textContent = 'Review on site';
   else elements.primaryAction.textContent = 'Fill this page';
 }
 
+function capturePanelState() {
+  const active = document.activeElement;
+  const openDetails = Object.fromEntries([...document.querySelectorAll('details')]
+    .map((detail) => [detail.dataset.panelDetail || detail.id, detail.open])
+    .filter(([key]) => Boolean(key)));
+  return {
+    activeId: active?.id || '',
+    selectionStart: active?.selectionStart, selectionEnd: active?.selectionEnd,
+    openDetails,
+    scrollX: window.scrollX, scrollY: window.scrollY,
+  };
+}
+
+function restorePanelState(state) {
+  [...document.querySelectorAll('details')].forEach((detail) => {
+    const key = detail.dataset.panelDetail || detail.id;
+    if (key && Object.hasOwn(state.openDetails, key)) detail.open = state.openDetails[key];
+  });
+  const active = state.activeId ? document.getElementById(state.activeId) : null;
+  if (active) {
+    active.focus({ preventScroll: true });
+    if (Number.isInteger(state.selectionStart) && active.setSelectionRange) active.setSelectionRange(state.selectionStart, state.selectionEnd);
+  }
+  const scrollTo = window.scrollTo;
+  const supportsNativeScrollTo = typeof scrollTo === 'function'
+    && !String(scrollTo).includes('notImplemented');
+  if (supportsNativeScrollTo) {
+    try {
+      scrollTo(state.scrollX, state.scrollY);
+    } catch {
+      // Ignore environment specific scroll behavior failures.
+    }
+  }
+}
+
 function renderRun(run) {
+  const panelState = capturePanelState();
+  runRevision += 1;
   const previousOrigin = `${currentRun?.applicationId || ''}:${currentRun?.pageSignature || ''}`;
   const nextOrigin = `${run?.applicationId || ''}:${run?.pageSignature || ''}`;
   if (previousOrigin !== nextOrigin || !run) discardStaleDrafts(run);
@@ -816,6 +930,7 @@ function renderRun(run) {
     renderList(elements.optionalList, [], { emptyLabel: 'No optional fields', emptyDetail: 'Optional questions will appear here when unanswered.' });
     renderList(elements.auditList, [], { emptyLabel: 'No captured values', emptyDetail: 'Filled values will appear here after a page check.' });
     setActionVisibility(null);
+    restorePanelState(panelState);
     return;
   }
 
@@ -823,7 +938,23 @@ function renderRun(run) {
   const optionalUnresolved = run.optionalUnresolved || [];
   const reviewRequired = run.reviewRequired || [];
   const audit = run.audit || [];
-  elements.runState.textContent = STATUS_LABELS[run.status] || run.status;
+  const failedAi = Object.values(run.aiOperations || {}).some((operation) => ['failed', 'interrupted'].includes(operation?.status || operation));
+  elements.retryAi.hidden = !failedAi;
+  elements.employmentChoices.replaceChildren();
+  for (const choice of run.employmentChoices || []) {
+    const label = document.createElement('label'); label.textContent = choice.label || 'Choose employment';
+    const select = document.createElement('select'); select.dataset.employmentChoice = 'true';
+    const placeholder = document.createElement('option'); placeholder.textContent = 'Choose an employer'; placeholder.value = ''; select.append(placeholder);
+    for (const employer of choice.employers || []) { const option = document.createElement('option'); option.textContent = employer.company || 'Employer'; option.value = employer.id; select.append(option); }
+    select.addEventListener('change', async () => {
+      if (!select.value) return;
+      const response = await chrome.runtime.sendMessage({ type: 'JOB_RUN_SELECT_EMPLOYMENT', tabId: activeTabId, frameId: run.frame?.frameId ?? run.frameId, applicationId: run.applicationId, pageSignature: run.pageSignature, sectionId: choice.sectionId, employmentId: select.value });
+      if (!response?.ok) setStatus(response?.error || 'Could not select employment.', 'error'); else if (response.run) renderRun(response.run);
+    });
+    const group = document.createElement('div'); group.className = 'employment-choice'; group.append(label, select); elements.employmentChoices.append(group);
+  }
+  const progressLabels = { checking_fields: 'Checking fields…', local_fill_complete: 'Local fill complete', preparing_suggestions: 'Preparing suggestions…', ready: 'Ready' };
+  elements.runState.textContent = progressLabels[run.progress] || STATUS_LABELS[run.status] || run.status;
   const accentStatuses = ['waiting_user', 'page_ready', 'ready_for_user_submit', 'answers_saved'];
   elements.runState.className = `pill${accentStatuses.includes(run.status) ? '' : ' neutral'}`;
   setActionVisibility(run);
@@ -863,6 +994,16 @@ function renderRun(run) {
     elements.runHint.textContent = `Filling page ${run.pageNumber || 1}. The panel will stop for your review before navigation.`;
     setStatus(`Filling page ${run.pageNumber || 1}…`, 'busy');
   }
+  restorePanelState(panelState);
+}
+
+function canRenderActionResponse(run, actionRevision) {
+  if (runRevision === actionRevision) return true;
+  if (!currentRun || !run) return false;
+  if (currentRun.applicationId !== run.applicationId || currentRun.pageSignature !== run.pageSignature) return false;
+  const currentRevision = Number(currentRun.revision);
+  const responseRevision = Number(run.revision);
+  return !(Number.isFinite(currentRevision) && Number.isFinite(responseRevision) && responseRevision < currentRevision);
 }
 
 async function activeTab() {
@@ -877,6 +1018,7 @@ async function sendRunAction(type) {
   busy = true;
   saving = type === 'JOB_RUN_SAVE_ANSWERS';
   const actionTabId = activeTabId;
+  const actionRevision = runRevision;
   setSaveFeedback(saving ? 'Saving filled values…' : '', saving ? 'saving' : '');
   setActionVisibility(currentRun);
   setStatus(saving ? 'Saving filled values…' : 'Working on the current application…', 'busy');
@@ -885,7 +1027,12 @@ async function sendRunAction(type) {
     const response = await chrome.runtime.sendMessage({ type, tabId: tab.id });
     if (tab.id !== activeTabId) return;
     if (!response?.ok) throw new Error(response?.error || 'The application action could not be completed.');
-    renderRun(response.run);
+    if (type === 'JOB_RUN_SAVE_ANSWERS' && response.run && response.run.status === 'ready_for_user_submit' && currentRun?.status === 'ready_for_user_submit') {
+      response.run.status = 'answers_saved';
+      response.run.waitingFor = null;
+      response.run.waitingLabel = null;
+    }
+    if (response.run && canRenderActionResponse(response.run, actionRevision)) renderRun(response.run);
     if (type === 'JOB_RUN_SAVE_ANSWERS') {
       const legacyResponse = !['persisted', 'updated', 'unchanged', 'unresolved'].some((key) => Object.hasOwn(response, key));
       if (legacyResponse) {
@@ -918,11 +1065,19 @@ async function sendRunAction(type) {
 }
 
 async function runPrimaryAction() {
+  if (currentRun?.status === 'waiting_user') {
+    const first = (currentRun.actionRequired || currentRun.unresolved || [])[0];
+    if (first?.fieldId) return focusField(first.fieldId);
+  }
+  if (['ready_for_user_submit', 'answers_saved'].includes(currentRun?.status)) {
+    const first = currentRun.reviewRequired?.[0] || currentRun.audit?.[0];
+    if (first?.fieldId || first?.key) return focusField(first.fieldId || first.key);
+    setStatus('Review the application on the site before submitting.');
+    return;
+  }
   const type = !currentRun || currentRun.status === 'answers_saved'
     ? 'JOB_RUN_START'
-    : currentRun.status === 'waiting_user'
-      ? 'JOB_RUN_CHECK_PAGE'
-      : currentRun.status === 'page_ready'
+    : currentRun.status === 'page_ready'
         ? 'JOB_RUN_ADVANCE_PAGE'
         : currentRun.status === 'ready_for_user_submit'
           ? 'JOB_RUN_SAVE_ANSWERS'
@@ -1030,17 +1185,22 @@ async function saveSettings() {
   setStatus(elements.autoAdvance.checked ? 'Automatic page advance enabled.' : 'Automatic page advance disabled.');
 }
 
-async function saveProfile() {
+async function saveProfile(changedField) {
   try {
     const company = elements.employerName.value.trim() || 'DeepSight AI Labs';
     elements.employerName.value = company;
+    const employment = structuredClone(currentProfile?.employment || []);
+    if (employment.length) employment[0] = { ...employment[0], company };
+    else employment.push({ company });
+    const defaultsConfirmation = { ...(currentProfile?.defaultsConfirmation || {}) };
+    if (changedField && changedField !== 'employerName') defaultsConfirmation[changedField] = 'confirmed';
     const response = await chrome.runtime.sendMessage({ type: 'JOB_DATASOURCE_PROFILE_UPDATE', profile: {
-      employment: [{ company }],
+      ...(currentProfile || {}), employment,
       defaults: {
         relatedToHiringCompany: elements.relatedDefault.value,
         knownAtHiringCompany: elements.knownDefault.value,
         phoneDeviceType: elements.phoneDeviceDefault.value,
-      },
+      }, defaultsConfirmation,
     } });
     if (!response?.ok) throw new Error(response?.error || 'Could not save profile defaults.');
     updateDatasourceSummary(response.datasource);
@@ -1057,12 +1217,13 @@ elements.provider.addEventListener('change', saveProvider);
 elements.apiModel.addEventListener('change', saveModel);
 elements.apiModel.addEventListener('blur', saveModel);
 elements.autoAdvance.addEventListener('change', saveSettings);
-for (const field of [elements.employerName, elements.relatedDefault, elements.knownDefault, elements.phoneDeviceDefault]) field.addEventListener('change', saveProfile);
+for (const [field, key] of [[elements.employerName, 'employerName'], [elements.relatedDefault, 'relatedToHiringCompany'], [elements.knownDefault, 'knownAtHiringCompany'], [elements.phoneDeviceDefault, 'phoneDeviceType']]) field.addEventListener('change', () => saveProfile(key));
 elements.exportDatasource.addEventListener('click', exportDatasource);
 elements.importDatasourceButton.addEventListener('click', () => elements.importDatasource.click());
 elements.importDatasource.addEventListener('change', () => importDatasource(elements.importDatasource.files?.[0]));
 elements.primaryAction.addEventListener('click', runPrimaryAction);
-elements.checkPage.addEventListener('click', () => sendRunAction('JOB_RUN_CHECK_PAGE'));
+elements.checkPage.addEventListener('click', () => sendRunAction('JOB_RUN_VALIDATE_PAGE'));
+elements.retryAi.addEventListener('click', () => sendRunAction('JOB_RUN_RETRY_AI'));
 elements.advancePage.addEventListener('click', () => sendRunAction('JOB_RUN_ADVANCE_PAGE'));
 elements.saveAnswers.addEventListener('click', () => sendRunAction('JOB_RUN_SAVE_ANSWERS'));
 for (const container of [elements.actionRequiredList, elements.optionalList]) {

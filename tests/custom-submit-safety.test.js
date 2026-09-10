@@ -39,7 +39,7 @@ test('rechecks each option after the preceding selection changes its native type
   button.setAttribute('aria-multiselectable', 'true');
   const [first, second] = document.querySelectorAll('[role="option"]');
   first.onclick = () => { second.type = 'submit'; };
-  await applyDecisions(document, [{ fieldId: 'country', action: 'fill', value: 'India, Canada' }]);
+  await applyDecisions(document, [{ fieldId: 'country', action: 'fill', value: 'India, Canada', approved: true }]);
   assert.deepEqual(events, { submit: 0, reset: 0 });
 });
 
@@ -51,7 +51,7 @@ test('excludes externally form-associated and image custom triggers', async () =
 });
 
 async function fill(document) {
-  return applyDecisions(document, [{ fieldId: 'country', action: 'fill', value: 'India' }]);
+  return applyDecisions(document, [{ fieldId: 'country', action: 'fill', value: 'India', approved: true }]);
 }
 
 for (const type of ['', 'type="submit"', 'type="reset"', 'type="invalid"']) {

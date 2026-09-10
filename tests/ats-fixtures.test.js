@@ -33,7 +33,7 @@ test('Lever fixture fills only the application and preserves URL purpose and mul
     { key: 'full_name', answer: 'Ada Lovelace' }, { key: 'email', answer: 'ada@example.com' },
     { key: 'github', answer: 'https://github.com/example' }, { key: 'linkedin', answer: 'https://linkedin.com/in/example' },
     { key: 'skills', answer: 'JavaScript, Python' },
-  ].map((record) => ({ ...record, sensitivity: 'safe' }));
+  ].map((record) => ({ ...record, sensitivity: 'safe', confirmationState: 'confirmed' }));
   const result = await applyDecisions(document, planDeterministicFill(collectFieldDescriptors(document), records));
   assert.equal(result.applied.length, 5);
   assert.equal(document.querySelector('#subscribe-email').value, '');
@@ -68,7 +68,7 @@ test('Ashby fixture commits delayed searchable and multiple-selection options', 
     languages.textContent = [...document.querySelectorAll('#language-options [aria-selected="true"]')].map((item) => item.textContent).join(', ');
   });
   const result = await applyDecisions(document, planDeterministicFill(collectFieldDescriptors(document), [
-    { key: 'location', answer: 'London', sensitivity: 'safe' }, { key: 'languages', answer: 'English, French', sensitivity: 'safe' },
+    { key: 'location', answer: 'London', sensitivity: 'safe', confirmationState: 'confirmed' }, { key: 'languages', answer: 'English, French', sensitivity: 'safe', confirmationState: 'confirmed' },
   ]));
   assert.equal(result.applied.length, 2);
   assert.equal(result.unresolved.length, 0);

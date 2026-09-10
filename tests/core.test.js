@@ -156,7 +156,7 @@ test('validates options, patterns, lengths, and numeric bounds', () => {
 
 test('only high-confidence safe short answers are unreviewed', () => {
   const field = { type: 'text', label: 'Full name' };
-  assert.equal(shouldReviewDecision({ confidence: 'high', sensitivity: 'safe', value: 'Nithin' }, field), false);
+  assert.equal(shouldReviewDecision({ confidence: 'high', sensitivity: 'safe', value: 'Nithin', confirmationState: 'confirmed', matchKind: 'exact' }, field), false);
   assert.equal(shouldReviewDecision({ confidence: 'medium', sensitivity: 'safe', value: 'Nithin' }, field), true);
   assert.equal(shouldReviewDecision({ confidence: 'high', sensitivity: 'review', value: '14 days' }, field), true);
   assert.equal(shouldReviewDecision({ confidence: 'high', sensitivity: 'safe', value: 'long answer' }, { type: 'textarea' }), true);

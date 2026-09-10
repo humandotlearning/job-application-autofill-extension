@@ -1,0 +1,49 @@
+{
+  "corpus": "synthetic-regression-v2",
+  "representative": false,
+  "baseline": {
+    "corpus": "synthetic-regression-v1",
+    "count": 8,
+    "sourceCorrect": 7,
+    "answerCorrect": 7,
+    "dispositionCorrect": 2,
+    "automatic": 7,
+    "correctAutomatic": 1,
+    "representative": false,
+    "note": "Recorded before policy changes. Detection and review coverage were not measured in this initial baseline."
+  },
+  "comparableCurrent": {
+    "count": 8,
+    "detected": 8,
+    "sourceCorrect": 8,
+    "answerCorrect": 8,
+    "dispositionCorrect": 8,
+    "automatic": 1,
+    "correctAutomatic": 1,
+    "reviewExpected": 4,
+    "correctReview": 4
+  },
+  "expandedCurrent": {
+    "count": 20,
+    "detected": 20,
+    "sourceCorrect": 19,
+    "answerCorrect": 19,
+    "dispositionCorrect": 19,
+    "automatic": 2,
+    "correctAutomatic": 2,
+    "reviewExpected": 6,
+    "correctReview": 6
+  },
+  "atsDetection": {
+    "snapshots": 4,
+    "correctSnapshots": 4,
+    "expectedFields": 14,
+    "detectedFields": 14,
+    "unexpectedFields": 0
+  },
+  "retention": {
+    "cases": 2,
+    "correct": 2
+  },
+  "note": "Small synthetic regression checks; no estimate of real-world >99% accuracy. Expanded cases and detection have no pre-change baseline. No applicant values or field labels are logged."
+}

@@ -34,6 +34,8 @@
         <button id="save-answers" type="button">Save answers</button>
       </div>
       <p id="save-feedback" class="save-feedback" role="status" aria-live="polite" aria-atomic="true" hidden></p>
+      <div id="employment-choices"></div>
+      <button id="retry-ai" type="button" data-retry-ai hidden>Retry AI</button>
       <p id="run-hint" class="hint">Uploads, CAPTCHA, login, inaccessible widgets, and final site submission stay manual.</p>
     </section>
 
@@ -92,11 +94,11 @@
         <input id="employer-name" type="text" autocomplete="organization" value="DeepSight AI Labs">
         <p class="muted">Only saved employment for cross-site work-history fields.</p>
         <label for="related-default">Related to hiring company</label>
-        <select id="related-default"><option>No</option><option>Yes</option></select>
+        <select id="related-default"><option>Unknown</option><option>No</option><option>Yes</option></select>
         <label for="known-default">Know someone at hiring company</label>
-        <select id="known-default"><option>No</option><option>Yes</option></select>
+        <select id="known-default"><option>Unknown</option><option>No</option><option>Yes</option></select>
         <label for="phone-device-default">Phone device type</label>
-        <select id="phone-device-default"><option>Mobile</option><option>Landline</option></select>
+        <select id="phone-device-default"><option>Unknown</option><option>Mobile</option><option>Landline</option></select>
         <label for="ai-model">Answer planner model</label>
         <input id="ai-model" list="fireworks-models" type="text" autocomplete="off" spellcheck="false" value="accounts/fireworks/models/glm-5p3-flash" placeholder="accounts/fireworks/models/glm-5p3-flash">
         <datalist id="fireworks-models">

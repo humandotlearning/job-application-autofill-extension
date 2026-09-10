@@ -61,6 +61,11 @@ function canonicalConcept(value = '') {
   return conceptForNormalized(normalizeText(value));
 }
 
+function recordConceptFor(record) {
+  const candidates = [record.concept, record.key, record.question].filter(Boolean).map(canonicalConcept);
+  return candidates.find(concept => Object.hasOwn(CONCEPT_REGISTRY, concept)) || canonicalConcept(record.question || record.key);
+}
+
 const SENSITIVITIES = new Set(['safe', 'review', 'legal']);
 
 function timestamp(value, fallback = new Date().toISOString()) {
@@ -128,7 +133,7 @@ function normalizeAnswerRecord(record = {}) {
     sensitivity,
     updatedAt,
   };
-  for (const key of ['id', 'concept', 'entityId', 'entityType', 'employmentId', 'context', 'provenance', 'confirmedAt', 'confirmationState', 'pendingAnswer']) {
+  for (const key of ['id', 'concept', 'entityId', 'entityType', 'employmentId', 'context', 'provenance', 'confirmedAt', 'confirmationState', 'pendingAnswer', 'reusePolicy']) {
     if (record[key] != null && String(record[key]).trim()) normalized[key] = String(record[key]).trim();
   }
   if (Array.isArray(record.evidenceKeys)) normalized.evidenceKeys = uniqueStrings(record.evidenceKeys);
@@ -185,6 +190,8 @@ function candidateLabels(record) {
 }
 
 function recordScopeCompatible(field, record) {
+  if (record.semantic?.reusePolicy === 'never' || record.reusePolicy === 'never') return false;
+  if (record.suppressedFor?.includes(suggestionTargetKey(field))) return false;
   if (record.confirmationState === 'pending') return false;
   if (record.alternatives?.length && record.confirmationState !== 'confirmed') return false;
   if (record.employmentId && record.employmentId !== field.employmentId) return false;
@@ -204,7 +211,7 @@ function meaningCompatible(field, record, { numericReview = true } = {}) {
   const left = normalizeText(field.label || field.question);
   const right = normalizeText(record.question || record.key);
   const fieldConcept = canonicalConcept(field.label || field.question || field.name || field.id || '');
-  const recordConcept = canonicalConcept(record.concept || record.key || record.question);
+  const recordConcept = recordConceptFor(record);
   const phoneConcepts = new Set(['phone_number', 'phone_extension', 'phone_country_code', 'phone_device_type']);
   if (phoneConcepts.has(fieldConcept) || phoneConcepts.has(recordConcept)) return fieldConcept === recordConcept;
   const protectedConcepts = ['first_name', 'last_name', 'full_name', 'preferred_name', 'github_url', 'linkedin_url', 'portfolio_url', 'date_of_birth'];
@@ -253,7 +260,7 @@ function chooseRecord(field = {}, records = []) {
   const fieldConcept = canonicalConcept(field.label || field.name || field.id || '');
   const unambiguous = (candidates) => new Set(candidates.map((record) => String(record.answer).trim())).size === 1 ? candidates[0] : null;
   if (fieldConcept === 'generic_name') {
-    const fullName = unambiguous(records.filter((record) => canonicalConcept(record.concept || record.key || record.question) === 'full_name' && String(record.answer ?? '').trim()));
+    const fullName = unambiguous(records.filter((record) => recordConceptFor(record) === 'full_name' && String(record.answer ?? '').trim()));
     return fullName ? { record: fullName, confidence: 'high', score: 1, reason: 'generic-name:full_name' } : null;
   }
   if (fieldConcept) {
@@ -267,7 +274,7 @@ function chooseRecord(field = {}, records = []) {
     let candidates = records.filter((record) => preferredKeys.includes(slugify(record.key)) && String(record.answer ?? '').trim());
     if (autocompleteToken === 'url') {
       const compatible = records.filter((record) => {
-        const concept = canonicalConcept(record.key || record.question);
+        const concept = recordConceptFor(record);
         return String(record.answer ?? '').trim()
           && (concept === fieldConcept || candidateLabels(record).some((candidate) => fieldLabel.includes(normalizeText(candidate))));
       });
@@ -282,7 +289,7 @@ function chooseRecord(field = {}, records = []) {
   const bestByRecord = new Map();
   for (const record of records) {
     if (!String(record.answer ?? '').trim()) continue;
-    const recordConcept = canonicalConcept(record.concept || record.key || record.question);
+    const recordConcept = recordConceptFor(record);
     if (['first_name', 'last_name', 'full_name', 'preferred_name', 'github_url', 'linkedin_url', 'portfolio_url', 'date_of_birth'].includes(fieldConcept)
       && recordConcept !== fieldConcept) continue;
     if (fieldConcept && fieldConcept !== 'generic_name' && fieldConcept !== slugify(field.label || field.name || field.id || '')
@@ -358,15 +365,31 @@ function validateFillValue(field = {}, value) {
   return { ok: true, reason: 'valid' };
 }
 
+function decideDisposition(decision = {}, field = {}) {
+  const manual = reason => ({ disposition: 'manual', reason });
+  const review = reason => ({ disposition: 'review', reason });
+  const sensitivity = inferSensitivity(field.label || field.question, `${field.name || ''} ${field.id || ''}`);
+  if (field.labelConfidence === 'low') return manual('Field meaning is unclear');
+  if (field.entityUnresolved) return manual('Employment identity is unresolved');
+  if (sensitivity === 'legal' || decision.sensitivity === 'legal') return manual('Legal and consent answers require manual entry');
+  if (decision.reusePolicy === 'never' || decision.semantic?.reusePolicy === 'never') return manual('Source prohibits reuse');
+  if (decision.action === 'ask_user' || decision.value == null || !String(decision.value).trim() || decision.compatible === false || decision.conflicting) return manual('Missing, conflicting, or incompatible evidence');
+  if (decision.confirmationState === 'pending') return manual('Saved answer has a pending conflict');
+  if (decision.approved === true) return { disposition: 'autofill', reason: 'Explicitly approved answer' };
+  if (decision.reusePolicy === 'review_only' || decision.semantic?.reusePolicy === 'review_only') return review('Source requires review on every reuse');
+  if (sensitivity !== 'safe' || decision.sensitivity !== 'safe') return review('Sensitive answer requires approval');
+  if (normalizeText(field.type) === 'textarea' || String(decision.value).length > 240 || /describe|tell us|why.*(?:join|company|work)|motivat/.test(normalizeText(field.label))) return review('Narrative answer requires approval');
+  if (decision.confirmationState !== 'confirmed') return review('Saved answer is not confirmed');
+  if (!['exact', 'concept'].includes(decision.matchKind) || decision.confidence !== 'high') return review('Match requires explicit approval');
+  return { disposition: 'autofill', reason: 'Unique confirmed compatible short fact' };
+}
+
 function shouldReviewDecision(decision = {}, field = {}) {
-  return decision.sensitivity !== 'safe'
-    || decision.confidence !== 'high'
-    || normalizeText(field.type) === 'textarea'
-    || String(decision.value ?? '').length > 240;
+  return decideDisposition(decision, field).disposition !== 'autofill';
 }
 
 function shouldAutofill(record = {}) {
-  return String(record.answer ?? '').trim() !== '' && record.sensitivity === 'safe';
+  return decideDisposition({ value: record.answer, sensitivity: record.sensitivity, confirmationState: record.confirmationState, reusePolicy: record.semantic?.reusePolicy || record.reusePolicy, matchKind: 'exact', confidence: 'high' }, { label: record.question, type: record.type }).disposition === 'autofill';
 }
 
 function upsertAnswerRecords(existing = [], incoming = [], updatedAt = new Date().toISOString()) {
@@ -1025,7 +1048,7 @@ function waitForCustomOptions(document, element, answer, timeoutMs = 1500) {
   });
 }
 
-async function setCustomChoiceValue(document, element, answer) {
+async function setCustomChoiceValue(document, element, answer, deadline = Infinity) {
   element.focus?.();
   if (hasNativeFormAction(element)) {
     return { ok: false, unresolved: true, reason: 'Refusing to activate a native submit/reset control' };
@@ -1038,7 +1061,7 @@ async function setCustomChoiceValue(document, element, answer) {
     element.__jobApplicationSearchQuery = true;
     setTextValue(element, answer);
   }
-  const options = await waitForCustomOptions(document, element, answer);
+  const options = await waitForCustomOptions(document, element, answer, Math.max(0, Math.min(1500, deadline - Date.now())));
   if (!options.length) {
     if (element.tagName === 'INPUT') setTextValue(element, '');
     return { ok: false, unresolved: true, reason: 'The custom widget did not reveal any options' };
@@ -1052,6 +1075,7 @@ async function setCustomChoiceValue(document, element, answer) {
     return { ok: false, unresolved: true, reason: 'The custom widget does not expose one unique exact option' };
   }
   for (const match of matches) {
+    if (Date.now() >= deadline) return { ok: false, unresolved: true, reason: 'Autofill deadline reached' };
     if (match.getAttribute('aria-selected') === 'true') continue;
     // Recheck after awaiting options and after every preceding selection.
     if (hasNativeFormAction(match)) {
@@ -1090,11 +1114,11 @@ async function setCustomChoiceValue(document, element, answer) {
   return { ok: true };
 }
 
-async function fillElement(document, element, answer) {
+async function fillElement(document, element, answer, deadline = Infinity) {
   if (!element) return { ok: false, reason: 'The field control is no longer available' };
   element.__jobApplicationAutofillValue = String(answer);
   delete element.__jobApplicationUserEdited;
-  if (customWidgetElements(document).includes(element)) return setCustomChoiceValue(document, element, answer);
+  if (customWidgetElements(document).includes(element)) return setCustomChoiceValue(document, element, answer, deadline);
   if (element.tagName === 'SELECT') return { ok: setSelectValue(element, answer) };
   if (element.type === 'radio') return { ok: setRadioGroup(document, element, answer) };
   if (element.type === 'checkbox') return { ok: setCheckbox(element, answer) };
@@ -1294,12 +1318,12 @@ function hiringCompanyDefault(field, profile = {}, page = {}) {
   if (!employers.length) return null;
   const employer = employers.find((entry) => company === entry || ` ${text} `.includes(` ${entry} `));
   if (/have you (?:ever |previously )?(?:worked (?:at|for|with)|been employed (?:at|by|with))|former employee|prior employment/.test(text)) {
-    return employer ? { value: 'Yes', reason: 'Confirmed prior employer' } : { value: 'No', reason: 'No prior employment at this company' };
+    return employer ? { value: 'Yes', reason: 'Saved prior employer; confirm relationship' } : null;
   }
-  if (/relative|family member|related to/.test(text)) {
+  if (/relative|family member|related to/.test(text) && profile.defaultsConfirmation?.relatedToHiringCompany === 'confirmed') {
     return { value: profile.defaults?.relatedToHiringCompany || 'No', reason: 'Profile company-relationship default' };
   }
-  if (/know (?:anyone|someone)|friends? (?:or )?contacts?|any contacts? (?:at|in)/.test(text)) {
+  if (/know (?:anyone|someone)|friends? (?:or )?contacts?|any contacts? (?:at|in)/.test(text) && profile.defaultsConfirmation?.knownAtHiringCompany === 'confirmed') {
     return { value: profile.defaults?.knownAtHiringCompany || 'No', reason: 'Profile company-contact default' };
   }
   return null;
@@ -1348,14 +1372,24 @@ function planDeterministicFill(fields, records, coverMessages = [], profile = {}
       confidence: usableMatch.confidence === 'exact' ? 'high' : usableMatch.confidence,
       sensitivity: usableMatch.record.sensitivity || inferSensitivity(field.label, field.id),
       reason: usableMatch.reason,
+      matchKind: usableMatch.score === 1 ? (usableMatch.reason.startsWith('concept:') ? 'concept' : 'exact') : 'fuzzy',
     };
-  }).map((decision, index) => ({ ...decision, handle: fields[index].handle }));
+  }).map((decision, index) => {
+    const sources = (decision.evidenceKeys || []).map(key => records.find(record => record.key === key)).filter(Boolean);
+    const decorated = { ...decision, handle: fields[index].handle,
+      confirmationState: sources.length && sources.every(record => record.confirmationState === 'confirmed') ? 'confirmed' : 'unconfirmed',
+      reusePolicy: sources.some(record => (record.semantic?.reusePolicy || record.reusePolicy) === 'never') ? 'never' : sources.some(record => (record.semantic?.reusePolicy || record.reusePolicy) === 'review_only') ? 'review_only' : 'allowed',
+      matchKind: decision.matchKind || (decision.transformation ? 'derived' : 'exact'),
+    };
+    return { ...decorated, ...decideDisposition(decorated, fields[index]) };
+  });
 }
 
-async function applyDecisions(document, decisions = []) {
+async function applyDecisions(document, decisions = [], { deadline = Infinity } = {}) {
   const result = { applied: [], kept: [], reviewRequired: [], unresolved: [], failed: [] };
   for (const decision of decisions) {
     try {
+    if (Date.now() >= deadline) { result.unresolved.push({ fieldId: decision.fieldId, reason: 'Autofill deadline reached' }); continue; }
     const field = currentField(document, decision.fieldId);
     if (!field || (decision.handle && decision.handle !== field.handle)) {
       result.failed.push({ fieldId: decision.fieldId, reason: 'Field is no longer on the page' });
@@ -1377,9 +1411,16 @@ async function applyDecisions(document, decisions = []) {
       continue;
     }
     const current = field.currentValue;
-    if (current && validateFillValue(field, current).ok) {
+    if (current && decision.approved !== true) {
       result.kept.push({ fieldId: field.id, value: current });
       addReviewIfNeeded(result, field, decision, current);
+      continue;
+    }
+    const policy = decideDisposition(decision, field);
+    if (policy.disposition !== 'autofill') {
+      const issue = { ...decision, field, sensitivity: effectiveSensitivity(field, decision), reason: policy.reason, disposition: policy.disposition };
+      if (policy.disposition === 'review') result.reviewRequired.push(issue);
+      else result.unresolved.push({ ...issue, fieldId: field.id, label: field.label });
       continue;
     }
     // Custom options may be filtered, stale, or loaded only after opening/searching.
@@ -1390,8 +1431,18 @@ async function applyDecisions(document, decisions = []) {
       continue;
     }
     document.__jobApplicationFilling = true;
-    const fillResult = await fillElement(document, element, decision.value);
-    await new Promise((resolve) => setTimeout(resolve, 25));
+    const fillResult = await fillElement(document, element, decision.value, deadline);
+    const immediateValue = fieldValue(document, element);
+    await waitForDocumentSettled(document, { quietMs: 75, minWaitMs: 120, timeoutMs: Math.max(0, Math.min(400, deadline - Date.now())) });
+    const retained = fieldValue(document, element);
+    const expected = field.type === 'checkbox' ? (/^(yes|true|checked)$/i.test(String(decision.value)) ? 'Yes' : 'No') : String(decision.value).trim();
+    const valuesEqual = (left, right) => field.multiple
+      ? left.split(/\s*[,;]\s*/).sort().join('|') === right.split(/\s*[,;]\s*/).sort().join('|')
+      : left === right;
+    if (fillResult?.ok && (!valuesEqual(retained, field.widget === 'custom' ? immediateValue : expected) || !currentField(document, field.id) || currentField(document, field.id).handle !== field.handle)) {
+      result.failed.push({ fieldId: field.id, reason: 'The control did not retain the exact approved value after settling' });
+      continue;
+    }
     if (!element.isConnected || !checkValiditySafely(element) || (field.widget !== 'custom' && !fieldValue(document, element))) {
       result.failed.push({ fieldId: field.id, reason: 'The control did not retain a valid value' });
       continue;
@@ -1611,9 +1662,10 @@ function waitForDocumentSettled(document, { quietMs = 150, minWaitMs = 400, time
 }
 
 // Learning is enabled only by the worker for the selected application frame.
-function createLearningSession(document, { capture, send, onFinalSubmit, delayMs = 350 }) {
+function createLearningSession(document, { capture, send, onFinalSubmit, onRevalidate, validationDelayMs = 500, delayMs = 350 }) {
   let applicationId = null;
   let timer;
+  let validationTimer;
   let lastSaved = '';
   let queue = Promise.resolve();
   function flush() {
@@ -1633,6 +1685,11 @@ function createLearningSession(document, { capture, send, onFinalSubmit, delayMs
   }
   function schedule(event) {
     if (!applicationId || document.__jobApplicationFilling || event.target?.__jobApplicationAutofillDispatch) return;
+    if (typeof onRevalidate === 'function' && event.target?.closest?.('input,textarea,select,[role="combobox"],[role="option"],button[aria-haspopup="listbox"]')) {
+      clearTimeout(validationTimer);
+      const id=applicationId;
+      validationTimer=setTimeout(()=>{if(applicationId===id && !document.__jobApplicationFilling) Promise.resolve(onRevalidate({applicationId:id})).catch(()=>{});},validationDelayMs);
+    }
     clearTimeout(timer);
     timer = setTimeout(() => { flush().catch(() => {}); }, delayMs);
   }
@@ -1656,6 +1713,7 @@ function createLearningSession(document, { capture, send, onFinalSubmit, delayMs
     dispose() {
       applicationId = null;
       clearTimeout(timer);
+      clearTimeout(validationTimer);
       for (const name of ['input', 'change', 'blur', 'click']) document.removeEventListener(name, schedule, true);
       document.removeEventListener('submit', checkpoint, true);
       document.removeEventListener('visibilitychange', checkpoint, true);
@@ -1670,12 +1728,13 @@ function notifyNavigation() {
   waitForDocumentSettled(document).then(() => chrome.runtime.sendMessage({ type: 'JOB_APP_NAVIGATED' })).catch(() => {});
 }
 
-const CONTENT_VERSION = 'general-reuse-1';
+const CONTENT_VERSION = 'reliable-review-1';
 if (!globalThis.__jobApplicationAutofillInstalled) {
   globalThis.__jobApplicationAutofillInstalled = CONTENT_VERSION;
   const learning = createLearningSession(document, {
     capture: () => collectAnswerRecords(document),
     send: (message) => chrome.runtime.sendMessage(message),
+    onRevalidate: ({applicationId}) => chrome.runtime.sendMessage({type:'JOB_APP_REVALIDATE',applicationId}),
     onFinalSubmit: ({ applicationId, records, event }) => {
       if (!isFinalApplicationSubmit(document, event)) return null;
       return chrome.runtime.sendMessage({
@@ -1701,7 +1760,7 @@ if (!globalThis.__jobApplicationAutofillInstalled) {
           return true;
         case 'JOB_APP_APPLY':
           if (message.applicationId) learning.activate(message.applicationId);
-          applyDecisions(document, message.decisions || [])
+          applyDecisions(document, message.decisions || [], {deadline: message.deadline ?? Infinity})
             .then((result) => sendResponse({ ok: true, result }))
             .catch((error) => sendResponse({ ok: false, error: error.message }));
           return true;

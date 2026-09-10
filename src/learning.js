@@ -1,7 +1,8 @@
 // Learning is enabled only by the worker for the selected application frame.
-export function createLearningSession(document, { capture, send, onFinalSubmit, delayMs = 350 }) {
+export function createLearningSession(document, { capture, send, onFinalSubmit, onRevalidate, validationDelayMs = 500, delayMs = 350 }) {
   let applicationId = null;
   let timer;
+  let validationTimer;
   let lastSaved = '';
   let queue = Promise.resolve();
   function flush() {
@@ -21,6 +22,11 @@ export function createLearningSession(document, { capture, send, onFinalSubmit, 
   }
   function schedule(event) {
     if (!applicationId || document.__jobApplicationFilling || event.target?.__jobApplicationAutofillDispatch) return;
+    if (typeof onRevalidate === 'function' && event.target?.closest?.('input,textarea,select,[role="combobox"],[role="option"],button[aria-haspopup="listbox"]')) {
+      clearTimeout(validationTimer);
+      const id=applicationId;
+      validationTimer=setTimeout(()=>{if(applicationId===id && !document.__jobApplicationFilling) Promise.resolve(onRevalidate({applicationId:id})).catch(()=>{});},validationDelayMs);
+    }
     clearTimeout(timer);
     timer = setTimeout(() => { flush().catch(() => {}); }, delayMs);
   }
@@ -44,6 +50,7 @@ export function createLearningSession(document, { capture, send, onFinalSubmit, 
     dispose() {
       applicationId = null;
       clearTimeout(timer);
+      clearTimeout(validationTimer);
       for (const name of ['input', 'change', 'blur', 'click']) document.removeEventListener(name, schedule, true);
       document.removeEventListener('submit', checkpoint, true);
       document.removeEventListener('visibilitychange', checkpoint, true);
