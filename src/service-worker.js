@@ -1094,6 +1094,111 @@ async function guardInlineField(message, sender, {requireFocus = true} = {}) {
   return {session: latest, inspection, field: scoped.field};
 }
 
+const PANEL_OPEN_FALLBACK = 'Open the extension toolbar button to continue editing';
+
+async function inlinePanelState(message) {
+  if (!Number.isInteger(message.tabId)) throw new Error('The selected tab is unavailable');
+  if (message.close) {
+    requiredBoundedText(message.inlineSessionId, 'Session ID', 200);
+    await mutateInlineSession(message.tabId, message.frameId, message.inlineSessionId, current => ({...current, panelRequested: false}));
+  }
+  // Read without writing: a panel refresh must not trigger another storage refresh.
+  const stored = await chrome.storage.session.get({[INLINE_STORAGE_KEY]: {}});
+  const sessions = Object.values(stored[INLINE_STORAGE_KEY] || {}).filter(session => session.tabId === message.tabId
+    && session.panelRequested && session.field && session.expiresAt > Date.now());
+  sessions.sort((a, b) => b.panelRequestedAt - a.panelRequestedAt);
+  return {ok: true, inlineSession: sessions[0] || null};
+}
+
+async function handoffInlineField(message, sender, opening) {
+  const request = {...message, requestId: message.requestId || crypto.randomUUID()};
+  const {session} = await guardInlineField(request, sender, {requireFocus: false});
+  if (message.candidateId && !inlineReply(session).candidates.some(candidate => candidate.candidateId === message.candidateId)) {
+    throw new Error('Inline candidate expired. Focus the field again.');
+  }
+  const error = await opening;
+  const saved = await writeInlineSessions(sessions => {
+    const key = `${session.tabId}:${session.frameId}`;
+    const current = sessions[key];
+    if (!current || current.sessionId !== session.sessionId || current.revision !== session.revision) throw new Error('Inline session changed');
+    for (const previous of Object.values(sessions)) {
+      if (previous.tabId === session.tabId && previous.panelRequested) {
+        previous.panelRequested = false;
+        previous.revision += 1;
+      }
+    }
+    return sessions[key] = {...current, panelRequested: true, panelRequestedAt: Date.now(), panelCandidateId: message.candidateId || null,
+      revision: current.revision + 1, expiresAt: Date.now() + INLINE_TTL_MS, workerId: WORKER_ID};
+  });
+  return {ok: true, inlineSession: saved, ...(error ? {error} : {})};
+}
+
+// Called only after the runtime listener's existing trusted-extension sender guard.
+async function guardedPanelInline(message) {
+  requiredBoundedText(message.inlineSessionId, 'Session ID', 200);
+  const stored = await chrome.storage.session.get({[INLINE_STORAGE_KEY]: {}});
+  const session = stored[INLINE_STORAGE_KEY]?.[`${message.tabId}:${message.frameId}`];
+  if (!session?.panelRequested || session.sessionId !== message.inlineSessionId) throw new Error('Inline panel session expired or closed');
+  const [tab] = await chrome.tabs.query({active: true, currentWindow: true});
+  if (tab?.id !== session.tabId) throw new Error('The selected tab changed');
+  if (processingTabs.has(session.tabId) || saveLocks.has(session.tabId)) throw new Error('Fill is in progress');
+  const sender = {id: chrome.runtime.id, tab: {id: session.tabId}, frameId: session.frameId, documentId: session.documentId, url: session.url};
+  const request = {...message, sessionId: session.sessionId, requestId: crypto.randomUUID()};
+  const guarded = await guardInlineField(request, sender, {requireFocus: false});
+  return {...guarded, sender, request, suggestion: guarded.session.suggestions?.[guarded.field.id]};
+}
+
+async function inlinePanelAction(message) {
+  const context = await guardedPanelInline(message);
+  const {session, field, sender, request} = context;
+  if (message.type === 'JOB_RUN_FOCUS_FIELD') {
+    const response = await sendToFrame(session.tabId, session.frameId, {type: 'JOB_APP_FOCUS', fieldId: field.id, handle: field.handle});
+    if (!response?.ok) throw new Error(response?.error || 'Could not show this field on the page');
+    return {ok: true, inlineSession: session};
+  }
+  if (message.type === 'JOB_RUN_REWRITE_ANSWER') {
+    const response = await rewriteAnswer(message, context);
+    const current = await guardedPanelInline(message);
+    return {...response, inlineSession: current.session};
+  }
+  if (message.type === 'JOB_RUN_GENERATE_SUGGESTIONS') {
+    const response = await generateInlineField(request, sender, {requireFocus: false, jobDescription: message.jobDescription});
+    if (response.error) throw new Error(response.error);
+    return {ok: true, inlineSession: (await guardedPanelInline(message)).session};
+  }
+  if (message.type === 'JOB_RUN_SEARCH_ANSWERS') {
+    const candidates = await savedSearchCandidates(field, message.query);
+    const current = await guardedPanelInline(message);
+    const saved = await mutateInlineSession(session.tabId, session.frameId, session.sessionId, latest => {
+      if (latest.revision !== current.session.revision) throw new Error('Inline session changed. Search again.');
+      return {...latest, suggestions: {...latest.suggestions, [field.id]: {...latest.suggestions[field.id], field, candidates}}};
+    });
+    return {ok: true, candidates, inlineSession: saved};
+  }
+  if (!['JOB_RUN_APPLY_DRAFT', 'JOB_RUN_APPROVE_SUGGESTION'].includes(message.type)) throw new Error('Unsupported inline panel action');
+  const answer = message.type === 'JOB_RUN_APPLY_DRAFT' ? requiredBoundedText(message.answer, 'Answer', MAX_DRAFT_CHARS) : message.answer;
+  if (answer != null && isOpaqueIdentifier(answer)) throw new Error('Internal IDs must be entered manually on the application page');
+  if (processingTabs.has(session.tabId) || saveLocks.has(session.tabId)) throw new Error('Fill is in progress');
+  saveLocks.add(session.tabId);
+  let saved;
+  try {
+    const current = await guardInlineField(request, sender, {requireFocus: false});
+    await applyReviewedField({tabId: session.tabId, frameId: session.frameId, applicationId: session.attachedRun?.applicationId,
+      field: current.field, suggestion: message.type === 'JOB_RUN_APPROVE_SUGGESTION' ? current.session.suggestions[field.id] : null,
+      message: {...message, ...(answer != null ? {answer} : {})},
+      approvalGuard: {expectedRawValue: session.field.rawValue, expectedEditRevision: session.field.editRevision},
+      assertAuthority: () => {
+        const authority = inlineSessionAuthorities.get(`${session.tabId}:${session.frameId}`);
+        if (!authority || authority.sessionId !== session.sessionId || authority.revision !== current.session.revision || authority.expiresAt <= Date.now()) {
+          throw new Error('Inline session expired or revoked before applying');
+        }
+      }});
+    saved = await mutateInlineSession(session.tabId, session.frameId, session.sessionId, latest => ({...latest,
+      suggestions: {}, generatedSuggestions: {}, panelCandidateId: null, applied: true}));
+  } finally { saveLocks.delete(session.tabId); }
+  return {ok: true, inlineSession: saved, ...(session.attachedRun ? {run: await validatePageOnly(session.tabId)} : {})};
+}
+
 async function acceptInlineField(message, sender) {
   const origin = inlineOrigin(message, sender);
   if (processingTabs.has(origin.tabId) || saveLocks.has(origin.tabId)) throw new Error('Fill is in progress');
@@ -1169,21 +1274,23 @@ async function currentInlineDestination(session, snapshot) {
     const compatible = compatibleInlineRun(run, current.inspection, current.field, session.frameId);
     if (JSON.stringify(compatible?.jobContext || {}) !== snapshot.runJobContext) return null;
     const jobContext = inlineJobContext(session, current.inspection, compatible);
+    if (snapshot.jobDescription) jobContext.jobDescription = snapshot.jobDescription;
     if (aiEvidenceRevision({jobContext}, current.inspection, datasource) !== snapshot.evidenceRevision) return null;
     return current;
   } catch { return null; }
 }
 
-async function generateInlineField(message, sender) {
+async function generateInlineField(message, sender, {requireFocus = true, jobDescription = ''} = {}) {
   const origin = inlineOrigin(message, sender);
   if (processingTabs.has(origin.tabId) || saveLocks.has(origin.tabId)) throw new Error('Fill is in progress');
-  const {session, inspection, field} = await guardInlineField(message, sender);
+  const {session, inspection, field} = await guardInlineField(message, sender, {requireFocus});
   if (session.generation.status === 'pending') return inlineReply(session, message.requestId, {error: 'This answer is already being prepared'});
   const [settings, datasource, run] = await Promise.all([getSettings(), getDatasource(), getRun(origin.tabId)]);
   const compatible = compatibleInlineRun(run, inspection, field, origin.frameId);
   const jobContext = inlineJobContext(session, inspection, compatible);
+  if (jobDescription) jobContext.jobDescription = requiredBoundedText(jobDescription, 'Job description', 16_000);
   const snapshot = {field: aiFieldSnapshot(field), settings: {aiProvider: settings.aiProvider, aiModel: settings.aiModel},
-    requestId: message.requestId, workerId: WORKER_ID, pageContext: JSON.stringify(inspection.page),
+    requestId: message.requestId, workerId: WORKER_ID, pageContext: JSON.stringify(inspection.page), jobDescription: jobDescription || '',
     runJobContext: JSON.stringify(compatible?.jobContext || {}),
     evidenceRevision: aiEvidenceRevision({jobContext}, inspection, datasource)};
   const cached = compatible?.generatedSuggestions?.[field.id];
@@ -1439,10 +1546,10 @@ async function applyDraft(message) {
   }
 }
 
-async function rewriteAnswer(message) {
+async function rewriteAnswer(message, inlineContext = null) {
   const draft = requiredBoundedText(message.draft, 'Draft answer', MAX_DRAFT_CHARS);
   const instruction = requiredBoundedText(message.instruction, 'Rewrite instruction', MAX_REWRITE_INSTRUCTION_CHARS);
-  const { suggestion, field } = await guardedDraftField(message);
+  const { suggestion, field } = inlineContext || await guardedDraftField(message);
   const settings = await getSettings();
   const apiKey = await getApiKey(settings.aiProvider);
   if (!apiKey) throw new Error(`Add a ${settings.aiProvider === 'fireworks' ? 'Fireworks' : 'OpenAI'} API key before requesting a rewrite`);
@@ -1453,7 +1560,7 @@ async function rewriteAnswer(message) {
     draft,
     instruction,
     records,
-    page: (await getRun(message.tabId))?.jobContext || {},
+    page: inlineContext ? inlineContext.session.jobContext || {} : (await getRun(message.tabId))?.jobContext || {},
   }, { provider: settings.aiProvider, model: settings.aiModel });
   return { ok: true, answer: requiredBoundedText(rewritten.answer, 'Rewritten answer', MAX_DRAFT_CHARS) };
 }
@@ -1824,6 +1931,23 @@ function beginSaveOperation(tabId) {
 }
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (message?.type === 'JOB_INLINE_EDIT_IN_PANEL') {
+    try {
+      const request = {...message, requestId: message.requestId || crypto.randomUUID()};
+      const origin = inlineOrigin(request, sender);
+      // Chrome 116+ only; preserve Chrome 114 support. Invoke directly during the
+      // content-script user gesture, before storage/inspection awaits consume it.
+      // https://developer.chrome.com/docs/extensions/reference/api/sidePanel
+      let opening;
+      try {
+        opening = typeof chrome.sidePanel?.open === 'function'
+          ? Promise.resolve(chrome.sidePanel.open({tabId: origin.tabId})).then(() => null, () => PANEL_OPEN_FALLBACK)
+          : Promise.resolve(PANEL_OPEN_FALLBACK);
+      } catch { opening = Promise.resolve(PANEL_OPEN_FALLBACK); }
+      handoffInlineField(request, sender, opening).then(sendResponse).catch(error => sendResponse({ok: false, error: error.message}));
+    } catch (error) { sendResponse({ok: false, error: error.message}); }
+    return true;
+  }
   if (['JOB_INLINE_QUERY', 'JOB_INLINE_GENERATE', 'JOB_INLINE_ACCEPT', 'JOB_INLINE_CANCEL'].includes(message?.type)) {
     (async () => {
       if (message.type === 'JOB_INLINE_QUERY') return queryInlineField(message, sender);
@@ -1895,6 +2019,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
 
   if (![
+    'JOB_INLINE_PANEL_STATE',
     'JOB_RUN_APPROVE_SUGGESTION',
     'JOB_RUN_APPLY_DRAFT',
     'JOB_RUN_REWRITE_ANSWER',
@@ -1924,6 +2049,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       || typeof sender?.url !== 'string' || !sender.url.startsWith(`chrome-extension://${chrome.runtime.id}/`)) {
       throw new Error('This action must originate in the extension panel');
     }
+    if (message.type === 'JOB_INLINE_PANEL_STATE') return inlinePanelState(message);
+    if (message.inlineSessionId) return inlinePanelAction(message);
     if (['JOB_DATASOURCE_SUPPRESS_ANSWER', 'JOB_DATASOURCE_DELETE_ANSWER'].includes(message.type)) {
       return updateSavedAnswerFeedback(message, message.type === 'JOB_DATASOURCE_DELETE_ANSWER' ? 'delete' : 'suppress');
     }
@@ -2114,11 +2241,15 @@ async function selectEmployment(message) {
   return {ok:true,run:await checkPage(message.tabId)};
 }
 
+async function savedSearchCandidates(field, value) {
+  const records=await getRecords();
+  const query=String(value || '').trim().toLowerCase().slice(0,200);
+  return searchEvidence(field,records,{limit:20}).filter(item=>!query || `${item.sourceQuestion} ${item.answer}`.toLowerCase().includes(query));
+}
+
 async function searchSavedAnswers(message) {
   const {run,field}=await guardedDraftField(message);
-  const records=await getRecords();
-  const query=String(message.query || '').trim().toLowerCase().slice(0,200);
-  const candidates=searchEvidence(field,records,{limit:20}).filter(item=>!query || `${item.sourceQuestion} ${item.answer}`.toLowerCase().includes(query));
+  const candidates=await savedSearchCandidates(field,message.query);
   const updated=await mutateRun(message.tabId,current=>{
     if(current.startedAt!==run.startedAt || current.pageSignature!==run.pageSignature) return false;
     current.suggestions ||= {};

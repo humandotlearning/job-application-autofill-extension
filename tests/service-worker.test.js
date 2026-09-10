@@ -283,6 +283,110 @@ async function inlineHarness({ field = {}, page = {}, ...options } = {}) {
   return harness;
 }
 
+const panelOrigin = session => ({tabId: session.tabId, frameId: session.frameId, inlineSessionId: session.sessionId, fieldId: session.field.id, handle: session.field.handle, pageSignature: session.pageSignature, applicationId: session.attachedRun?.applicationId || session.sessionId});
+async function handoffInline(harness, query, sender = inlineSender()) {
+  return harness.dispatch({type: 'JOB_INLINE_EDIT_IN_PANEL', sessionId: query.sessionId, candidateId: query.candidates[0]?.candidateId}, sender);
+}
+
+for (const support of ['available', 'missing', 'rejected']) test(`inline panel handoff opens before async storage with ${support} API and no run`, async () => {
+  const harness = await inlineHarness();
+  const query = await harness.dispatch(inlineQuery(), inlineSender());
+  const calls = [];
+  if (support !== 'missing') chrome.sidePanel.open = ({tabId}) => {calls.push(`open:${tabId}`); return support === 'rejected' ? Promise.reject(new Error('Gesture expired')) : Promise.resolve();};
+  const get = chrome.storage.session.get;
+  chrome.storage.session.get = async defaults => {calls.push('storage'); return get(defaults);};
+  const response = await handoffInline(harness, query);
+  assert.equal(response.ok, true, response.error);
+  if (support !== 'missing') assert.equal(calls[0], 'open:7');
+  if (support !== 'available') assert.equal(response.error, 'Open the extension toolbar button to continue editing');
+  const state = await harness.dispatch({type: 'JOB_INLINE_PANEL_STATE', tabId: 7});
+  assert.equal(state.inlineSession.sessionId, query.sessionId);
+  assert.equal(state.inlineSession.panelCandidateId, query.candidates[0].candidateId);
+  assert.equal(harness.sessionData.applicationRun?.['7'], undefined);
+  assert.equal((await harness.dispatch({type: 'JOB_INLINE_PANEL_STATE', tabId: 8})).inlineSession, null);
+  assert.equal((await harness.dispatch({type: 'JOB_INLINE_PANEL_STATE', tabId: 7}, inlineSender())).ok, false);
+  const closed = await harness.dispatch({type: 'JOB_INLINE_PANEL_STATE', ...panelOrigin(state.inlineSession), close: true});
+  assert.equal(closed.inlineSession, null);
+  assert.equal((await harness.dispatch({type: 'JOB_INLINE_PANEL_STATE', tabId: 7})).inlineSession, null);
+});
+
+test('inline panel child-frame focus and edited saved approval use the live session and existing shared write', async () => {
+  const field = {id: 'name', handle: 'doc-a:name', label: 'Full name', type: 'text', rawValue: '', editRevision: 0};
+  const harness = await inlineHarness({pagesByTab: {7: {frames: [{frameId: 3, pages: [{fields: [field]}]}]}}});
+  const sender = inlineSender({frameId: 3});
+  const query = await harness.dispatch(inlineQuery(), sender);
+  await handoffInline(harness, query, sender);
+  const {inlineSession} = await harness.dispatch({type: 'JOB_INLINE_PANEL_STATE', tabId: 7});
+  assert.ok(inlineSession);
+  const origin = panelOrigin(inlineSession);
+  harness.tabs.get(7).frames[0].pages[0].focusedFieldId = null;
+  const focus = await harness.dispatch({type: 'JOB_RUN_FOCUS_FIELD', ...origin});
+  assert.equal(focus.ok, true, focus.error);
+  assert.equal(harness.tabs.get(7).messageTargets.find(({message}) => message.type === 'JOB_APP_FOCUS').frameId, 3);
+  const applied = await harness.dispatch({type: 'JOB_RUN_APPROVE_SUGGESTION', ...origin, sourceKey: 'full_name', answer: 'Nithin edited'});
+  assert.equal(applied.ok, true, applied.error); assert.ok(applied.inlineSession);
+  assert.equal(harness.tabs.get(7).frames[0].pages[0].values.name, 'Nithin edited');
+  assert.equal(harness.sessionData.applicationRun?.['7'], undefined);
+});
+
+test('inline panel rejects changed destinations and untrusted origins before applying', async () => {
+  const harness = await inlineHarness();
+  const query = await harness.dispatch(inlineQuery(), inlineSender()); await handoffInline(harness, query);
+  const {inlineSession} = await harness.dispatch({type: 'JOB_INLINE_PANEL_STATE', tabId: 7});
+  assert.ok(inlineSession);
+  const message = {type: 'JOB_RUN_APPLY_DRAFT', ...panelOrigin(inlineSession), answer: 'Manual draft'};
+  assert.equal((await harness.dispatch(message, inlineSender())).ok, false);
+  harness.tabs.get(7).frames[0].pages[0].fields[0].editRevision++;
+  assert.equal((await harness.dispatch(message)).ok, false);
+  assert.equal(harness.tabs.get(7).messages.some(message => message.type === 'JOB_APP_APPLY'), false);
+});
+
+test('inline panel search, rewrite and generation share existing operations without a listed run field', async () => {
+  const harness = await inlineHarness(); harness.localData.openaiApiKey = 'synthetic-key';
+  const query = await harness.dispatch(inlineQuery(), inlineSender()); await handoffInline(harness, query);
+  const {inlineSession} = await harness.dispatch({type: 'JOB_INLINE_PANEL_STATE', tabId: 7}); assert.ok(inlineSession);
+  const origin = panelOrigin(inlineSession);
+  harness.tabs.get(7).frames[0].pages[0].focusedFieldId = null;
+  const searched = await harness.dispatch({type: 'JOB_RUN_SEARCH_ANSWERS', ...origin, query: 'Nithin'});
+  assert.equal(searched.ok, true, searched.error); assert.equal(searched.candidates[0].sourceKey, 'full_name');
+  globalThis.fetch = async () => ({ok: true, json: async () => ({output_text: JSON.stringify({answer: 'Nithin', evidenceKeys: ['full_name']})})});
+  const rewritten = await harness.dispatch({type: 'JOB_RUN_REWRITE_ANSWER', ...origin, draft: 'Nithin', instruction: 'Keep concise', sourceKey: 'full_name'});
+  assert.equal(rewritten.ok, true, rewritten.error); assert.equal(rewritten.answer, 'Nithin'); assert.ok(rewritten.inlineSession);
+  globalThis.fetch = async () => generatedResponse();
+  const generated = await harness.dispatch({type: 'JOB_RUN_GENERATE_SUGGESTIONS', ...origin});
+  assert.equal(generated.ok, true, generated.error); assert.equal(generated.inlineSession.generatedSuggestions.name.suggestions[0].answer, 'Nithin');
+  const before = structuredClone(harness.localData.answerRecords);
+  const applied = await harness.dispatch({type: 'JOB_RUN_APPLY_DRAFT', ...origin, answer: 'Manual draft'});
+  assert.equal(applied.ok, true, applied.error); assert.deepEqual(harness.localData.answerRecords, before);
+});
+
+test('inline panel apply refreshes its attached real run after releasing the save lock', async () => {
+  const harness = await inlineHarness({field: {label: 'Current CTC', type: 'textarea'},
+    answerRecords: [{key: 'current_salary', question: 'Current salary', answer: 'Synthetic explanation', sensitivity: 'review'}],
+    page: {actions: [{id: 'submit', label: 'Submit application', kind: 'submit'}]}});
+  await harness.dispatch({type: 'JOB_RUN_START', tabId: 7});
+  const query = await harness.dispatch(inlineQuery(), inlineSender()); await handoffInline(harness, query);
+  const {inlineSession} = await harness.dispatch({type: 'JOB_INLINE_PANEL_STATE', tabId: 7});
+  assert.ok(inlineSession.attachedRun);
+  const applied = await harness.dispatch({type: 'JOB_RUN_APPLY_DRAFT', ...panelOrigin(inlineSession), answer: 'Reviewed salary explanation'});
+  assert.equal(applied.ok, true, applied.error);
+  assert.equal(applied.run.suggestions.name, undefined);
+  assert.equal(applied.run.status, 'ready_for_user_submit');
+});
+
+test('closing the latest handoff cannot resurrect an earlier requested frame', async () => {
+  const field = {id: 'name', handle: 'doc-a:name', label: 'Full name', type: 'text', rawValue: '', editRevision: 0};
+  const harness = await inlineHarness({pagesByTab: {7: {frames: [0, 3].map(frameId => ({frameId, pages: [{fields: [field]}]}))}}});
+  for (const frameId of [0, 3]) {
+    const sender = inlineSender({frameId});
+    const query = await harness.dispatch(inlineQuery(), sender); await handoffInline(harness, query, sender);
+  }
+  const {inlineSession} = await harness.dispatch({type: 'JOB_INLINE_PANEL_STATE', tabId: 7});
+  assert.equal(inlineSession.frameId, 3);
+  await harness.dispatch({type: 'JOB_INLINE_PANEL_STATE', ...panelOrigin(inlineSession), close: true});
+  assert.equal((await harness.dispatch({type: 'JOB_INLINE_PANEL_STATE', tabId: 7})).inlineSession, null);
+});
+
 test('inline explicit generation without a run creates selectable drafts without learning or applying', async () => {
   const harness = await inlineHarness({waitForAI: false});
   harness.localData.openaiApiKey = 'synthetic-test-key';

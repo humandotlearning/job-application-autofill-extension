@@ -23,6 +23,7 @@ async function loadPanelHtml() {
 
 async function setupPanel({
   run = null,
+  inlineSession = null,
   datasource = { answerCount: 3, coverMessageCount: 1 },
   localData = { openaiApiKey: 'sk-test', autoAdvancePages: false },
   applyDraftResponse = { ok: true, run },
@@ -37,6 +38,8 @@ async function setupPanel({
   });
   const sentMessages = [];
   const storageListeners = [];
+  const tabListeners = [];
+  let tabId = 7;
   const createdUrls = [];
   const revokedUrls = [];
   const clickedDownloads = [];
@@ -79,6 +82,10 @@ async function setupPanel({
       sendMessage: async (message) => {
         sentMessages.push(message);
         if (message.type === 'JOB_RUN_STATE') return { ok: true, run };
+        if (message.type === 'JOB_INLINE_PANEL_STATE') {
+          if (message.close) inlineSession = null;
+          return { ok: true, inlineSession: inlineSession?.tabId === message.tabId ? inlineSession : null };
+        }
         if (message.type === 'JOB_DATASOURCE_STATE') return { ok: true, datasource };
         if (message.type === 'JOB_RUN_START') return { ok: true, run: { ...run, status: 'running' } };
         if (message.type === 'JOB_RUN_CHECK_PAGE') return { ok: true, run: { ...run, status: 'waiting_user' } };
@@ -95,7 +102,7 @@ async function setupPanel({
         if (message.type === 'JOB_RUN_GENERATE_SUGGESTIONS') return typeof generateResponse === 'function' ? generateResponse(message) : generateResponse;
         if (message.type === 'JOB_RUN_VALIDATE_PAGE') return validateResponse;
         if (message.type === 'JOB_RUN_RETRY_AI') return retryAiResponse;
-        if (message.type === 'JOB_RUN_SEARCH_ANSWERS') return searchResponse;
+        if (message.type === 'JOB_RUN_SEARCH_ANSWERS') return typeof searchResponse === 'function' ? searchResponse(message) : searchResponse;
         if (message.type === 'JOB_RUN_SELECT_EMPLOYMENT') return selectEmploymentResponse;
         if (message.type === 'JOB_DATASOURCE_EXPORT') return { ok: true, backup: '{"schemaVersion":1}' };
         if (message.type === 'JOB_DATASOURCE_IMPORT') return { ok: true, datasource };
@@ -103,8 +110,8 @@ async function setupPanel({
       },
     },
     tabs: {
-      query: async () => [{ id: 7 }],
-      onActivated: { addListener: () => {} },
+      query: async () => [{ id: tabId }],
+      onActivated: { addListener: listener => tabListeners.push(listener) },
     },
     storage: {
       local: {
@@ -125,6 +132,8 @@ async function setupPanel({
     localData,
     sentMessages,
     storageListeners,
+    handoff(session) { inlineSession = session; storageListeners.forEach(listener => listener({inlineFieldSessions: {newValue: {}}}, 'session')); },
+    activate(id) { tabId = id; tabListeners.forEach(listener => listener({tabId: id})); },
     createdUrls,
     revokedUrls,
     clickedDownloads,
@@ -146,6 +155,98 @@ async function setupPanel({
     },
   };
 }
+
+const panelTick = () => new Promise(resolve => setTimeout(resolve, 0));
+function panelInlineSession(kind = 'saved') {
+  const field = {id: 'name', handle: 'doc:name', label: 'Full name', type: 'text'};
+  const candidate = {candidateId: 'choice-1', answer: 'Selected answer', kind: kind === 'saved' ? 'equivalent' : 'generated', sourceKey: 'name-source', sourceQuestion: 'Full name'};
+  return {sessionId: 'inline-one', tabId: 7, frameId: 3, pageSignature: 'inline-page', field, panelRequested: true, panelCandidateId: 'choice-1',
+    suggestions: {name: {field, candidates: kind === 'saved' ? [candidate] : []}},
+    generatedSuggestions: kind === 'generated' ? {name: {suggestions: [candidate]}} : {}};
+}
+
+for (const kind of ['saved', 'generated']) test(`inline ${kind} handoff reuses workspace while run, settings and drafts remain independent`, async () => {
+  const session = panelInlineSession(kind);
+  const run = {applicationId: 'main-run', pageSignature: 'main-page', status: 'waiting_user', actionRequired: [{fieldId: 'name', handle: 'main:name', label: 'Main name'}]};
+  const harness = await setupPanel({run, applyDraftResponse: {ok: true, inlineSession: session}, approveSuggestionResponse: {ok: true, inlineSession: session}});
+  try {
+    const doc = harness.dom.window.document;
+    const main = doc.querySelector('#action-required-list [data-answer-draft]');
+    main.value = 'Pending main draft'; main.dispatchEvent(new Event('input'));
+    doc.querySelector('#settings-data').open = true;
+    harness.handoff(session); await panelTick();
+    const card = doc.querySelector('#inline-field-card');
+    assert.equal(card.hidden, false);
+    const draft = card.querySelector('[data-answer-draft]');
+    assert.equal(draft.value, 'Selected answer'); assert.equal(draft.readOnly, false);
+    assert.equal(card.querySelector('[data-delete-saved-answer]'), null);
+    assert.equal(card.querySelector('[data-dismiss-saved-answer]'), null);
+    draft.value = 'Edited selected answer'; draft.dispatchEvent(new Event('input'));
+    card.querySelector('[data-send-answer]').click(); await panelTick();
+    const sent = harness.sentMessages.find(message => message.type === (kind === 'saved' ? 'JOB_RUN_APPROVE_SUGGESTION' : 'JOB_RUN_APPLY_DRAFT'));
+    assert.equal(sent.inlineSessionId, session.sessionId); assert.equal(sent.frameId, 3);
+    assert.equal(sent.answer, 'Edited selected answer');
+    if (kind === 'saved') assert.equal(sent.sourceKey, 'name-source');
+    assert.equal(doc.querySelector('#action-required-list [data-answer-draft]').value, 'Pending main draft');
+    assert.equal(doc.querySelector('#settings-data').open, true);
+    assert.equal(doc.querySelector('#run-state').textContent, 'Action required');
+  } finally { harness.cleanup(); }
+});
+
+test('inline typing survives main-run refresh and delayed rewrite/apply, then closes and follows the active tab', async () => {
+  const session = panelInlineSession('generated');
+  let finishRewrite, finishApply;
+  const harness = await setupPanel({inlineSession: session,
+    rewriteResponse: () => new Promise(resolve => { finishRewrite = resolve; }),
+    applyDraftResponse: () => new Promise(resolve => { finishApply = resolve; })});
+  try {
+    const doc = harness.dom.window.document;
+    const card = doc.querySelector('#inline-field-card');
+    assert.equal(card.hidden, false);
+    card.querySelector('[data-rewrite-answer]').click();
+    const instruction = card.querySelector('[data-rewrite-prompt]'); instruction.value = 'Shorten'; instruction.dispatchEvent(new Event('input'));
+    card.querySelector('[data-submit-rewrite]').click(); await panelTick();
+    let draft = card.querySelector('[data-answer-draft]');
+    assert.equal(draft.disabled, false);
+    draft.value = 'Latest typing'; draft.dispatchEvent(new Event('input'));
+    harness.storageListeners.forEach(listener => listener({applicationRun: {newValue: {}}}, 'session'));
+    harness.handoff(session); await panelTick();
+    finishRewrite({ok: true, answer: 'Old rewritten answer', inlineSession: session}); await panelTick();
+    assert.equal(card.querySelector('[data-answer-draft]').value, 'Latest typing');
+    card.querySelector('[data-send-answer]').click(); await panelTick();
+    draft = card.querySelector('[data-answer-draft]'); draft.value = 'Newer typing'; draft.dispatchEvent(new Event('input'));
+    finishApply({ok: true, inlineSession: session}); await panelTick();
+    assert.equal(card.querySelector('[data-answer-draft]').value, 'Newer typing');
+    harness.activate(8); await panelTick(); assert.equal(card.hidden, true);
+    harness.activate(7); await panelTick(); assert.equal(card.hidden, false);
+    assert.equal(card.querySelector('[data-answer-draft]').value, 'Newer typing');
+    doc.querySelector('#close-inline-field').click(); await panelTick(); assert.equal(card.hidden, true);
+    harness.storageListeners.forEach(listener => listener({applicationRun: {newValue: {}}}, 'session'));
+    assert.equal(card.hidden, true);
+    assert.ok(harness.sentMessages.some(message => message.type === 'JOB_INLINE_PANEL_STATE' && message.close));
+  } finally { harness.cleanup(); }
+});
+
+test('inline saved search remains selectable after its storage echo and uses the shared focus/generate routes', async () => {
+  const session = panelInlineSession();
+  const searched = {...session, suggestions: {name: {...session.suggestions.name, candidates: [{sourceKey: 'search-source', sourceQuestion: 'Other name', answer: 'Search choice', kind: 'equivalent'}]}}};
+  const harness = await setupPanel({inlineSession: session, searchResponse: {ok: true, inlineSession: searched, candidates: searched.suggestions.name.candidates},
+    generateResponse: {ok: true, inlineSession: {...searched, generatedSuggestions: {name: {suggestions: [{answer: 'Generated result'}]}}}}});
+  try {
+    const card = harness.dom.window.document.querySelector('#inline-field-card');
+    card.querySelector('[data-field-id]').click(); await panelTick();
+    card.querySelector('[data-search-answers]').click(); await panelTick();
+    harness.handoff(searched); await panelTick();
+    card.querySelector('[data-search-result]').click();
+    assert.equal(card.querySelector('[data-answer-draft]').value, 'Search choice');
+    card.querySelector('[data-generate-suggestions]').click(); await panelTick();
+    assert.match(card.textContent, /Generated result/);
+    assert.equal(card.querySelector('[data-answer-draft]').value, 'Search choice');
+    for (const type of ['JOB_RUN_FOCUS_FIELD', 'JOB_RUN_SEARCH_ANSWERS', 'JOB_RUN_GENERATE_SUGGESTIONS']) {
+      assert.equal(harness.sentMessages.find(message => message.type === type).inlineSessionId, 'inline-one');
+    }
+  } finally { harness.cleanup(); }
+});
 
 test('recommended saved answer applies through the guarded path in one click', async () => {
   const suggestion = { tabId: 7, frameId: 3, applicationId: 'run-one', pageSignature: 'page-one', field: { id: 'ml', handle: 'handle-one' }, candidates: [{ sourceKey: 'story', sourceQuestion: 'Saved project', answer: 'Synthetic model project narrative.', provenance: 'user', reason: 'Related ML evidence', kind: 'related' }] };

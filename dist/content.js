@@ -2016,9 +2016,21 @@ function createInlineAutofill(document, {send, describe}) {
     if (loading || !sessionId || !isCurrent(epoch, target, fingerprint(snapshot))) return;
     const payload = {type: 'JOB_INLINE_EDIT_IN_PANEL', sessionId};
     if (answers[index]) payload.candidateId = answers[index].candidateId;
+    const element = target, field = snapshot, expected = fingerprint(snapshot);
     // The panel owns the continuing guarded session. Only this display/token is revoked.
-    message(payload).catch(() => {});
+    const response = message(payload);
     dismiss({retainSession: true});
+    const version = epoch;
+    response.then(reply => {
+      if (!reply?.error) return;
+      if (disposed || epoch !== version || document.activeElement !== element || fingerprint(eligible(element)) !== expected) return;
+      target = element; snapshot = field; retry = true; host.hidden = false;
+      observe(); render(); setStatus(reply.error);
+    }).catch(() => {
+      if (disposed || epoch !== version || document.activeElement !== element || fingerprint(eligible(element)) !== expected) return;
+      target = element; snapshot = field; retry = true; host.hidden = false;
+      observe(); render(); setStatus('Open the extension toolbar button to continue editing');
+    });
   }
   function keydown(event) {
     if (composing || event.isComposing || event.keyCode === 229 || !target || host.hidden) return;

@@ -11,6 +11,7 @@ async function readJson(path) {
 test('manifest has only the permissions needed for local autofill', async () => {
   const manifest = await readJson('manifest.json');
   assert.equal(manifest.manifest_version, 3);
+  assert.equal(manifest.minimum_chrome_version, '114');
   assert.equal(manifest.version, '0.1.4');
   assert.equal(manifest.side_panel.default_path, 'sidepanel.html');
   assert.deepEqual(manifest.permissions.sort(), ['activeTab', 'scripting', 'sidePanel', 'storage'].sort());
@@ -45,6 +46,10 @@ test('side panel contains the guided workflow, review groups, and settings contr
   assert.match(html, /id="advance-page"/);
   assert.match(html, /id="save-answers"/);
   assert.match(html, /id="action-required-list"/);
+  assert.match(html, /id="inline-field-card"[^>]*hidden/);
+  assert.match(html, /Selected field/);
+  assert.match(html, /id="close-inline-field"/);
+  assert.match(html, /id="inline-field-list"/);
   assert.match(html, /id="review-list"/);
   assert.match(html, /id="optional-list"/);
   assert.match(html, /id="audit-list"/);

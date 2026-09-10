@@ -316,6 +316,18 @@ test('worker error envelopes without request IDs surface locally and allow retry
   assert.equal(f.messages.filter(m => m.type === 'JOB_INLINE_QUERY').length, 2);
 });
 
+test('Edit in panel displays the toolbar fallback without cancelling the handed-off session', async t => {
+  const fallback = 'Open the extension toolbar button to continue editing';
+  const f = fixture(t, message => message.type === 'JOB_INLINE_EDIT_IN_PANEL'
+    ? {ok: true, error: fallback}
+    : {ok: true, sessionId: 's1', requestId: message.requestId, candidates});
+  f.field.focus(); await tick();
+  f.button('Edit in panel').click(); await tick();
+  assert.equal(f.host().hidden, false);
+  assert.equal(f.root().querySelector('[role="status"]').textContent, fallback);
+  assert.equal(f.messages.some(message => message.type === 'JOB_INLINE_CANCEL'), false);
+});
+
 test('Generate routes only explicit activation and Edit in panel retains the session without cancel', async t => {
   const f = fixture(t); f.field.focus(); await tick();
   assert.equal(f.messages.some(m => m.type === 'JOB_INLINE_GENERATE'), false);
