@@ -86,6 +86,10 @@ export function createInlineAutofill(document, {send, describe}) {
     for (const element of shadow.querySelectorAll('button, [role="listbox"]')) element.tabIndex = enabled ? 0 : -1;
   }
   function setStatus(text) { status.textContent = text; schedulePosition(); }
+  function provenance(answer) {
+    return answer.kind === 'generated' ? `Draft · Evidence: ${(answer.evidenceKeys || []).join(', ') || 'No candidate facts cited'}`
+      : `Source: ${answer.sourceQuestion || 'Reviewed answer'} · ${answer.kind || 'saved'}`;
+  }
   function render() {
     const kept = snapshot?.rawValue !== '';
     list.hidden = preview.hidden = generate.hidden = edit.hidden = hint.hidden = kept;
@@ -93,7 +97,7 @@ export function createInlineAutofill(document, {send, describe}) {
     list.removeAttribute('aria-activedescendant');
     answers.forEach((answer, answerIndex) => {
       const option = node('div', null, {role: 'option', id: `inline-answer-${answerIndex}`, 'aria-selected': String(index === answerIndex)});
-      option.append(node('p', String(answer.answer ?? '')), node('small', `Source: ${answer.sourceQuestion || 'Reviewed answer'} · ${answer.kind || 'saved'}`));
+      option.append(node('p', String(answer.answer ?? '')), node('small', provenance(answer)));
       option.addEventListener('click', () => select(answerIndex));
       list.append(option);
     });
@@ -105,7 +109,7 @@ export function createInlineAutofill(document, {send, describe}) {
   function updateSelection() {
     [...list.children].forEach((option, optionIndex) => option.setAttribute('aria-selected', String(index === optionIndex)));
     const answer = answers[index];
-    preview.textContent = answer ? `${answer.answer}\nSource: ${answer.sourceQuestion || 'Reviewed answer'}\n${answer.requiresApproval === false ? 'Review this draft before use.' : 'Using this answer also saves it as a reviewed answer.'}` : '';
+    preview.textContent = answer ? `${answer.answer}\n${provenance(answer)}\n${answer.requiresApproval === false ? 'Review this draft before use.' : 'Using this answer also saves it as a reviewed answer.'}` : '';
     if (answer) list.setAttribute('aria-activedescendant', `inline-answer-${index}`);
     else list.removeAttribute('aria-activedescendant');
     use.textContent = answer?.requiresApproval === false ? 'Use draft' : 'Use and save reviewed answer';
@@ -225,7 +229,12 @@ export function createInlineAutofill(document, {send, describe}) {
       dismiss();
     }).catch(error => {
       if (epoch !== version || target !== element) return;
-      acceptance = null; loading = false; retry = true; answers = []; render(); setStatus(error.message);
+      acceptance = null; loading = false;
+      const busy = /Fill is in progress|Application is busy/i.test(error.message);
+      retry = !busy;
+      if (busy) index = answers.indexOf(answer);
+      else answers = [];
+      render(); setStatus(error.message);
     });
   }
   function beforeFill({field, element, decision, acceptanceToken} = {}) {
@@ -239,16 +248,19 @@ export function createInlineAutofill(document, {send, describe}) {
   }
   function generateAnswer() {
     if (loading || !sessionId || !isCurrent(epoch, target, fingerprint(snapshot)) || snapshot.rawValue !== '') return;
-    const version = epoch, element = target, expected = fingerprint(snapshot), session = sessionId;
+    const version = epoch, element = target, expected = fingerprint(snapshot), session = sessionId, selected = index;
     loading = true; index = -1; requestId = uniqueId(); const request = requestId;
     render(); setStatus('Generating an answer…');
     message({type: 'JOB_INLINE_GENERATE', sessionId, requestId}).then(response => {
       if (!isCurrent(version, element, expected)) return;
       if (!response?.ok) throw new Error(response?.error || 'Generation is unavailable. Open the panel for help.');
       if (response.sessionId !== session || response.requestId !== request) return;
-      loading = false; render(); setStatus(response.error || 'Review generated answers in the panel.');
+      if (Array.isArray(response.candidates)) answers = response.candidates;
+      loading = false; render();
+      setStatus(response.error || response.generatedSuggestion?.missingContext || 'Choose a draft to review before using it.');
     }).catch(error => {
       if (!isCurrent(version, element, expected)) return;
+      if (/Fill is in progress|Application is busy/i.test(error.message)) index = selected;
       loading = false; render(); setStatus(error.message);
     });
   }

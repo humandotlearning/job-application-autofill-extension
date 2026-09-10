@@ -1007,9 +1007,10 @@ function invalidateInlineSessions(tabId, frameId = null) {
 }
 
 function inlineReply(session, requestId, extra = {}) {
+  const generated = session.generatedSuggestions?.[session.field?.id];
   return {ok: true, sessionId: session.sessionId, requestId, field: session.field,
-    candidates: session.suggestions?.[session.field?.id]?.candidates || [],
-    generatedSuggestion: session.generatedSuggestions?.[session.field?.id] || null, ...extra};
+    candidates: [...(session.suggestions?.[session.field?.id]?.candidates || []), ...(generated?.suggestions || [])],
+    generatedSuggestion: generated || null, ...extra};
 }
 
 function compatibleInlineRun(run, inspection, field, frameId) {
@@ -1048,7 +1049,7 @@ async function scopeInlineField(origin, inspection, field) {
 
 async function queryInlineField(message, sender) {
   const origin = inlineOrigin(message, sender);
-  if (processingTabs.has(origin.tabId) || saveLocks.has(origin.tabId)) throw new Error('Application is busy or unavailable');
+  if (processingTabs.has(origin.tabId) || saveLocks.has(origin.tabId)) throw new Error('Fill is in progress');
   // Reserve first: a later focus query or navigation must revoke this operation even while inspection awaits.
   const reserved = await mutateInlineSession(origin.tabId, origin.frameId, null, () => ({...origin,
     sessionId: crypto.randomUUID(), field: null, suggestions: {}, generatedSuggestions: {},
@@ -1061,7 +1062,7 @@ async function queryInlineField(message, sender) {
   if (pageSignature(current.inspection) !== pageSignature(inspection) || !sameFieldSnapshot(current.field, aiFieldSnapshot(field))
     || current.field.editRevision !== field.editRevision) throw new Error('Inline destination changed. Focus the field again.');
   const session = await mutateInlineSession(origin.tabId, origin.frameId, reserved.sessionId, currentSession => {
-    const savedCandidates = candidates.map(candidate => ({...candidate, candidateId: `${currentSession.revision + 1}:${crypto.randomUUID()}`}));
+    const savedCandidates = candidates.map(candidate => ({...candidate, candidateId: `saved:${currentSession.revision + 1}:${crypto.randomUUID()}`}));
     const signature = pageSignature(inspection);
     return {...currentSession, field: scoped.field, pageSignature: signature, jobContext: inspection.page,
       attachedRun: scoped.attachedRun, suggestions: {[field.id]: {...origin, applicationId: scoped.attachedRun?.applicationId || reserved.sessionId,
@@ -1093,23 +1094,29 @@ async function guardInlineField(message, sender, {requireFocus = true} = {}) {
 
 async function acceptInlineField(message, sender) {
   const origin = inlineOrigin(message, sender);
-  if (processingTabs.has(origin.tabId) || saveLocks.has(origin.tabId)) throw new Error('Application is busy or unavailable');
+  if (processingTabs.has(origin.tabId) || saveLocks.has(origin.tabId)) throw new Error('Fill is in progress');
   saveLocks.add(origin.tabId);
   let session;
   let result;
   try {
     ({session} = await guardInlineField(message, sender, {requireFocus: false}));
     const suggestion = session.suggestions?.[session.field.id];
-    const candidate = suggestion?.candidates.find(item => item.candidateId === message.candidateId);
+    const generated = session.generatedSuggestions?.[session.field.id];
+    const draft = generated?.suggestions.find(item => item.candidateId === message.candidateId);
+    const candidate = draft || suggestion?.candidates.find(item => item.candidateId === message.candidateId);
     if (!candidate) throw new Error('Inline candidate expired. Focus the field again.');
     // Only worker-stored candidate keys/answers authorize the shared reviewed write.
     const approval = {sourceKeys: sourceKeysForCandidate(candidate)};
-    await reviewedCandidate(suggestion, approval);
+    if (!draft) await reviewedCandidate(suggestion, approval);
     const guarded = await guardInlineField(message, sender, {requireFocus: false});
     if (guarded.session.revision !== session.revision) throw new Error('Inline session changed');
+    if (draft && !(await currentInlineDestination(session, generated.snapshot))) {
+      throw new Error('The page or supporting evidence changed. Generate again.');
+    }
     // A fresh approval object avoids reusing the preflight evidence cache across the awaited guard.
     await applyReviewedField({tabId: origin.tabId, frameId: origin.frameId, applicationId: session.attachedRun?.applicationId,
-      field: guarded.field, suggestion, message: {sourceKeys: sourceKeysForCandidate(candidate)},
+      field: guarded.field, suggestion: draft ? null : suggestion,
+      message: draft ? {answer: requiredBoundedText(draft.answer, 'Answer', MAX_DRAFT_CHARS)} : {sourceKeys: sourceKeysForCandidate(candidate)},
       assertAuthority: () => {
         const current = inlineSessionAuthorities.get(`${origin.tabId}:${origin.frameId}`);
         if (!current || current.sessionId !== session.sessionId || current.revision !== session.revision || !(current.expiresAt > Date.now())) {
@@ -1127,6 +1134,81 @@ async function acceptInlineField(message, sender) {
   return result;
 }
 
+function inlineJobContext(session, inspection, run) {
+  return mergeJobContext(mergeJobContext({}, run?.jobContext || session.jobContext), inspection.page);
+}
+
+async function currentInlineDestination(session, snapshot) {
+  try {
+    const origin = {tabId: session.tabId, frameId: session.frameId, documentId: session.documentId, url: session.url};
+    const sender = {id: chrome.runtime.id, tab: {id: session.tabId}, frameId: session.frameId, documentId: session.documentId, url: session.url};
+    const current = await guardInlineField({...origin, sessionId: session.sessionId, requestId: snapshot.requestId}, sender, {requireFocus: false});
+    if (current.session.revision !== session.revision || current.session.workerId !== snapshot.workerId
+      || current.session.generation.requestId !== snapshot.requestId
+      || !sameFieldSnapshot(current.field, snapshot.field)
+      || current.field.rawValue !== snapshot.field.rawValue || current.field.editRevision !== snapshot.field.editRevision
+      || JSON.stringify(current.inspection.page) !== snapshot.pageContext) return null;
+    const [settings, datasource, run] = await Promise.all([getSettings(), getDatasource(), getRun(session.tabId)]);
+    if (settings.aiProvider !== snapshot.settings.aiProvider || settings.aiModel !== snapshot.settings.aiModel) return null;
+    const compatible = compatibleInlineRun(run, current.inspection, current.field, session.frameId);
+    if (JSON.stringify(compatible?.jobContext || {}) !== snapshot.runJobContext) return null;
+    const jobContext = inlineJobContext(session, current.inspection, compatible);
+    if (aiEvidenceRevision({jobContext}, current.inspection, datasource) !== snapshot.evidenceRevision) return null;
+    return current;
+  } catch { return null; }
+}
+
+async function generateInlineField(message, sender) {
+  const origin = inlineOrigin(message, sender);
+  if (processingTabs.has(origin.tabId) || saveLocks.has(origin.tabId)) throw new Error('Fill is in progress');
+  const {session, inspection, field} = await guardInlineField(message, sender);
+  if (session.generation.status === 'pending') return inlineReply(session, message.requestId, {error: 'This answer is already being prepared'});
+  const [settings, datasource, run] = await Promise.all([getSettings(), getDatasource(), getRun(origin.tabId)]);
+  const compatible = compatibleInlineRun(run, inspection, field, origin.frameId);
+  const jobContext = inlineJobContext(session, inspection, compatible);
+  const snapshot = {field: aiFieldSnapshot(field), settings: {aiProvider: settings.aiProvider, aiModel: settings.aiModel},
+    requestId: message.requestId, workerId: WORKER_ID, pageContext: JSON.stringify(inspection.page),
+    runJobContext: JSON.stringify(compatible?.jobContext || {}),
+    evidenceRevision: aiEvidenceRevision({jobContext}, inspection, datasource)};
+  const cached = compatible?.generatedSuggestions?.[field.id];
+  const reusable = cached?.snapshot && sameFieldSnapshot(field, cached.snapshot.field)
+    && cached.snapshot.field.rawValue === field.rawValue && cached.snapshot.field.editRevision === field.editRevision
+    && cached.snapshot.evidenceRevision === snapshot.evidenceRevision
+    && cached.snapshot.settings.aiProvider === settings.aiProvider && cached.snapshot.settings.aiModel === settings.aiModel;
+  if (!reusable && compatible?.aiOperations?.[`suggestion:${field.id}`]?.status === 'pending') {
+    return inlineReply(session, message.requestId, {error: 'This answer is already being prepared'});
+  }
+  const apiKey = reusable ? null : await getApiKey(settings.aiProvider);
+  if (!reusable && !apiKey) throw new Error(`Add a ${settings.aiProvider === 'fireworks' ? 'Fireworks' : 'OpenAI'} API key before generating answer suggestions`);
+  const pending = await mutateInlineSession(origin.tabId, origin.frameId, session.sessionId, current => {
+    if (processingTabs.has(origin.tabId) || saveLocks.has(origin.tabId)) throw new Error('Fill is in progress');
+    if (current.generation.status === 'pending' || current.revision !== session.revision) return false;
+    return {...current, generation: {status: 'pending', requestId: message.requestId}};
+  });
+  if (!pending) return inlineReply(session, message.requestId, {error: 'This answer is already being prepared'});
+  try {
+    if (!(await currentInlineDestination(pending, snapshot))) throw new Error('The page or supporting evidence changed. Generate again.');
+    const generated = reusable ? cached : await generateFieldDrafts({field, inspection, jobContext, datasource, records: datasource.answerRecords, settings, apiKey});
+    if (!(await currentInlineDestination(pending, snapshot))) throw new Error('The page or supporting evidence changed. Generate again.');
+    const committed = await mutateInlineSession(origin.tabId, origin.frameId, pending.sessionId, current => {
+      if (processingTabs.has(origin.tabId) || saveLocks.has(origin.tabId)) throw new Error('Fill is in progress');
+      if (current.workerId !== WORKER_ID || current.revision !== pending.revision || current.generation.requestId !== message.requestId || current.generation.status !== 'pending') return false;
+      const suggestions = generated.suggestions.map(draft => ({answer: draft.answer, evidenceKeys: draft.evidenceKeys,
+        candidateId: `generated:${crypto.randomUUID()}`, kind: 'generated', requiresApproval: false}));
+      return {...current, generation: {status: 'completed', requestId: message.requestId},
+        generatedSuggestions: {...current.generatedSuggestions, [field.id]: {suggestions, missingContext: generated.missingContext, snapshot}}};
+    });
+    if (!committed) throw new Error('Inline session changed. Generate again.');
+    return inlineReply(committed, message.requestId);
+  } catch (error) {
+    await mutateInlineSession(origin.tabId, origin.frameId, pending.sessionId, current => {
+      if (current.workerId !== WORKER_ID || current.generation.status !== 'pending' || current.revision !== pending.revision || current.generation.requestId !== message.requestId) return false;
+      return {...current, generation: {status: 'failed', requestId: message.requestId, error: error.message}};
+    }).catch(() => {});
+    throw error;
+  }
+}
+
 // Completed suggestions survive worker suspension; foreign pending jobs cannot silently succeed.
 writeInlineSessions(() => null).catch(() => {});
 
@@ -1138,6 +1220,8 @@ function listedRunField(run, fieldId) {
 function sameFieldSnapshot(field, snapshot = {}) {
   if (!snapshot || typeof snapshot !== 'object') return true;
   if (snapshot.handle && field.handle !== snapshot.handle) return false;
+  if (snapshot.rawValue !== undefined && field.rawValue !== snapshot.rawValue) return false;
+  if (snapshot.editRevision !== undefined && field.editRevision !== snapshot.editRevision) return false;
   if (snapshot.label && field.label !== snapshot.label) return false;
   if (snapshot.fieldType && field.type !== snapshot.fieldType) return false;
   if (snapshot.fieldOptions && JSON.stringify(field.options || []) !== JSON.stringify(snapshot.fieldOptions)) return false;
@@ -1388,7 +1472,7 @@ async function generateSuggestions(message) {
     run.generatedSuggestions = run.generatedSuggestions || {};
     run.generatedSuggestions[field.id] = {
       tabId: message.tabId, frameId: message.frameId, applicationId: run.startedAt, pageSignature: run.pageSignature,
-      field, suggestions: generated.suggestions, missingContext: generated.missingContext,
+      field, suggestions: generated.suggestions, missingContext: generated.missingContext, snapshot,
     };
     categorizeRun(run, current.inspection, validation?.validation || {});
   });
@@ -1719,9 +1803,10 @@ function beginSaveOperation(tabId) {
 }
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-  if (['JOB_INLINE_QUERY', 'JOB_INLINE_ACCEPT', 'JOB_INLINE_CANCEL'].includes(message?.type)) {
+  if (['JOB_INLINE_QUERY', 'JOB_INLINE_GENERATE', 'JOB_INLINE_ACCEPT', 'JOB_INLINE_CANCEL'].includes(message?.type)) {
     (async () => {
       if (message.type === 'JOB_INLINE_QUERY') return queryInlineField(message, sender);
+      if (message.type === 'JOB_INLINE_GENERATE') return generateInlineField(message, sender);
       if (message.type === 'JOB_INLINE_ACCEPT') return acceptInlineField(message, sender);
       const origin = inlineOrigin(message, sender);
       const session = await writeInlineSessions(sessions => sessions[`${origin.tabId}:${origin.frameId}`]);
@@ -2030,6 +2115,8 @@ function aiFieldSnapshot(field = {}) {
     label: field.label,
     fieldType: field.type,
     currentValue: field.currentValue,
+    rawValue: field.rawValue,
+    editRevision: field.editRevision,
     fieldOptions: field.options || [],
     fieldConstraints: field.constraints || {},
     fieldMultiple: Boolean(field.multiple),
@@ -2148,7 +2235,7 @@ async function currentAiDestination(tabId,snapshot,field=null) {
   if(aiEvidenceRevision(run,inspected.inspection,datasource)!==snapshot.evidenceRevision) return null;
   if(field) {
     const live=inspected.inspection.fields.find(item=>item.id===field.id);
-    if(!live || live.currentValue!==field.currentValue || live.handle!==field.handle || JSON.stringify(live.constraints)!==JSON.stringify(field.constraints)) return null;
+    if(!live || live.currentValue!==field.currentValue || !sameFieldSnapshot(live,aiFieldSnapshot(field))) return null;
   }
   return {run,inspection:inspected.inspection};
 }
@@ -2191,7 +2278,8 @@ async function prepareAi(tabId,snapshot,plannerFields,suggestionFields,allFields
       await mutateRun(tabId,current=>{
         if(current.aiOperations?.[snapshot.operationKey]?.id!==snapshot.id || current.pageSignature!==snapshot.pageSignature)return false;
         current.generatedSuggestions ||= {};
-        current.generatedSuggestions[field.id]={tabId,frameId:snapshot.frameId,applicationId:snapshot.startedAt,pageSignature:snapshot.pageSignature,field,...generated};
+        current.generatedSuggestions[field.id]={tabId,frameId:snapshot.frameId,applicationId:snapshot.startedAt,pageSignature:snapshot.pageSignature,field,...generated,
+          snapshot: {...snapshot, field: aiFieldSnapshot(field)}};
         current.aiOperations[key].status='completed';
       });
       await validatePageOnly(tabId);

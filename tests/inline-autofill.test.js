@@ -32,6 +32,53 @@ function fixture(t, handler, html = '<form><label>Name<input id="name"></label><
   return {dom, document, messages, inline, field, host, root, button, key, input};
 }
 
+test('generated rows show draft provenance and missing context and require selection before acceptance', async t => {
+  const draft = {candidateId: 'generated:1', answer: 'Generated answer', kind: 'generated', requiresApproval: false, evidenceKeys: ['profile:experience']};
+  let finish;
+  const f = fixture(t, message => message.type === 'JOB_INLINE_GENERATE'
+    ? new Promise(resolve => {finish = () => resolve({ok: true, sessionId: 's1', requestId: message.requestId, candidates: [...candidates, draft], generatedSuggestion: {missingContext: 'Add the job description.'}});})
+    : {ok: true, sessionId: 's1', requestId: message.requestId, candidates});
+  f.field.focus(); await tick();
+  f.button('Generate answer').click();
+  assert.match(f.root().textContent, /Generating an answer/);
+  finish(); await tick();
+  assert.equal(f.root().querySelectorAll('[role="option"]').length, 3);
+  assert.match(f.root().textContent, /Draft/);
+  assert.match(f.root().textContent, /profile:experience/);
+  assert.match(f.root().textContent, /Add the job description/);
+  assert.equal(f.button('Edit in panel').hidden, false);
+  assert.equal(f.key('Tab').defaultPrevented, false);
+  f.root().querySelectorAll('[role="option"]')[2].click();
+  f.button('Use draft').click();
+  assert.equal(f.messages.find(message => message.type === 'JOB_INLINE_ACCEPT').candidateId, draft.candidateId);
+});
+
+test('busy acceptance keeps the selected answer available for explicit retry', async t => {
+  const f = fixture(t, message => message.type === 'JOB_INLINE_ACCEPT'
+    ? {ok: false, error: 'Fill is in progress'}
+    : {ok: true, sessionId: 's1', requestId: message.requestId, candidates});
+  f.field.focus(); await tick(); f.key('ArrowDown'); f.key('Tab'); await tick();
+  assert.match(f.root().textContent, /Fill is in progress/);
+  assert.equal(f.root().querySelectorAll('[role="option"]').length, 2);
+  assert.equal(f.button('Use and save reviewed answer').disabled, false);
+});
+
+test('busy generation and provider errors retain saved choices and busy selection', async t => {
+  let error = 'Fill is in progress';
+  const f = fixture(t, message => message.type === 'JOB_INLINE_GENERATE'
+    ? {ok: false, error}
+    : {ok: true, sessionId: 's1', requestId: message.requestId, candidates});
+  f.field.focus(); await tick(); f.key('ArrowDown');
+  f.button('Generate answer').click(); await tick();
+  assert.equal(f.root().querySelector('[aria-selected="true"]')?.id, 'inline-answer-0');
+  error = 'Add an API key';
+  f.button('Generate answer').click(); await tick();
+  assert.equal(f.root().querySelectorAll('[role="option"]').length, 2);
+  assert.match(f.root().textContent, /Add an API key/);
+  f.key('ArrowDown');
+  assert.equal(f.button('Use and save reviewed answer').disabled, false);
+});
+
 test('ordinary Tab does not accept the first returned answer', async () => {
   const dom = new JSDOM('<label>Name<input id="name"></label><input id="next">',
     {url: 'https://jobs.example.com/apply', pretendToBeVisual: true});

@@ -72,7 +72,7 @@ function createHarness({
     const frame = frameFor(tabId, frameId);
     const page = frame.pages[frame.currentPage];
     return {
-      page: page.page || { title: frame.context.title || `Step ${frame.currentPage + 1}`, domain: frame.context.domain || 'jobs.example.com' },
+      page: {...(page.page || { title: frame.context.title || `Step ${frame.currentPage + 1}`, domain: frame.context.domain || 'jobs.example.com' })},
       fields: page.fields.map((field) => materializeField(field, page.values || {})),
       actions: page.actions || [],
       pauseReasons: page.pauseReasons || [],
@@ -268,6 +268,12 @@ test('inline lookup works with no run and never fills on focus', async () => {
 
 const inlineSender = (overrides = {}) => ({ id: 'test-extension', tab: {id: 7}, frameId: 0, documentId: 'doc-a', url: 'https://jobs.example.com/apply', ...overrides });
 const inlineQuery = (overrides = {}) => ({ type: 'JOB_INLINE_QUERY', fieldId: 'name', handle: 'doc-a:name', requestId: 'query-1', ...overrides });
+const inlineGeneration = (query, requestId = 'generate-1') => ({type: 'JOB_INLINE_GENERATE', sessionId: query.sessionId, requestId});
+const generatedResponse = (suggestions = [{answer: 'Nithin', evidenceKeys: ['full_name']}], missingContext = '') => ({ok: true, status: 200, statusText: 'OK', json: async () => ({output_text: JSON.stringify({suggestions, missingContext})})});
+async function waitUntil(predicate) {
+  for (let i = 0; i < 100 && !predicate(); i++) await new Promise(resolve => setTimeout(resolve, 5));
+  assert.ok(predicate(), 'Expected deferred provider operation to start');
+}
 const inlineAcceptance = (query, overrides = {}) => ({ type: 'JOB_INLINE_ACCEPT', sessionId: query.sessionId, requestId: 'accept-1', candidateId: query.candidates[0].candidateId, acceptanceToken: 'content-token', ...overrides });
 async function inlineHarness({ field = {}, page = {}, ...options } = {}) {
   const harness = createHarness({pagesByTab: {7: {pages: [{page: {title: 'Job application', domain: 'jobs.example.com'}, fields: [
@@ -276,6 +282,221 @@ async function inlineHarness({ field = {}, page = {}, ...options } = {}) {
   await import(`../src/service-worker.js?test=inline-${Date.now()}-${Math.random()}`);
   return harness;
 }
+
+test('inline explicit generation without a run creates selectable drafts without learning or applying', async () => {
+  const harness = await inlineHarness({waitForAI: false});
+  harness.localData.openaiApiKey = 'synthetic-test-key';
+  let calls = 0;
+  globalThis.fetch = async () => {calls++; return generatedResponse();};
+  const query = await harness.dispatch(inlineQuery(), inlineSender());
+  assert.equal(calls, 0, 'focus lookup cannot call AI');
+  const before = structuredClone(harness.localData.answerRecords);
+  const response = await harness.dispatch(inlineGeneration(query), inlineSender());
+  assert.equal(response.ok, true, response.error);
+  assert.equal(calls, 1);
+  assert.equal(response.generatedSuggestion.suggestions[0].answer, 'Nithin');
+  assert.ok(response.generatedSuggestion.snapshot.evidenceRevision);
+  assert.match(response.candidates[0].candidateId, /^saved:/);
+  const draft = response.candidates.find(candidate => candidate.kind === 'generated');
+  assert.match(draft.candidateId, /^generated:/);
+  assert.equal(draft.requiresApproval, false);
+  assert.deepEqual(draft.evidenceKeys, ['full_name']);
+  assert.equal(harness.tabs.get(7).messages.some(message => message.type === 'JOB_APP_APPLY'), false);
+  const accepted = await harness.dispatch(inlineAcceptance(response, {candidateId: draft.candidateId, answer: 'Forged'}), inlineSender());
+  assert.equal(accepted.ok, true, accepted.error);
+  assert.equal(harness.tabs.get(7).frames[0].pages[0].values.name, 'Nithin');
+  assert.deepEqual(harness.localData.answerRecords, before, 'generated provenance is not reusable evidence authority');
+  assert.equal(harness.sessionData.applicationRun?.['7'], undefined);
+});
+
+test('inline generation without a key or with provider failure preserves saved choices', async () => {
+  const harness = await inlineHarness();
+  const query = await harness.dispatch(inlineQuery(), inlineSender());
+  const missing = await harness.dispatch(inlineGeneration(query), inlineSender());
+  assert.equal(missing.ok, false);
+  assert.match(missing.error, /API key/);
+  harness.localData.openaiApiKey = 'synthetic-test-key';
+  globalThis.fetch = async () => {throw new Error('Synthetic provider failure');};
+  const failed = await harness.dispatch(inlineGeneration(query, 'generate-2'), inlineSender());
+  assert.equal(failed.ok, false);
+  assert.match(failed.error, /Synthetic provider failure/);
+  assert.deepEqual(harness.sessionData.inlineFieldSessions['7:0'].suggestions.name.candidates, query.candidates);
+  assert.equal((await harness.dispatch(inlineAcceptance(query), inlineSender())).ok, true);
+});
+
+test('deferred inline generation rejects changed field, profile, job context, settings and deleted evidence', async () => {
+  for (const change of ['raw', 'editRevision', 'profile', 'jobContext', 'provider', 'model', 'deletedEvidence', 'newSession', 'navigation']) {
+    const harness = await inlineHarness({waitForAI: false});
+    harness.localData.openaiApiKey = 'synthetic-test-key';
+    let release, called = false;
+    globalThis.fetch = () => {called = true; return new Promise(resolve => {release = resolve;});};
+    const query = await harness.dispatch(inlineQuery(), inlineSender());
+    const pending = harness.dispatch(inlineGeneration(query), inlineSender());
+    await waitUntil(() => called);
+    const page = harness.tabs.get(7).frames[0].pages[0];
+    if (change === 'raw') page.fields[0].rawValue = ' ';
+    if (change === 'editRevision') page.fields[0].editRevision++;
+    if (change === 'profile') harness.localData.profile = {employment: [{id: 'new', company: 'Changed'}]};
+    if (change === 'jobContext') page.page.jobDescription = 'Different requirements';
+    if (change === 'provider') harness.localData.aiProvider = 'fireworks';
+    if (change === 'model') harness.localData.aiModel = 'different-model';
+    if (change === 'deletedEvidence') harness.localData.answerRecords = [];
+    let newer;
+    if (change === 'newSession') newer = await harness.dispatch(inlineQuery({requestId: 'query-2'}), inlineSender());
+    if (change === 'navigation') await harness.dispatch({type: 'JOB_APP_NAVIGATED'}, inlineSender());
+    const before = structuredClone(harness.localData.answerRecords);
+    release(generatedResponse());
+    const response = await pending;
+    assert.equal(response.ok, false, change);
+    assert.equal(harness.sessionData.inlineFieldSessions['7:0']?.generatedSuggestions?.name, undefined, change);
+    if (newer) assert.equal(harness.sessionData.inlineFieldSessions['7:0'].sessionId, newer.sessionId);
+    assert.equal(harness.tabs.get(7).messages.some(message => message.type === 'JOB_APP_APPLY'), false, change);
+    assert.deepEqual(harness.localData.answerRecords, before, change);
+  }
+});
+
+test('only one inline request can be pending and generated acceptance rechecks evidence', async () => {
+  const harness = await inlineHarness({waitForAI: false});
+  harness.localData.openaiApiKey = 'synthetic-test-key';
+  let release, calls = 0;
+  globalThis.fetch = () => {calls++; return new Promise(resolve => {release = resolve;});};
+  const query = await harness.dispatch(inlineQuery(), inlineSender());
+  const pending = harness.dispatch(inlineGeneration(query), inlineSender());
+  await waitUntil(() => calls === 1);
+  const duplicate = await harness.dispatch(inlineGeneration(query, 'generate-2'), inlineSender());
+  assert.equal(duplicate.ok, true, duplicate.error);
+  assert.equal(duplicate.error, 'This answer is already being prepared');
+  assert.equal(calls, 1);
+  release(generatedResponse());
+  const response = await pending;
+  assert.equal(response.ok, true, response.error);
+  harness.localData.answerRecords = [];
+  const draft = response.candidates.find(candidate => candidate.kind === 'generated');
+  assert.equal((await harness.dispatch(inlineAcceptance(response, {candidateId: draft.candidateId}), inlineSender())).ok, false);
+  assert.equal(harness.tabs.get(7).messages.some(message => message.type === 'JOB_APP_APPLY'), false);
+});
+
+test('generated acceptance rejects evidence or settings changed during the final destination guard', async () => {
+  for (const change of ['evidence', 'model']) {
+    const harness = await inlineHarness();
+    harness.localData.openaiApiKey = 'synthetic-test-key';
+    globalThis.fetch = async () => generatedResponse();
+    const query = await harness.dispatch(inlineQuery(), inlineSender());
+    const generated = await harness.dispatch(inlineGeneration(query), inlineSender());
+    const draft = generated.candidates.find(candidate => candidate.kind === 'generated');
+    let inspections = 0;
+    harness.tabs.get(7).frames[0].pages[0].onInlineInspect = () => {
+      if (++inspections !== 3) return;
+      if (change === 'evidence') harness.localData.answerRecords = [];
+      else harness.localData.aiModel = 'different-model';
+    };
+    const accepted = await harness.dispatch(inlineAcceptance(generated, {candidateId: draft.candidateId}), inlineSender());
+    assert.equal(accepted.ok, false, change);
+    assert.equal(harness.tabs.get(7).messages.some(message => message.type === 'JOB_APP_APPLY'), false, change);
+  }
+});
+
+test('inline generated requests reject legal, unresolved-employment and unsupported controls before AI', async () => {
+  for (const field of [{label: 'I agree to terms and conditions'}, {type: 'select'}, {label: 'Job title', entityType: 'employment', entityId: 'work-1'}]) {
+    const harness = await inlineHarness({field});
+    harness.localData.profile = {employment: [{id: 'a', company: 'A'}, {id: 'b', company: 'B'}]};
+    harness.localData.openaiApiKey = 'synthetic-test-key';
+    let calls = 0;
+    globalThis.fetch = async () => {calls++; return generatedResponse();};
+    const query = await harness.dispatch(inlineQuery(), inlineSender());
+    const generated = await harness.dispatch(inlineGeneration({...query, sessionId: query.sessionId || 'invalid'}), inlineSender());
+    assert.equal(generated.ok, false);
+    assert.equal(calls, 0);
+  }
+});
+
+test('inline generation reuses completed panel snapshots and deduplicates same-field background work', async () => {
+  const drafts = [{answer: 'Built reliable event processing services.', evidenceKeys: ['experience']}];
+  for (const route of ['panel', 'background']) {
+    const harness = await inlineHarness({waitForAI: false, answerRecords: [{key: 'experience', question: 'Experience', answer: 'Built reliable event processing services.', confirmationState: 'confirmed', sensitivity: 'safe'}], field: {id: 'why', handle: 'doc-a:why', label: 'Why are you a good fit?', type: 'textarea', required: true},
+      page: {actions: [{id: 'submit', kind: 'submit', label: 'Submit application'}]}});
+    let release, calls = 0;
+    globalThis.fetch = async (_url, options) => {
+      const request = JSON.parse(JSON.parse(options.body).input[1].content[0].text);
+      if (request.fields) return {ok: true, json: async () => ({output_text: JSON.stringify({decisions: []})})};
+      assert.ok(request.records.some(record => record.key === 'experience'), JSON.stringify(request));
+      calls++;
+      if (route === 'background' && calls === 1) return new Promise(resolve => {release = resolve;});
+      return generatedResponse(drafts, 'Add relevant experience.');
+    };
+    if (route === 'background') harness.localData.openaiApiKey = 'synthetic-test-key';
+    const started = await harness.dispatch({type: 'JOB_RUN_START', tabId: 7});
+    assert.equal(started.ok, true, started.error);
+    harness.localData.openaiApiKey = 'synthetic-test-key';
+    if (route === 'panel') {
+      const generated = await harness.dispatch({type: 'JOB_RUN_GENERATE_SUGGESTIONS', ...draftOrigin(started.run, {id: 'why', handle: 'doc-a:why'})});
+      assert.equal(generated.ok, true, generated.error);
+    } else await waitUntil(() => Boolean(release));
+    const query = await harness.dispatch(inlineQuery({fieldId: 'why', handle: 'doc-a:why'}), inlineSender());
+    assert.equal(query.ok, true, query.error);
+    if (route === 'background') {
+      const duplicate = await harness.dispatch(inlineGeneration(query), inlineSender());
+      assert.equal(duplicate.ok, true, duplicate.error);
+      assert.equal(duplicate.error, 'This answer is already being prepared');
+      assert.equal(calls, 1);
+      release(generatedResponse(drafts, 'Add relevant experience.'));
+      await waitUntil(() => harness.sessionData.applicationRun['7'].aiOperations['suggestion:why'].status === 'completed');
+    }
+    const before = structuredClone(harness.sessionData.applicationRun['7']);
+    const cached = await harness.dispatch(inlineGeneration(query, 'generate-cached'), inlineSender());
+    assert.equal(cached.ok, true, cached.error);
+    assert.equal(cached.generatedSuggestion.missingContext, 'Add relevant experience.');
+    assert.equal(cached.candidates.find(candidate => candidate.kind === 'generated').answer, drafts[0].answer);
+    assert.equal(calls, 1, route);
+    assert.deepEqual(harness.sessionData.applicationRun['7'], before, 'inline cache reuse never rewrites run state');
+  }
+});
+
+test('unrelated background work stays pending through inline query and apply, then rejects changed page evidence', async () => {
+  const harness = await inlineHarness({waitForAI: false, field: {label: 'Current CTC', type: 'textarea'},
+    answerRecords: [{key: 'current_salary', question: 'Current salary', answer: 'Synthetic explanation', sensitivity: 'review'}]});
+  const page = harness.tabs.get(7).frames[0].pages[0];
+  page.fields.push({id: 'why', handle: 'doc-a:why', label: 'Why are you a good fit?', type: 'textarea', required: true, rawValue: '', editRevision: 0});
+  harness.localData.openaiApiKey = 'synthetic-test-key';
+  let release, calls = 0;
+  globalThis.fetch = async (_url, options) => {
+    const request = JSON.parse(JSON.parse(options.body).input[1].content[0].text);
+    if (request.fields) return {ok: true, json: async () => ({output_text: JSON.stringify({decisions: []})})};
+    calls++;
+    return new Promise(resolve => {release = resolve;});
+  };
+  await harness.dispatch({type: 'JOB_RUN_START', tabId: 7});
+  await waitUntil(() => Boolean(release));
+  const runBefore = structuredClone(harness.sessionData.applicationRun['7']);
+  const query = await harness.dispatch(inlineQuery(), inlineSender());
+  assert.equal(query.ok, true, query.error);
+  assert.deepEqual(harness.sessionData.applicationRun['7'], runBefore);
+  const accepted = await harness.dispatch(inlineAcceptance(query), inlineSender());
+  assert.equal(accepted.ok, true, accepted.error);
+  assert.deepEqual(harness.sessionData.applicationRun['7'].aiOperations, runBefore.aiOperations);
+  assert.equal(calls, 1);
+  release(generatedResponse([], 'Add relevant experience.'));
+  await waitUntil(() => harness.sessionData.applicationRun['7'].aiOperations['suggestion:why'].status === 'interrupted');
+  assert.equal(harness.sessionData.applicationRun['7'].generatedSuggestions.why, undefined);
+  assert.equal(page.values.name, 'Synthetic explanation');
+});
+
+test('worker restart interrupts actual pending inline work and rejects the old response', async () => {
+  const harness = await inlineHarness({waitForAI: false});
+  harness.localData.openaiApiKey = 'synthetic-test-key';
+  let release;
+  globalThis.fetch = () => new Promise(resolve => {release = resolve;});
+  const query = await harness.dispatch(inlineQuery(), inlineSender());
+  const pending = harness.dispatch(inlineGeneration(query), inlineSender());
+  await waitUntil(() => Boolean(release));
+  harness.listeners.length = 0;
+  await import(`../src/service-worker.js?inline-pending-restart=${Date.now()}`);
+  await waitUntil(() => harness.sessionData.inlineFieldSessions['7:0'].generation.status === 'interrupted');
+  release(generatedResponse());
+  assert.equal((await pending).ok, false);
+  assert.equal(harness.sessionData.inlineFieldSessions['7:0'].generation.status, 'interrupted');
+  assert.equal(harness.sessionData.inlineFieldSessions['7:0'].generatedSuggestions.name, undefined);
+});
 
 test('inline saved acceptance resolves worker candidate authority, persists once, and does not create a run', async () => {
   const harness = await inlineHarness();
