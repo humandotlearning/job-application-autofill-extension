@@ -284,7 +284,10 @@ export function createInlineAutofill(document, {send, describe}) {
     if (event.target === host && target?.isConnected && !host.hidden) {
       document.__jobApplicationInlineFocusAnchor = target;
       controlsMode(true);
-    } else delete document.__jobApplicationInlineFocusAnchor;
+    } else {
+      delete document.__jobApplicationInlineFocusAnchor;
+      if (shadow) controlsMode(false);
+    }
     activate(event.target);
   });
   listen(document, 'click', event => { if (!event.composedPath().includes(host)) activate(event.target); });

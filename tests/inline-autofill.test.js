@@ -135,6 +135,23 @@ test('Alt+ArrowDown enters popup controls; Escape restores field focus and close
   assert.equal(f.messages.filter(m => m.type === 'JOB_INLINE_QUERY').length, 1);
 });
 
+test('returning from popup controls to the unchanged field restores ordinary Tab order', async t => {
+  const f = fixture(t); f.field.focus(); await tick();
+  f.key('ArrowDown', {altKey: true});
+  const controls = [f.root().querySelector('[role="listbox"]'), f.button('Generate answer'), f.button('Edit in panel'), f.button('Close')];
+  f.button('Generate answer').focus();
+  assert.ok(controls.every(control => control.tabIndex === 0), 'focus within the popup preserves normal control Tab order');
+  f.field.focus();
+  assert.equal(f.host().hidden, false);
+  assert.equal(f.root().querySelector('[aria-selected="true"]'), null);
+  assert.ok(controls.every(control => control.tabIndex === -1), 'returning to the page removes popup controls from sequential Tab order');
+  assert.equal(f.key('Tab').defaultPrevented, false);
+  assert.equal(f.document.activeElement, f.field);
+  assert.equal(f.root().activeElement, null);
+  assert.equal(f.messages.some(message => message.type === 'JOB_INLINE_ACCEPT'), false);
+  assert.equal(f.messages.filter(message => message.type === 'JOB_INLINE_QUERY').length, 1);
+});
+
 test('popup focus retains the selected field when application forms have equal scores', async t => {
   const f = fixture(t, null, '<form aria-label="Job application"><label>Name<input id="name"></label></form><form aria-label="Job application"><label>Name<input id="other"></label></form>');
   f.field.focus(); await tick();
