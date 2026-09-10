@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { callAnswerPlanner, callAnswerRewriter } from '../src/llm.js';
+import { callAnswerPlanner, callAnswerRewriter, callAnswerSuggestions } from '../src/llm.js';
 
 function createInput() {
   return {
@@ -433,6 +433,68 @@ test('accepts a canonical option label when the stored answer uses a common abbr
   assert.equal(result.decisions[0].value, 'United States');
 });
 
+test('accepts a reviewed semantic option mapping only as a visible label', async () => {
+  const result = await callAnswerPlanner({
+    apiKey: 'test-api-key',
+    fields: [{ id: 'heard', label: 'How did you hear about us?', type: 'select', options: ['Recruiter', 'Company website'] }],
+    records: [{ key: 'how_did_you_hear_about_this_job', question: 'How did you hear about this job?', answer: 'My Hermes agent found the role relevant to my profile', sensitivity: 'safe' }],
+    page: {},
+  }, {
+    fetchImpl: async () => plannerResponse([{
+      fieldId: 'heard', action: 'fill', value: 'Recruiter', evidenceKeys: ['how_did_you_hear_about_this_job'], confidence: 'medium', sensitivity: 'safe', transformation: 'map_option', reason: 'Visible option selected for review',
+    }]),
+  });
+  assert.equal(result.decisions[0].value, 'Recruiter');
+  assert.equal(result.decisions[0].transformation, 'map_option');
+});
+
+test('rejects opaque option values from planner output', async () => {
+  await assert.rejects(callAnswerPlanner({
+    apiKey: 'test-api-key',
+    fields: [{ id: 'heard', label: 'How did you hear about us?', type: 'select', options: ['Recruiter', '4466d54cbeba1000aec278b38cc80000'] }],
+    records: [{ key: 'how_did_you_hear_about_this_job', question: 'How did you hear about this job?', answer: 'Recruiter', sensitivity: 'safe' }],
+    page: {},
+  }, {
+    fetchImpl: async () => plannerResponse([{
+      fieldId: 'heard', action: 'fill', value: '4466d54cbeba1000aec278b38cc80000', evidenceKeys: ['how_did_you_hear_about_this_job'], confidence: 'high', sensitivity: 'safe', transformation: 'map_option', reason: 'Internal option value',
+    }]),
+  }), /opaque|evidence|option/i);
+});
+
+test('planner payload treats option values as transport data and instructs label-only mapping', async () => {
+  let requestBody;
+  await callAnswerPlanner({
+    apiKey: 'test-api-key',
+    fields: [{ id: 'heard', label: 'How did you hear about us?', type: 'select', structuredOptions: [{ label: 'Recruiter', value: '4466d54cbeba1000aec278b38cc80000' }] }],
+    records: [],
+    page: {},
+  }, {
+    fetchImpl: async (_url, options) => { requestBody = JSON.parse(options.body); return plannerResponse([{ fieldId: 'heard', action: 'ask_user', value: null, evidenceKeys: [], confidence: 'low', sensitivity: 'safe', reason: 'Needs review' }]); },
+  });
+  const body = JSON.stringify(requestBody);
+  assert.doesNotMatch(body, /4466d54cbeba1000aec278b38cc80000/);
+  assert.match(requestBody.input[0].content[0].text, /human-readable|internal|option label/i);
+});
+
+test('map_option requires an exact visible label on a choice field', async () => {
+  await assert.rejects(callAnswerPlanner({
+    apiKey: 'test-api-key',
+    fields: [{ id: 'country', label: 'Country', type: 'select', options: ['United States'] }],
+    records: [{ key: 'country', question: 'Country', answer: 'US', sensitivity: 'safe' }],
+    page: {},
+  }, {
+    fetchImpl: async () => plannerResponse([{ fieldId: 'country', action: 'fill', value: 'US', evidenceKeys: ['country'], confidence: 'high', sensitivity: 'safe', transformation: 'map_option', reason: 'Abbreviation' }]),
+  }), /evidence|transformation/i);
+  await assert.rejects(callAnswerPlanner({
+    apiKey: 'test-api-key',
+    fields: [{ id: 'country', label: 'Country', type: 'text', options: ['United States'] }],
+    records: [{ key: 'country', question: 'Country', answer: 'United States', sensitivity: 'safe' }],
+    page: {},
+  }, {
+    fetchImpl: async () => plannerResponse([{ fieldId: 'country', action: 'fill', value: 'United States', evidenceKeys: ['country'], confidence: 'high', sensitivity: 'safe', transformation: 'map_option', reason: 'Not a choice control' }]),
+  }), /evidence|transformation/i);
+});
+
 test('keeps valid planner decisions when another decision fails validation', async () => {
   const result = await callAnswerPlanner(createInput(), {
     allowPartial: true,
@@ -508,6 +570,34 @@ function rewriteResponse(answer) {
     output: [{ type: 'message', content: [{ type: 'output_text', text: JSON.stringify({ answer }) }] }],
   });
 }
+
+test('suggestion and rewrite prompts quarantine opaque records and answers', async () => {
+  const opaque = '4466d54cbeba1000aec278b38cc80000';
+  let suggestionBody;
+  await callAnswerSuggestions({
+    apiKey: 'test',
+    field: { id: 'summary', label: 'Summary', type: 'textarea' },
+    records: [{ key: 'opaque', question: 'Opaque', answer: opaque }, { key: 'readable', question: 'Summary', answer: 'Readable evidence' }],
+  }, {
+    fetchImpl: async (_url, options) => {
+      suggestionBody = JSON.parse(options.body);
+      return createResponse({ output: [{ type: 'message', content: [{ type: 'output_text', text: JSON.stringify({ suggestions: [], missingContext: '' }) }] }] });
+    },
+  });
+  assert.doesNotMatch(JSON.stringify(suggestionBody), new RegExp(opaque));
+  await assert.rejects(callAnswerSuggestions({ apiKey: 'test', field: { id: 'summary', label: 'Summary', type: 'textarea' } }, {
+    fetchImpl: async () => createResponse({ output: [{ type: 'message', content: [{ type: 'output_text', text: JSON.stringify({ suggestions: [{ answer: opaque, evidenceKeys: [] }], missingContext: '' }) }] }] }),
+  }), /Invalid suggestion/);
+
+  let rewriteBody;
+  await callAnswerRewriter({ apiKey: 'test', question: 'Summary', draft: 'Readable draft', records: [{ key: 'opaque', question: 'Opaque', answer: opaque }] }, {
+    fetchImpl: async (_url, options) => { rewriteBody = JSON.parse(options.body); return rewriteResponse('Readable rewrite'); },
+  });
+  assert.doesNotMatch(JSON.stringify(rewriteBody), new RegExp(opaque));
+  await assert.rejects(callAnswerRewriter({ apiKey: 'test', question: 'Summary', draft: 'Readable draft' }, {
+    fetchImpl: async () => rewriteResponse(opaque),
+  }), /non-empty/);
+});
 
 test('rewriter sends bounded structured data using the configured model', async () => {
   let request;

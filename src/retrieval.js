@@ -1,4 +1,4 @@
-import { canonicalConcept, chooseRecord, normalizeText, recordScopeCompatible, meaningCompatible, inferSensitivity, suggestionTargetKey } from './core.js';
+import { canonicalConcept, chooseRecord, inferSensitivity, isOpaqueIdentifier, meaningCompatible, normalizeText, recordScopeCompatible, suggestionTargetKey } from './core.js';
 
 const EXPERIENCE_TAGS = {
   ml: /\b(ml|machine learning|models?|computer vision)\b/,
@@ -31,18 +31,23 @@ export function retrieveEvidence(field, records = [], { limit = 3 } = {}) {
   const targetKey = suggestionTargetKey(field);
   const tags = Object.entries(EXPERIENCE_TAGS).filter(([, regex]) => regex.test(query)).map(([tag]) => tag);
   return records.flatMap(record => {
-    if (!recordScopeCompatible(field, record) || !meaningCompatible(field, record, { numericReview: false }) || !String(record.answer || '').trim()) return [];
+    if (isOpaqueIdentifier(record.answer) || isOpaqueIdentifier(record.question) || isOpaqueIdentifier(record.key)
+      || !recordScopeCompatible(field, record) || !meaningCompatible(field, record, { numericReview: false }) || !String(record.answer || '').trim()) return [];
     if (targetKey && record.suppressedFor?.includes(targetKey)) return [];
     const exact = chooseRecord(field, [record]);
     const equivalent = exact?.score === 1;
     const reviewEquivalent = !equivalent && canonicalConcept(field.label) === canonicalConcept(record.question);
+    const choiceField = ['select', 'select-one', 'radio', 'checkbox'].includes(normalizeText(field.type));
+    const visibleOptions = Array.isArray(field.options)
+      && field.options.some((option) => typeof option === 'string' && option.trim() && !isOpaqueIdentifier(option));
+    const choiceMapping = choiceField && visibleOptions && !equivalent && !reviewEquivalent && Number(exact?.score || 0) >= 0.6;
     const text = normalizeText(`${record.question} ${(record.aliases || []).join(' ')} ${String(record.answer).slice(0, 4000)}`);
     const overlap = tags.length ? tags.filter(tag => EXPERIENCE_TAGS[tag].test(text)) : narrativeOverlap(field, record);
-    if (!equivalent && !reviewEquivalent && ((record.confirmationState && record.confirmationState !== 'confirmed') || record.sensitivity === 'legal' || inferSensitivity(record.question) !== 'safe'
+    if (!equivalent && !reviewEquivalent && !choiceMapping && ((record.confirmationState && record.confirmationState !== 'confirmed') || record.sensitivity === 'legal' || inferSensitivity(record.question) !== 'safe'
       || /\b(no|not|never|without|lack)\b/.test(normalizeText(record.answer)) || record.answer.trim().split(/\s+/).length < 5
       || /why.*(?:join|company|work)|motivat/.test(normalizeText(record.question))
       || !overlap.length || (tags.length > 0 && overlap.length !== tags.length))) return [];
-    return [{ sourceKey: record.key, sourceQuestion: record.question, answer: record.answer, excerpt: record.answer.slice(0, 400), provenance: record.provenance || 'saved record', kind: equivalent ? 'equivalent' : reviewEquivalent ? 'review' : 'related', requiresApproval: true,
-      reason: !record.confirmationState ? 'Unconfirmed saved evidence — explicit approval required' : equivalent ? 'Saved answer requires confirmation' : reviewEquivalent ? 'Saved answer has units/context to review; no conversion performed' : `Related saved evidence: ${overlap.join(', ')}; not an asserted qualification`, score: equivalent ? 100 : overlap.length }];
+    return [{ sourceKey: record.key, sourceQuestion: record.question, answer: record.answer, excerpt: record.answer.slice(0, 400), provenance: record.provenance || 'saved record', kind: equivalent ? 'equivalent' : reviewEquivalent ? 'review' : choiceMapping ? 'choice_mapping' : 'related', requiresApproval: true,
+      reason: !record.confirmationState ? 'Unconfirmed saved evidence — explicit approval required' : equivalent ? 'Saved answer requires confirmation' : reviewEquivalent ? 'Saved answer has units/context to review; no conversion performed' : choiceMapping ? 'Saved answer may support a visible option mapping; explicit approval required' : `Related saved evidence: ${overlap.join(', ')}; not an asserted qualification`, score: equivalent ? 100 : choiceMapping ? Math.round((exact?.score || 0) * 100) : overlap.length }];
   }).sort((a,b) => b.score - a.score || a.sourceKey.localeCompare(b.sourceKey)).slice(0, limit);
 }

@@ -24,6 +24,17 @@ test('migrates legacy datasource state to a profile with confirmed employer defa
   assert.deepEqual(migrated.profile.employment.map((entry) => entry.company), ['DeepSight AI Labs']);
   assert.equal(migrated.profile.defaults.relatedToHiringCompany, 'No');
   assert.equal(migrated.profile.defaults.knownAtHiringCompany, 'No');
+  assert.equal(migrated.profile.defaults.phoneDeviceType, 'Mobile');
+});
+
+test('preserves an editable phone device preference through backup normalization', () => {
+  const state = createDatasourceState({
+    answerRecords: [{ key: 'email', question: 'Email', answer: 'nithin@example.com' }],
+    coverMessages: [],
+    profile: { defaults: { phoneDeviceType: 'Landline' } },
+  });
+  assert.equal(state.profile.defaults.phoneDeviceType, 'Landline');
+  assert.equal(parseDatasourceBackup(serializeDatasourceBackup(state)).profile.defaults.phoneDeviceType, 'Landline');
 });
 
 async function readSeed() {

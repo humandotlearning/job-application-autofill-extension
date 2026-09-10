@@ -396,6 +396,22 @@ test('panel persists settings, focuses blockers, and saves answers without any s
   }
 });
 
+test('panel exposes and saves the phone device profile default', async () => {
+  const harness = await setupPanel({
+    datasource: { answerCount: 3, coverMessageCount: 1, profile: { employment: [{ company: 'Example' }], defaults: { relatedToHiringCompany: 'No', knownAtHiringCompany: 'No', phoneDeviceType: 'Mobile' } } },
+  });
+  try {
+    const select = harness.dom.window.document.querySelector('#phone-device-default');
+    assert.ok(select);
+    assert.equal(select.value, 'Mobile');
+    select.value = 'Landline';
+    select.dispatchEvent(new harness.dom.window.Event('change', { bubbles: true }));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const message = harness.sentMessages.find((entry) => entry.type === 'JOB_DATASOURCE_PROFILE_UPDATE');
+    assert.equal(message.profile.defaults.phoneDeviceType, 'Landline');
+  } finally { harness.cleanup(); }
+});
+
 test('panel offers local saving while a page is ready to continue', async () => {
   const run = {
     status: 'page_ready',

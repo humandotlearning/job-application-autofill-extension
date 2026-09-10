@@ -6,6 +6,7 @@ const elements = {
   employerName: byId('employer-name'),
   relatedDefault: byId('related-default'),
   knownDefault: byId('known-default'),
+  phoneDeviceDefault: byId('phone-device-default'),
   recordCount: byId('record-count'),
   coverMessageCount: byId('cover-message-count'),
   datasourceHint: byId('datasource-hint'),
@@ -129,6 +130,7 @@ function updateDatasourceSummary(datasource = {}) {
     elements.employerName.value = datasource.profile.employment?.[0]?.company || 'DeepSight AI Labs';
     elements.relatedDefault.value = datasource.profile.defaults?.relatedToHiringCompany || 'No';
     elements.knownDefault.value = datasource.profile.defaults?.knownAtHiringCompany || 'No';
+    elements.phoneDeviceDefault.value = datasource.profile.defaults?.phoneDeviceType || 'Mobile';
   }
 }
 
@@ -1012,7 +1014,11 @@ async function saveProfile() {
     elements.employerName.value = company;
     const response = await chrome.runtime.sendMessage({ type: 'JOB_DATASOURCE_PROFILE_UPDATE', profile: {
       employment: [{ company }],
-      defaults: { relatedToHiringCompany: elements.relatedDefault.value, knownAtHiringCompany: elements.knownDefault.value },
+      defaults: {
+        relatedToHiringCompany: elements.relatedDefault.value,
+        knownAtHiringCompany: elements.knownDefault.value,
+        phoneDeviceType: elements.phoneDeviceDefault.value,
+      },
     } });
     if (!response?.ok) throw new Error(response?.error || 'Could not save profile defaults.');
     updateDatasourceSummary(response.datasource);
@@ -1026,7 +1032,7 @@ elements.apiKey.addEventListener('input', saveApiKey);
 elements.apiModel.addEventListener('change', saveModel);
 elements.apiModel.addEventListener('blur', saveModel);
 elements.autoAdvance.addEventListener('change', saveSettings);
-for (const field of [elements.employerName, elements.relatedDefault, elements.knownDefault]) field.addEventListener('change', saveProfile);
+for (const field of [elements.employerName, elements.relatedDefault, elements.knownDefault, elements.phoneDeviceDefault]) field.addEventListener('change', saveProfile);
 elements.exportDatasource.addEventListener('click', exportDatasource);
 elements.importDatasourceButton.addEventListener('click', () => elements.importDatasource.click());
 elements.importDatasource.addEventListener('change', () => importDatasource(elements.importDatasource.files?.[0]));
