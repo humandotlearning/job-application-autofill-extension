@@ -1617,9 +1617,9 @@ function collectAnswerRecords(document) {
       && !record.aliases.some((alias) => invalidIds.has(alias)));
 }
 
-function focusField(document, fieldId) {
+function focusField(document, fieldId, expectedHandle) {
   const element = elementForField(document, fieldId);
-  if (!element) return false;
+  if (!element || (expectedHandle !== undefined && controlHandle(element) !== expectedHandle)) return false;
   const className = 'job-autofill-focus-highlight';
   for (const highlighted of document.querySelectorAll(`.${className}`)) highlighted.classList.remove(className);
   const targets = new Set([element]);
@@ -2087,7 +2087,15 @@ function createInlineAutofill(document, {send, describe}) {
   listen(view, 'resize', schedulePosition);
   listen(view.visualViewport, 'resize', schedulePosition);
   listen(view.visualViewport, 'scroll', schedulePosition);
-  return {activeField, beforeFill, dispose() { if (disposed) return; dismiss(); disposed = true; listeners.forEach(remove => remove()); host?.remove(); }};
+  function withExplicitFocus(focus) {
+    // The worker is revealing a reviewed destination, not requesting new suggestions.
+    // DOM focus events are synchronous; ordinary user focus resumes after this call.
+    const previous = restoringFocus;
+    restoringFocus = true;
+    try { return focus(); }
+    finally { restoringFocus = previous; }
+  }
+  return {activeField, beforeFill, withExplicitFocus, dispose() { if (disposed) return; dismiss(); disposed = true; listeners.forEach(remove => remove()); host?.remove(); }};
 }
 
 
@@ -2150,7 +2158,7 @@ if (!globalThis.__jobApplicationAutofillInstalled) {
           sendResponse({ ok: true, validation: validateDocument(document) });
           break;
         case 'JOB_APP_FOCUS':
-          sendResponse({ ok: focusField(document, message.fieldId) });
+          sendResponse({ ok: inline.withExplicitFocus(() => focusField(document, message.fieldId, message.handle)) });
           break;
         case 'JOB_APP_CLICK_NEXT':
           learning.flush().then(() => {

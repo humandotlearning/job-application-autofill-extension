@@ -1156,9 +1156,9 @@ export function collectAnswerRecords(document) {
       && !record.aliases.some((alias) => invalidIds.has(alias)));
 }
 
-export function focusField(document, fieldId) {
+export function focusField(document, fieldId, expectedHandle) {
   const element = elementForField(document, fieldId);
-  if (!element) return false;
+  if (!element || (expectedHandle !== undefined && controlHandle(element) !== expectedHandle)) return false;
   const className = 'job-autofill-focus-highlight';
   for (const highlighted of document.querySelectorAll(`.${className}`)) highlighted.classList.remove(className);
   const targets = new Set([element]);

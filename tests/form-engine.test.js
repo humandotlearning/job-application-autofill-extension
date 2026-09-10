@@ -913,6 +913,20 @@ test('focuses and temporarily highlights a matching field and its label without 
   assert.ok(document.querySelector('label[for="name"]').classList.contains('job-autofill-focus-highlight'));
 });
 
+test('focus rejects a replaced same-ID control before highlighting or moving focus', () => {
+  const document = makeDocument('<form><label for="name">Full name</label><input id="name"></form><button id="outside">Outside</button>');
+  const original = document.querySelector('#name');
+  const {handle} = descriptorForElement(document, original);
+  const replacement = original.cloneNode(); original.replaceWith(replacement);
+  document.querySelector('#outside').focus();
+  assert.equal(focusField(document, 'name', handle), false);
+  assert.equal(document.activeElement.id, 'outside');
+  assert.equal(document.querySelector('.job-autofill-focus-highlight'), null);
+  const liveHandle = descriptorForElement(document, replacement).handle;
+  assert.equal(focusField(document, 'name', liveHandle), true);
+  assert.equal(document.activeElement, replacement);
+});
+
 test('uses company defaults only for clearly identified employer relationship questions', () => {
   const profile = {
     employment: [{ id: 'deepsight-ai-labs', company: 'DeepSight AI Labs' }],

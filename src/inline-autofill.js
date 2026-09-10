@@ -339,5 +339,13 @@ export function createInlineAutofill(document, {send, describe}) {
   listen(view, 'resize', schedulePosition);
   listen(view.visualViewport, 'resize', schedulePosition);
   listen(view.visualViewport, 'scroll', schedulePosition);
-  return {activeField, beforeFill, dispose() { if (disposed) return; dismiss(); disposed = true; listeners.forEach(remove => remove()); host?.remove(); }};
+  function withExplicitFocus(focus) {
+    // The worker is revealing a reviewed destination, not requesting new suggestions.
+    // DOM focus events are synchronous; ordinary user focus resumes after this call.
+    const previous = restoringFocus;
+    restoringFocus = true;
+    try { return focus(); }
+    finally { restoringFocus = previous; }
+  }
+  return {activeField, beforeFill, withExplicitFocus, dispose() { if (disposed) return; dismiss(); disposed = true; listeners.forEach(remove => remove()); host?.remove(); }};
 }

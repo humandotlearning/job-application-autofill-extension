@@ -1,5 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { readFile } from 'node:fs/promises';
+import { Script, createContext } from 'node:vm';
+import { JSDOM } from 'jsdom';
 
 function createHarness({
   autoAdvancePages = false,
@@ -385,6 +388,88 @@ test('closing the latest handoff cannot resurrect an earlier requested frame', a
   assert.equal(inlineSession.frameId, 3);
   await harness.dispatch({type: 'JOB_INLINE_PANEL_STATE', ...panelOrigin(inlineSession), close: true});
   assert.equal((await harness.dispatch({type: 'JOB_INLINE_PANEL_STATE', tabId: 7})).inlineSession, null);
+});
+
+async function inlinePanelIntegration(t) {
+  const harness = await inlineHarness();
+  const content = new JSDOM('<form><label>Full name<input id="name"></label></form><button id="outside">Outside</button>', {url: 'https://jobs.example.com/apply', pretendToBeVisual: true});
+  const panel = new JSDOM(await readFile(new URL('../sidepanel.html', import.meta.url), 'utf8'), {url: 'https://extension.local/sidepanel.html', pretendToBeVisual: true});
+  t.after(() => {content.window.close(); panel.window.close();});
+  const contentListeners = [], storageListeners = [], contentMessages = [];
+  const set = chrome.storage.session.set;
+  chrome.storage.session.set = async values => {
+    const changes = Object.fromEntries(Object.entries(values).map(([key, value]) => [key, {newValue: structuredClone(value)}]));
+    await set(values);
+    storageListeners.forEach(listener => listener(changes, 'session'));
+  };
+  const contentContext = createContext({document: content.window.document, setTimeout, clearTimeout, console, chrome: {...chrome, runtime: {
+    sendMessage: message => {contentMessages.push(message); return harness.dispatch(message, inlineSender());},
+    onMessage: {addListener: listener => contentListeners.push(listener)},
+  }}});
+  new Script(await readFile(new URL('../dist/content.js', import.meta.url), 'utf8')).runInContext(contentContext);
+  chrome.tabs.sendMessage = (_tabId, message) => new Promise(resolve => contentListeners[0](message, {}, resolve));
+  const panelContext = createContext({window: panel.window, document: panel.window.document, navigator: panel.window.navigator,
+    structuredClone, setTimeout, clearTimeout, console, chrome: {...chrome,
+      runtime: {sendMessage: message => harness.dispatch(message)},
+      storage: {...chrome.storage, onChanged: {addListener: listener => storageListeners.push(listener)}},
+    }});
+  new Script(await readFile(new URL('../src/sidepanel.js', import.meta.url), 'utf8')).runInContext(panelContext);
+  const field = content.window.document.querySelector('#name');
+  field.focus();
+  await waitUntil(() => harness.sessionData.inlineFieldSessions?.['7:0']?.field);
+  await new Promise(resolve => setTimeout(resolve, 0));
+  const popup = content.window.document.querySelector('[data-job-inline-autofill]').shadowRoot;
+  popup.querySelector('[role="option"]').click();
+  [...popup.querySelectorAll('button')].find(button => button.textContent === 'Edit in panel').click();
+  await waitUntil(() => !panel.window.document.querySelector('#inline-field-card').hidden);
+  const card = panel.window.document.querySelector('#inline-field-card');
+  const draft = card.querySelector('[data-answer-draft]');
+  draft.value = 'Edited in the panel'; draft.dispatchEvent(new panel.window.Event('input'));
+  content.window.document.querySelector('#outside').focus();
+  return {harness, content, panel, card, field, contentMessages};
+}
+
+test('panel Show on page preserves the handed-off session and edited draft while ordinary focus still queries', async t => {
+  const {harness, content, card, field, contentMessages} = await inlinePanelIntegration(t);
+  const sessionId = harness.sessionData.inlineFieldSessions['7:0'].sessionId;
+  const queries = contentMessages.filter(message => message.type === 'JOB_INLINE_QUERY').length;
+  card.querySelector('[data-field-id]').click();
+  await waitUntil(() => content.window.document.activeElement === field);
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.equal(contentMessages.filter(message => message.type === 'JOB_INLINE_QUERY').length, queries);
+  assert.equal(harness.sessionData.inlineFieldSessions['7:0'].sessionId, sessionId);
+  assert.equal(harness.sessionData.inlineFieldSessions['7:0'].panelRequested, true);
+  assert.equal(card.hidden, false);
+  assert.equal(card.querySelector('[data-answer-draft]').value, 'Edited in the panel');
+  content.window.document.querySelector('#outside').focus(); field.focus();
+  await waitUntil(() => contentMessages.filter(message => message.type === 'JOB_INLINE_QUERY').length === queries + 1);
+  await waitUntil(() => harness.sessionData.inlineFieldSessions['7:0'].sessionId !== sessionId && harness.sessionData.inlineFieldSessions['7:0'].field);
+});
+
+test('panel Show on page rejects a same-ID replacement between worker inspection and content focus', async t => {
+  const {harness, content, panel, card, field, contentMessages} = await inlinePanelIntegration(t);
+  const queries = contentMessages.filter(message => message.type === 'JOB_INLINE_QUERY').length;
+  const send = chrome.tabs.sendMessage;
+  let replacement, focusResponse;
+  chrome.tabs.sendMessage = (tabId, message, options) => {
+    if (message.type === 'JOB_APP_FOCUS') {
+      replacement = field.cloneNode(); field.replaceWith(replacement);
+    }
+    const response = send(tabId, message, options);
+    if (message.type === 'JOB_APP_FOCUS') response.then(result => {focusResponse = result;});
+    return response;
+  };
+  card.querySelector('[data-field-id]').click();
+  await waitUntil(() => focusResponse);
+  assert.equal(focusResponse.ok, false);
+  assert.match(panel.window.document.querySelector('#status').textContent, /Could not show/);
+  assert.ok(replacement);
+  assert.equal(content.window.document.activeElement.id, 'outside');
+  assert.equal(replacement.classList.contains('job-autofill-focus-highlight'), false);
+  assert.equal(content.window.document.querySelector('.job-autofill-focus-highlight'), null);
+  assert.equal(contentMessages.filter(message => message.type === 'JOB_INLINE_QUERY').length, queries);
+  assert.equal(harness.sessionData.inlineFieldSessions['7:0'].panelRequested, true);
+  assert.equal(card.querySelector('[data-answer-draft]').value, 'Edited in the panel');
 });
 
 test('inline explicit generation without a run creates selectable drafts without learning or applying', async () => {

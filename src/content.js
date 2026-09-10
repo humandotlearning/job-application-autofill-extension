@@ -69,7 +69,7 @@ if (!globalThis.__jobApplicationAutofillInstalled) {
           sendResponse({ ok: true, validation: validateDocument(document) });
           break;
         case 'JOB_APP_FOCUS':
-          sendResponse({ ok: focusField(document, message.fieldId) });
+          sendResponse({ ok: inline.withExplicitFocus(() => focusField(document, message.fieldId, message.handle)) });
           break;
         case 'JOB_APP_CLICK_NEXT':
           learning.flush().then(() => {
