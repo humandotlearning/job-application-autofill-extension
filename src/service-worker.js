@@ -1,5 +1,5 @@
 import { retrieveEvidence } from './retrieval.js';
-import { inferSensitivity, validateFillValue, meaningCompatible, suggestionTargetKey } from './core.js';
+import { inferSensitivity, isOpaqueIdentifier, validateFillValue, meaningCompatible, suggestionTargetKey } from './core.js';
 import { callAnswerPlanner, callAnswerRewriter, callAnswerSuggestions } from './llm.js';
 import { upsertAnswerRecords, mergeLearnedAnswers, normalizeAnswerRecord } from './core.js';
 import {
@@ -11,7 +11,7 @@ import {
   seedDatasource,
   shouldSeedDatasource,
 } from './datasource.js';
-import { planDeterministicFill } from './form-engine.js';
+import { exactVisibleChoice, planDeterministicFill, requiresVisibleChoiceMatch } from './form-engine.js';
 import { buildLearningCandidates, callLearningReviewer } from './learning-review.js';
 
 const RUN_STORAGE_KEY = 'applicationRun';
@@ -31,13 +31,6 @@ const APPLICATION_TITLE_PATTERN = /\b(?:apply|application|candidate|profile|resu
 const UTILITY_FRAME_PATTERN = /\b(?:search|cookie|job[\s-]?alerts?|talent[\s-]?communities?|subscribe|feedback)\b/i;
 const NO_APPLICATION_FRAME_REASON = 'No unique application form frame was found. Complete the application manually.';
 const AMBIGUOUS_APPLICATION_FRAME_REASON = 'More than one application form frame was found. Complete the application manually.';
-
-function isOpaqueIdentifier(value) {
-  const text = String(value ?? '').trim();
-  const distinctHexCharacters = new Set(text.toLowerCase()).size;
-  return (/^[a-f\d]{24,}$/i.test(text) && (/\d/.test(text) || distinctHexCharacters >= 3))
-    || /^(?:[a-z][a-z\d_-]*\|)?[a-f\d]{8}-[a-f\d]{4}-[a-f\d]{4}-[a-f\d]{4}-[a-f\d]{12}(?:\[[a-z\d_-]+\])?$/i.test(text);
-}
 
 function requiredBoundedText(value, label, maxLength) {
   if (typeof value !== 'string') throw new Error(`${label} must be text`);
@@ -592,6 +585,11 @@ function unresolvedFields(fields, validation = {}) {
   return fields.filter((field) => !field.currentValue || invalidIds.has(field.id));
 }
 
+function choiceEvidenceNeedsPlanner(field, candidates = []) {
+  if (!requiresVisibleChoiceMatch(field)) return false;
+  return candidates.some((candidate) => !exactVisibleChoice(field, candidate.answer));
+}
+
 function reviewItems(fields, decisions, existing = [], appliedReviews = [], pageNumber = null) {
   const byId = fieldMap(fields);
   const items = [...existing];
@@ -822,7 +820,8 @@ async function applyPageDecisions(tabId, run, inspection, records, coverMessages
       if (!candidates.some(saved => saved.answer === candidate.answer)) candidates.push({ ...candidate, kind: 'draft', reason: 'Previously entered, not yet saved for reuse — explicit approval required' });
     }
     candidates.splice(3);
-    const gated = candidates.length && (decision.action !== 'fill' || field.type === 'textarea' || decision.sensitivity !== 'safe' || inferSensitivity(field.label, field.id) !== 'safe');
+    const choiceMapping = choiceEvidenceNeedsPlanner(field, candidates);
+    const gated = candidates.length && !choiceMapping && (decision.action !== 'fill' || field.type === 'textarea' || decision.sensitivity !== 'safe' || inferSensitivity(field.label, field.id) !== 'safe');
     if (gated) {
       run.suggestions[field.id] = { tabId, frameId: run.frame.frameId, applicationId: run.startedAt, pageSignature: currentPageSignature, field, candidates };
       return { ...decision, action: 'ask_user', value: null, reason: 'Relevant saved evidence available — approve an answer before use' };

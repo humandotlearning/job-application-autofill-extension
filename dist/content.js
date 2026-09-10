@@ -9,7 +9,10 @@ const CONCEPT_REGISTRY = {
   preferred_name: /^(?:preferred name|nickname|preferred first name)$/,
   date_of_birth: /^(?:dob|date of birth|birth date|birthday)$/,
   email: /^(?:email|email address|e mail)$/,
-  phone: /^(?:phone|phone number|mobile|mobile number|telephone)$/,
+  phone_number: /^(?:phone|phone number|mobile|mobile number|telephone)$/,
+  phone_extension: /^(?:(?:phone|telephone|mobile) )?extension$/,
+  phone_country_code: /^(?:country code|country phone code|phone country code|country calling code|calling code)$/,
+  phone_device_type: /^(?:phone|telephone|mobile) (?:device )?type$/,
   github_url: /^(?:github|github profile|github url)$/,
   linkedin_url: /^(?:linkedin|linkedin profile|linkedin url)$/,
   portfolio_url: /^(?:portfolio|portfolio url|personal website|website)$/,
@@ -46,6 +49,13 @@ const AUTOCOMPLETE_KEYS = {
 };
 
 const GENERIC_NAME_LABELS = new Set(['name', 'your name', 'applicant name', 'candidate name']);
+
+function isOpaqueIdentifier(value) {
+  const text = String(value ?? '').trim();
+  const distinctHexCharacters = new Set(text.toLowerCase()).size;
+  return (/^[a-f\d]{24,}$/i.test(text) && (/\d/.test(text) || distinctHexCharacters >= 3))
+    || /^(?:[a-z][a-z\d_-]*\|)?[a-f\d]{8}-[a-f\d]{4}-[a-f\d]{4}-[a-f\d]{4}-[a-f\d]{12}(?:\[[a-z\d_-]+\])?$/i.test(text);
+}
 
 function canonicalConcept(value = '') {
   return conceptForNormalized(normalizeText(value));
@@ -195,6 +205,8 @@ function meaningCompatible(field, record, { numericReview = true } = {}) {
   const right = normalizeText(record.question || record.key);
   const fieldConcept = canonicalConcept(field.label || field.question || field.name || field.id || '');
   const recordConcept = canonicalConcept(record.concept || record.key || record.question);
+  const phoneConcepts = new Set(['phone_number', 'phone_extension', 'phone_country_code', 'phone_device_type']);
+  if (phoneConcepts.has(fieldConcept) || phoneConcepts.has(recordConcept)) return fieldConcept === recordConcept;
   const protectedConcepts = ['first_name', 'last_name', 'full_name', 'preferred_name', 'github_url', 'linkedin_url', 'portfolio_url', 'date_of_birth'];
   if (protectedConcepts.includes(fieldConcept) && recordConcept !== fieldConcept) return false;
   const locationGranularity = text => /\bcity\b/.test(text) ? 'city' : /\b(location|address)\b/.test(text) ? 'location' : '';
@@ -228,7 +240,9 @@ function meaningCompatible(field, record, { numericReview = true } = {}) {
 
 function chooseRecord(field = {}, records = []) {
   if (!Array.isArray(records) || records.length === 0) return null;
-  records = records.filter((record) => recordScopeCompatible(field, record) && meaningCompatible(field, record));
+  records = records.filter((record) => !isOpaqueIdentifier(record.answer)
+    && !isOpaqueIdentifier(record.question) && !isOpaqueIdentifier(record.key)
+    && recordScopeCompatible(field, record) && meaningCompatible(field, record));
   const fieldTexts = [field.label, field.name, field.id, field.placeholder]
     .map(normalizeText)
     .filter(Boolean);
@@ -305,6 +319,7 @@ function numberConstraint(value, fallback) {
 function validateFillValue(field = {}, value) {
   if (value == null || String(value).trim() === '') return { ok: false, reason: 'value is empty' };
   const text = String(value).trim();
+  if (isOpaqueIdentifier(text)) return { ok: false, reason: 'value is an opaque internal identifier' };
   const constraints = field.constraints || {};
   if (Array.isArray(field.options) && field.options.length) {
     const values = field.multiple ? text.split(/\s*[,;]\s*/) : [text];
@@ -398,7 +413,9 @@ function upsertAnswerRecords(existing = [], incoming = [], updatedAt = new Date(
 function mergeLearnedAnswers(existing = [], incoming = [], now = new Date().toISOString(), { confirm = false } = {}) {
   let result = existing.map(normalizeAnswerRecord);
   for (const raw of incoming) {
-    if (raw.provenance !== 'user' || raw.completed === false || !validateFillValue({ type: raw.type }, raw.answer).ok) continue;
+    if (raw.provenance !== 'user' || raw.completed === false
+      || isOpaqueIdentifier(raw.answer) || isOpaqueIdentifier(raw.question) || isOpaqueIdentifier(raw.key)
+      || !validateFillValue({ type: raw.type }, raw.answer).ok) continue;
     const next = normalizeAnswerRecord({ ...raw, updatedAt: now });
     const previous = result.find((record) => record.key === next.key);
     const changed = previous && previous.answer !== next.answer;
@@ -491,6 +508,7 @@ function ensureEditTracking(document) {
       delete element.__jobApplicationSearchQuery;
     }
     if (event.type === 'blur' && !element.__jobApplicationUserEdited) return;
+    delete element.__jobApplicationCommittedLabel;
     element.__jobApplicationUserEdited = true;
     element.__jobApplicationUserCompleted = event.type !== 'input';
   };
@@ -633,9 +651,9 @@ function customWidgetValue(element) {
     .map(customOptionText)
     .filter(Boolean);
   const typedValue = element.__jobApplicationSearchQuery || (element.getAttribute('aria-expanded') === 'true' && element.__jobApplicationUserEdited) ? '' : element.value;
-  const value = String(selectedOptions.length ? selectedOptions.join(', ') : (element.getAttribute('aria-valuetext') || typedValue || element.textContent || ''))
+  const value = String(selectedOptions.length ? selectedOptions.join(', ') : (element.getAttribute('aria-valuetext') || element.__jobApplicationCommittedLabel || typedValue || element.textContent || ''))
     .replace(/\s+/g, ' ').trim();
-  return EMPTY_CUSTOM_WIDGET_VALUE.test(value) ? '' : value;
+  return EMPTY_CUSTOM_WIDGET_VALUE.test(value) || isOpaqueIdentifier(value) ? '' : value;
 }
 
 function customWidgetRequired(element) {
@@ -1014,6 +1032,8 @@ async function setCustomChoiceValue(document, element, answer) {
   }
   if (element.getAttribute('aria-expanded') !== 'true') element.click();
   const expected = normalizeText(answer);
+  const initialText = normalizeText(element.textContent || '');
+  const initialValue = String(element.value || '');
   if (element.tagName === 'INPUT' && element.getAttribute('aria-autocomplete')) {
     element.__jobApplicationSearchQuery = true;
     setTextValue(element, answer);
@@ -1040,6 +1060,11 @@ async function setCustomChoiceValue(document, element, answer) {
     match.click();
   }
   await new Promise((resolve) => setTimeout(resolve, 50));
+  const selectionCommitted = matches.every((option) => option.getAttribute('aria-selected') === 'true')
+    || (!element.__jobApplicationSearchQuery && (normalizeText(element.textContent || '') !== initialText
+      || String(element.value || '') !== initialValue
+      || Boolean(element.getAttribute('aria-valuetext'))));
+  if (selectionCommitted) element.__jobApplicationCommittedLabel = customOptionText(matches[0]);
   const backingInput = [...(element.parentElement?.querySelectorAll('input, textarea') || [])].find((input) => input !== element);
   const acceptedSingleValues = multiple ? [expected] : [...new Set([expected, ...customOptionAliases(matches[0])])];
   if (element.tagName === 'INPUT') {
@@ -1129,6 +1154,130 @@ function coverMessageDecision(field, coverMessages = []) {
   };
 }
 
+const PHONE_CONCEPTS = new Set(['phone_number', 'phone_extension', 'phone_country_code', 'phone_device_type']);
+
+function phoneOptionEntries(field = {}) {
+  const structured = Array.isArray(field.structuredOptions) && field.structuredOptions.length
+    ? field.structuredOptions
+    : (Array.isArray(field.options) ? field.options.map((option) => ({ label: option, value: option })) : []);
+  return structured
+    .filter((option) => !option.disabled)
+    .map((option) => ({ label: String(option.label || '').trim(), value: String(option.value || '').trim() }))
+    .filter((option) => option.label || option.value);
+}
+
+function phoneChoiceValue(entry = {}) {
+  if (entry.label && !isOpaqueIdentifier(entry.label)) return entry.label;
+  if (entry.value && !isOpaqueIdentifier(entry.value)) return entry.value;
+  return '';
+}
+
+function phoneCallingCode(entry = {}) {
+  const match = /(?:^|[^\d])\+(\d{1,3})(?!\d)/.exec(`${entry.value} ${entry.label}`);
+  return match ? `+${match[1]}` : '';
+}
+
+function phoneBlockKey(field = {}) {
+  return `${field.entityId || ''}|${field.section ? normalizeText(field.section) : 'phone'}`;
+}
+
+function phoneDecision(field, action, value, reason, evidenceKeys = [], transformation = null) {
+  return {
+    fieldId: field.id,
+    action,
+    value: action === 'fill' ? value : null,
+    evidenceKeys,
+    confidence: action === 'fill' ? 'high' : 'low',
+    sensitivity: 'safe',
+    ...(action === 'fill' && transformation ? { transformation } : {}),
+    reason,
+  };
+}
+
+function phoneBlockDecisions(fields, records, profile = {}) {
+  const decisions = new Map();
+  const groups = new Map();
+  let previousWasPhone = false;
+  let previousBaseKey = '';
+  let blockIndex = 0;
+  for (const field of fields) {
+    const concept = canonicalConcept(field.label || field.id);
+    if (!PHONE_CONCEPTS.has(concept)) {
+      previousWasPhone = false;
+      continue;
+    }
+    const baseKey = phoneBlockKey(field);
+    if (!previousWasPhone || previousBaseKey !== baseKey) blockIndex += 1;
+    const key = `${baseKey}|${blockIndex}`;
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(field);
+    previousWasPhone = true;
+    previousBaseKey = baseKey;
+  }
+  const source = chooseRecord({ label: 'Phone Number', type: 'tel', autocomplete: 'tel' }, records);
+  for (const group of groups.values()) {
+    const numberField = group.find((field) => canonicalConcept(field.label || field.id) === 'phone_number');
+    const countryField = group.find((field) => canonicalConcept(field.label || field.id) === 'phone_country_code');
+    const deviceField = group.find((field) => canonicalConcept(field.label || field.id) === 'phone_device_type');
+    const sourceAnswer = String(source?.record?.answer || '').trim();
+    const sourceDigits = sourceAnswer.replace(/\D/g, '');
+    const sourceKey = source?.record?.key ? [source.record.key] : [];
+    let splitPrefix = '';
+    let splitEntry = null;
+    let splitAmbiguous = false;
+    if (countryField && /^\s*\+\d/.test(sourceAnswer)) {
+      const matches = phoneOptionEntries(countryField)
+        .map((entry) => ({ entry, prefix: phoneCallingCode(entry) }))
+        .filter(({ prefix }) => prefix && sourceDigits.startsWith(prefix.replace(/\D/g, '')));
+      if (matches.length === 1 && phoneChoiceValue(matches[0].entry)) {
+        splitPrefix = matches[0].prefix;
+        splitEntry = matches[0].entry;
+      } else {
+        splitAmbiguous = true;
+      }
+    }
+    if (countryField) {
+      if (splitEntry && phoneChoiceValue(splitEntry)) decisions.set(countryField.id, phoneDecision(countryField, 'fill', phoneChoiceValue(splitEntry), 'Matched the unique country calling-code option', sourceKey, 'map_option'));
+      else if (splitAmbiguous || sourceAnswer) decisions.set(countryField.id, phoneDecision(countryField, 'ask_user', null, splitAmbiguous ? 'Country calling-code options are ambiguous' : 'No unique country calling-code option matches the stored number'));
+    }
+    if (numberField) {
+      if (!sourceAnswer) decisions.set(numberField.id, phoneDecision(numberField, 'ask_user', null, 'No stored phone number is available'));
+      else if (countryField && !splitEntry) decisions.set(numberField.id, phoneDecision(numberField, 'ask_user', null, 'Phone number cannot be split safely without a unique country calling code'));
+      else {
+        const value = splitPrefix ? sourceDigits.slice(splitPrefix.replace(/\D/g, '').length) : sourceAnswer;
+        decisions.set(numberField.id, phoneDecision(numberField, 'fill', value, splitPrefix ? 'Split from the stored international number' : 'Copied the stored phone number', sourceKey, 'format_phone'));
+      }
+    }
+    if (deviceField) {
+      const desired = String(profile.defaults?.phoneDeviceType || 'Mobile').trim() || 'Mobile';
+      const option = phoneOptionEntries(deviceField).find((entry) => normalizeText(entry.label) === normalizeText(desired) || normalizeText(entry.value) === normalizeText(desired));
+      if (option && phoneChoiceValue(option)) decisions.set(deviceField.id, phoneDecision(deviceField, 'fill', phoneChoiceValue(option), 'Profile phone device preference', [], 'map_option'));
+      else decisions.set(deviceField.id, phoneDecision(deviceField, 'ask_user', null, 'Profile phone device preference is not an available option'));
+    }
+  }
+  return decisions;
+}
+
+function isChoiceField(field = {}) {
+  return ['select', 'select-one', 'radio', 'checkbox'].includes(normalizeText(field.type));
+}
+
+function visibleChoiceLabels(field = {}) {
+  const labels = Array.isArray(field.structuredOptions) && field.structuredOptions.length
+    ? field.structuredOptions.map((option) => option.label)
+    : (Array.isArray(field.options) ? field.options : []);
+  return [...new Set(labels.filter((label) => typeof label === 'string' && label.trim() && !isOpaqueIdentifier(label)))];
+}
+
+function requiresVisibleChoiceMatch(field = {}) {
+  const text = normalizeText(`${field.label || ''} ${field.name || ''} ${field.id || ''}`);
+  return /\bhow did you hear\b/.test(text);
+}
+
+function exactVisibleChoice(field, answer) {
+  return isChoiceField(field) && visibleChoiceLabels(field).some((label) => normalizeText(label) === normalizeText(answer));
+}
+
 function hiringCompanyDefault(field, profile = {}, page = {}) {
   const text = normalizeText(`${field.label || ''} ${field.name || ''} ${field.id || ''}`);
   // Do not turn referrals, professional references, or broad declarations
@@ -1139,9 +1288,12 @@ function hiringCompanyDefault(field, profile = {}, page = {}) {
   // unresolved rather than receiving a guess.
   const titleCompany = String(page.title || '').match(/^\s*(.+?)\s+(?:careers?|jobs?)\b/i)?.[1] || '';
   const company = normalizeText(field.targetCompany || page.company || titleCompany);
-  if (!company) return null;
-  const employer = (profile.employment || []).find((entry) => normalizeText(entry.company) === company);
-  if (/have you (?:ever |previously )?worked (?:at|for|with)|former employee|prior employment/.test(text)) {
+  const employers = (profile.employment || [])
+    .map((entry) => normalizeText(entry.company))
+    .filter(Boolean);
+  if (!employers.length) return null;
+  const employer = employers.find((entry) => company === entry || ` ${text} `.includes(` ${entry} `));
+  if (/have you (?:ever |previously )?(?:worked (?:at|for|with)|been employed (?:at|by|with))|former employee|prior employment/.test(text)) {
     return employer ? { value: 'Yes', reason: 'Confirmed prior employer' } : { value: 'No', reason: 'No prior employment at this company' };
   }
   if (/relative|family member|related to/.test(text)) {
@@ -1154,11 +1306,15 @@ function hiringCompanyDefault(field, profile = {}, page = {}) {
 }
 
 function planDeterministicFill(fields, records, coverMessages = [], profile = {}, page = {}) {
+  const phoneDecisions = phoneBlockDecisions(fields, records, profile);
   return fields.map((field) => {
+    const phonePlan = phoneDecisions.get(field.id);
+    if (phonePlan) return phonePlan;
     const coverDecision = coverMessageDecision(field, coverMessages);
     if (coverDecision) return coverDecision;
     const match = chooseRecord(field, records);
-    if (!match) {
+    const usableMatch = match && (!requiresVisibleChoiceMatch(field) || exactVisibleChoice(field, match.record.answer)) ? match : null;
+    if (!usableMatch) {
       const defaultAnswer = hiringCompanyDefault(field, profile, page);
       if (defaultAnswer) return {
         fieldId: field.id,
@@ -1187,11 +1343,11 @@ function planDeterministicFill(fields, records, coverMessages = [], profile = {}
     return {
       fieldId: field.id,
       action: 'fill',
-      value: match.record.answer,
-      evidenceKeys: [match.record.key],
-      confidence: match.confidence === 'exact' ? 'high' : match.confidence,
-      sensitivity: match.record.sensitivity || inferSensitivity(field.label, field.id),
-      reason: match.reason,
+      value: usableMatch.record.answer,
+      evidenceKeys: [usableMatch.record.key],
+      confidence: usableMatch.confidence === 'exact' ? 'high' : usableMatch.confidence,
+      sensitivity: usableMatch.record.sensitivity || inferSensitivity(field.label, field.id),
+      reason: usableMatch.reason,
     };
   }).map((decision, index) => ({ ...decision, handle: fields[index].handle }));
 }

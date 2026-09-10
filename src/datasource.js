@@ -8,6 +8,7 @@ export const DEFAULT_PROFILE = Object.freeze({
   defaults: {
     relatedToHiringCompany: 'No',
     knownAtHiringCompany: 'No',
+    phoneDeviceType: 'Mobile',
   },
 });
 
@@ -38,6 +39,7 @@ export function normalizeCoverMessage(message = {}) {
 }
 
 function normalizeProfile(profile = {}) {
+  const phoneDeviceType = String(profile.defaults?.phoneDeviceType || '').trim().toLowerCase();
   const employment = Array.isArray(profile.employment) && profile.employment.length
     ? profile.employment
       .map((entry) => ({
@@ -52,6 +54,9 @@ function normalizeProfile(profile = {}) {
     defaults: {
       relatedToHiringCompany: profile.defaults?.relatedToHiringCompany === 'Yes' ? 'Yes' : DEFAULT_PROFILE.defaults.relatedToHiringCompany,
       knownAtHiringCompany: profile.defaults?.knownAtHiringCompany === 'Yes' ? 'Yes' : DEFAULT_PROFILE.defaults.knownAtHiringCompany,
+      phoneDeviceType: phoneDeviceType === 'landline' ? 'Landline'
+        : phoneDeviceType === 'mobile' ? 'Mobile'
+          : DEFAULT_PROFILE.defaults.phoneDeviceType,
     },
   };
 }

@@ -28,7 +28,7 @@ test('meaning facets block fuzzy cross-matches and uncertain numeric compensatio
   for (const [label, question] of [['Current annual salary USD', 'Current monthly salary INR'], ['Current fixed CTC', 'Current total CTC'], ['Expected salary', 'Current salary'], ['Available start date', 'Notice period'], ['Willing to relocate', 'Current location']]) assert.equal(pick(label, question), null, label);
   assert.equal(pick('Current CTC in LPA', 'Current salary'), null);
   assert.equal(chooseRecord({ label: 'Present company' }, [{ key: 'legacy_company', question: 'Current employer', answer: 'Example' }])?.record.answer, 'Example');
-  assert.equal(canonicalConcept('Please enter your mobile number'), 'phone');
+  assert.equal(canonicalConcept('Please enter your mobile number'), 'phone_number');
 });
 
 test('custom choices use the bounded question resolver and explain the label', () => {

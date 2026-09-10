@@ -18,6 +18,13 @@ const AUTOCOMPLETE_KEYS = {
 
 const GENERIC_NAME_LABELS = new Set(['name', 'your name', 'applicant name', 'candidate name']);
 
+export function isOpaqueIdentifier(value) {
+  const text = String(value ?? '').trim();
+  const distinctHexCharacters = new Set(text.toLowerCase()).size;
+  return (/^[a-f\d]{24,}$/i.test(text) && (/\d/.test(text) || distinctHexCharacters >= 3))
+    || /^(?:[a-z][a-z\d_-]*\|)?[a-f\d]{8}-[a-f\d]{4}-[a-f\d]{4}-[a-f\d]{4}-[a-f\d]{12}(?:\[[a-z\d_-]+\])?$/i.test(text);
+}
+
 export function canonicalConcept(value = '') {
   return conceptForNormalized(normalizeText(value));
 }
@@ -166,6 +173,8 @@ export function meaningCompatible(field, record, { numericReview = true } = {}) 
   const right = normalizeText(record.question || record.key);
   const fieldConcept = canonicalConcept(field.label || field.question || field.name || field.id || '');
   const recordConcept = canonicalConcept(record.concept || record.key || record.question);
+  const phoneConcepts = new Set(['phone_number', 'phone_extension', 'phone_country_code', 'phone_device_type']);
+  if (phoneConcepts.has(fieldConcept) || phoneConcepts.has(recordConcept)) return fieldConcept === recordConcept;
   const protectedConcepts = ['first_name', 'last_name', 'full_name', 'preferred_name', 'github_url', 'linkedin_url', 'portfolio_url', 'date_of_birth'];
   if (protectedConcepts.includes(fieldConcept) && recordConcept !== fieldConcept) return false;
   const locationGranularity = text => /\bcity\b/.test(text) ? 'city' : /\b(location|address)\b/.test(text) ? 'location' : '';
@@ -199,7 +208,9 @@ export function meaningCompatible(field, record, { numericReview = true } = {}) 
 
 export function chooseRecord(field = {}, records = []) {
   if (!Array.isArray(records) || records.length === 0) return null;
-  records = records.filter((record) => recordScopeCompatible(field, record) && meaningCompatible(field, record));
+  records = records.filter((record) => !isOpaqueIdentifier(record.answer)
+    && !isOpaqueIdentifier(record.question) && !isOpaqueIdentifier(record.key)
+    && recordScopeCompatible(field, record) && meaningCompatible(field, record));
   const fieldTexts = [field.label, field.name, field.id, field.placeholder]
     .map(normalizeText)
     .filter(Boolean);
@@ -276,6 +287,7 @@ function numberConstraint(value, fallback) {
 export function validateFillValue(field = {}, value) {
   if (value == null || String(value).trim() === '') return { ok: false, reason: 'value is empty' };
   const text = String(value).trim();
+  if (isOpaqueIdentifier(text)) return { ok: false, reason: 'value is an opaque internal identifier' };
   const constraints = field.constraints || {};
   if (Array.isArray(field.options) && field.options.length) {
     const values = field.multiple ? text.split(/\s*[,;]\s*/) : [text];
@@ -369,7 +381,9 @@ export function upsertAnswerRecords(existing = [], incoming = [], updatedAt = ne
 export function mergeLearnedAnswers(existing = [], incoming = [], now = new Date().toISOString(), { confirm = false } = {}) {
   let result = existing.map(normalizeAnswerRecord);
   for (const raw of incoming) {
-    if (raw.provenance !== 'user' || raw.completed === false || !validateFillValue({ type: raw.type }, raw.answer).ok) continue;
+    if (raw.provenance !== 'user' || raw.completed === false
+      || isOpaqueIdentifier(raw.answer) || isOpaqueIdentifier(raw.question) || isOpaqueIdentifier(raw.key)
+      || !validateFillValue({ type: raw.type }, raw.answer).ok) continue;
     const next = normalizeAnswerRecord({ ...raw, updatedAt: now });
     const previous = result.find((record) => record.key === next.key);
     const changed = previous && previous.answer !== next.answer;

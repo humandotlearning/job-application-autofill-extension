@@ -828,3 +828,66 @@ test('uses company defaults only for clearly identified employer relationship qu
   assert.deepEqual(decisions.map((decision) => decision.value), ['No', 'No', null, 'Yes']);
   assert.equal(decisions[2].action, 'ask_user');
 });
+
+test('defaults unmatched named employer questions to No and matches any confirmed employer', () => {
+  const profile = {
+    employment: [{ id: 'deepsight-ai-labs', company: 'DeepSight AI Labs' }],
+    defaults: { relatedToHiringCompany: 'No', knownAtHiringCompany: 'No' },
+  };
+  const fields = [
+    { id: 'fox', label: 'Have you ever been employed by Fox Corporation, Fox Sports, Fox Broadcasting/Entertainment, Fox News Media, Fox owned and operated Television Stations, or any of its subsidiaries?', type: 'radio', options: ['Yes', 'No'] },
+    { id: 'mine', label: 'Have you ever worked at DeepSight AI Labs?', type: 'radio', options: ['Yes', 'No'] },
+    { id: 'unknown', label: 'Have you ever worked for this company?', type: 'radio', options: ['Yes', 'No'] },
+  ];
+  const decisions = planDeterministicFill(fields, [], [], profile, {});
+  assert.deepEqual(decisions.map((decision) => decision.value), ['No', 'Yes', 'No']);
+});
+
+test('plans a phone block from one international number without filling extension', () => {
+  const fields = [
+    { id: 'device', label: 'Phone Device Type', type: 'select', options: ['Select One', 'Landline', 'Mobile'], currentValue: '', section: 'Phone', formOrder: 0 },
+    { id: 'country', label: 'Country Phone Code', type: 'select', options: ['+1', '+91'], structuredOptions: [{ label: '+1', value: '+1' }, { label: '+91', value: '+91' }], currentValue: '', section: 'Phone', formOrder: 1 },
+    { id: 'number', label: 'Phone Number', type: 'tel', currentValue: '', section: 'Phone', formOrder: 2 },
+    { id: 'extension', label: 'Phone Extension', type: 'text', currentValue: '', section: 'Phone', formOrder: 3 },
+  ];
+  const decisions = planDeterministicFill(fields, [{ key: 'phone', question: 'Phone number', answer: '+918882339186', sensitivity: 'safe' }], [], {
+    defaults: { phoneDeviceType: 'Mobile' },
+  });
+  assert.equal(decisions.find((decision) => decision.fieldId === 'device').value, 'Mobile');
+  assert.equal(decisions.find((decision) => decision.fieldId === 'country').value, '+91');
+  assert.equal(decisions.find((decision) => decision.fieldId === 'number').value, '8882339186');
+  assert.equal(decisions.find((decision) => decision.fieldId === 'extension').action, 'ask_user');
+});
+
+test('leaves a phone number unresolved when country-code options are ambiguous', () => {
+  const fields = [
+    { id: 'country', label: 'Country Phone Code', type: 'select', options: ['+9', '+91'], currentValue: '', section: 'Phone', formOrder: 0 },
+    { id: 'number', label: 'Phone Number', type: 'tel', currentValue: '', section: 'Phone', formOrder: 1 },
+  ];
+  const decisions = planDeterministicFill(fields, [{ key: 'phone', question: 'Phone number', answer: '+918882339186', sensitivity: 'safe' }]);
+  assert.equal(decisions.find((decision) => decision.fieldId === 'country').action, 'ask_user');
+  assert.equal(decisions.find((decision) => decision.fieldId === 'number').action, 'ask_user');
+});
+
+test('keeps separate contiguous phone blocks independent', () => {
+  const fields = [
+    { id: 'device-one', label: 'Phone Device Type', type: 'select', options: ['Mobile', 'Landline'], section: 'Phone', formOrder: 0 },
+    { id: 'number-one', label: 'Phone Number', type: 'tel', section: 'Phone', formOrder: 1 },
+    { id: 'preferred-contact', label: 'Preferred contact name', type: 'text', formOrder: 2 },
+    { id: 'device-two', label: 'Phone Device Type', type: 'select', options: ['Mobile', 'Landline'], section: 'Phone', formOrder: 3 },
+    { id: 'number-two', label: 'Phone Number', type: 'tel', section: 'Phone', formOrder: 4 },
+  ];
+  const decisions = planDeterministicFill(fields, [{ key: 'phone', question: 'Phone number', answer: '+918882339186', sensitivity: 'safe' }], [], {
+    defaults: { phoneDeviceType: 'Mobile' },
+  });
+  assert.equal(decisions.find((decision) => decision.fieldId === 'device-one').value, 'Mobile');
+  assert.equal(decisions.find((decision) => decision.fieldId === 'number-one').value, '+918882339186');
+  assert.equal(decisions.find((decision) => decision.fieldId === 'device-two').value, 'Mobile');
+  assert.equal(decisions.find((decision) => decision.fieldId === 'number-two').value, '+918882339186');
+});
+
+test('does not expose a custom widget transport ID as its current value', () => {
+  const document = makeDocument('<form><button id="hear" type="button" role="combobox" aria-label="How did you hear about us?" aria-controls="hear-options" value="4466d54cbeba1000aec278b38cc80000">Select one</button><div id="hear-options" role="listbox" hidden><div role="option" aria-selected="true" data-value="4466d54cbeba1000aec278b38cc80000">Recruiter</div></div></form>');
+  const [field] = collectFieldDescriptors(document);
+  assert.equal(field.currentValue, '');
+});

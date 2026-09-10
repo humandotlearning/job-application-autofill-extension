@@ -56,3 +56,18 @@ test('suppressed saved evidence stays hidden only for its selected destination q
   assert.deepEqual(retrieveEvidence({ label: 'Describe ML model training experience', type: 'textarea' }, [record]), []);
   assert.equal(retrieveEvidence({ label: 'Tell us about your experience building ML models', type: 'textarea' }, [record])[0]?.sourceKey, 'deployment_story');
 });
+
+test('retrieves a human-readable saved answer for reviewed choice mapping', async () => {
+  const { retrieveEvidence } = await import('../src/retrieval.js');
+  const record = {
+    key: 'how_did_you_hear_about_this_job',
+    question: 'How did you hear about this job?',
+    answer: 'My Hermes agent found the role relevant to my profile',
+    confirmationState: 'confirmed',
+    sensitivity: 'safe',
+  };
+  const candidates = retrieveEvidence({ label: 'How did you hear about us?', type: 'select', options: ['Recruiter', 'Company website'] }, [record]);
+  assert.equal(candidates[0]?.sourceKey, record.key);
+  assert.equal(candidates[0]?.kind, 'choice_mapping');
+  assert.equal(candidates[0]?.requiresApproval, true);
+});

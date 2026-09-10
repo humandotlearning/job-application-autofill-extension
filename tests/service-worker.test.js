@@ -361,6 +361,43 @@ test('planner fill candidates wait for explicit review instead of applying to th
   assert.equal(approved.run.suggestions?.ml_experience, undefined);
 });
 
+test('choice evidence stays unresolved until the planner proposes a reviewed visible label', async () => {
+  const harness = createHarness({ answerRecords: [{
+    key: 'how_did_you_hear_about_us',
+    question: 'How did you hear about us?',
+    answer: 'A recruiter contacted me',
+    confirmationState: 'confirmed',
+    sensitivity: 'safe',
+  }], pagesByTab: { 7: { pages: [{ fields: [
+    { id: 'heard', handle: 'heard-handle', label: 'How did you hear about us?', type: 'select', required: true, options: ['Recruiter', 'Company website'] },
+  ], actions: [{ id: 'submit', label: 'Submit application', kind: 'submit' }] }] } } });
+  harness.localData.openaiApiKey = 'synthetic-choice-planner-key';
+  const bodies = [];
+  globalThis.fetch = async (_url, options) => {
+    bodies.push(JSON.parse(options.body));
+    return {
+      ok: true,
+      status: 200,
+      statusText: 'OK',
+      json: async () => ({ output_text: JSON.stringify({ decisions: [{
+        fieldId: 'heard', action: 'fill', value: 'Recruiter', evidenceKeys: ['how_did_you_hear_about_us'],
+        confidence: 'high', sensitivity: 'safe', reason: 'The saved source describes recruiter outreach', transformation: 'map_option',
+      }] }) }),
+    };
+  };
+  await import(`../src/service-worker.js?choice-planner-${Date.now()}`);
+
+  const started = await harness.dispatch({ type: 'JOB_RUN_START', tabId: 7 });
+
+  assert.equal(started.ok, true, started.error);
+  assert.equal(bodies.length, 1, 'the non-label saved answer must reach the planner');
+  const suggestion = started.run.suggestions?.heard;
+  assert.ok(suggestion, JSON.stringify(started.run));
+  assert.equal(suggestion.candidates[0].answer, 'Recruiter');
+  assert.equal(suggestion.candidates[0].kind, 'planner');
+  assert.equal(harness.tabs.get(7).frames[0].pages[0].values?.heard, undefined);
+});
+
 test('planner candidates preserve every evidence snapshot and reject approval after any source changes', async () => {
   const plannerAnswer = 'I built and deployed machine learning systems in production.';
   const harness = createHarness({ answerRecords: [

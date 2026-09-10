@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 
 import {
   chooseRecord,
+  canonicalConcept,
   inferSensitivity,
   normalizeAnswerRecord,
   normalizeText,
@@ -16,6 +17,24 @@ test('normalizes labels and creates stable canonical keys', () => {
   assert.equal(normalizeText('  Phone Number * (required) '), 'phone number');
   assert.equal(normalizeText('LinkedIn URL'), 'linkedin url');
   assert.equal(slugify('Why do you want this role?'), 'why_do_you_want_this_role');
+});
+
+test('keeps phone number, extension, and device type concepts separate', () => {
+  assert.equal(canonicalConcept('Phone Number'), 'phone_number');
+  assert.equal(canonicalConcept('Phone Extension'), 'phone_extension');
+  assert.equal(canonicalConcept('Phone Device Type'), 'phone_device_type');
+  assert.equal(canonicalConcept('Country Phone Code'), 'phone_country_code');
+  assert.equal(canonicalConcept('Country Code'), 'phone_country_code');
+  const phone = { key: 'phone', question: 'Phone number', answer: '+918882339186', sensitivity: 'safe' };
+  assert.equal(chooseRecord({ label: 'Phone Extension' }, [phone]), null);
+  assert.equal(chooseRecord({ label: 'Phone Device Type' }, [phone]), null);
+  assert.equal(chooseRecord({ label: 'Phone Number' }, [phone])?.record.key, 'phone');
+  assert.equal(chooseRecord({ label: 'Phone Extension' }, [{ key: 'phone_extension', question: 'Phone extension', answer: '123', sensitivity: 'safe' }])?.record.key, 'phone_extension');
+});
+
+test('rejects opaque values as semantic fill answers', () => {
+  assert.equal(validateFillValue({ type: 'text' }, '4466d54cbeba1000aec278b38cc80000').ok, false);
+  assert.equal(chooseRecord({ label: 'Phone Device Type' }, [{ key: 'phone_device_type', question: 'Phone Device Type', answer: '4466d54cbeba1000aec278b38cc80000', sensitivity: 'safe' }]), null);
 });
 
 test('matches autocomplete metadata before labels and aliases', () => {
