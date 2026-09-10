@@ -50,6 +50,24 @@ test('side panel contains the guided workflow, review groups, and settings contr
   }
 });
 
+test('side panel exposes a themeable terminal UI token layer', async () => {
+  const [html, css] = await Promise.all([
+    readFile(new URL('sidepanel.html', root), 'utf8'),
+    readFile(new URL('src/sidepanel.css', root), 'utf8'),
+  ]);
+  assert.match(html, /class="app-shell"/);
+  assert.match(html, /class="brand-row"/);
+  assert.match(html, /GUIDED COPILOT/);
+  for (const token of ['--color-bg', '--color-surface', '--color-surface-raised', '--color-text', '--color-text-muted', '--color-border', '--color-accent', '--color-accent-soft', '--color-focus', '--color-ok', '--color-warning', '--color-danger', '--font-mono', '--line-body', '--line-copy', '--border-width', '--focus-width', '--radius-control', '--size-prompt-textarea']) {
+    assert.match(css, new RegExp(`${token}:`));
+  }
+  assert.match(css, /\.app-shell/);
+  assert.match(css, /\.brand-row/);
+  assert.match(css, /\.pill\s*\{/);
+  assert.match(css, /outline:\s*var\(--focus-width\) solid var\(--color-focus\)/);
+  assert.match(css, /\.answer-send::before/);
+});
+
 test('legacy source and pending-learning workflow is absent', async () => {
   const [worker, panel] = await Promise.all([
     readFile(new URL('src/service-worker.js', root), 'utf8'),

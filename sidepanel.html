@@ -6,14 +6,22 @@
   <title>Job Application Autofill</title>
   <link rel="stylesheet" href="src/sidepanel.css">
 </head>
-<body>
-  <header>
-    <div class="eyebrow">GUIDED APPLICATION ASSISTANT</div>
+<body class="app-shell">
+  <header class="app-header">
+    <div class="brand-row" aria-label="Job Application Autofill">
+      <span class="brand-mark" aria-hidden="true">▣</span>
+      <span class="brand-name">Job Application Autofill</span>
+      <span class="brand-dot" aria-hidden="true"></span>
+    </div>
+    <div class="header-context">
+      <span class="eyebrow">GUIDED COPILOT</span>
+      <span class="header-prompt" aria-hidden="true">›_</span>
+    </div>
     <h1>Job Application Autofill</h1>
     <p>Fill one page at a time, review what needs attention, then submit on the application site yourself.</p>
   </header>
 
-  <main>
+  <main class="app-main">
     <section class="card hero-card" aria-labelledby="run-title">
       <div class="section-heading">
         <div><span class="step">01</span><h2 id="run-title">Current application</h2></div>

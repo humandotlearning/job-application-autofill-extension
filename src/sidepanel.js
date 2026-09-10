@@ -821,7 +821,8 @@ function renderRun(run) {
   const reviewRequired = run.reviewRequired || [];
   const audit = run.audit || [];
   elements.runState.textContent = STATUS_LABELS[run.status] || run.status;
-  elements.runState.className = `pill${['page_ready', 'ready_for_user_submit', 'answers_saved'].includes(run.status) ? '' : ' neutral'}`;
+  const accentStatuses = ['waiting_user', 'page_ready', 'ready_for_user_submit', 'answers_saved'];
+  elements.runState.className = `pill${accentStatuses.includes(run.status) ? '' : ' neutral'}`;
   setActionVisibility(run);
 
   elements.actionRequiredCount.textContent = String(actionRequired.length);

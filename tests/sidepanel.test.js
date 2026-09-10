@@ -358,6 +358,15 @@ test('panel renders grouped sections, collapsed details, and status-specific act
   }
 });
 
+test('panel uses the accent status treatment when user action is required', async () => {
+  const harness = await setupPanel({ run: { status: 'waiting_user', pageNumber: 1, actionRequired: [], optionalUnresolved: [], reviewRequired: [], audit: [] } });
+  try {
+    const state = harness.dom.window.document.querySelector('#run-state');
+    assert.equal(state.className, 'pill');
+    assert.equal(state.classList.contains('neutral'), false);
+  } finally { harness.cleanup(); }
+});
+
 test('panel persists settings, focuses blockers, and saves answers without any submit control', async () => {
   const run = {
     status: 'ready_for_user_submit',
