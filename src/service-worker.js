@@ -1,6 +1,6 @@
 import { retrieveEvidence } from './retrieval.js';
 import { inferSensitivity, isOpaqueIdentifier, validateFillValue, meaningCompatible, suggestionTargetKey } from './core.js';
-import { callAnswerPlanner, callAnswerRewriter, callAnswerSuggestions } from './llm.js';
+import { callAnswerPlanner, callAnswerRewriter, callAnswerSuggestions, DEFAULT_FIREWORKS_MODEL, DEFAULT_OPENAI_MODEL, DEFAULT_PROVIDER } from './llm.js';
 import { upsertAnswerRecords, mergeLearnedAnswers, normalizeAnswerRecord } from './core.js';
 import {
   createDatasourceState,
@@ -140,14 +140,15 @@ async function queueLearningReview(records = []) {
   const inbox = Array.isArray(current.learningInbox) ? current.learningInbox : [];
   const candidates = buildLearningCandidates(records).filter(candidate => !current.answerRecords.some(record => record.key === candidate.id) && !inbox.some(item => item.candidate?.id === candidate.id));
   if (!candidates.length) return { queued: 0, error: '' };
-  const { openaiApiKey, openaiModel } = await chrome.storage.local.get({ openaiApiKey: '', openaiModel: 'gpt-5.6-terra' });
+  const settings = await getSettings();
+  const apiKey = await getApiKey(settings.aiProvider);
   let proposals;
   let error = '';
   try {
-    proposals = openaiApiKey ? await callLearningReviewer({ apiKey: openaiApiKey, candidates }, { model: openaiModel }) : candidates.map(candidate => ({ candidateId: candidate.id, outcome: 'needs_user_label', canonicalKey: '', displayLabel: '', intent: 'other', valueKind: candidate.valueShape, aliases: [], topicTags: [], scope: candidate.scope, reusePolicy: 'never', confidence: 'low', classifier: { model: '', promptVersion: 'learning-review-v1', classifiedAt: new Date().toISOString() } }));
+    proposals = apiKey ? await callLearningReviewer({ apiKey, candidates }, { provider: settings.aiProvider, model: settings.aiModel }) : candidates.map(candidate => ({ candidateId: candidate.id, outcome: 'needs_user_label', canonicalKey: '', displayLabel: '', intent: 'other', valueKind: candidate.valueShape, aliases: [], topicTags: [], scope: candidate.scope, reusePolicy: 'never', confidence: 'low', classifier: { model: '', promptVersion: 'learning-review-v1', classifiedAt: new Date().toISOString() } }));
   } catch (caught) {
     error = caught.message;
-    proposals = candidates.map(candidate => ({ candidateId: candidate.id, outcome: 'needs_user_label', canonicalKey: '', displayLabel: '', intent: 'other', valueKind: candidate.valueShape, aliases: [], topicTags: [], scope: candidate.scope, reusePolicy: 'never', confidence: 'low', classifier: { model: openaiModel, promptVersion: 'learning-review-v1', classifiedAt: new Date().toISOString() } }));
+    proposals = candidates.map(candidate => ({ candidateId: candidate.id, outcome: 'needs_user_label', canonicalKey: '', displayLabel: '', intent: 'other', valueKind: candidate.valueShape, aliases: [], topicTags: [], scope: candidate.scope, reusePolicy: 'never', confidence: 'low', classifier: { model: settings.aiModel, promptVersion: 'learning-review-v1', classifiedAt: new Date().toISOString() } }));
   }
   const now = new Date().toISOString();
   const byKey = new Map(records.map(record => [record.key, record]));
@@ -248,10 +249,17 @@ async function getCoverMessages() {
 }
 
 async function getSettings() {
-  const stored = await chrome.storage.local.get({ autoAdvancePages: false, openaiModel: 'gpt-5.6-terra' });
+  const stored = await chrome.storage.local.get({ autoAdvancePages: false, aiProvider: '', aiModel: '', openaiModel: '', openaiApiKey: '', fireworksApiKey: '' });
+  const aiProvider = stored.aiProvider === 'openai' || stored.aiProvider === 'fireworks'
+    ? stored.aiProvider
+    : (String(stored.openaiApiKey || '').trim() ? 'openai' : DEFAULT_PROVIDER);
+  const fallbackModel = aiProvider === 'fireworks' ? DEFAULT_FIREWORKS_MODEL : DEFAULT_OPENAI_MODEL;
+  const aiModel = String(stored.aiModel || (aiProvider === 'openai' ? stored.openaiModel : '') || fallbackModel).trim() || fallbackModel;
   return {
     autoAdvancePages: Boolean(stored.autoAdvancePages),
-    openaiModel: String(stored.openaiModel || 'gpt-5.6-terra').trim() || 'gpt-5.6-terra',
+    aiProvider,
+    aiModel,
+    openaiModel: aiModel,
   };
 }
 
@@ -363,9 +371,10 @@ async function importDatasourceBackup(backup) {
   return datasourceWriteChain;
 }
 
-async function getApiKey() {
-  const stored = await chrome.storage.local.get({ openaiApiKey: '' });
-  return String(stored.openaiApiKey || '').trim();
+async function getApiKey(provider = null) {
+  const selectedProvider = provider || (await getSettings()).aiProvider;
+  const stored = await chrome.storage.local.get({ openaiApiKey: '', fireworksApiKey: '' });
+  return String(stored[selectedProvider === 'fireworks' ? 'fireworksApiKey' : 'openaiApiKey'] || '').trim();
 }
 
 async function enumerateFrames(tabId) {
@@ -780,7 +789,7 @@ async function focusFirstProblem(tabId, run, inspection, validation) {
   return first?.label || '';
 }
 
-async function applyPageDecisions(tabId, run, inspection, records, coverMessages, apiKey, model, profile = {}, datasourceRevision = '') {
+async function applyPageDecisions(tabId, run, inspection, records, coverMessages, apiKey, provider, model, profile = {}, datasourceRevision = '') {
   const currentPageSignature = pageSignature(inspection, run.frame);
   if (run.lastAction === 'next' && run.pageSignature === currentPageSignature) {
     run.status = 'waiting_user';
@@ -854,7 +863,7 @@ async function applyPageDecisions(tabId, run, inspection, records, coverMessages
         fields: remaining,
         records: plannerRecords,
         page: currentInspection.page,
-      }, { model, allowPartial: true });
+      }, { provider, model, allowPartial: true });
       const heldPlannerDecisions = [];
       for (const decision of llmDecisions.decisions) {
         const field = remaining.find((item) => item.id === decision.fieldId);
@@ -918,7 +927,7 @@ async function applyPageDecisions(tabId, run, inspection, records, coverMessages
     const suggestionRecords = [...records, ...profileEvidenceRecords(profile), ...pageRecords];
     for (const field of suggestionFields) {
       try {
-        const generated = await callAnswerSuggestions({ apiKey, field, page: run.jobContext, records: suggestionRecords }, { model });
+        const generated = await callAnswerSuggestions({ apiKey, field, page: run.jobContext, records: suggestionRecords }, { provider, model });
         if (generated.suggestions.length || generated.missingContext) {
           run.generatedSuggestions[field.id] = {
             tabId, frameId: run.frame.frameId, applicationId: run.startedAt, pageSignature: currentPageSignature,
@@ -1158,9 +1167,10 @@ async function rewriteAnswer(message) {
   const draft = requiredBoundedText(message.draft, 'Draft answer', MAX_DRAFT_CHARS);
   const instruction = requiredBoundedText(message.instruction, 'Rewrite instruction', MAX_REWRITE_INSTRUCTION_CHARS);
   const { suggestion, field } = await guardedDraftField(message);
-  const apiKey = await getApiKey();
-  if (!apiKey) throw new Error('Add an OpenAI API key before requesting a rewrite');
-  const [settings, records] = await Promise.all([getSettings(), rewriteEvidence(suggestion, message)]);
+  const settings = await getSettings();
+  const apiKey = await getApiKey(settings.aiProvider);
+  if (!apiKey) throw new Error(`Add a ${settings.aiProvider === 'fireworks' ? 'Fireworks' : 'OpenAI'} API key before requesting a rewrite`);
+  const records = await rewriteEvidence(suggestion, message);
   const rewritten = await callAnswerRewriter({
     apiKey,
     question: field.label,
@@ -1168,7 +1178,7 @@ async function rewriteAnswer(message) {
     instruction,
     records,
     page: (await getRun(message.tabId))?.jobContext || {},
-  }, { model: settings.openaiModel });
+  }, { provider: settings.aiProvider, model: settings.aiModel });
   return { ok: true, answer: requiredBoundedText(rewritten.answer, 'Rewritten answer', MAX_DRAFT_CHARS) };
 }
 
@@ -1176,15 +1186,16 @@ async function generateSuggestions(message) {
   const jobDescription = message.jobDescription == null ? '' : requiredBoundedText(message.jobDescription, 'Job description', 16_000);
   const { run, field } = await guardedDraftField(message);
   if (!readableQuestion(field)) throw new Error('The form question is unclear. Use Show on page and enter the answer manually.');
-  const apiKey = await getApiKey();
-  if (!apiKey) throw new Error('Add an OpenAI API key before generating answer suggestions');
-  const [settings, records, datasource, inspected] = await Promise.all([getSettings(), getRecords(), getDatasource(), sendToFrame(message.tabId, message.frameId, { type: 'JOB_APP_INSPECT' })]);
+  const settings = await getSettings();
+  const apiKey = await getApiKey(settings.aiProvider);
+  if (!apiKey) throw new Error(`Add a ${settings.aiProvider === 'fireworks' ? 'Fireworks' : 'OpenAI'} API key before generating answer suggestions`);
+  const [records, datasource, inspected] = await Promise.all([getRecords(), getDatasource(), sendToFrame(message.tabId, message.frameId, { type: 'JOB_APP_INSPECT' })]);
   run.jobContext = mergeJobContext(run.jobContext, inspected.inspection?.page);
   if (jobDescription) run.jobContext.jobDescription = jobDescription;
   const pageRecords = (inspected.inspection?.fields || [])
     .filter(item => item.currentValue && readableQuestion(item))
     .map(item => ({ key: `page:${item.id}`, question: item.label, answer: item.currentValue, provenance: 'current application page', sensitivity: 'safe' }));
-  const generated = await callAnswerSuggestions({ apiKey, field, page: run.jobContext, records: [...records, ...profileEvidenceRecords(datasource.profile), ...pageRecords] }, { model: settings.openaiModel });
+  const generated = await callAnswerSuggestions({ apiKey, field, page: run.jobContext, records: [...records, ...profileEvidenceRecords(datasource.profile), ...pageRecords] }, { provider: settings.aiProvider, model: settings.aiModel });
   run.generatedSuggestions = run.generatedSuggestions || {};
   run.generatedSuggestions[field.id] = {
     tabId: message.tabId, frameId: message.frameId, applicationId: run.startedAt, pageSignature: run.pageSignature,
@@ -1231,7 +1242,8 @@ async function processPage(tabId, { autoAdvance } = { autoAdvance: false }) {
       records,
       coverMessages,
       apiKey,
-      settings.openaiModel,
+      settings.aiProvider,
+      settings.aiModel,
       datasource.profile,
       datasource.datasourceMeta?.updatedAt || '',
     );

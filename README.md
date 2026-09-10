@@ -112,7 +112,7 @@ At most one request is made per page, and only when local answers do not cover i
 
 It does not contain raw HTML, hidden inputs, passwords, cookies, URLs with query strings, or the API key. The model must use evidence from the supplied records and return `ask_user` when evidence is missing or ambiguous. Failed API calls fall back to local fills and a manual pause.
 
-The extension uses the configured answer-planner model (default `gpt-5.6-terra`) with low reasoning effort, `store: false`, and strict JSON Schema output. The model ID can be changed in the side panel for compatible Luna deployments. The API key is held in trusted `chrome.storage.local` and read only by the extension side panel/service worker.
+The extension uses the configured AI provider and answer-planner model. Fireworks is the default provider with model `accounts/fireworks/models/glm-5p3-flash`; OpenAI remains available as an alternative. Fireworks requests use the OpenAI-compatible Chat Completions endpoint and JSON output mode. The provider, model ID, and provider-specific API keys are held in trusted `chrome.storage.local` and read only by the extension side panel/service worker.
 
 ## Install and use
 
@@ -120,7 +120,7 @@ The extension uses the configured answer-planner model (default `gpt-5.6-terra`)
 2. Open `chrome://extensions`, enable Developer mode, and choose **Load unpacked**.
 3. Select `C:\Users\nithi\job-application-autofill-extension`.
 4. Open a job application and open the extension side panel.
-5. Enter an OpenAI API key if you want unresolved-field assistance. Local deterministic filling works without it.
+5. Open **Settings & data**, choose Fireworks or OpenAI, enter that provider’s API key, and select or type a compatible model ID. Local deterministic filling works without a key.
 6. Click **Fill this page**. Complete any highlighted required fields or manual steps, then click **Check again**.
 7. When a page is ready, review it and click **Continue to next page**. On the final page, review the form and submit through the application site; the extension captures the final values automatically. **Save answers** remains available as an optional local checkpoint.
 

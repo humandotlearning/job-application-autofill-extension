@@ -79,7 +79,14 @@
           <div><span class="step">04</span><h2 id="profile-title">Answer profile</h2></div>
           <span id="record-count" class="pill neutral">0 answers</span>
         </div>
-        <label for="openai-api-key">OpenAI API key <span class="muted">(optional for answer planner)</span></label>
+        <label for="ai-provider">AI provider</label>
+        <select id="ai-provider">
+          <option value="fireworks">Fireworks (default)</option>
+          <option value="openai">OpenAI</option>
+        </select>
+        <label for="fireworks-api-key">Fireworks API key <span class="muted">(stored locally)</span></label>
+        <input id="fireworks-api-key" type="password" autocomplete="off" spellcheck="false" placeholder="Paste your Fireworks key">
+        <label for="openai-api-key">OpenAI API key <span class="muted">(optional alternative)</span></label>
         <input id="openai-api-key" type="password" autocomplete="off" spellcheck="false" placeholder="sk-…">
         <label for="employer-name">Confirmed employer</label>
         <input id="employer-name" type="text" autocomplete="organization" value="DeepSight AI Labs">
@@ -90,8 +97,12 @@
         <select id="known-default"><option>No</option><option>Yes</option></select>
         <label for="phone-device-default">Phone device type</label>
         <select id="phone-device-default"><option>Mobile</option><option>Landline</option></select>
-        <label for="openai-model">Answer planner model</label>
-        <input id="openai-model" type="text" autocomplete="off" spellcheck="false" value="gpt-5.6-terra" placeholder="gpt-5.6-terra">
+        <label for="ai-model">Answer planner model</label>
+        <input id="ai-model" list="fireworks-models" type="text" autocomplete="off" spellcheck="false" value="accounts/fireworks/models/glm-5p3-flash" placeholder="accounts/fireworks/models/glm-5p3-flash">
+        <datalist id="fireworks-models">
+          <option value="accounts/fireworks/models/glm-5p3-flash"></option>
+        </datalist>
+        <p class="muted">Choose Fireworks above to use its model IDs, or enter any compatible model ID.</p>
         <label class="checkbox-row" for="auto-advance-pages">
           <input id="auto-advance-pages" type="checkbox">
           <span>Auto-advance pages when exactly one valid Next action is found</span>
