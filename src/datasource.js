@@ -43,6 +43,7 @@ function normalizeProfile(profile = {}) {
   const employment = Array.isArray(profile.employment) && profile.employment.length
     ? profile.employment
       .map((entry) => ({
+        ...entry,
         id: slugify(entry?.id || entry?.company),
         company: String(entry?.company || '').trim(),
         roles: Array.isArray(entry?.roles) ? entry.roles.filter((role) => role && typeof role === 'object') : [],

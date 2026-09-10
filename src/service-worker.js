@@ -1,4 +1,4 @@
-import { retrieveEvidence } from './retrieval.js';
+import { retrieveEvidence, searchEvidence, selectPlannerEvidence, rankSuggestionEvidence } from './retrieval.js';
 import { inferSensitivity, isOpaqueIdentifier, validateFillValue, meaningCompatible, suggestionTargetKey } from './core.js';
 import { callAnswerPlanner, callAnswerRewriter, callAnswerSuggestions, DEFAULT_FIREWORKS_MODEL, DEFAULT_OPENAI_MODEL, DEFAULT_PROVIDER } from './llm.js';
 import { upsertAnswerRecords, mergeLearnedAnswers, normalizeAnswerRecord } from './core.js';
@@ -19,6 +19,8 @@ const MAX_PAGES = 20;
 const ACTIVE_RUN_STATUSES = new Set(['running', 'waiting_user', 'page_ready', 'ready_for_user_submit']);
 const SAVABLE_RUN_STATUSES = new Set(['waiting_user', 'page_ready', 'ready_for_user_submit', 'answers_saved']);
 const processingTabs = new Set();
+const backgroundJobs = new Map();
+const WORKER_ID = `${Date.now()}:${Math.random()}`;
 const saveLocks = new Set();
 const saveOperations = new Map();
 const MAX_DRAFT_CHARS = 4_000;
@@ -46,13 +48,20 @@ async function getRuns() {
 
 async function getRun(tabId) {
   const runs = await getRuns();
-  return runs[String(tabId)] || null;
+  const run = runs[String(tabId)] || null;
+  if (run && ((run.status === 'running' && run.workerId !== WORKER_ID) || Object.values(run.aiOperations || {}).some(op => op.status === 'pending' && op.workerId !== WORKER_ID))) {
+    for (const op of Object.values(run.aiOperations || {})) if (op.status === 'pending' && op.workerId !== WORKER_ID) op.status = 'interrupted';
+    run.status = 'waiting_user'; run.progress = 'ready'; run.waitingFor = 'operation_interrupted'; run.nextAction = null;
+    run.actionRequired = [...(run.actionRequired || []).filter(item => item.reasonCode !== 'operation_interrupted'), { reasonCode: 'operation_interrupted', reason: 'The previous operation was interrupted. Check the page or retry AI.' }];
+    await saveRun(run);
+  }
+  return run;
 }
 
 async function saveRun(run) {
   runWriteChain = runWriteChain.catch(() => {}).then(async () => {
     const runs = await getRuns();
-    runs[String(run.tabId)] = { ...run, updatedAt: new Date().toISOString() };
+    runs[String(run.tabId)] = { ...run, revision: (runs[String(run.tabId)]?.revision || 0) + 1, workerId: WORKER_ID, updatedAt: new Date().toISOString() };
     await chrome.storage.session.set({ [RUN_STORAGE_KEY]: runs });
     return runs[String(run.tabId)];
   });
@@ -565,6 +574,12 @@ function nowRun(tabId) {
     waitingFor: null,
     waitingLabel: null,
     llmPages: [],
+    revision: 0,
+    workerId: WORKER_ID,
+    progress: 'checking_fields',
+    aiOperations: {},
+    employmentMappings: {},
+    employmentChoices: [],
     llmError: null,
     generatedSuggestions: {},
     jobContext: null,
@@ -767,9 +782,12 @@ function categorizeRun(run, inspection, validation, unresolvedResults = []) {
     }));
   run.actionRequired = [
     ...navigationIssues(inspection),
-    ...unresolvedFieldsOnPage.filter((field) => field.required),
+    ...unresolvedFieldsOnPage.filter((field) => field.required || invalidIds.has(field.fieldId)),
   ];
-  run.optionalUnresolved = unresolvedFieldsOnPage.filter((field) => !field.required);
+  run.optionalUnresolved = unresolvedFieldsOnPage.filter((field) => !field.required && !invalidIds.has(field.fieldId));
+  const unresolvedIds = new Set(unresolvedFieldsOnPage.map(field => field.fieldId));
+  run.reviewRequired = (run.reviewRequired || []).filter(item => !unresolvedIds.has(item.fieldId));
+  run.fieldStates = Object.fromEntries(inspection.fields.map(field => [field.id, { handle: field.handle, status: unresolvedIds.has(field.id) ? (run.suggestions?.[field.id] || run.generatedSuggestions?.[field.id]?.suggestions?.length ? 'review' : 'manual') : 'filled' }]));
   run.audit = auditItems(run.answers, run.pages);
   return run;
 }
@@ -789,7 +807,7 @@ async function focusFirstProblem(tabId, run, inspection, validation) {
   return first?.label || '';
 }
 
-async function applyPageDecisions(tabId, run, inspection, records, coverMessages, apiKey, provider, model, profile = {}, datasourceRevision = '') {
+async function applyPageDecisions(tabId, run, inspection, records, coverMessages, apiKey, provider, model, profile = {}, datasourceRevision = '', cycle = {pass: 0, deadline: Date.now() + 8000}) {
   const currentPageSignature = pageSignature(inspection, run.frame);
   if (run.lastAction === 'next' && run.pageSignature === currentPageSignature) {
     run.status = 'waiting_user';
@@ -808,142 +826,74 @@ async function applyPageDecisions(tabId, run, inspection, records, coverMessages
   run.suggestionDatasourceRevision = datasourceRevision;
   run.jobContext = mergeJobContext(run.jobContext, inspection.page);
   await saveRun(run);
-  const employment = profile.employment?.[0];
-  const scopedFields = employment
-    ? inspection.fields.map((field) => field.entityType === 'employment' ? { ...field, employmentId: employment.id } : field)
-    : inspection.fields;
   const draftRecords = await draftEvidenceRecords();
-  const initialValidationResponse = await sendToApplicationFrame(tabId, run, { type: 'JOB_APP_VALIDATE' });
-  const invalidFieldIds = new Set((initialValidationResponse?.validation?.invalid || []).map((field) => field.fieldId));
-  const localDecisions = planDeterministicFill(scopedFields, records, coverMessages, profile, inspection.page).map(decision => {
-    const field = scopedFields.find(field => field.id === decision.fieldId);
-    if (!field) return decision;
-    // An existing invalid value must not be silently replaced by deterministic
-    // autofill. Keep it unresolved so planner output can be reviewed first.
-    if (field.currentValue && invalidFieldIds.has(field.id)) {
-      return { ...decision, action: 'keep', value: null, reason: 'The current value does not satisfy the field constraints' };
+  let currentInspection = inspection;
+  let currentValidation = { ok: false, requiredEmpty: [], invalid: [] };
+  let allDecisions = [];
+  let appliedReviews = [];
+  let unresolvedResults = [];
+  let currentSignature = currentPageSignature;
+  const firstPass = Math.max(0, Number(cycle.pass) || 0);
+  for (let pass = firstPass; pass < 3 && Date.now() < cycle.deadline; pass += 1) {
+    const inspectedSignature = pageSignature(currentInspection, run.frame);
+    if (inspectedSignature !== currentSignature) {
+      currentSignature = inspectedSignature;
+      run.pageSignature = currentSignature;
+      run.suggestions = {};
+      run.generatedSuggestions = {};
     }
-    if (field.currentValue) return decision;
-    const candidates = retrieveEvidence(field, records);
-    for (const candidate of retrieveEvidence(field, draftRecords)) {
-      if (!candidates.some(saved => saved.answer === candidate.answer)) candidates.push({ ...candidate, kind: 'draft', reason: 'Previously entered, not yet saved for reuse — explicit approval required' });
-    }
-    candidates.splice(3);
-    const choiceMapping = choiceEvidenceNeedsPlanner(field, candidates);
-    const gated = candidates.length && !choiceMapping && (decision.action !== 'fill' || field.type === 'textarea' || decision.sensitivity !== 'safe' || inferSensitivity(field.label, field.id) !== 'safe');
-    if (gated) {
-      run.suggestions[field.id] = { tabId, frameId: run.frame.frameId, applicationId: run.startedAt, pageSignature: currentPageSignature, field, candidates };
-      return { ...decision, action: 'ask_user', value: null, reason: 'Relevant saved evidence available — approve an answer before use' };
-    }
-    return decision;
-  });
-  const localResult = await sendToApplicationFrame(tabId, run, { type: 'JOB_APP_APPLY', decisions: localDecisions, applicationId: run.startedAt });
-  if (!localResult?.ok) throw new Error(localResult?.error || 'The page rejected local answers');
-
-  let refreshed = await sendToApplicationFrame(tabId, run, { type: 'JOB_APP_INSPECT' });
-  let currentInspection = refreshed.inspection;
-  let validationResponse = await sendToApplicationFrame(tabId, run, { type: 'JOB_APP_VALIDATE' });
-  let currentValidation = validationResponse?.validation || {};
-  let allDecisions = [...localDecisions];
-  let appliedReviews = [...(localResult.result?.reviewRequired || [])];
-  let unresolvedResults = [...(localResult.result?.unresolved || [])];
-  let llmError = null;
-  let plannerFailed = false;
-  let plannerAttempted = false;
-  const remaining = unresolvedFields(currentInspection.fields, currentValidation).filter(field => !run.suggestions[field.id]);
-  const llmPageKey = `${run.pageNumber}:${currentPageSignature}`;
-  if (remaining.length && apiKey && !run.llmPages.includes(llmPageKey)) {
-    plannerAttempted = true;
-    run.llmPages = [...run.llmPages, llmPageKey];
-    await saveRun(run);
-    try {
-      const plannerRecords = records.filter(record => remaining.some(field => retrieveEvidence(field, [record]).length)).slice(0, 20);
-      const llmDecisions = await callAnswerPlanner({
-        apiKey,
-        fields: remaining,
-        records: plannerRecords,
-        page: currentInspection.page,
-      }, { provider, model, allowPartial: true });
-      const heldPlannerDecisions = [];
-      for (const decision of llmDecisions.decisions) {
-        const field = remaining.find((item) => item.id === decision.fieldId);
-        if (!field || decision.action !== 'fill') {
-          heldPlannerDecisions.push(decision);
-          continue;
-        }
-        const sourceKeys = [...new Set(decision.evidenceKeys || [])];
-        const sources = sourceKeys.map((key) => plannerRecords.find((record) => record.key === key));
-        if (sources.length !== sourceKeys.length || sources.some((source) => !source)) {
-          throw new Error(`Answer planner evidence is unavailable for ${field.label || field.id}`);
-        }
-        run.suggestions[field.id] = {
-          tabId,
-          frameId: run.frame.frameId,
-          applicationId: run.startedAt,
-          pageSignature: currentPageSignature,
-          field,
-          candidates: [{
-            sourceKey: sourceKeys[0],
-            sourceKeys,
-            sourceAnswers: Object.fromEntries(sources.map((source) => [source.key, source.answer])),
-            sourceQuestion: sources.map((source) => source.question).join(' + '),
-            answer: decision.value,
-            excerpt: String(decision.value).slice(0, 400),
-            provenance: 'AI planner',
-            kind: 'planner',
-            requiresApproval: true,
-            reason: decision.reason,
-            transformation: decision.transformation || null,
-            confidence: decision.confidence,
-            sensitivity: decision.sensitivity,
-          }],
-        };
-        heldPlannerDecisions.push({
-          ...decision,
-          action: 'ask_user',
-          value: null,
-          reason: 'AI-planned answer is ready for review before use',
-        });
+    const scopedFields = resolveEmploymentFields(run, currentInspection.fields, profile);
+    const validationResponse = await sendToApplicationFrame(tabId, run, { type: 'JOB_APP_VALIDATE' });
+    currentValidation = validationResponse?.validation || { ok: false, requiredEmpty: [], invalid: [] };
+    const invalidFieldIds = new Set((currentValidation.invalid || []).map((field) => field.fieldId));
+    const localDecisions = planDeterministicFill(scopedFields, records, coverMessages, profile, currentInspection.page).map(decision => {
+      const field = scopedFields.find(field => field.id === decision.fieldId);
+      if (!field) return decision;
+      if (field.entityUnresolved) return {...decision, action:'ask_user',value:null,disposition:'manual',reason:'Choose the employer for this work-history section'};
+      // An existing invalid value must not be silently replaced by deterministic
+      // autofill. Keep it unresolved so planner output can be reviewed first.
+      if (String(field.currentValue || '').trim() && invalidFieldIds.has(field.id)) {
+        return { ...decision, action: 'keep', value: null, reason: 'The current value does not satisfy the field constraints' };
       }
-      // Planner output is a proposed answer, never an automatic fill.  The
-      // candidate is revalidated and applied only through explicit Send to
-      // form in approveSuggestion.
-      allDecisions = [...allDecisions, ...heldPlannerDecisions];
-    } catch (error) {
-      llmError = error.message;
-      plannerFailed = true;
-    }
-  }
-
-  // Generated drafts are separate from saved-answer approvals. They are shown
-  // for explicit review and never mutate the page or datasource automatically.
-  run.generatedSuggestions = run.generatedSuggestions || {};
-  if (apiKey && plannerAttempted && !plannerFailed) {
-    const suggestionFields = unresolvedFields(currentInspection.fields, currentValidation)
-      .filter(field => !run.suggestions[field.id] && readableQuestion(field));
-    const pageRecords = currentInspection.fields
-      .filter(field => field.currentValue && readableQuestion(field))
-      .map(field => ({ key: `page:${field.id}`, question: field.label, answer: field.currentValue, provenance: 'current application page', sensitivity: 'safe' }));
-    const suggestionRecords = [...records, ...profileEvidenceRecords(profile), ...pageRecords];
-    for (const field of suggestionFields) {
-      try {
-        const generated = await callAnswerSuggestions({ apiKey, field, page: run.jobContext, records: suggestionRecords }, { provider, model });
-        if (generated.suggestions.length || generated.missingContext) {
-          run.generatedSuggestions[field.id] = {
-            tabId, frameId: run.frame.frameId, applicationId: run.startedAt, pageSignature: currentPageSignature,
-            field, suggestions: generated.suggestions, missingContext: generated.missingContext,
-          };
-        }
-      } catch (error) {
-        llmError = llmError || error.message;
+      if (String(field.currentValue || '').trim()) return decision;
+      const candidates = retrieveEvidence(field, records);
+      for (const candidate of retrieveEvidence(field, draftRecords)) {
+        if (!candidates.some(saved => saved.answer === candidate.answer)) candidates.push({ ...candidate, kind: 'draft', reason: 'Previously entered, not yet saved for reuse — explicit approval required' });
       }
-    }
+      candidates.splice(3);
+      const choiceMapping = choiceEvidenceNeedsPlanner(field, candidates);
+      const gated = candidates.length && !choiceMapping && (decision.action !== 'fill' || decision.disposition !== 'autofill' || field.type === 'textarea' || decision.sensitivity !== 'safe' || inferSensitivity(field.label, field.id) !== 'safe');
+      if (gated) {
+        const existing = run.suggestions[field.id];
+        const plannerCandidate = existing?.candidates?.some((candidate) => candidate.kind === 'planner');
+        if (!plannerCandidate) {
+          run.suggestions[field.id] = { tabId, frameId: run.frame.frameId, applicationId: run.startedAt, pageSignature: currentSignature, field, candidates };
+        }
+        return { ...decision, action: 'ask_user', value: null, reason: 'Relevant saved evidence available — approve an answer before use' };
+      }
+      return decision.disposition === 'autofill' ? decision : {...decision,action:'ask_user',value:null};
+    });
+    allDecisions.push(...localDecisions);
+    const fillable = localDecisions.filter(decision => {
+      const field = scopedFields.find(item => item.id === decision.fieldId);
+      return decision.action === 'fill' && !String(field?.currentValue || '').trim();
+    });
+    if (!fillable.length) break;
+    const before = JSON.stringify(currentInspection.fields.map(field => [field.id, field.handle, field.currentValue, field.options]));
+    const localResult = await sendToApplicationFrame(tabId, run, { type: 'JOB_APP_APPLY', decisions: fillable, deadline: cycle.deadline, applicationId: run.startedAt });
+    if (!localResult?.ok) throw new Error(localResult?.error || 'The page rejected local answers');
+    appliedReviews.push(...(localResult.result?.reviewRequired || []));
+    unresolvedResults.push(...(localResult.result?.unresolved || []));
+    const refreshed = await sendToApplicationFrame(tabId, run, { type: 'JOB_APP_INSPECT' });
+    currentInspection = refreshed.inspection;
+    const after = JSON.stringify(currentInspection.fields.map(field => [field.id, field.handle, field.currentValue, field.options]));
+    if (after === before) break;
   }
-
-  refreshed = await sendToApplicationFrame(tabId, run, { type: 'JOB_APP_INSPECT' });
-  currentInspection = refreshed.inspection;
-  validationResponse = await sendToApplicationFrame(tabId, run, { type: 'JOB_APP_VALIDATE' });
-  currentValidation = validationResponse?.validation || { ok: false, requiredEmpty: [], invalid: [] };
+  currentSignature = pageSignature(currentInspection, run.frame);
+  run.pageSignature = currentSignature;
+  for (const suggestion of Object.values(run.suggestions || {})) suggestion.pageSignature = currentSignature;
+  const finalValidationResponse = await sendToApplicationFrame(tabId, run, { type: 'JOB_APP_VALIDATE' });
+  currentValidation = finalValidationResponse?.validation || { ok: false, requiredEmpty: [], invalid: [] };
   run = await capturePage(tabId, run, currentInspection);
   run.reviewRequired = reviewItems(
     currentInspection.fields,
@@ -952,7 +902,7 @@ async function applyPageDecisions(tabId, run, inspection, records, coverMessages
     appliedReviews,
     run.pageNumber,
   );
-  run.llmError = llmError;
+  run.progress = 'local_fill_complete';
   return {
     run: categorizeRun(run, currentInspection, currentValidation, unresolvedResults),
     inspection: currentInspection,
@@ -978,25 +928,28 @@ async function approveSuggestion(message) {
     const sourceKeys = sourceKeysForCandidate(candidate);
     const records = candidate?.kind === 'draft' ? await draftEvidenceRecords() : await getRecords();
     const sources = sourceKeys.map((key) => records.find((record) => record.key === key));
+    const compatibleEvidence = candidate?.kind === 'planner'
+      ? rankSuggestionEvidence(suggestion.field, records, {limit: records.length})
+      : retrieveEvidence(suggestion.field, records, {limit: records.length});
     if (!candidate || !sourceKeys.length || sources.some((source) => !source)
       || sources.some((source) => source.answer !== sourceAnswerSnapshot(candidate, source.key))
-      || sources.some((source) => !retrieveEvidence(suggestion.field, records).some((item) => item.sourceKey === source.key))) {
+      || sources.some((source) => !compatibleEvidence.some((item) => (item.sourceKey || item.key) === source.key))) {
       throw new Error('Saved evidence changed; check again');
     }
     const source = sources[0];
     // Never rediscover/reroute an approval into another frame.
     const inspected = await sendToFrame(tabId, message.frameId, { type: 'JOB_APP_INSPECT' });
-    const field = inspected.inspection?.fields.find(item => item.id === fieldId);
+    const field = resolveEmploymentFields(run, inspected.inspection?.fields || [], (await getDatasource()).profile).find(item => item.id === fieldId);
     if (!field || field.handle !== message.handle || field.currentValue || JSON.stringify(field.options) !== JSON.stringify(suggestion.field.options)
       || field.label !== suggestion.field.label || field.type !== suggestion.field.type
       || pageSignature(inspected.inspection, run.frame) !== message.pageSignature) throw new Error('Destination changed; check the page again');
     const value = String(message.answer ?? candidate.answer).trim();
     const validation = validateFillValue(field, value);
     const sourceCompatible = candidate.kind === 'planner'
-      ? sources.every((item) => retrieveEvidence(field, records).some((evidence) => evidence.sourceKey === item.key))
+      ? sources.every((item) => compatibleEvidence.some((evidence) => (evidence.sourceKey || evidence.key) === item.key))
       : meaningCompatible(field, source, { numericReview: !(['textarea', 'text'].includes(field.type) && value === candidate.answer) });
     if (!validation.ok || !sourceCompatible || inferSensitivity(field.label, field.id) === 'legal' || field.type === 'checkbox') throw new Error(validation.reason || 'This destination requires manual entry');
-    const result = await sendToFrame(tabId, message.frameId, { type: 'JOB_APP_APPLY', applicationId: run.startedAt, decisions: [{ fieldId, handle: field.handle, action: 'fill', value, evidenceKeys: sourceKeys, sensitivity: inferSensitivity(field.label, field.id), confidence: 'high', reason: 'Explicitly approved saved answer' }] });
+    const result = await sendToFrame(tabId, message.frameId, { type: 'JOB_APP_APPLY', applicationId: run.startedAt, decisions: [{ fieldId, handle: field.handle, action: 'fill', approved: true, value, evidenceKeys: sourceKeys, sensitivity: inferSensitivity(field.label, field.id), confidence: 'high', reason: 'Explicitly approved saved answer' }] });
     if (!result?.ok) throw new Error(result?.error || 'Could not apply the answer');
     const verified = await sendToFrame(tabId, message.frameId, { type: 'JOB_APP_INSPECT' });
     if (verified.inspection?.fields.find(item => item.id === fieldId && item.handle === field.handle)?.currentValue !== value) throw new Error('The page did not retain the approved answer');
@@ -1118,7 +1071,7 @@ async function rewriteEvidence(suggestion, message) {
   const records = candidate.kind === 'draft' ? await draftEvidenceRecords() : await getRecords();
   const relevant = records.filter((record) => requestedKeys.includes(record.key));
   if (relevant.length !== requestedKeys.length
-    || relevant.some((record) => !retrieveEvidence(suggestion.field, records).some((item) => item.sourceKey === record.key))) {
+    || relevant.some((record) => !retrieveEvidence(suggestion.field, records, {limit: records.length}).some((item) => item.sourceKey === record.key))) {
     throw new Error('Saved evidence changed; choose an answer again');
   }
   return relevant;
@@ -1143,6 +1096,7 @@ async function applyDraft(message) {
         fieldId: field.id,
         handle: field.handle,
         action: 'fill',
+        approved: true,
         value: answer,
         evidenceKeys: [],
         sensitivity: inferSensitivity(field.label, field.id),
@@ -1190,20 +1144,24 @@ async function generateSuggestions(message) {
   const apiKey = await getApiKey(settings.aiProvider);
   if (!apiKey) throw new Error(`Add a ${settings.aiProvider === 'fireworks' ? 'Fireworks' : 'OpenAI'} API key before generating answer suggestions`);
   const [records, datasource, inspected] = await Promise.all([getRecords(), getDatasource(), sendToFrame(message.tabId, message.frameId, { type: 'JOB_APP_INSPECT' })]);
-  run.jobContext = mergeJobContext(run.jobContext, inspected.inspection?.page);
-  if (jobDescription) run.jobContext.jobDescription = jobDescription;
+  const jobContext = mergeJobContext(run.jobContext, inspected.inspection?.page);
+  if (jobDescription) jobContext.jobDescription = jobDescription;
+  const snapshot = suggestionRequestSnapshot(run, field, inspected.inspection, datasource, settings, jobContext);
   const pageRecords = (inspected.inspection?.fields || [])
     .filter(item => item.currentValue && readableQuestion(item))
-    .map(item => ({ key: `page:${item.id}`, question: item.label, answer: item.currentValue, provenance: 'current application page', sensitivity: 'safe' }));
-  const generated = await callAnswerSuggestions({ apiKey, field, page: run.jobContext, records: [...records, ...profileEvidenceRecords(datasource.profile), ...pageRecords] }, { provider: settings.aiProvider, model: settings.aiModel });
-  run.generatedSuggestions = run.generatedSuggestions || {};
-  run.generatedSuggestions[field.id] = {
-    tabId: message.tabId, frameId: message.frameId, applicationId: run.startedAt, pageSignature: run.pageSignature,
+    .map(item => ({ key: `page:${item.id}`, question: item.label, answer: item.currentValue, provenance: 'current application page', sensitivity: inferSensitivity(item.label, item.id) }));
+  const generated = await callAnswerSuggestions({ apiKey, field, page: jobContext, records: rankSuggestionEvidence(field, [...records, ...profileEvidenceRecords(datasource.profile), ...pageRecords], {limit:40}) }, { provider: settings.aiProvider, model: settings.aiModel });
+  const current = await currentSuggestionDestination(message.tabId, snapshot);
+  if (!current) throw new Error('The page or supporting evidence changed. Generate again.');
+  current.run.jobContext = jobContext;
+  current.run.generatedSuggestions = current.run.generatedSuggestions || {};
+  current.run.generatedSuggestions[field.id] = {
+    tabId: message.tabId, frameId: message.frameId, applicationId: current.run.startedAt, pageSignature: current.run.pageSignature,
     field, suggestions: generated.suggestions, missingContext: generated.missingContext,
   };
   const validation = await sendToFrame(message.tabId, message.frameId, { type: 'JOB_APP_VALIDATE' });
-  categorizeRun(run, inspected.inspection, validation?.validation || {});
-  return { ok: true, run: await saveRun(run) };
+  categorizeRun(current.run, current.inspection, validation?.validation || {});
+  return { ok: true, run: await saveRun(current.run) };
 }
 
 function hasBlockingIssues(run, validation) {
@@ -1222,7 +1180,7 @@ async function processPage(tabId, { autoAdvance } = { autoAdvance: false }) {
       run.waitingFor = 'page_limit_exceeded';
       run.actionRequired = [{ reason: 'The application exceeded the 20-page automatic limit.' }];
       run.nextAction = null;
-      return saveRun(run);
+      return await saveRun(run);
     }
 
     const [records, apiKey, coverMessages, settings, datasource] = await Promise.all([
@@ -1233,7 +1191,7 @@ async function processPage(tabId, { autoAdvance } = { autoAdvance: false }) {
       getDatasource(),
     ]);
     const discovery = await discoverApplicationFrame(tabId);
-    if (discovery.errorCode) return saveRun(pauseForFrame(run, discovery));
+    if (discovery.errorCode) return await saveRun(pauseForFrame(run, discovery));
     updateSelectedFrame(run, discovery);
     const processed = await applyPageDecisions(
       tabId,
@@ -1251,13 +1209,13 @@ async function processPage(tabId, { autoAdvance } = { autoAdvance: false }) {
     const inspection = processed.inspection;
     const validation = processed.validation;
 
-    if (run.waitingFor === 'navigation_not_detected') return saveRun(run);
+    if (run.waitingFor === 'navigation_not_detected') return await saveRun(run);
     if (hasBlockingIssues(run, validation)) {
       run.status = 'waiting_user';
       run.waitingFor = run.actionRequired[0]?.reason || 'invalid_field';
       run.waitingLabel = await focusFirstProblem(tabId, run, inspection, validation);
       run.nextAction = null;
-      return saveRun(run);
+      return await saveRun(run);
     }
 
     const nextActions = inspection.actions.filter((action) => action.kind === 'next');
@@ -1268,14 +1226,14 @@ async function processPage(tabId, { autoAdvance } = { autoAdvance: false }) {
         run.waitingFor = 'page_limit_exceeded';
         run.actionRequired = [{ reason: 'The application reached the 20-page automatic limit.' }];
         run.nextAction = null;
-        return saveRun(run);
+        return await saveRun(run);
       }
       run.nextAction = nextActions[0];
       run.waitingFor = null;
       run.waitingLabel = null;
       if (!autoAdvance) {
         run.status = 'page_ready';
-        return saveRun(run);
+        return await saveRun(run);
       }
       const clicked = await sendToApplicationFrame(tabId, run, {
         type: 'JOB_APP_CLICK_NEXT',
@@ -1286,31 +1244,31 @@ async function processPage(tabId, { autoAdvance } = { autoAdvance: false }) {
         run.waitingFor = 'ambiguous_navigation';
         run.actionRequired = [{ reason: clicked?.error || 'The Next control could not be activated' }];
         run.nextAction = null;
-        return saveRun(run);
+        return await saveRun(run);
       }
       run.pageNumber += 1;
       run.status = 'running';
       run.lastAction = 'next';
-      return saveRun(run);
+      return await saveRun(run);
     }
     if (submitActions.length === 1 && validation.ok) {
       run.status = 'ready_for_user_submit';
       run.nextAction = null;
       run.waitingFor = null;
       run.waitingLabel = null;
-      return saveRun(run);
+      return await saveRun(run);
     }
 
     run.status = 'waiting_user';
     run.waitingFor = submitActions.length === 0 ? 'no_submit_control' : 'ambiguous_navigation';
     run.actionRequired = [{ reason: run.waitingFor }];
     run.nextAction = null;
-    return saveRun(run);
+    return await saveRun(run);
   } catch (error) {
     if (error.frameDiscovery) {
       const currentRun = await getRun(tabId);
       if (!currentRun) return null;
-      return saveRun(pauseForFrame(currentRun, error.frameDiscovery));
+      return await saveRun(pauseForFrame(currentRun, error.frameDiscovery));
     }
     const run = await getRun(tabId);
     if (!run) return null;
@@ -1319,15 +1277,16 @@ async function processPage(tabId, { autoAdvance } = { autoAdvance: false }) {
       run.waitingFor = 'navigation_not_detected';
       run.actionRequired = [{ reason: 'The page could not be inspected after Next/Continue.' }];
       run.nextAction = null;
-      return saveRun(run);
+      return await saveRun(run);
     }
     run.status = 'waiting_user';
     run.waitingFor = 'extension_error';
     run.actionRequired = [{ reason: error.message }];
     run.nextAction = null;
-    return saveRun(run);
+    return await saveRun(run);
   } finally {
     processingTabs.delete(tabId);
+    await scheduleAi(tabId).catch(() => {});
   }
 }
 
@@ -1533,6 +1492,14 @@ function beginSaveOperation(tabId) {
 }
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (message?.type === 'JOB_APP_REVALIDATE') {
+    (async()=>{
+      const tabId=sender?.tab?.id;const run=Number.isInteger(tabId)?await getRun(tabId):null;
+      if(!run || message.applicationId!==run.startedAt || (sender.frameId??0)!==run.frame?.frameId) return {ok:false};
+      if(sender.url){const url=new URL(sender.url);if(url.hostname!==run.frame.domain || (run.frame.pathname && url.pathname!==run.frame.pathname))return {ok:false};}
+      return {ok:true,run:await validatePageOnly(tabId)};
+    })().then(sendResponse).catch(error=>sendResponse({ok:false,error:error.message}));return true;
+  }
   if (message?.type === 'JOB_APP_FINAL_SUBMISSION') {
     saveFinalSubmission(message, sender).then(sendResponse).catch((error) => sendResponse({ ok: false, error: error.message }));
     return true;
@@ -1588,6 +1555,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     'JOB_RUN_ADVANCE_PAGE',
     'JOB_RUN_FOCUS_FIELD',
     'JOB_RUN_SAVE_ANSWERS',
+    'JOB_RUN_VALIDATE_PAGE',
+    'JOB_RUN_RETRY_AI',
+    'JOB_RUN_SELECT_EMPLOYMENT',
+    'JOB_RUN_SEARCH_ANSWERS',
     'JOB_RUN_STATE',
     'JOB_DATASOURCE_STATE',
     'JOB_DATASOURCE_EXPORT',
@@ -1649,6 +1620,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
     const tabId = message.tabId || tab?.id;
     if (!tabId) throw new Error('No active browser tab was found');
+    if (['JOB_RUN_VALIDATE_PAGE', 'JOB_RUN_RETRY_AI', 'JOB_RUN_SELECT_EMPLOYMENT', 'JOB_RUN_SEARCH_ANSWERS'].includes(message.type) && sender?.tab) throw new Error('This action must originate in the extension panel');
+    if (message.type === 'JOB_RUN_VALIDATE_PAGE') return { ok: true, run: await validatePageOnly(tabId) };
+    if (message.type === 'JOB_RUN_RETRY_AI') { await scheduleAi(tabId, { retry: true }); return { ok: true, run: await getRun(tabId) }; }
+    if (message.type === 'JOB_RUN_SELECT_EMPLOYMENT') return selectEmployment(message);
+    if (message.type === 'JOB_RUN_SEARCH_ANSWERS') return searchSavedAnswers(message);
     if (message.type === 'JOB_RUN_STATE') return { ok: true, run: await getRun(tabId) };
     if (message.type === 'JOB_RUN_FOCUS_FIELD') return focusRunField(tabId, message.fieldId);
     if (message.type === 'JOB_RUN_ADVANCE_PAGE') return advancePage(tabId);
@@ -1665,7 +1641,7 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
   if (changeInfo.status !== 'complete') return;
   getRun(tabId)
     .then(async (run) => {
-      if (run?.status !== 'running') return;
+      if (run?.status !== 'running' || run.waitingFor === 'operation_interrupted') return;
       run.frame = null;
       await saveRun(run);
       const settings = await getSettings();
@@ -1700,3 +1676,278 @@ chrome.runtime.onInstalled.addListener(async () => {
     await chrome.storage.local.setAccessLevel({ accessLevel: 'TRUSTED_CONTEXTS' });
   }
 });
+
+function resolveEmploymentFields(run, fields, profile) {
+  const employers = profile.employment || [];
+  run.employmentMappings ||= {};
+  const sections = [...new Set(fields.filter(field => field.entityType === 'employment').map(field => field.entityId).filter(Boolean))];
+  run.employmentChoices = [];
+  const sectionMappings = {};
+  for (const sectionId of sections) {
+    const mappingKey = `${run.pageSignature}:${sectionId}`;
+    let employmentId = run.employmentMappings[mappingKey];
+    if (!employers.some(entry => entry.id === employmentId)) employmentId = null;
+    if (!employmentId) {
+      const companyFields = fields.filter(field => field.entityId === sectionId && /company|employer|organization/i.test(field.label || ''));
+      const matches = employers.filter(entry => companyFields.some(field => field.currentValue && field.currentValue.trim().toLowerCase() === entry.company.trim().toLowerCase()));
+      if (matches.length === 1) employmentId = matches[0].id;
+    }
+    if (employmentId) { run.employmentMappings[mappingKey] = employmentId; sectionMappings[sectionId] = employmentId; }
+    else if (fields.some(field => field.entityId === sectionId && !field.currentValue)) run.employmentChoices.push({sectionId,label:fields.find(field => field.entityId===sectionId)?.section || 'Work history', employers:employers.map(({id,company})=>({id,company}))});
+  }
+  return fields.map(field => field.entityType === 'employment' ? {...field, employmentId:sectionMappings[field.entityId] || '', entityUnresolved:!sectionMappings[field.entityId]} : field);
+}
+
+async function mutateRun(tabId, change) {
+  let result;
+  runWriteChain = runWriteChain.catch(() => {}).then(async () => {
+    const runs = await getRuns();
+    const current = runs[String(tabId)];
+    if (!current || change(current) === false) { result = null; return; }
+    result = {...current, revision:(current.revision || 0)+1,workerId:WORKER_ID,updatedAt:new Date().toISOString()};
+    runs[String(tabId)] = result;
+    await chrome.storage.session.set({[RUN_STORAGE_KEY]:runs});
+  });
+  await runWriteChain;
+  return result;
+}
+
+async function validatePageOnly(tabId) {
+  const run = await getRun(tabId);
+  if (!run || processingTabs.has(tabId) || saveLocks.has(tabId)) return run;
+  const inspected = await sendToApplicationFrame(tabId, run, {type:'JOB_APP_INSPECT'});
+  const validated = await sendToApplicationFrame(tabId, run, {type:'JOB_APP_VALIDATE'});
+  if (!inspected?.ok || !validated?.ok) throw new Error('The page could not be checked. Try Check again.');
+  const inspection = inspected.inspection;
+  return mutateRun(tabId, current => {
+    if (current.startedAt !== run.startedAt || current.frame?.frameId !== run.frame?.frameId) return false;
+    const signature = pageSignature(inspection,current.frame);
+    if (signature !== current.pageSignature) {
+      current.pageSignature=signature; current.suggestions={}; current.generatedSuggestions={};
+      for (const op of Object.values(current.aiOperations || {})) if(op.status==='pending') op.status='interrupted';
+    }
+    for (const [id,suggestion] of Object.entries(current.suggestions || {})) {
+      const field=inspection.fields.find(field=>field.id===id);
+      const hasText = String(field?.currentValue || '').trim().length > 0;
+      if(!field || hasText || field.handle!==suggestion.field.handle) delete current.suggestions[id];
+    }
+    for (const [id,suggestion] of Object.entries(current.generatedSuggestions || {})) {
+      const field=inspection.fields.find(field=>field.id===id);
+      const hasText = String(field?.currentValue || '').trim().length > 0;
+      if(!field || hasText || field.handle!==suggestion.field.handle) delete current.generatedSuggestions[id];
+    }
+    categorizeRun(current,inspection,validated.validation);
+    const next=inspection.actions.filter(action=>action.kind==='next');
+    const submit=inspection.actions.filter(action=>action.kind==='submit');
+    current.nextAction=null;
+    if(hasBlockingIssues(current,validated.validation)) {current.status='waiting_user';current.waitingFor=current.actionRequired[0]?.reason || 'invalid_field';}
+    else if(next.length===1) {current.status='page_ready';current.nextAction=next[0];current.waitingFor=null;}
+    else if(submit.length===1) {current.status='ready_for_user_submit';current.waitingFor=null;}
+    else {current.status='waiting_user';current.waitingFor='ambiguous_navigation';}
+    current.progress=Object.values(current.aiOperations || {}).some(op=>op.status==='pending')?'preparing_suggestions':'ready';
+  });
+}
+
+async function selectEmployment(message) {
+  const run=await getRun(message.tabId);
+  if(!run || processingTabs.has(message.tabId) || saveLocks.has(message.tabId) || run.startedAt!==message.applicationId || run.pageSignature!==message.pageSignature || run.frame?.frameId!==message.frameId) throw new Error('Work-history section changed. Check the page again.');
+  const profile=(await getDatasource()).profile;
+  if(!profile.employment.some(entry=>entry.id===message.employmentId)) throw new Error('Saved employer is unavailable. Update your profile.');
+  const inspected=await sendToFrame(message.tabId,message.frameId,{type:'JOB_APP_INSPECT'});
+  if(pageSignature(inspected.inspection,run.frame)!==run.pageSignature || !inspected.inspection.fields.some(field=>field.entityType==='employment' && field.entityId===message.sectionId)) throw new Error('Work-history section changed. Check the page again.');
+  run.employmentMappings ||= {};
+  run.employmentMappings[`${run.pageSignature}:${message.sectionId}`]=message.employmentId;
+  await saveRun(run);
+  return {ok:true,run:await checkPage(message.tabId)};
+}
+
+async function searchSavedAnswers(message) {
+  const {run,field}=await guardedDraftField(message);
+  const records=await getRecords();
+  const query=String(message.query || '').trim().toLowerCase().slice(0,200);
+  const candidates=searchEvidence(field,records,{limit:20}).filter(item=>!query || `${item.sourceQuestion} ${item.answer}`.toLowerCase().includes(query));
+  const updated=await mutateRun(message.tabId,current=>{
+    if(current.startedAt!==run.startedAt || current.pageSignature!==run.pageSignature) return false;
+    current.suggestions ||= {};
+    current.suggestions[field.id]={tabId:message.tabId,frameId:message.frameId,applicationId:run.startedAt,pageSignature:run.pageSignature,field,candidates};
+    for(const item of [...(current.actionRequired||[]),...(current.optionalUnresolved||[])]) if(item.fieldId===field.id) item.suggestion=current.suggestions[field.id];
+  });
+  if(!updated) throw new Error('The application changed. Search again.');
+  return {ok:true,candidates,run:updated};
+}
+
+function aiFieldSnapshot(field = {}) {
+  return {
+    id: field.id,
+    handle: field.handle,
+    label: field.label,
+    fieldType: field.type,
+    currentValue: field.currentValue,
+    fieldOptions: field.options || [],
+    fieldConstraints: field.constraints || {},
+    fieldMultiple: Boolean(field.multiple),
+  };
+}
+
+function aiEvidenceRevision(run, inspection, datasource) {
+  return JSON.stringify({
+    context: run.jobContext || {},
+    profile: datasource?.profile || {},
+    records: datasource?.answerRecords || [],
+    pageFacts: (inspection?.fields || []).map((field) => aiFieldSnapshot(field)),
+  });
+}
+
+function aiFingerprint(run, fields, records, settings, evidenceRevision) {
+  return JSON.stringify({applicationId:run.startedAt,frame:run.frame?.frameId,page:run.pageSignature,context:run.jobContext,fields:fields.map(({id,handle,label,type,currentValue,options,constraints,required,entityId,employmentId})=>({id,handle,label,type,currentValue,options,constraints,required,entityId,employmentId})),records:records.map(({key,answer,confirmationState,semantic,updatedAt})=>({key,answer,confirmationState,semantic,updatedAt})),evidenceRevision,provider:settings.aiProvider,model:settings.aiModel,promptVersion:'reliable-review-1'});
+}
+
+function suggestionRequestSnapshot(run, field, inspection, datasource, settings, jobContext) {
+  const contextualRun = { ...run, jobContext };
+  return {
+    startedAt: run.startedAt,
+    pageSignature: run.pageSignature,
+    frameId: run.frame?.frameId,
+    field: aiFieldSnapshot(field),
+    settings: { aiProvider: settings.aiProvider, aiModel: settings.aiModel },
+    sourceJobContext: run.jobContext || {},
+    jobContext,
+    evidenceRevision: aiEvidenceRevision(contextualRun, inspection, datasource),
+  };
+}
+
+async function currentSuggestionDestination(tabId, snapshot) {
+  const run = await getRun(tabId);
+  if (!run || run.startedAt !== snapshot.startedAt || run.pageSignature !== snapshot.pageSignature
+    || run.frame?.frameId !== snapshot.frameId || !SAVABLE_RUN_STATUSES.has(run.status)
+    || JSON.stringify(run.jobContext || {}) !== JSON.stringify(snapshot.sourceJobContext || {})) return null;
+  const settings = await getSettings();
+  if (settings.aiProvider !== snapshot.settings.aiProvider || settings.aiModel !== snapshot.settings.aiModel) return null;
+  const [datasource, inspected] = await Promise.all([
+    getDatasource(),
+    sendToFrame(tabId, snapshot.frameId, { type: 'JOB_APP_INSPECT' }),
+  ]);
+  if (!inspected?.ok || pageSignature(inspected.inspection, run.frame) !== snapshot.pageSignature) return null;
+  const field = inspected.inspection.fields.find((item) => item.id === snapshot.field.id);
+  if (!field || String(field.currentValue || '') !== String(snapshot.field.currentValue || '')
+    || !sameFieldSnapshot(field, snapshot.field)) return null;
+  const contextualRun = { ...run, jobContext: snapshot.jobContext };
+  if (aiEvidenceRevision(contextualRun, inspected.inspection, datasource) !== snapshot.evidenceRevision) return null;
+  return { run, inspection: inspected.inspection };
+}
+
+async function scheduleAi(tabId,{retry=false}={}) {
+  if(backgroundJobs.has(tabId) || processingTabs.has(tabId) || saveLocks.has(tabId)) return;
+  const run=await getRun(tabId);
+  if(!run || !SAVABLE_RUN_STATUSES.has(run.status) || !Number.isInteger(run.frame?.frameId)) return;
+  const settings=await getSettings(); const apiKey=await getApiKey(settings.aiProvider);
+  if(!apiKey) return;
+  const inspected=await sendToApplicationFrame(tabId,run,{type:'JOB_APP_INSPECT'});
+  if(!inspected?.ok || pageSignature(inspected.inspection,run.frame)!==run.pageSignature) return;
+  const validated=await sendToApplicationFrame(tabId,run,{type:'JOB_APP_VALIDATE'});
+  const invalidIds=new Set((validated?.validation?.invalid || []).map(field=>field.fieldId));
+  const datasource=await getDatasource();
+  const fields=resolveEmploymentFields(run,inspected.inspection.fields,datasource.profile);
+  const unresolved=fields.filter(field=>field.required && !String(field.currentValue || '').trim() && (!run.suggestions?.[field.id] || invalidIds.has(field.id)) && readableQuestion(field) && inferSensitivity(field.label,field.id)!=='legal' && !field.entityUnresolved);
+  if(!unresolved.length) return;
+  const planner=run.aiOperations?.planner;
+  const retryableStates=new Set(['failed','interrupted']);
+  const plannerFields=retry
+    ? (retryableStates.has(planner?.status) ? unresolved : [])
+    : unresolved;
+  const suggestionFields=retry
+    ? unresolved.filter(field=>retryableStates.has(run.aiOperations?.[`suggestion:${field.id}`]?.status) && !run.generatedSuggestions?.[field.id])
+    : unresolved.filter(field=>!run.generatedSuggestions?.[field.id]);
+  if(!plannerFields.length && !suggestionFields.length) return;
+  const operationFields=plannerFields.length ? plannerFields : suggestionFields;
+  const records=datasource.answerRecords;
+  const evidenceRevision=aiEvidenceRevision(run,inspected.inspection,datasource);
+  const fingerprint=aiFingerprint(run,operationFields,records,settings,evidenceRevision);
+  const op=planner;
+  if(op?.cacheKey===fingerprint && ((!retry && ['completed','failed','interrupted'].includes(op.status)) || op.status==='pending')) return;
+  const id=`${WORKER_ID}:${Date.now()}:${Math.random()}`;
+  const operationKey=plannerFields.length ? 'planner' : 'suggestion_batch';
+  const snapshot={startedAt:run.startedAt,pageSignature:run.pageSignature,frameId:run.frame.frameId,cacheKey:fingerprint,id,operationKey,evidenceRevision,jobContext:run.jobContext || {},settings};
+  await mutateRun(tabId,current=>{
+    if(current.startedAt!==snapshot.startedAt || current.pageSignature!==snapshot.pageSignature) return false;
+    current.aiOperations ||= {};
+    current.aiOperations[operationKey]={status:'pending',cacheKey:fingerprint,id,workerId:WORKER_ID};
+    current.progress='preparing_suggestions'; current.llmError=null;
+  });
+  const job=prepareAi(tabId,snapshot,plannerFields,suggestionFields,fields,datasource,apiKey).catch(async error=>{
+    await mutateRun(tabId,current=>{
+      if(current.aiOperations?.[operationKey]?.id!==id) return false;
+      current.aiOperations[operationKey].status='failed';current.aiOperations[operationKey].error=error.message;current.llmError=error.message;current.progress='ready';
+    });
+  }).finally(()=>{ if(backgroundJobs.get(tabId)===job) backgroundJobs.delete(tabId); });
+  backgroundJobs.set(tabId,job);
+}
+
+async function currentAiDestination(tabId,snapshot,field=null) {
+  const run=await getRun(tabId);
+  if(!run || run.startedAt!==snapshot.startedAt || run.pageSignature!==snapshot.pageSignature || run.frame?.frameId!==snapshot.frameId || run.aiOperations?.[snapshot.operationKey]?.id!==snapshot.id || !SAVABLE_RUN_STATUSES.has(run.status)) return null;
+  const settings=await getSettings();
+  if(settings.aiProvider!==snapshot.settings.aiProvider || settings.aiModel!==snapshot.settings.aiModel) return null;
+  const [datasource, inspected]=await Promise.all([getDatasource(),sendToFrame(tabId,snapshot.frameId,{type:'JOB_APP_INSPECT'})]);
+  if(!inspected?.ok || pageSignature(inspected.inspection,run.frame)!==snapshot.pageSignature) return null;
+  if(aiEvidenceRevision(run,inspected.inspection,datasource)!==snapshot.evidenceRevision) return null;
+  if(field) {
+    const live=inspected.inspection.fields.find(item=>item.id===field.id);
+    if(!live || live.currentValue!==field.currentValue || live.handle!==field.handle || JSON.stringify(live.constraints)!==JSON.stringify(field.constraints)) return null;
+  }
+  return {run,inspection:inspected.inspection};
+}
+
+async function prepareAi(tabId,snapshot,plannerFields,suggestionFields,allFields,datasource,apiKey) {
+  const {aiProvider:provider,aiModel:model}=snapshot.settings;
+  const plannerRecords=selectPlannerEvidence(plannerFields,datasource.answerRecords,{limit:20});
+  let decisions=[]; let plannerError='';
+  if(plannerFields.length) {
+    try { decisions=(await callAnswerPlanner({apiKey,fields:plannerFields,records:plannerRecords,page:snapshot.jobContext},{provider,model,allowPartial:true})).decisions; }
+    catch(error) {plannerError=error.message;}
+  }
+  const proposed=new Set();
+  for(const decision of decisions) {
+    const field=plannerFields.find(item=>item.id===decision.fieldId);
+    if(!field || decision.action!=='fill' || !(await currentAiDestination(tabId,snapshot,field))) continue;
+    const keys=[...new Set(decision.evidenceKeys)]; const sources=keys.map(key=>plannerRecords.find(record=>record.key===key));
+    if(sources.some(source=>!source)) continue;
+    const candidate={sourceKey:keys[0],sourceKeys:keys,sourceAnswers:Object.fromEntries(sources.map(source=>[source.key,source.answer])),sourceQuestion:sources.map(source=>source.question).join(' + '),answer:decision.value,excerpt:String(decision.value).slice(0,400),provenance:'AI planner',kind:'planner',requiresApproval:true,reason:decision.reason,transformation:decision.transformation || null,confidence:decision.confidence,sensitivity:decision.sensitivity};
+    await mutateRun(tabId,current=>{
+      if(current.aiOperations?.[snapshot.operationKey]?.id!==snapshot.id || current.pageSignature!==snapshot.pageSignature) return false;
+      current.suggestions ||= {};
+      current.suggestions[field.id]={tabId,frameId:snapshot.frameId,applicationId:snapshot.startedAt,pageSignature:snapshot.pageSignature,field,candidates:[candidate]};
+    });
+    proposed.add(field.id);
+  }
+  const pageRecords=allFields.filter(field=>field.currentValue && readableQuestion(field)).map(field=>({key:`page:${field.id}`,question:field.label,answer:field.currentValue,provenance:'current application page',sensitivity:inferSensitivity(field.label,field.id),entityId:field.entityId,entityType:field.entityType}));
+  const evidence=[...datasource.answerRecords,...profileEvidenceRecords(datasource.profile),...pageRecords];
+  const tasks=suggestionFields.filter(field=>!proposed.has(field.id)).sort((a,b)=>Number(a.type==='textarea')-Number(b.type==='textarea'));
+  let index=0;
+  const consume=async()=>{while(index<tasks.length){
+    const field=tasks[index++]; const key=`suggestion:${field.id}`;
+    if(!(await currentAiDestination(tabId,snapshot,field))) continue;
+    await mutateRun(tabId,current=>{if(current.aiOperations?.[snapshot.operationKey]?.id!==snapshot.id)return false;current.aiOperations[key]={status:'pending',workerId:WORKER_ID,id:snapshot.id,cacheKey:snapshot.cacheKey};});
+    try {
+      const generated=await callAnswerSuggestions({apiKey,field,page:snapshot.jobContext,records:rankSuggestionEvidence(field,evidence,{limit:40})},{provider,model});
+      if(!(await currentAiDestination(tabId,snapshot,field))) {
+        await mutateRun(tabId,current=>{if(current.aiOperations?.[key]?.id!==snapshot.id)return false;current.aiOperations[key].status='interrupted';}); continue;
+      }
+      await mutateRun(tabId,current=>{
+        if(current.aiOperations?.[snapshot.operationKey]?.id!==snapshot.id || current.pageSignature!==snapshot.pageSignature)return false;
+        current.generatedSuggestions ||= {};
+        current.generatedSuggestions[field.id]={tabId,frameId:snapshot.frameId,applicationId:snapshot.startedAt,pageSignature:snapshot.pageSignature,field,...generated};
+        current.aiOperations[key].status='completed';
+      });
+      await validatePageOnly(tabId);
+    } catch(error) {await mutateRun(tabId,current=>{if(current.aiOperations?.[key]?.id!==snapshot.id)return false;current.aiOperations[key].status='failed';current.aiOperations[key].error=error.message;current.llmError=error.message;});}
+  }};
+  await Promise.all([consume(),consume()]);
+  await mutateRun(tabId,current=>{
+    if(current.aiOperations?.[snapshot.operationKey]?.id!==snapshot.id)return false;
+    current.aiOperations[snapshot.operationKey].status=plannerError?'failed':'completed';
+    if(plannerError){current.aiOperations[snapshot.operationKey].error=plannerError;current.llmError=plannerError;}
+    current.progress='ready';
+  });
+  await validatePageOnly(tabId);
+}

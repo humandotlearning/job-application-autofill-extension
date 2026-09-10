@@ -57,7 +57,7 @@ test('fills a custom dropdown identified by a linked label', async () => {
   document.querySelector('[role="option"]').onclick = () => { button.textContent = 'India'; };
   const fields = collectFieldDescriptors(document);
   assert.equal(fields.length, 1);
-  const result = await applyDecisions(document, planDeterministicFill(fields, [{ key: 'country', answer: 'India', sensitivity: 'safe' }]));
+  const result = await applyDecisions(document, planDeterministicFill(fields, [{ key: 'country', answer: 'India', sensitivity: 'safe', confirmationState: 'confirmed', matchKind: 'exact' }]));
   assert.equal(result.applied.length, 1);
   assert.equal(button.textContent, 'India');
 });
@@ -94,7 +94,7 @@ test('selects a SuccessFactors numbered degree option through aria-owns', async 
     };
     document.body.append(list);
   };
-  const result = await applyDecisions(document, [{ fieldId: input.id, action: 'fill', value: "Bachelor's degree", sensitivity: 'safe', confidence: 'high' }]);
+  const result = await applyDecisions(document, [{ fieldId: input.id, action: 'fill', value: "Bachelor's degree", sensitivity: 'safe', confirmationState: 'confirmed', matchKind: 'exact', confidence: 'high' }]);
   assert.equal(result.applied.length, 1);
   assert.equal(input.value, "4 - Bachelor's degree");
 });
@@ -103,7 +103,7 @@ test('leaves ambiguous numbered dropdown labels unresolved', async () => {
   const document = makeDocument('<form><button id="degree" type="button" role="combobox" aria-label="Degree" aria-expanded="true" aria-controls="degrees">Select one</button><ul id="degrees" class="sf-list-select" role="listbox"><li role="option">4 - Bachelor\'s degree</li><li role="option">5 - Bachelor\'s degree</li></ul></form>');
   let selections = 0;
   document.querySelectorAll('[role="option"]').forEach((option) => { option.onclick = () => { selections += 1; }; });
-  const result = await applyDecisions(document, [{ fieldId: 'degree', action: 'fill', value: "Bachelor's degree" }]);
+  const result = await applyDecisions(document, [{ fieldId: 'degree', action: 'fill', value: "Bachelor's degree", approved: true }]);
   assert.equal(result.applied.length, 0);
   assert.equal(result.unresolved.length, 1);
   assert.equal(selections, 0);
@@ -114,14 +114,14 @@ test('uses an already open dropdown without toggling it closed', async () => {
   const button = document.getElementById('country');
   button.onclick = () => { document.getElementById('countries').remove(); };
   document.querySelector('[role="option"]').onclick = () => { button.textContent = 'India'; };
-  const result = await applyDecisions(document, [{ fieldId: 'country', action: 'fill', value: 'India' }]);
+  const result = await applyDecisions(document, [{ fieldId: 'country', action: 'fill', value: 'India', approved: true }]);
   assert.equal(result.applied.length, 1);
   assert.equal(button.textContent, 'India');
 });
 
 test('replaces a disabled native dropdown placeholder with a real selection', async () => {
   const document = makeDocument('<form><label for="country">Country</label><select id="country"><option disabled selected>Select country</option><option value="IN">India</option></select></form>');
-  const result = await applyDecisions(document, planDeterministicFill(collectFieldDescriptors(document), [{ key: 'country', answer: 'India', sensitivity: 'safe' }]));
+  const result = await applyDecisions(document, planDeterministicFill(collectFieldDescriptors(document), [{ key: 'country', answer: 'India', sensitivity: 'safe', confirmationState: 'confirmed', matchKind: 'exact' }]));
   assert.equal(result.applied.length, 1);
   assert.equal(document.getElementById('country').value, 'IN');
 });
@@ -141,7 +141,7 @@ test('waits for searchable dropdown results even when initial options are presen
       };
     }, 100);
   }, { once: true });
-  const result = await applyDecisions(document, planDeterministicFill(collectFieldDescriptors(document), [{ key: 'country', answer: 'India', sensitivity: 'safe' }]));
+  const result = await applyDecisions(document, planDeterministicFill(collectFieldDescriptors(document), [{ key: 'country', answer: 'India', sensitivity: 'safe', confirmationState: 'confirmed', matchKind: 'exact' }]));
   assert.equal(result.applied.length, 1);
   assert.equal(input.getAttribute('aria-expanded'), 'false');
   assert.equal(collectFieldDescriptors(document)[0].currentValue, 'India');
@@ -353,7 +353,7 @@ test('selects an exact option from a generic custom listbox after delayed render
     value: 'India',
     evidenceKeys: ['country'],
     confidence: 'high',
-    sensitivity: 'safe',
+    sensitivity: 'safe', confirmationState: 'confirmed', matchKind: 'exact',
     reason: 'Known country',
   }]);
 
@@ -388,7 +388,7 @@ test('applies to an accessible custom choice without an id or name', async () =>
     value: 'India',
     evidenceKeys: ['country'],
     confidence: 'high',
-    sensitivity: 'safe',
+    sensitivity: 'safe', confirmationState: 'confirmed', matchKind: 'exact',
     reason: 'Known country',
   }]);
 
@@ -407,7 +407,7 @@ async function runCustomFailureScenario(html, attach, fieldId, reason) {
     value: 'India',
     evidenceKeys: [fieldId],
     confidence: 'high',
-    sensitivity: 'safe',
+    sensitivity: 'safe', confirmationState: 'confirmed', matchKind: 'exact',
     reason: 'Known country',
   }]);
   assert.equal(result.applied.length, 0);
@@ -481,7 +481,7 @@ test('keeps native fill failures in failed', async () => {
     value: 'not-an-email',
     evidenceKeys: ['email'],
     confidence: 'high',
-    sensitivity: 'safe',
+    sensitivity: 'safe', confirmationState: 'confirmed', matchKind: 'exact',
     reason: 'Known email',
   }]);
 
@@ -534,8 +534,8 @@ test('fills deterministic safe matches and preserves valid existing values', asy
   let changes = 0;
   document.querySelector('#name').addEventListener('change', () => changes++);
   const records = [
-    { key: 'full_name', question: 'Full Name', answer: 'Nithin Varghese', aliases: ['Name'], sensitivity: 'safe', type: 'text' },
-    { key: 'email', question: 'Email Address', answer: 'new@example.com', aliases: [], sensitivity: 'safe', type: 'email' },
+    { key: 'full_name', question: 'Full Name', answer: 'Nithin Varghese', aliases: ['Name'], sensitivity: 'safe', confirmationState: 'confirmed', matchKind: 'exact', type: 'text' },
+    { key: 'email', question: 'Email Address', answer: 'new@example.com', aliases: [], sensitivity: 'safe', confirmationState: 'confirmed', matchKind: 'exact', type: 'email' },
   ];
   const decisions = planDeterministicFill(collectFieldDescriptors(document), records);
   const result = await applyDecisions(document, decisions);
@@ -558,7 +558,7 @@ test('matches spaced brand labels when the field uses a generated id', () => {
     question: 'LinkedIn',
     answer: 'https://www.linkedin.com/in/nithin1357',
     aliases: ['LinkedIn'],
-    sensitivity: 'safe',
+    sensitivity: 'safe', confirmationState: 'confirmed', matchKind: 'exact',
     type: 'url',
   }];
 
@@ -583,13 +583,14 @@ test('applies select, radio, and checkbox decisions only when options validate',
     value: field.id === 'country' ? 'India' : field.id === 'relocate' ? 'Yes' : 'Yes',
     evidenceKeys: ['country'],
     confidence: 'high',
-    sensitivity: field.id === 'consent' ? 'legal' : 'safe',
+    sensitivity: field.id === 'consent' ? 'legal' : 'safe', approved: true,
     reason: 'known record',
   })));
   assert.equal(result.failed.length, 0);
   assert.equal(document.querySelector('#country').value, 'IN');
   assert.equal(document.querySelector('input[value="Yes"]').checked, true);
-  assert.equal(document.querySelector('#consent').checked, true);
+  assert.equal(document.querySelector('#consent').checked, false);
+  assert.equal(result.unresolved.length, 1);
 });
 
 test('reads the selected radio option instead of only the first radio element', () => {
@@ -603,7 +604,7 @@ test('reads the selected radio option instead of only the first radio element', 
   assert.deepEqual(collectAnswerRecords(document).map((record) => record.answer), ['No']);
 });
 
-test('distinguishes an explicit unchecked checkbox from an untouched checkbox', async () => {
+test('keeps untouched legal checkbox manual', async () => {
   const document = makeDocument('<label><input id="consent" type="checkbox">Consent</label>');
   const field = collectFieldDescriptors(document)[0];
   assert.equal(field.currentValue, '');
@@ -616,8 +617,9 @@ test('distinguishes an explicit unchecked checkbox from an untouched checkbox', 
     sensitivity: 'legal',
     reason: 'Known negative answer',
   }]);
-  assert.equal(result.applied.length, 1);
-  assert.equal(collectFieldDescriptors(document)[0].currentValue, 'No');
+  assert.equal(result.applied.length, 0);
+  assert.equal(result.unresolved.length, 1);
+  assert.equal(collectFieldDescriptors(document)[0].currentValue, '');
 });
 
 test('fills an anonymous native input without throwing', async () => {
@@ -629,7 +631,7 @@ test('fills an anonymous native input without throwing', async () => {
     value: 'ada@example.com',
     evidenceKeys: ['email'],
     confidence: 'high',
-    sensitivity: 'safe',
+    sensitivity: 'safe', confirmationState: 'confirmed', matchKind: 'exact',
     reason: 'Known email',
   }]);
   assert.equal(result.applied.length, 1);
@@ -645,7 +647,7 @@ test('marks extension fills as provisional until the applicant edits the value',
     value: 'ada@example.com',
     evidenceKeys: ['email'],
     confidence: 'high',
-    sensitivity: 'safe',
+    sensitivity: 'safe', confirmationState: 'confirmed', matchKind: 'exact',
     reason: 'Known email',
   }]);
   assert.equal(collectAnswerRecords(document)[0].provenance, 'autofill');
@@ -684,7 +686,7 @@ test('keeps repeated entry identity when an earlier entry is empty', () => {
 
 test('rejects stale handles when a control is replaced', async () => {
   const document = makeDocument('<label>Email<input id="email" type="email"></label>');
-  const decisions = planDeterministicFill(collectFieldDescriptors(document), [{ key: 'email', answer: 'ada@example.com', sensitivity: 'safe' }]);
+  const decisions = planDeterministicFill(collectFieldDescriptors(document), [{ key: 'email', answer: 'ada@example.com', sensitivity: 'safe', confirmationState: 'confirmed', matchKind: 'exact' }]);
   const old = document.querySelector('input');
   old.replaceWith(old.cloneNode());
   const result = await applyDecisions(document, decisions);
@@ -719,7 +721,7 @@ test('does not treat a combobox highlighted option as a committed value', () => 
 
 test('requires a committed searchable dropdown selection', async () => {
   const document = makeDocument('<form><div><input id="country" role="combobox" aria-label="Country" aria-autocomplete="list" aria-controls="countries"><div role="listbox" id="countries"><div role="option" aria-selected="false">India</div></div></div></form>');
-  const result = await applyDecisions(document, planDeterministicFill(collectFieldDescriptors(document), [{ key: 'country', answer: 'India', sensitivity: 'safe' }]));
+  const result = await applyDecisions(document, planDeterministicFill(collectFieldDescriptors(document), [{ key: 'country', answer: 'India', sensitivity: 'safe', confirmationState: 'confirmed', matchKind: 'exact' }]));
   assert.equal(result.applied.length, 0);
   assert.equal(collectAnswerRecords(document).length, 0);
 });
@@ -733,7 +735,7 @@ test('does not steal options when its controlled popup is missing', async () => 
 test('composes full names locally from unambiguous name parts', () => {
   const document = makeDocument('<label>Name<input id="name"></label>');
   const decisions = planDeterministicFill(collectFieldDescriptors(document), [
-    { key: 'first_name', answer: 'Ada', sensitivity: 'safe' }, { key: 'last_name', answer: 'Lovelace', sensitivity: 'safe' },
+    { key: 'first_name', answer: 'Ada', sensitivity: 'safe', confirmationState: 'confirmed', matchKind: 'exact' }, { key: 'last_name', answer: 'Lovelace', sensitivity: 'safe', confirmationState: 'confirmed', matchKind: 'exact' },
   ]);
   assert.equal(decisions[0].value, 'Ada Lovelace');
   assert.equal(decisions[0].transformation, 'compose_name');
@@ -749,13 +751,13 @@ test('round trips repeated employers with their original entity IDs', () => {
 
 test('round trips all native multiple selections', async () => {
   const document = makeDocument('<label>Skills<select multiple id="skills"><option>Java</option><option>Python</option></select></label>');
-  const decisions = planDeterministicFill(collectFieldDescriptors(document), [{ key: 'skills', answer: 'Java, Python', sensitivity: 'safe' }]);
+  const decisions = planDeterministicFill(collectFieldDescriptors(document), [{ key: 'skills', answer: 'Java, Python', sensitivity: 'safe', confirmationState: 'confirmed', matchKind: 'exact' }]);
   const result = await applyDecisions(document, decisions);
   assert.equal(result.applied.length, 1);
   assert.equal(collectAnswerRecords(document)[0].answer, 'Java, Python');
 });
 
-test('promotes inferred sensitive fields to final review even when a record says safe', async () => {
+test('holds inferred sensitive fields for approval even when a record says safe', async () => {
   const document = makeDocument('<label for="salary">Expected CTC</label><input id="salary">');
   const result = await applyDecisions(document, [{
     fieldId: 'salary',
@@ -763,10 +765,10 @@ test('promotes inferred sensitive fields to final review even when a record says
     value: '5000000',
     evidenceKeys: ['salary'],
     confidence: 'high',
-    sensitivity: 'safe',
+    sensitivity: 'safe', confirmationState: 'confirmed', matchKind: 'exact',
     reason: 'Known value',
   }]);
-  assert.equal(result.applied.length, 1);
+  assert.equal(result.applied.length, 0);
   assert.equal(result.reviewRequired[0].sensitivity, 'review');
 });
 
@@ -825,11 +827,11 @@ test('uses company defaults only for clearly identified employer relationship qu
     { id: 'prior', label: 'Have you worked for this company?', targetCompany: 'DeepSight AI Labs', type: 'radio', options: ['Yes', 'No'] },
   ];
   const decisions = planDeterministicFill(fields, [], [], profile);
-  assert.deepEqual(decisions.map((decision) => decision.value), ['No', 'No', null, 'Yes']);
+  assert.deepEqual(decisions.map((decision) => decision.value), [null, null, null, 'Yes']);
   assert.equal(decisions[2].action, 'ask_user');
 });
 
-test('defaults unmatched named employer questions to No and matches any confirmed employer', () => {
+test('leaves unmatched named employer questions unknown and suggests known employer', () => {
   const profile = {
     employment: [{ id: 'deepsight-ai-labs', company: 'DeepSight AI Labs' }],
     defaults: { relatedToHiringCompany: 'No', knownAtHiringCompany: 'No' },
@@ -840,7 +842,7 @@ test('defaults unmatched named employer questions to No and matches any confirme
     { id: 'unknown', label: 'Have you ever worked for this company?', type: 'radio', options: ['Yes', 'No'] },
   ];
   const decisions = planDeterministicFill(fields, [], [], profile, {});
-  assert.deepEqual(decisions.map((decision) => decision.value), ['No', 'Yes', 'No']);
+  assert.deepEqual(decisions.map((decision) => decision.value), [null, 'Yes', null]);
 });
 
 test('plans a phone block from one international number without filling extension', () => {
@@ -850,7 +852,7 @@ test('plans a phone block from one international number without filling extensio
     { id: 'number', label: 'Phone Number', type: 'tel', currentValue: '', section: 'Phone', formOrder: 2 },
     { id: 'extension', label: 'Phone Extension', type: 'text', currentValue: '', section: 'Phone', formOrder: 3 },
   ];
-  const decisions = planDeterministicFill(fields, [{ key: 'phone', question: 'Phone number', answer: '+918882339186', sensitivity: 'safe' }], [], {
+  const decisions = planDeterministicFill(fields, [{ key: 'phone', question: 'Phone number', answer: '+918882339186', sensitivity: 'safe', confirmationState: 'confirmed', matchKind: 'exact' }], [], {
     defaults: { phoneDeviceType: 'Mobile' },
   });
   assert.equal(decisions.find((decision) => decision.fieldId === 'device').value, 'Mobile');
@@ -864,7 +866,7 @@ test('leaves a phone number unresolved when country-code options are ambiguous',
     { id: 'country', label: 'Country Phone Code', type: 'select', options: ['+9', '+91'], currentValue: '', section: 'Phone', formOrder: 0 },
     { id: 'number', label: 'Phone Number', type: 'tel', currentValue: '', section: 'Phone', formOrder: 1 },
   ];
-  const decisions = planDeterministicFill(fields, [{ key: 'phone', question: 'Phone number', answer: '+918882339186', sensitivity: 'safe' }]);
+  const decisions = planDeterministicFill(fields, [{ key: 'phone', question: 'Phone number', answer: '+918882339186', sensitivity: 'safe', confirmationState: 'confirmed', matchKind: 'exact' }]);
   assert.equal(decisions.find((decision) => decision.fieldId === 'country').action, 'ask_user');
   assert.equal(decisions.find((decision) => decision.fieldId === 'number').action, 'ask_user');
 });
@@ -877,7 +879,7 @@ test('keeps separate contiguous phone blocks independent', () => {
     { id: 'device-two', label: 'Phone Device Type', type: 'select', options: ['Mobile', 'Landline'], section: 'Phone', formOrder: 3 },
     { id: 'number-two', label: 'Phone Number', type: 'tel', section: 'Phone', formOrder: 4 },
   ];
-  const decisions = planDeterministicFill(fields, [{ key: 'phone', question: 'Phone number', answer: '+918882339186', sensitivity: 'safe' }], [], {
+  const decisions = planDeterministicFill(fields, [{ key: 'phone', question: 'Phone number', answer: '+918882339186', sensitivity: 'safe', confirmationState: 'confirmed', matchKind: 'exact' }], [], {
     defaults: { phoneDeviceType: 'Mobile' },
   });
   assert.equal(decisions.find((decision) => decision.fieldId === 'device-one').value, 'Mobile');

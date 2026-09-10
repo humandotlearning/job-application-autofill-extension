@@ -13,7 +13,7 @@ test('fresh classic bundle executes and same-version reinjection preserves value
   new Script(bundle).runInContext(context);
   assert.equal(listeners.size, 1);
   const ping = await new Promise(resolve => [...listeners][0]({ type: 'JOB_APP_PING' }, {}, resolve));
-  assert.equal(ping.version, 'general-reuse-1');
+  assert.equal(ping.version, 'reliable-review-1');
   const result = await new Promise(resolve => [...listeners][0]({ type: 'JOB_APP_INSPECT' }, {}, resolve));
   assert.equal(result.ok, true, result.error);
   assert.equal(result.inspection.fields[0].label, 'Current CTC');

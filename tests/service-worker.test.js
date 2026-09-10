@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 
 function createHarness({
   autoAdvancePages = false,
+  waitForAI = true,
   answerRecords = [{ key: 'full_name', question: 'Full name', answer: 'Nithin', aliases: ['Full name'], type: 'text', sensitivity: 'safe', updatedAt: '2025-01-01T00:00:00.000Z' }],
   coverMessages = [],
   pagesByTab = {},
@@ -10,7 +11,8 @@ function createHarness({
   const localData = {
     openaiApiKey: '',
     autoAdvancePages,
-    answerRecords: [...answerRecords],
+    // Fixture profile represents explicitly reviewed facts unless overridden.
+    answerRecords: answerRecords.map(record => ({confirmationState:'confirmed',...record})),
     coverMessages: [...coverMessages],
     datasourceMeta: null,
   };
@@ -44,6 +46,7 @@ function createHarness({
 
   function materializeField(field, valueOverrides = {}) {
     return {
+      labelConfidence: 'high',
       autocomplete: '',
       constraints: {},
       options: [],
@@ -140,6 +143,7 @@ function createHarness({
             if (!page.values) page.values = {};
             if (!Object.prototype.hasOwnProperty.call(page.values, decision.fieldId)) page.values[decision.fieldId] = decision.value;
           }
+          page.onApply?.({ page, decisions: message.decisions || [] });
           return { ok: true, result: { applied: [], kept: [], reviewRequired: [], unresolved: [], failed: [] } };
         }
         if (message.type === 'JOB_APP_VALIDATE') return { ok: true, validation: validationFor(tabId, frameId) };
@@ -210,10 +214,15 @@ function createHarness({
     tabs,
     updatedListeners,
     removedListeners,
-    dispatch: async (message, sender = {}) => new Promise((resolve) => {
-      const handled = listeners[0](message, sender, resolve);
-      if (handled === false) resolve({ ok: false, unhandled: true });
-    }),
+    dispatch: async (message, sender = {}) => {
+      const response=await new Promise(resolve=>{const handled=listeners[0](message,sender,resolve);if(handled===false)resolve({ok:false,unhandled:true});});
+      if(waitForAI && response.run && !['JOB_RUN_STATE','JOB_RUN_VALIDATE_PAGE'].includes(message.type)) {
+        const until=Date.now()+2000;
+        while(Object.values(sessionData.applicationRun?.[String(message.tabId || 7)]?.aiOperations || {}).some(op=>op.status==='pending') && Date.now()<until) await new Promise(resolve=>setTimeout(resolve,5));
+        response.run=sessionData.applicationRun?.[String(message.tabId || 7)] || response.run;
+      }
+      return response;
+    },
   };
 }
 
@@ -235,9 +244,8 @@ test('saved narrative and sensitive equivalents wait for scoped approval before 
   const { JSDOM } = await import('jsdom');
   const { applyDecisions } = await import('../src/form-engine.js');
   const document = new JSDOM('<label>Current CTC<textarea id="ctc"></textarea></label><label>Describe your ML experience<textarea id="ml"></textarea></label>').window.document;
-  const sentDecisions = harness.tabs.get(7).messages.find(message => message.type === 'JOB_APP_APPLY').decisions;
-  assert.equal(sentDecisions.find(decision => decision.fieldId === 'ctc').action, 'ask_user');
-  assert.equal(sentDecisions.find(decision => decision.fieldId === 'ctc').value, null);
+  const sentDecisions = harness.tabs.get(7).messages.find(message => message.type === 'JOB_APP_APPLY')?.decisions || [];
+  assert.equal(sentDecisions.some(decision => decision.fieldId === 'ctc' && decision.action === 'fill'), false);
   await applyDecisions(document, sentDecisions.map(({ handle, ...decision }) => decision));
   assert.equal(document.querySelector('#ctc').value, '');
   assert.equal(document.querySelector('#ml').value, '');
@@ -278,7 +286,7 @@ test('previous application drafts are source-qualified suggestions, not promoted
   assert.equal(harness.localData.answerRecords.find(record => record.question === 'Notice period').answer, 'Synthetic notice answer');
 });
 
-test('optional planner sends bounded relevant evidence and preserves failure diagnostics without retries', async () => {
+test('planner failure preserves diagnostics while required suggestion preparation continues', async () => {
   const harness = createHarness({ pagesByTab: { 7: { pages: [{ fields: [{ id: 'unknown', label: 'Describe underwater welding', type: 'text', required: true }], actions: [{ id: 'submit', label: 'Submit application', kind: 'submit' }] }] } } });
   harness.localData.openaiApiKey = 'synthetic-key';
   const bodies = [];
@@ -288,7 +296,50 @@ test('optional planner sends bounded relevant evidence and preserves failure dia
   assert.deepEqual(JSON.parse(bodies[0].input[1].content[0].text).records, []);
   assert.match(first.run.llmError, /Synthetic network failure/);
   await harness.dispatch({ type: 'JOB_RUN_CHECK_PAGE', tabId: 7 });
-  assert.equal(bodies.length, 1);
+  assert.equal(bodies.length, 2);
+});
+
+test('Retry AI reruns only failed work and keeps completed drafts', async () => {
+  const harness = createHarness({ answerRecords: [{
+    key: 'experience', question: 'Experience', answer: 'Built reliable event processing services.', confirmationState: 'confirmed', sensitivity: 'safe',
+  }], pagesByTab: { 7: { pages: [{
+    fields: [{ id: 'why', handle: 'why-handle', label: 'Why are you a good fit?', type: 'textarea', required: true }],
+    actions: [{ id: 'submit', label: 'Submit application', kind: 'submit' }],
+  }] } } });
+  harness.localData.openaiApiKey = 'synthetic-key';
+  let initialRequests = 0;
+  globalThis.fetch = async (_url, options) => {
+    initialRequests += 1;
+    const request = JSON.parse(JSON.parse(options.body).input[1].content[0].text);
+    if (request.fields) throw new Error('planner is temporarily unavailable');
+    return {
+      ok: true, status: 200, statusText: 'OK',
+      json: async () => ({ output_text: JSON.stringify({ suggestions: [{ answer: 'A reviewed draft.', evidenceKeys: ['experience'] }], missingContext: '' }) }),
+    };
+  };
+  await import(`../src/service-worker.js?retry-completed=${Date.now()}`);
+  const started = await harness.dispatch({ type: 'JOB_RUN_START', tabId: 7 });
+  assert.equal(initialRequests, 2);
+  assert.equal(started.run.aiOperations.planner.status, 'failed');
+  assert.equal(started.run.aiOperations['suggestion:why'].status, 'completed');
+  assert.equal(started.run.generatedSuggestions.why.suggestions[0].answer, 'A reviewed draft.');
+
+  let retryRequests = 0;
+  globalThis.fetch = async (_url, options) => {
+    retryRequests += 1;
+    const request = JSON.parse(JSON.parse(options.body).input[1].content[0].text);
+    assert.ok(request.fields, 'only the failed planner operation should rerun');
+    return {
+      ok: true, status: 200, statusText: 'OK',
+      json: async () => ({ output_text: JSON.stringify({ decisions: [{
+        fieldId: 'why', action: 'ask_user', value: null, evidenceKeys: [], confidence: 'low', sensitivity: 'safe', reason: 'Keep the completed draft', transformation: null,
+      }] }) }),
+    };
+  };
+  const retried = await harness.dispatch({ type: 'JOB_RUN_RETRY_AI', tabId: 7 });
+  assert.equal(retryRequests, 1);
+  assert.equal(retried.run.aiOperations.planner.status, 'completed');
+  assert.equal(retried.run.generatedSuggestions.why.suggestions[0].answer, 'A reviewed draft.');
 });
 
 test('planner fill candidates wait for explicit review instead of applying to the page', async () => {
@@ -766,6 +817,37 @@ test('default run fills one page and stops in page_ready without clicking Next',
   assert.equal(started.run.audit[0].answer, 'Nithin');
 });
 
+test('bounded fill loop reinspects and fills a supported conditional field', async () => {
+  const harness = createHarness({
+    waitForAI: false,
+    answerRecords: [
+      { key: 'country', question: 'Country', answer: 'India', sensitivity: 'safe' },
+      { key: 'city', question: 'City', answer: 'Pune', sensitivity: 'safe' },
+    ],
+    pagesByTab: {
+      7: {
+        pages: [{
+          fields: [{ id: 'country', label: 'Country', type: 'text', required: true }],
+          onApply: ({ page, decisions }) => {
+            if (decisions.some((decision) => decision.fieldId === 'country' && decision.action === 'fill')) {
+              page.fields.push({ id: 'city', label: 'City', type: 'text', required: true });
+            }
+          },
+          actions: [{ id: 'submit', label: 'Submit application', kind: 'submit' }],
+        }],
+      },
+    },
+  });
+
+  await import(`../src/service-worker.js?conditional-loop=${Date.now()}`);
+  const started = await harness.dispatch({ type: 'JOB_RUN_START', tabId: 7 });
+
+  assert.equal(started.ok, true, started.error);
+  assert.equal(harness.tabs.get(7).frames[0].pages[0].values.country, 'India');
+  assert.equal(harness.tabs.get(7).frames[0].pages[0].values.city, 'Pune');
+  assert.equal(harness.tabs.get(7).messages.filter((message) => message.type === 'JOB_APP_APPLY').length, 2);
+});
+
 test('explicit page advance revalidates, captures, and clicks one Next action', async () => {
   const harness = createHarness({
     pagesByTab: {
@@ -889,7 +971,7 @@ test('does not advance beyond the 20-page limit', async () => {
   assert.equal(harness.tabs.get(7).nextClicks, 19);
 });
 
-test('worker categorizes blockers, optional unresolved fields, review items, and audit values separately', async () => {
+test('worker keeps empty optional sensitive fields under optional unanswered', async () => {
   const harness = createHarness({
     answerRecords: [{ key: 'full_name', question: 'Full name', answer: 'Nithin', aliases: ['Full name'], type: 'text', sensitivity: 'safe' }],
     coverMessages: [{ id: 'default', title: 'Default', body: 'I would like to contribute to your team with a strong engineering background and hands-on execution across product delivery.' }],
@@ -914,12 +996,12 @@ test('worker categorizes blockers, optional unresolved fields, review items, and
   assert.equal(started.run.status, 'waiting_user');
   assert.equal(started.run.actionRequired.some((item) => item.fieldId === 'work_authorization'), true);
   assert.equal(started.run.optionalUnresolved.some((item) => item.fieldId === 'portfolio'), true);
-  assert.equal(started.run.reviewRequired.some((item) => item.fieldId === 'cover_letter'), true);
+  assert.equal(started.run.optionalUnresolved.some((item) => item.fieldId === 'cover_letter'), true);
   assert.equal(started.run.audit.some((item) => item.key === 'full_name'), true);
   assert.equal(started.run.actionRequired.find((item) => item.fieldId === 'work_authorization').formOrder, 1);
   assert.equal(started.run.optionalUnresolved.find((item) => item.fieldId === 'portfolio').formOrder, 2);
-  assert.equal(started.run.reviewRequired.find((item) => item.fieldId === 'cover_letter').formOrder, 3);
-  assert.equal(started.run.reviewRequired.find((item) => item.fieldId === 'cover_letter').pageNumber, 1);
+  assert.equal(started.run.optionalUnresolved.find((item) => item.fieldId === 'cover_letter').formOrder, 3);
+  assert.equal(started.run.optionalUnresolved.find((item) => item.fieldId === 'cover_letter').pageNumber, 1);
   assert.equal(started.run.audit.find((item) => item.key === 'full_name').formOrder, 0);
   assert.equal(started.run.audit.find((item) => item.key === 'full_name').pageNumber, 1);
   assert.equal(harness.tabs.get(7).focusCalls[0], 'work_authorization');
@@ -1315,6 +1397,39 @@ test('automatic generated drafts use job context and records, and regenerate onl
   assert.equal(refreshed.run.generatedSuggestions.why.suggestions.length, 1);
 });
 
+test('a late on-demand AI suggestion cannot overwrite a changed field destination', async () => {
+  const harness = createHarness({ waitForAI: false, pagesByTab: { 7: { pages: [{
+    page: { title: 'Application', domain: 'example.test' },
+    fields: [{ id: 'why', handle: 'why-original', label: 'Why are you a good fit?', type: 'textarea', required: true }],
+    actions: [{ id: 'next', label: 'Next', kind: 'next' }],
+  }] } } });
+  await import(`../src/service-worker.js?late-on-demand=${Date.now()}`);
+  const started = await harness.dispatch({ type: 'JOB_RUN_START', tabId: 7 });
+  harness.localData.aiProvider = 'openai';
+  harness.localData.openaiApiKey = 'synthetic-test-key';
+
+  let requestStarted;
+  const requestStartedPromise = new Promise((resolve) => { requestStarted = resolve; });
+  let releaseResponse;
+  globalThis.fetch = async () => {
+    requestStarted();
+    return new Promise((resolve) => { releaseResponse = () => resolve({
+      ok: true, status: 200, statusText: 'OK',
+      json: async () => ({ output_text: JSON.stringify({ suggestions: [{ answer: 'A grounded draft.', evidenceKeys: [] }], missingContext: '' }) }),
+    }); });
+  };
+
+  const pending = harness.dispatch({ type: 'JOB_RUN_GENERATE_SUGGESTIONS', ...draftOrigin(started.run, { id: 'why', handle: 'why-original' }) });
+  await requestStartedPromise;
+  harness.tabs.get(7).frames[0].pages[0].fields[0].handle = 'why-replaced';
+  releaseResponse();
+
+  const response = await pending;
+  assert.equal(response.ok, false);
+  assert.match(response.error, /page or supporting evidence changed|destination changed/i);
+  assert.equal(harness.sessionData.applicationRun['7'].generatedSuggestions?.why, undefined);
+});
+
 function draftOrigin(run, field) {
   return {
     tabId: 7,
@@ -1557,4 +1672,35 @@ test('worker uses the selected Fireworks key and default model for planner reque
   assert.equal(requests[0].body.model, 'accounts/fireworks/models/glm-5p3-flash');
   assert.equal(requests[0].body.messages.length, 2);
   assert.equal(harness.localData.openaiApiKey, '');
+});
+
+test('invalid optional fields block; validation-only refresh never fills or calls AI', async () => {
+  const h=createHarness({pagesByTab:{7:{pages:[{fields:[{id:'email',handle:'email-h',label:'Email',type:'email',currentValue:'bad'}],invalidFieldIds:['email'],actions:[{id:'next',kind:'next',label:'Next'}]}]}}});
+  await import(`../src/service-worker.js?optional-invalid-${Date.now()}`);
+  const response=await h.dispatch({type:'JOB_RUN_START',tabId:7});
+  assert.ok(response.run.actionRequired.some(field=>field.fieldId==='email'));
+  assert.equal(response.run.optionalUnresolved.length,0);
+  const count=h.tabs.get(7).messages.filter(message=>message.type==='JOB_APP_APPLY').length;
+  assert.equal((await h.dispatch({type:'JOB_RUN_VALIDATE_PAGE',tabId:7})).ok,true);
+  assert.equal(h.tabs.get(7).messages.filter(message=>message.type==='JOB_APP_APPLY').length,count);
+  assert.equal(h.tabs.get(7).nextClicks,0);
+});
+
+test('local results return before AI and optional questions do not generate automatically', async () => {
+  const h=createHarness({waitForAI:false,pagesByTab:{7:{pages:[{page:{title:'Application',domain:'example.test'},fields:[{id:'required',handle:'r-h',label:'Why this role?',type:'textarea',required:true},{id:'optional',handle:'o-h',label:'Additional information',type:'textarea'}],actions:[]}]}}});
+  h.localData.openaiApiKey='test-key'; let release;const requests=[];
+  globalThis.fetch=async(_url,options)=>{const body=JSON.parse(options.body);const request=JSON.parse(body.input[1].content[0].text);requests.push(request);if(request.fields)await new Promise(resolve=>{release=resolve;});return{ok:true,json:async()=>({output_text:JSON.stringify(request.fields?{decisions:[]}:{suggestions:[],missingContext:'Add relevant experience'})})};};
+  await import(`../src/service-worker.js?background-${Date.now()}`);
+  const response=await Promise.race([h.dispatch({type:'JOB_RUN_START',tabId:7}),new Promise(resolve=>setTimeout(()=>resolve({error:'Blocked on AI'}),600))]);
+  try{assert.equal(response.ok,true,response.error);assert.notEqual(response.run.waitingFor,'extension_error');assert.ok(release,'planner actually started');}finally{release?.();}
+  for(let n=0;n<100&&Object.values(h.sessionData.applicationRun['7'].aiOperations||{}).some(op=>op.status==='pending');n++)await new Promise(resolve=>setTimeout(resolve,5));
+  assert.equal(requests.filter(request=>request.field?.id==='optional').length,0);
+});
+
+test('worker restart marks pending operations interrupted without replaying navigation', async () => {
+  const h=createHarness({pagesByTab:{7:{pages:[{fields:[],actions:[]}]}}});
+  h.sessionData.applicationRun={'7':{tabId:7,startedAt:'old-run',status:'running',revision:3,aiOperations:{planner:{status:'pending'}},frame:{frameId:0},actionRequired:[],reviewRequired:[],optionalUnresolved:[]}};
+  await import(`../src/service-worker.js?restart-${Date.now()}`);
+  const response=await h.dispatch({type:'JOB_RUN_STATE',tabId:7});
+  assert.equal(response.run.aiOperations.planner.status,'interrupted');assert.equal(response.run.status,'waiting_user');assert.equal(h.tabs.get(7).nextClicks,0);
 });

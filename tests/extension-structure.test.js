@@ -11,6 +11,7 @@ async function readJson(path) {
 test('manifest has only the permissions needed for local autofill', async () => {
   const manifest = await readJson('manifest.json');
   assert.equal(manifest.manifest_version, 3);
+  assert.equal(manifest.version, '0.1.4');
   assert.equal(manifest.side_panel.default_path, 'sidepanel.html');
   assert.deepEqual(manifest.permissions.sort(), ['activeTab', 'scripting', 'sidePanel', 'storage'].sort());
   assert.equal(manifest.permissions.includes('identity'), false);
@@ -108,7 +109,7 @@ test('content script keeps the message channel open for asynchronous widget sele
     readFile(new URL('dist/content.js', root), 'utf8'),
   ]);
   assert.match(engine, /export async function applyDecisions/);
-  assert.match(content, /applyDecisions\(document, message\.decisions \|\| \[\]\)\s*\.then/);
+  assert.match(content, /applyDecisions\(document, message\.decisions \|\| \[\], \{deadline: message\.deadline \?\? Infinity\}\)\s*\.then/);
   assert.match(content, /return true;/);
   assert.match(bundle, /CUSTOM_WIDGET_SELECTOR|button\[aria-haspopup="listbox"\]/);
   assert.match(bundle, /unique exact option/);

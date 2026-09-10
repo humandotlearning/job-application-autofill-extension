@@ -290,6 +290,9 @@ button:disabled { cursor: wait; opacity: .55; }
 .rewrite-prompt-row[hidden] { display: none; }
 .rewrite-prompt-row textarea { min-height: var(--size-prompt-textarea); }
 .generated-drafts { display: grid; gap: var(--space-sm); margin-top: var(--space-md); }
+.answer-search, .employment-choice { display: grid; gap: var(--space-xs); margin-top: var(--space-md); }
+.answer-search { grid-template-columns: 1fr auto; }
+.answer-search > div { grid-column: 1 / -1; display: grid; gap: var(--space-xs); }
 .generated-drafts-heading { color: var(--color-text); font-size: var(--font-xs); font-weight: 750; }
 .generated-draft { padding: var(--space-sm); border: var(--border-width) solid var(--color-border); color: var(--color-text); font-size: var(--font-sm); line-height: var(--line-body); overflow-wrap: anywhere; }
 .generated-draft button { min-height: var(--size-compact-control); margin-top: var(--space-sm); padding: var(--space-xs) var(--space-sm); color: var(--color-text); background: transparent; font-size: var(--font-xs); }

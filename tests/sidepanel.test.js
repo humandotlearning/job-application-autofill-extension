@@ -29,6 +29,7 @@ async function setupPanel({
   approveSuggestionResponse = { ok: true, run },
   rewriteResponse = { ok: true, answer: 'Rewritten answer.' },
   generateResponse = { ok: true, run },
+  validateResponse = { ok: true, run }, retryAiResponse = { ok: true, run }, searchResponse = { ok: true, candidates: [], run }, selectEmploymentResponse = { ok: true, run },
 } = {}) {
   const dom = new JSDOM(await loadPanelHtml(), {
     url: 'https://extension.local/sidepanel.html',
@@ -92,6 +93,10 @@ async function setupPanel({
         if (message.type === 'JOB_RUN_APPROVE_SUGGESTION') return typeof approveSuggestionResponse === 'function' ? approveSuggestionResponse(message) : approveSuggestionResponse;
         if (message.type === 'JOB_RUN_REWRITE_ANSWER') return typeof rewriteResponse === 'function' ? rewriteResponse(message) : rewriteResponse;
         if (message.type === 'JOB_RUN_GENERATE_SUGGESTIONS') return typeof generateResponse === 'function' ? generateResponse(message) : generateResponse;
+        if (message.type === 'JOB_RUN_VALIDATE_PAGE') return validateResponse;
+        if (message.type === 'JOB_RUN_RETRY_AI') return retryAiResponse;
+        if (message.type === 'JOB_RUN_SEARCH_ANSWERS') return searchResponse;
+        if (message.type === 'JOB_RUN_SELECT_EMPLOYMENT') return selectEmploymentResponse;
         if (message.type === 'JOB_DATASOURCE_EXPORT') return { ok: true, backup: '{"schemaVersion":1}' };
         if (message.type === 'JOB_DATASOURCE_IMPORT') return { ok: true, datasource };
         return { ok: true };
@@ -142,7 +147,7 @@ async function setupPanel({
   };
 }
 
-test('candidate selection requires an explicit Send to form action', async () => {
+test('recommended saved answer applies through the guarded path in one click', async () => {
   const suggestion = { tabId: 7, frameId: 3, applicationId: 'run-one', pageSignature: 'page-one', field: { id: 'ml', handle: 'handle-one' }, candidates: [{ sourceKey: 'story', sourceQuestion: 'Saved project', answer: 'Synthetic model project narrative.', provenance: 'user', reason: 'Related ML evidence', kind: 'related' }] };
   const harness = await setupPanel({ run: { status: 'waiting_user', actionRequired: [{ fieldId: 'ml', label: 'ML experience', suggestion }], optionalUnresolved: [], reviewRequired: [], audit: [] } });
   try {
@@ -150,17 +155,15 @@ test('candidate selection requires an explicit Send to form action', async () =>
     assert.match(doc.querySelector('#action-required-list').textContent, /Saved project/);
     assert.match(doc.querySelector('#action-required-list').textContent, /Synthetic model project narrative/);
     const row = doc.querySelector('#action-required-list .result-item');
-    assert.equal([...row.querySelectorAll('button')].some((button) => /use this saved answer|edit and use/i.test(button.textContent)), false);
+    assert.equal(row.querySelector('[data-choose-answer]').textContent, 'Use answer');
     row.querySelector('[data-choose-answer]').click();
-    assert.deepEqual(pageMutationMessages(harness.sentMessages), []);
-    row.querySelector('[data-send-answer]').click();
     await new Promise(resolve => setTimeout(resolve, 0));
     const sent = harness.sentMessages.find(message => message.type === 'JOB_RUN_APPROVE_SUGGESTION');
     assert.equal(sent.tabId, 7); assert.equal(sent.frameId, 3); assert.equal(sent.handle, 'handle-one'); assert.equal(sent.sourceKey, 'story');
   } finally { harness.cleanup(); }
 });
 
-test('saved answer card expands once and only copies its answer into the editable draft', async () => {
+test('editing a saved recommendation opens a writable draft without applying it', async () => {
   const answer = 'I built and deployed reliable machine-learning systems in production. '.repeat(5).trim();
   const suggestion = {
     tabId: 7,
@@ -179,8 +182,9 @@ test('saved answer card expands once and only copies its answer into the editabl
     assert.equal(card.querySelector('[data-saved-answer-text]').textContent, answer);
     assert.equal(row.querySelectorAll('.answer-details').length, 0);
     card.open = true;
-    row.querySelector('[data-choose-answer]').click();
+    row.querySelector('[data-edit-candidate]').click();
     assert.equal(row.querySelector('[data-answer-draft]').value, answer);
+    assert.equal(row.querySelector('[data-answer-draft]').readOnly, false);
     assert.deepEqual(pageMutationMessages(harness.sentMessages), []);
   } finally { harness.cleanup(); }
 });
@@ -391,8 +395,8 @@ test('panel persists settings, focuses blockers, and saves answers without any s
     assert.equal(harness.localData.openaiApiKey, 'sk-live');
 
     document.querySelector('#action-required-list button').click();
-    document.querySelector('#primary-action').click();
-    await new Promise((resolve) => setTimeout(resolve, 0));
+    document.querySelector('#save-answers').click();
+    await new Promise((resolve) => setTimeout(resolve, 25));
 
     assert.equal(harness.sentMessages.some((message) => message.type === 'JOB_RUN_FOCUS_FIELD' && message.fieldId === 'work_auth'), true);
     assert.equal(harness.sentMessages.some((message) => message.type === 'JOB_RUN_SAVE_ANSWERS'), true);
@@ -629,7 +633,7 @@ test('answer workspace stays blank until a readable candidate is chosen', async 
   } finally { harness.cleanup(); }
 });
 
-test('AI suggestions populate an editable draft without inserting it into the form', async () => {
+test('AI Use answer applies the selected draft in one click', async () => {
   const generatedSuggestion = {
     tabId: 7, frameId: 3, applicationId: 'run-ai', pageSignature: 'page-one',
     field: { id: 'summary', handle: 'handle-summary' },
@@ -642,9 +646,9 @@ test('AI suggestions populate an editable draft without inserting it into the fo
     const row = harness.dom.window.document.querySelector('#action-required-list .result-item');
     assert.equal(row.querySelector('.result-label').textContent, 'Why are you a good fit?');
     row.querySelector('[data-choose-generated-answer]').click();
-    assert.equal(row.querySelector('[data-answer-draft]').value, 'I built event processing systems that match this role.');
-    assert.deepEqual(pageMutationMessages(harness.sentMessages), []);
-    assert.equal(row.querySelector('[data-answer-draft]').readOnly, false);
+    await new Promise(resolve => setTimeout(resolve, 0));
+    const sent = harness.sentMessages.find(message => message.type === 'JOB_RUN_APPLY_DRAFT');
+    assert.equal(sent.answer, 'I built event processing systems that match this role.');
   } finally { harness.cleanup(); }
 });
 
@@ -701,7 +705,7 @@ test('choosing a candidate and editing it changes only the transient draft', asy
   const harness = await setupPanel({ run });
   try {
     const row = harness.dom.window.document.querySelector('#action-required-list .result-item');
-    row.querySelector('[data-choose-answer]').click();
+    row.querySelector('[data-edit-candidate]').click();
     await new Promise((resolve) => setTimeout(resolve, 0));
     const draft = row.querySelector('[data-answer-draft]');
     assert.equal(draft.value, 'Candidate answer verbatim.');
@@ -709,7 +713,6 @@ test('choosing a candidate and editing it changes only the transient draft', asy
     row.querySelector('[data-edit-answer]').click();
     draft.value = 'A freely edited answer.';
     draft.dispatchEvent(new harness.dom.window.Event('input', { bubbles: true }));
-    row.querySelector('[data-use-edited-answer]').click();
     await new Promise((resolve) => setTimeout(resolve, 0));
     assert.equal(draft.value, 'A freely edited answer.');
     assert.deepEqual(pageMutationMessages(harness.sentMessages), []);
@@ -723,7 +726,7 @@ test('rewrite prompt sends the question context and replaces only the draft', as
   const harness = await setupPanel({ run, rewriteResponse: (message) => shouldFail ? { ok: false, error: 'Rewrite unavailable' } : { ok: true, answer: 'Rewritten by the configured model.' } });
   try {
     const row = harness.dom.window.document.querySelector('#action-required-list .result-item');
-    row.querySelector('[data-choose-answer]').click();
+    row.querySelector('[data-edit-candidate]').click();
     row.querySelector('[data-rewrite-answer]').click();
     const prompt = row.querySelector('[data-rewrite-prompt]');
     assert.ok(prompt);
@@ -758,12 +761,11 @@ test('send to form stays disabled until a draft exists and preserves it on apply
     const send = row.querySelector('[data-send-answer]');
     assert.ok(send);
     assert.equal(send.disabled, true);
-    row.querySelector('[data-choose-answer]').click();
+    row.querySelector('[data-edit-candidate]').click();
     row.querySelector('[data-edit-answer]').click();
     const draft = row.querySelector('[data-answer-draft]');
     draft.value = 'Exact answer to send';
     draft.dispatchEvent(new harness.dom.window.Event('input', { bubbles: true }));
-    row.querySelector('[data-use-edited-answer]').click();
     send.click();
     await new Promise((resolve) => setTimeout(resolve, 0));
     const message = harness.sentMessages.find((entry) => entry.type === 'JOB_RUN_APPROVE_SUGGESTION');
@@ -835,7 +837,7 @@ test('candidate-backed drafts retain plural source keys when sent for approval',
   const harness = await setupPanel({ run });
   try {
     const row = harness.dom.window.document.querySelector('#action-required-list .result-item');
-    row.querySelector('[data-choose-answer]').click();
+    row.querySelector('[data-edit-candidate]').click();
     row.querySelector('[data-send-answer]').click();
     await new Promise((resolve) => setTimeout(resolve, 0));
     const message = harness.sentMessages.find((entry) => entry.type === 'JOB_RUN_APPROVE_SUGGESTION');
@@ -867,7 +869,7 @@ test('a delayed rewrite cannot overwrite a newer draft edit', async () => {
   const harness = await setupPanel({ run, rewriteResponse });
   try {
     const row = harness.dom.window.document.querySelector('#action-required-list .result-item');
-    row.querySelector('[data-choose-answer]').click();
+    row.querySelector('[data-edit-candidate]').click();
     row.querySelector('[data-rewrite-answer]').click();
     const draft = row.querySelector('[data-answer-draft]');
     const prompt = row.querySelector('[data-rewrite-prompt]');
@@ -918,5 +920,73 @@ test('opaque candidates stay hidden and expose no draft or apply controls', asyn
     assert.equal(row.querySelector('[data-edit-answer]'), null);
     assert.equal(row.querySelector('[data-rewrite-answer]'), null);
     assert.equal(row.querySelector('[data-send-answer]'), null);
+  } finally { harness.cleanup(); }
+});
+
+test('failed AI work exposes retry and validation uses the validation-only protocol', async () => {
+  const run = { status: 'waiting_user', applicationId: 'run-ai', pageSignature: 'page-one', progress: 'local_fill_complete', aiOperations: { summary: { status: 'failed' } }, actionRequired: [], optionalUnresolved: [], reviewRequired: [], audit: [] };
+  const harness = await setupPanel({ run });
+  try {
+    harness.dom.window.document.querySelector('[data-retry-ai]').click();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    harness.dom.window.document.querySelector('#check-page').click();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assert.ok(harness.sentMessages.some(({ type }) => type === 'JOB_RUN_RETRY_AI'));
+    assert.ok(harness.sentMessages.some(({ type }) => type === 'JOB_RUN_VALIDATE_PAGE'));
+  } finally { harness.cleanup(); }
+});
+
+test('unanswered fields can search saved answers and use a returned candidate', async () => {
+  const run = { status: 'waiting_user', applicationId: 'run-search', pageSignature: 'page-one', actionRequired: [{ fieldId: 'salary', label: 'Expected salary' }], optionalUnresolved: [], reviewRequired: [], audit: [] };
+  const searchResponse = { ok: true, candidates: [{ sourceKey: 'salary_saved', answer: '₹25,00,000', sourceQuestion: 'Salary expectation' }], run };
+  const harness = await setupPanel({ run, searchResponse });
+  try {
+    const row = harness.dom.window.document.querySelector('#action-required-list .result-item');
+    row.querySelector('[data-search-query]').value = 'salary';
+    row.querySelector('[data-search-answers]').click();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    row.querySelector('[data-search-result]').click();
+    assert.equal(row.querySelector('[data-answer-draft]').value, '₹25,00,000');
+    assert.equal(harness.sentMessages.find(({ type }) => type === 'JOB_RUN_SEARCH_ANSWERS').fieldId, 'salary');
+  } finally { harness.cleanup(); }
+});
+
+test('saved-answer search remains available beside a recommendation', async () => {
+  const suggestion = {
+    tabId: 7, frameId: 3, applicationId: 'run-search-recommendation', pageSignature: 'page-one',
+    field: { id: 'salary', handle: 'salary-h' },
+    candidates: [{ sourceKey: 'salary_first', answer: '₹20,00,000', sourceQuestion: 'Expected salary', kind: 'review' }],
+  };
+  const run = { status: 'waiting_user', applicationId: 'run-search-recommendation', pageSignature: 'page-one', actionRequired: [{ fieldId: 'salary', label: 'Expected salary', suggestion }], optionalUnresolved: [], reviewRequired: [], audit: [] };
+  const harness = await setupPanel({ run });
+  try {
+    const row = harness.dom.window.document.querySelector('#action-required-list .result-item');
+    assert.ok(row.querySelector('[data-search-query]'));
+    assert.ok(row.querySelector('[data-search-answers]'));
+  } finally { harness.cleanup(); }
+});
+
+test('employment choices select one profile entry for a section', async () => {
+  const run = { status: 'waiting_user', applicationId: 'run-work', pageSignature: 'page-one', employmentChoices: [{ sectionId: 'work-1', label: 'Employment 1', employers: [{ id: 'emp-2', company: 'Second Co' }] }], actionRequired: [], optionalUnresolved: [], reviewRequired: [], audit: [] };
+  const harness = await setupPanel({ run });
+  try {
+    harness.dom.window.document.querySelector('[data-employment-choice]').value = 'emp-2';
+    harness.dom.window.document.querySelector('[data-employment-choice]').dispatchEvent(new harness.dom.window.Event('change', { bubbles: true }));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assert.ok(harness.sentMessages.some(({ type, sectionId, employmentId }) => type === 'JOB_RUN_SELECT_EMPLOYMENT' && sectionId === 'work-1' && employmentId === 'emp-2'));
+  } finally { harness.cleanup(); }
+});
+
+test('editing a default preserves every employment entry and marks the changed default confirmed', async () => {
+  const profile = { employment: [{ id: 'one', company: 'First Co', roles: [{ title: 'Engineer' }] }, { id: 'two', company: 'Second Co' }], defaults: { relatedToHiringCompany: 'Unknown', knownAtHiringCompany: 'Unknown', phoneDeviceType: 'Unknown' }, defaultsConfirmation: {} };
+  const harness = await setupPanel({ datasource: { answerCount: 0, coverMessageCount: 0, profile } });
+  try {
+    const select = harness.dom.window.document.querySelector('#related-default');
+    select.value = 'No';
+    select.dispatchEvent(new harness.dom.window.Event('change', { bubbles: true }));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const message = harness.sentMessages.find(({ type }) => type === 'JOB_DATASOURCE_PROFILE_UPDATE');
+    assert.deepEqual(message.profile.employment, profile.employment);
+    assert.equal(message.profile.defaultsConfirmation.relatedToHiringCompany, 'confirmed');
   } finally { harness.cleanup(); }
 });

@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { buildLearningCandidates, sanitizeLearningProposals } from '../src/learning-review.js';
+import { buildLearningCandidates, callLearningReviewer, sanitizeLearningProposals } from '../src/learning-review.js';
 
 test('learning candidates include only clear safe user-entered values without exposing ordinary answers', () => {
   const candidates = buildLearningCandidates([
@@ -65,4 +65,15 @@ test('learning proposal cleanup keeps human metadata and removes jargon and code
     scope: { entityId: '', entityType: '', employmentId: '', context: '' }, reusePolicy: 'suggest_only', confidence: 'high',
     classifier: { model: 'gpt-5.6-terra', promptVersion: 'learning-review-v1', classifiedAt: '2026-09-08T00:00:00.000Z' },
   });
+});
+
+test('Fireworks learning review uses its strict schema and 3000 token budget', async () => {
+  let body;
+  const candidates = [{ id: 'favorite_language', label: 'Favorite programming language', type: 'text', valueShape: 'short_text', scope: {}, options: [], constraints: {}, narrative: '' }];
+  const reviews = [{ candidateId: 'favorite_language', outcome: 'reject', canonicalKey: '', displayLabel: '', intent: 'other', valueKind: 'short_text', aliases: [], topicTags: [], scope: 'global', reusePolicy: 'never', confidence: 'low' }];
+  await callLearningReviewer({ apiKey: 'test', candidates }, { provider: 'fireworks', fetchImpl: async (_url, options) => { body = JSON.parse(options.body); return { ok: true, json: async () => ({ choices: [{ message: { content: JSON.stringify({ reviews }) } }] }) }; } });
+  assert.equal(body.max_tokens, 3000);
+  assert.equal(body.response_format.type, 'json_schema');
+  assert.equal(body.response_format.json_schema.name, 'learning_review');
+  assert.match(body.messages[0].content, /JSON schema/);
 });

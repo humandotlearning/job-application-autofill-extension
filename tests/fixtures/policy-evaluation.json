@@ -1,0 +1,176 @@
+[
+  {
+    "id": "confirmed-email",
+    "label": "Email",
+    "type": "email",
+    "answer": "candidate@example.test",
+    "confirmed": true,
+    "expected": "autofill"
+  },
+  {
+    "id": "legacy-email",
+    "label": "Email",
+    "type": "email",
+    "answer": "candidate@example.test",
+    "expected": "review"
+  },
+  {
+    "id": "salary",
+    "label": "Expected salary",
+    "type": "text",
+    "answer": "100000",
+    "confirmed": true,
+    "expected": "review"
+  },
+  {
+    "id": "narrative",
+    "label": "Describe a project",
+    "type": "textarea",
+    "answer": "I built a search application.",
+    "confirmed": true,
+    "expected": "review"
+  },
+  {
+    "id": "consent",
+    "label": "I agree to the terms",
+    "type": "checkbox",
+    "answer": "Yes",
+    "confirmed": true,
+    "expected": "manual"
+  },
+  {
+    "id": "missing",
+    "label": "Favorite programming language",
+    "type": "text",
+    "expected": "manual"
+  },
+  {
+    "id": "never-reuse",
+    "label": "Email",
+    "type": "email",
+    "answer": "candidate@example.test",
+    "confirmed": true,
+    "reusePolicy": "never",
+    "expected": "manual"
+  },
+  {
+    "id": "review-only",
+    "label": "Email",
+    "type": "email",
+    "answer": "candidate@example.test",
+    "confirmed": true,
+    "reusePolicy": "review_only",
+    "expected": "review"
+  },
+  {
+    "id": "conflicting-email",
+    "label": "Email",
+    "type": "email",
+    "answer": "candidate@example.test",
+    "confirmed": true,
+    "conflict": "second@example.test",
+    "expected": "manual",
+    "expectedSource": false
+  },
+  {
+    "id": "suppressed-email",
+    "label": "Email",
+    "type": "email",
+    "answer": "candidate@example.test",
+    "confirmed": true,
+    "suppressed": true,
+    "expected": "manual",
+    "expectedSource": false
+  },
+  {
+    "id": "fuzzy-language",
+    "label": "Main programming language",
+    "sourceQuestion": "Preferred programming language",
+    "type": "text",
+    "answer": "Python",
+    "confirmed": true,
+    "expected": "review"
+  },
+  {
+    "id": "salary-scale",
+    "label": "Expected annual salary INR",
+    "sourceQuestion": "Expected CTC LPA",
+    "type": "text",
+    "answer": "25",
+    "confirmed": true,
+    "expected": "manual",
+    "expectedSource": false
+  },
+  {
+    "id": "city-granularity",
+    "label": "Current city",
+    "sourceQuestion": "Current location",
+    "type": "text",
+    "answer": "Pune, India",
+    "confirmed": true,
+    "expected": "manual",
+    "expectedSource": false
+  },
+  {
+    "id": "phone-extension",
+    "label": "Phone extension",
+    "sourceQuestion": "Phone number",
+    "type": "text",
+    "answer": "+911234567890",
+    "confirmed": true,
+    "expected": "manual",
+    "expectedSource": false
+  },
+  {
+    "id": "opaque-answer",
+    "label": "Email",
+    "type": "email",
+    "answer": "507f1f77bcf86cd799439011",
+    "confirmed": true,
+    "expected": "manual",
+    "expectedSource": false
+  },
+  {
+    "id": "pending-conflict",
+    "label": "Email",
+    "type": "email",
+    "answer": "candidate@example.test",
+    "confirmationState": "pending",
+    "expected": "manual",
+    "expectedSource": false
+  },
+  {
+    "id": "confirmed-city",
+    "label": "City",
+    "type": "text",
+    "answer": "Pune",
+    "confirmed": true,
+    "expected": "autofill"
+  },
+  {
+    "id": "employer-scope",
+    "label": "Company",
+    "type": "text",
+    "answer": "Example Co",
+    "confirmed": true,
+    "employmentId": "previous-job",
+    "expected": "manual",
+    "expectedSource": false
+  },
+  {
+    "id": "confirmed-github",
+    "label": "GitHub URL",
+    "type": "url",
+    "answer": "https://github.com/example",
+    "confirmed": true,
+    "expected": "autofill"
+  },
+  {
+    "id": "long-short-control",
+    "label": "Project summary",
+    "type": "text",
+    "answer": "Developed reliable software for internal operations. Developed reliable software for internal operations. Developed reliable software for internal operations. Developed reliable software for internal operations. Developed reliable software for internal operations. Developed reliable software for internal operations.",
+    "confirmed": true,
+    "expected": "review"
+  }
+]
