@@ -778,7 +778,7 @@ test('send to form stays disabled until a draft exists and preserves it on apply
 });
 
 test('manual draft sends through the guarded apply path with the exact edited answer', async () => {
-  const run = { status: 'waiting_user', applicationId: 'run-manual', pageSignature: 'page-one', actionRequired: [{ fieldId: 'salary', label: 'Expected salary' }], optionalUnresolved: [], reviewRequired: [], audit: [] };
+  const run = { status: 'waiting_user', applicationId: 'run-manual', pageSignature: 'page-one', frame: { frameId: 4 }, actionRequired: [{ fieldId: 'salary', label: 'Expected salary' }], optionalUnresolved: [], reviewRequired: [], audit: [] };
   const harness = await setupPanel({ run });
   try {
     const row = harness.dom.window.document.querySelector('#action-required-list .result-item');
@@ -790,6 +790,7 @@ test('manual draft sends through the guarded apply path with the exact edited an
     const message = harness.sentMessages.find((entry) => entry.type === 'JOB_RUN_APPLY_DRAFT');
     assert.equal(message.fieldId, 'salary');
     assert.equal(message.answer, '₹25,00,000');
+    assert.equal(message.frameId, 4);
   } finally { harness.cleanup(); }
 });
 
@@ -967,13 +968,26 @@ test('saved-answer search remains available beside a recommendation', async () =
 });
 
 test('employment choices select one profile entry for a section', async () => {
-  const run = { status: 'waiting_user', applicationId: 'run-work', pageSignature: 'page-one', employmentChoices: [{ sectionId: 'work-1', label: 'Employment 1', employers: [{ id: 'emp-2', company: 'Second Co' }] }], actionRequired: [], optionalUnresolved: [], reviewRequired: [], audit: [] };
+  const run = { status: 'waiting_user', applicationId: 'run-work', pageSignature: 'page-one', frame: { frameId: 4 }, employmentChoices: [{ sectionId: 'work-1', label: 'Employment 1', employers: [{ id: 'emp-2', company: 'Second Co' }] }], actionRequired: [], optionalUnresolved: [], reviewRequired: [], audit: [] };
   const harness = await setupPanel({ run });
   try {
     harness.dom.window.document.querySelector('[data-employment-choice]').value = 'emp-2';
     harness.dom.window.document.querySelector('[data-employment-choice]').dispatchEvent(new harness.dom.window.Event('change', { bubbles: true }));
     await new Promise((resolve) => setTimeout(resolve, 0));
-    assert.ok(harness.sentMessages.some(({ type, sectionId, employmentId }) => type === 'JOB_RUN_SELECT_EMPLOYMENT' && sectionId === 'work-1' && employmentId === 'emp-2'));
+    assert.ok(harness.sentMessages.some(({ type, frameId, sectionId, employmentId }) => type === 'JOB_RUN_SELECT_EMPLOYMENT' && frameId === 4 && sectionId === 'work-1' && employmentId === 'emp-2'));
+  } finally { harness.cleanup(); }
+});
+
+test('Review on site focuses the first audit field when no review field exists', async () => {
+  const run = {
+    status: 'ready_for_user_submit', applicationId: 'run-review', pageSignature: 'page-one', frame: { frameId: 4 },
+    actionRequired: [], optionalUnresolved: [], reviewRequired: [], audit: [{ key: 'portfolio', label: 'Portfolio link' }],
+  };
+  const harness = await setupPanel({ run });
+  try {
+    harness.dom.window.document.querySelector('#primary-action').click();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assert.ok(harness.sentMessages.some(({ type, fieldId }) => type === 'JOB_RUN_FOCUS_FIELD' && fieldId === 'portfolio'));
   } finally { harness.cleanup(); }
 });
 

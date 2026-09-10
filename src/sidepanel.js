@@ -111,7 +111,7 @@ function fieldOrigin(item) {
   const field = suggestion.field || {};
   return {
     tabId: suggestion.tabId ?? activeTabId,
-    frameId: suggestion.frameId ?? item.frameId ?? currentRun?.frameId ?? currentRun?.frame?.id,
+    frameId: suggestion.frameId ?? item.frameId ?? currentRun?.frame?.frameId ?? currentRun?.frameId,
     applicationId: suggestion.applicationId ?? currentRun?.applicationId,
     pageSignature: suggestion.pageSignature ?? currentRun?.pageSignature,
     fieldId: field.id ?? item.fieldId,
@@ -880,7 +880,7 @@ function capturePanelState() {
     .map((detail) => [detail.dataset.panelDetail || detail.id, detail.open])
     .filter(([key]) => Boolean(key)));
   return {
-    activeId: active?.id || '', activeSearchField: active?.closest?.('.result-item')?.querySelector('[data-field-id]')?.dataset.fieldId || '',
+    activeId: active?.id || '',
     selectionStart: active?.selectionStart, selectionEnd: active?.selectionEnd,
     openDetails,
     scrollX: window.scrollX, scrollY: window.scrollY,
@@ -948,7 +948,7 @@ function renderRun(run) {
     for (const employer of choice.employers || []) { const option = document.createElement('option'); option.textContent = employer.company || 'Employer'; option.value = employer.id; select.append(option); }
     select.addEventListener('change', async () => {
       if (!select.value) return;
-      const response = await chrome.runtime.sendMessage({ type: 'JOB_RUN_SELECT_EMPLOYMENT', tabId: activeTabId, frameId: run.frameId ?? run.frame?.id, applicationId: run.applicationId, pageSignature: run.pageSignature, sectionId: choice.sectionId, employmentId: select.value });
+      const response = await chrome.runtime.sendMessage({ type: 'JOB_RUN_SELECT_EMPLOYMENT', tabId: activeTabId, frameId: run.frame?.frameId ?? run.frameId, applicationId: run.applicationId, pageSignature: run.pageSignature, sectionId: choice.sectionId, employmentId: select.value });
       if (!response?.ok) setStatus(response?.error || 'Could not select employment.', 'error'); else if (response.run) renderRun(response.run);
     });
     const group = document.createElement('div'); group.className = 'employment-choice'; group.append(label, select); elements.employmentChoices.append(group);
@@ -1070,9 +1070,10 @@ async function runPrimaryAction() {
     if (first?.fieldId) return focusField(first.fieldId);
   }
   if (['ready_for_user_submit', 'answers_saved'].includes(currentRun?.status)) {
-    const first = (currentRun.reviewRequired || currentRun.audit || [])[0];
-    if (first?.fieldId) return focusField(first.fieldId);
-    return activeTab();
+    const first = currentRun.reviewRequired?.[0] || currentRun.audit?.[0];
+    if (first?.fieldId || first?.key) return focusField(first.fieldId || first.key);
+    setStatus('Review the application on the site before submitting.');
+    return;
   }
   const type = !currentRun || currentRun.status === 'answers_saved'
     ? 'JOB_RUN_START'

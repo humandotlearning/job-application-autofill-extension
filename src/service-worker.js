@@ -573,7 +573,6 @@ function nowRun(tabId) {
     nextAction: null,
     waitingFor: null,
     waitingLabel: null,
-    llmPages: [],
     revision: 0,
     workerId: WORKER_ID,
     progress: 'checking_fields',
@@ -602,11 +601,6 @@ function pageSignature(inspection, frame = null) {
     fields: inspection.fields.map((field) => [field.id, field.label, field.type, field.options]),
     actions: inspection.actions.map((action) => [action.kind, action.label]),
   });
-}
-
-function unresolvedFields(fields, validation = {}) {
-  const invalidIds = new Set((validation.invalid || []).map((field) => field.fieldId));
-  return fields.filter((field) => !field.currentValue || invalidIds.has(field.id));
 }
 
 function choiceEvidenceNeedsPlanner(field, candidates = []) {
@@ -807,7 +801,7 @@ async function focusFirstProblem(tabId, run, inspection, validation) {
   return first?.label || '';
 }
 
-async function applyPageDecisions(tabId, run, inspection, records, coverMessages, apiKey, provider, model, profile = {}, datasourceRevision = '', cycle = {pass: 0, deadline: Date.now() + 8000}) {
+async function applyPageDecisions(tabId, run, inspection, records, coverMessages, profile = {}, datasourceRevision = '', cycle = {pass: 0, deadline: Date.now() + 8000}) {
   const currentPageSignature = pageSignature(inspection, run.frame);
   if (run.lastAction === 'next' && run.pageSignature === currentPageSignature) {
     run.status = 'waiting_user';
@@ -1137,7 +1131,9 @@ async function rewriteAnswer(message) {
 }
 
 async function generateSuggestions(message) {
-  const jobDescription = message.jobDescription == null ? '' : requiredBoundedText(message.jobDescription, 'Job description', 16_000);
+  const jobDescription = message.jobDescription == null || (typeof message.jobDescription === 'string' && !message.jobDescription.trim())
+    ? ''
+    : requiredBoundedText(message.jobDescription, 'Job description', 16_000);
   const { run, field } = await guardedDraftField(message);
   if (!readableQuestion(field)) throw new Error('The form question is unclear. Use Show on page and enter the answer manually.');
   const settings = await getSettings();
@@ -1151,17 +1147,21 @@ async function generateSuggestions(message) {
     .filter(item => item.currentValue && readableQuestion(item))
     .map(item => ({ key: `page:${item.id}`, question: item.label, answer: item.currentValue, provenance: 'current application page', sensitivity: inferSensitivity(item.label, item.id) }));
   const generated = await callAnswerSuggestions({ apiKey, field, page: jobContext, records: rankSuggestionEvidence(field, [...records, ...profileEvidenceRecords(datasource.profile), ...pageRecords], {limit:40}) }, { provider: settings.aiProvider, model: settings.aiModel });
+  const validation = await sendToFrame(message.tabId, message.frameId, { type: 'JOB_APP_VALIDATE' });
   const current = await currentSuggestionDestination(message.tabId, snapshot);
   if (!current) throw new Error('The page or supporting evidence changed. Generate again.');
-  current.run.jobContext = jobContext;
-  current.run.generatedSuggestions = current.run.generatedSuggestions || {};
-  current.run.generatedSuggestions[field.id] = {
-    tabId: message.tabId, frameId: message.frameId, applicationId: current.run.startedAt, pageSignature: current.run.pageSignature,
-    field, suggestions: generated.suggestions, missingContext: generated.missingContext,
-  };
-  const validation = await sendToFrame(message.tabId, message.frameId, { type: 'JOB_APP_VALIDATE' });
-  categorizeRun(current.run, current.inspection, validation?.validation || {});
-  return { ok: true, run: await saveRun(current.run) };
+  const updated = await mutateRun(message.tabId, (run) => {
+    if (!sameSuggestionRun(run, snapshot)) return false;
+    run.jobContext = jobContext;
+    run.generatedSuggestions = run.generatedSuggestions || {};
+    run.generatedSuggestions[field.id] = {
+      tabId: message.tabId, frameId: message.frameId, applicationId: run.startedAt, pageSignature: run.pageSignature,
+      field, suggestions: generated.suggestions, missingContext: generated.missingContext,
+    };
+    categorizeRun(run, current.inspection, validation?.validation || {});
+  });
+  if (!updated) throw new Error('The page or supporting evidence changed. Generate again.');
+  return { ok: true, run: updated };
 }
 
 function hasBlockingIssues(run, validation) {
@@ -1174,7 +1174,6 @@ async function processPage(tabId, { autoAdvance } = { autoAdvance: false }) {
   try {
     let run = await getRun(tabId);
     if (!run || run.status !== 'running') return run;
-    run.llmPages = Array.isArray(run.llmPages) ? run.llmPages : [];
     if (run.pageNumber > MAX_PAGES) {
       run.status = 'waiting_user';
       run.waitingFor = 'page_limit_exceeded';
@@ -1183,11 +1182,9 @@ async function processPage(tabId, { autoAdvance } = { autoAdvance: false }) {
       return await saveRun(run);
     }
 
-    const [records, apiKey, coverMessages, settings, datasource] = await Promise.all([
+    const [records, coverMessages, datasource] = await Promise.all([
       getRecords(),
-      getApiKey(),
       getCoverMessages(),
-      getSettings(),
       getDatasource(),
     ]);
     const discovery = await discoverApplicationFrame(tabId);
@@ -1199,9 +1196,6 @@ async function processPage(tabId, { autoAdvance } = { autoAdvance: false }) {
       discovery.inspection,
       records,
       coverMessages,
-      apiKey,
-      settings.aiProvider,
-      settings.aiModel,
       datasource.profile,
       datasource.datasourceMeta?.updatedAt || '',
     );
@@ -1798,14 +1792,15 @@ function aiEvidenceRevision(run, inspection, datasource) {
   });
 }
 
-function aiFingerprint(run, fields, records, settings, evidenceRevision) {
-  return JSON.stringify({applicationId:run.startedAt,frame:run.frame?.frameId,page:run.pageSignature,context:run.jobContext,fields:fields.map(({id,handle,label,type,currentValue,options,constraints,required,entityId,employmentId})=>({id,handle,label,type,currentValue,options,constraints,required,entityId,employmentId})),records:records.map(({key,answer,confirmationState,semantic,updatedAt})=>({key,answer,confirmationState,semantic,updatedAt})),evidenceRevision,provider:settings.aiProvider,model:settings.aiModel,promptVersion:'reliable-review-1'});
+function aiFingerprint(run, fields, settings, evidenceRevision) {
+  return JSON.stringify({applicationId:run.startedAt,frame:run.frame?.frameId,page:run.pageSignature,fields:fields.map(({id,handle,entityId,employmentId})=>({id,handle,entityId,employmentId})),evidenceRevision,provider:settings.aiProvider,model:settings.aiModel,promptVersion:'reliable-review-1'});
 }
 
 function suggestionRequestSnapshot(run, field, inspection, datasource, settings, jobContext) {
   const contextualRun = { ...run, jobContext };
   return {
     startedAt: run.startedAt,
+    runRevision: Number(run.revision) || 0,
     pageSignature: run.pageSignature,
     frameId: run.frame?.frameId,
     field: aiFieldSnapshot(field),
@@ -1816,11 +1811,19 @@ function suggestionRequestSnapshot(run, field, inspection, datasource, settings,
   };
 }
 
+function sameSuggestionRun(run, snapshot) {
+  return Boolean(run
+    && run.startedAt === snapshot.startedAt
+    && Number(run.revision || 0) === snapshot.runRevision
+    && run.pageSignature === snapshot.pageSignature
+    && run.frame?.frameId === snapshot.frameId
+    && SAVABLE_RUN_STATUSES.has(run.status)
+    && JSON.stringify(run.jobContext || {}) === JSON.stringify(snapshot.sourceJobContext || {}));
+}
+
 async function currentSuggestionDestination(tabId, snapshot) {
   const run = await getRun(tabId);
-  if (!run || run.startedAt !== snapshot.startedAt || run.pageSignature !== snapshot.pageSignature
-    || run.frame?.frameId !== snapshot.frameId || !SAVABLE_RUN_STATUSES.has(run.status)
-    || JSON.stringify(run.jobContext || {}) !== JSON.stringify(snapshot.sourceJobContext || {})) return null;
+  if (!sameSuggestionRun(run, snapshot)) return null;
   const settings = await getSettings();
   if (settings.aiProvider !== snapshot.settings.aiProvider || settings.aiModel !== snapshot.settings.aiModel) return null;
   const [datasource, inspected] = await Promise.all([
@@ -1860,9 +1863,8 @@ async function scheduleAi(tabId,{retry=false}={}) {
     : unresolved.filter(field=>!run.generatedSuggestions?.[field.id]);
   if(!plannerFields.length && !suggestionFields.length) return;
   const operationFields=plannerFields.length ? plannerFields : suggestionFields;
-  const records=datasource.answerRecords;
   const evidenceRevision=aiEvidenceRevision(run,inspected.inspection,datasource);
-  const fingerprint=aiFingerprint(run,operationFields,records,settings,evidenceRevision);
+  const fingerprint=aiFingerprint(run,operationFields,settings,evidenceRevision);
   const op=planner;
   if(op?.cacheKey===fingerprint && ((!retry && ['completed','failed','interrupted'].includes(op.status)) || op.status==='pending')) return;
   const id=`${WORKER_ID}:${Date.now()}:${Math.random()}`;

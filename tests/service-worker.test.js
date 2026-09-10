@@ -146,7 +146,10 @@ function createHarness({
           page.onApply?.({ page, decisions: message.decisions || [] });
           return { ok: true, result: { applied: [], kept: [], reviewRequired: [], unresolved: [], failed: [] } };
         }
-        if (message.type === 'JOB_APP_VALIDATE') return { ok: true, validation: validationFor(tabId, frameId) };
+        if (message.type === 'JOB_APP_VALIDATE') {
+          const validation = await page.onValidate?.({ page, tabId, frameId });
+          return { ok: true, validation: validation || validationFor(tabId, frameId) };
+        }
         if (message.type === 'JOB_APP_CAPTURE') {
           const inspection = inspectionFor(tabId, frameId);
           return {
@@ -1427,6 +1430,74 @@ test('a late on-demand AI suggestion cannot overwrite a changed field destinatio
   const response = await pending;
   assert.equal(response.ok, false);
   assert.match(response.error, /page or supporting evidence changed|destination changed/i);
+  assert.equal(harness.sessionData.applicationRun['7'].generatedSuggestions?.why, undefined);
+});
+
+test('on-demand AI accepts an empty optional job description', async () => {
+  const harness = createHarness({ waitForAI: false, pagesByTab: { 7: { pages: [{
+    page: { title: 'Application', domain: 'example.test' },
+    fields: [{ id: 'why', handle: 'why-handle', label: 'Why are you a good fit?', type: 'textarea', required: true }],
+    actions: [{ id: 'submit', label: 'Submit application', kind: 'submit' }],
+  }] } } });
+  await import(`../src/service-worker.js?empty-job-context=${Date.now()}`);
+  const started = await harness.dispatch({ type: 'JOB_RUN_START', tabId: 7 });
+  harness.localData.aiProvider = 'openai';
+  harness.localData.openaiApiKey = 'synthetic-test-key';
+  globalThis.fetch = async () => ({
+    ok: true, status: 200, statusText: 'OK',
+    json: async () => ({ output_text: JSON.stringify({ suggestions: [], missingContext: 'Add a relevant example.' }) }),
+  });
+
+  const response = await harness.dispatch({
+    type: 'JOB_RUN_GENERATE_SUGGESTIONS',
+    ...draftOrigin(started.run, { id: 'why', handle: 'why-handle' }),
+    jobDescription: '',
+  });
+
+  assert.equal(response.ok, true, response.error);
+  assert.equal(response.run.generatedSuggestions.why.missingContext, 'Add a relevant example.');
+});
+
+test('on-demand AI cannot replace a run updated while validation is pending', async () => {
+  let validationStarted;
+  const validationStartedPromise = new Promise((resolve) => { validationStarted = resolve; });
+  let releaseValidation;
+  const validationReleasePromise = new Promise((resolve) => { releaseValidation = resolve; });
+  let holdValidation = false;
+  const harness = createHarness({ waitForAI: false, pagesByTab: { 7: { pages: [{
+    page: { title: 'Application', domain: 'example.test' },
+    fields: [{ id: 'why', handle: 'why-handle', label: 'Why are you a good fit?', type: 'textarea', required: true }],
+    actions: [{ id: 'submit', label: 'Submit application', kind: 'submit' }],
+    onValidate: async () => {
+      if (holdValidation) {
+        validationStarted();
+        await validationReleasePromise;
+      }
+    },
+  }] } } });
+  await import(`../src/service-worker.js?stale-on-demand-save=${Date.now()}`);
+  const started = await harness.dispatch({ type: 'JOB_RUN_START', tabId: 7 });
+  harness.localData.aiProvider = 'openai';
+  harness.localData.openaiApiKey = 'synthetic-test-key';
+  globalThis.fetch = async () => ({
+    ok: true, status: 200, statusText: 'OK',
+    json: async () => ({ output_text: JSON.stringify({ suggestions: [], missingContext: 'Add a relevant example.' }) }),
+  });
+
+  holdValidation = true;
+  const pending = harness.dispatch({
+    type: 'JOB_RUN_GENERATE_SUGGESTIONS',
+    ...draftOrigin(started.run, { id: 'why', handle: 'why-handle' }),
+  });
+  await validationStartedPromise;
+  const current = harness.sessionData.applicationRun['7'];
+  harness.sessionData.applicationRun['7'] = { ...current, revision: current.revision + 1, waitingFor: 'newer_update' };
+  releaseValidation();
+
+  const response = await pending;
+  assert.equal(response.ok, false);
+  assert.match(response.error, /page or supporting evidence changed/i);
+  assert.equal(harness.sessionData.applicationRun['7'].waitingFor, 'newer_update');
   assert.equal(harness.sessionData.applicationRun['7'].generatedSuggestions?.why, undefined);
 });
 
