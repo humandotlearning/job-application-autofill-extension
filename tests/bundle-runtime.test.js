@@ -55,9 +55,9 @@ test('classic content listener inspects the live focused descriptor and exact ra
   dom.window.close();
 });
 
-test('reinjected bundle installs one inline popup and guards reviewed writes while popup owns focus', async () => {
+test('bundled inline suggestions approve through the live listener once and stay out of page inspection and capture', async () => {
   const bundle = await readFile(new URL('../dist/content.js', import.meta.url), 'utf8');
-  const dom = new JSDOM('<form aria-label="Job application"><label>Name<input id="name"></label></form><form aria-label="Job application"><label>Name<input id="other"></label></form>', {url: 'https://jobs.example.com/apply', pretendToBeVisual: true});
+  const dom = new JSDOM('<form aria-label="Job application"><label>Name<input id="name"></label><label>Existing answer<textarea id="existing">Kept page answer</textarea></label></form>', {url: 'https://jobs.example.com/apply', pretendToBeVisual: true});
   const document = dom.window.document;
   const listeners = []; const messages = [];
   const context = createContext({document, setTimeout, clearTimeout, console, chrome: {runtime: {
@@ -69,27 +69,39 @@ test('reinjected bundle installs one inline popup and guards reviewed writes whi
   }}});
   new Script(bundle).runInContext(context); new Script(bundle).runInContext(context);
   const dispatch = message => new Promise(resolve => listeners[0](message, {}, resolve));
-  const input = document.querySelector('input'); input.focus(); input.click();
+  const input = document.querySelector('#name');
+  const formEvents = [];
+  input.addEventListener('input', () => formEvents.push('input'));
+  input.addEventListener('change', () => formEvents.push('change'));
+  input.focus(); input.click();
   await new Promise(resolve => setTimeout(resolve, 0));
   assert.equal(messages.filter(m => m.type === 'JOB_INLINE_QUERY').length, 1);
   assert.equal(document.querySelectorAll('[data-job-inline-autofill]').length, 1);
+  assert.equal(listeners.length, 1);
+  const inspectedBeforeApply = await dispatch({type: 'JOB_APP_INSPECT'});
+  assert.deepEqual(Array.from(inspectedBeforeApply.inspection.fields, field => field.label), ['Name', 'Existing answer']);
+  assert.doesNotMatch(JSON.stringify(inspectedBeforeApply.inspection), /Application answer suggestions|Saved answers/);
+  const capturedBeforeApply = await dispatch({type: 'JOB_APP_CAPTURE'});
+  assert.deepEqual(Array.from(capturedBeforeApply.records, record => record.question), ['Existing answer']);
   const key = (key, options = {}, target = input) => target.dispatchEvent(new dom.window.KeyboardEvent('keydown', {key, bubbles: true, composed: true, cancelable: true, ...options}));
-  key('ArrowDown', {altKey: true});
+  key('ArrowDown');
+  assert.equal(key('Tab'), false);
+  const acceptanceToken = messages.find(m => m.type === 'JOB_INLINE_ACCEPT').acceptanceToken;
   const state = await dispatch({type: 'JOB_APP_INSPECT_INLINE'});
   assert.equal(state.focusedHandle, state.inspection.fields[0].handle);
-  const root = document.querySelector('[data-job-inline-autofill]').shadowRoot;
-  key('ArrowDown', {}, root.activeElement);
-  [...root.querySelectorAll('button')].find(node => node.textContent === 'Use and save reviewed answer').click();
-  const acceptanceToken = messages.find(m => m.type === 'JOB_INLINE_ACCEPT').acceptanceToken;
   const field = state.inspection.fields[0];
   const decisions = [{fieldId: field.id, handle: field.handle, action: 'fill', approved: true, value: 'Ada', sensitivity: 'safe', confidence: 'high', expectedRawValue: '', expectedEditRevision: 0}];
   const wrongToken = await dispatch({type: 'JOB_APP_APPLY', decisions, approvalGuard: {acceptanceToken: 'invalid'}});
   assert.equal(wrongToken.result.applied.length, 0);
   assert.equal(input.value, '');
-  // A mismatched token must not consume the legitimate pending approval.
+  // A rejected token must not consume the deliberate selection's pending approval.
   const applied = await dispatch({type: 'JOB_APP_APPLY', decisions, approvalGuard: {acceptanceToken}});
   assert.equal(applied.result.applied.length, 1);
   assert.equal(input.value, 'Ada');
+  assert.deepEqual(formEvents, ['input', 'change']);
+  const capturedAfterApply = await dispatch({type: 'JOB_APP_CAPTURE'});
+  assert.deepEqual(Array.from(capturedAfterApply.records, record => record.question), ['Name', 'Existing answer']);
+  assert.doesNotMatch(JSON.stringify(capturedAfterApply.records), /Application answer suggestions|Saved answers/);
   assert.equal(listeners.length, 1);
   dom.window.close();
 });

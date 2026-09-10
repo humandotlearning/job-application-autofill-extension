@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Inline Autofill Synthetic Application</title>
+</head>
+<body>
+  <main>
+    <h1>Synthetic application form</h1>
+    <p>This local fixture contains fake candidate values only. Do not submit it.</p>
+    <form aria-label="Synthetic job application">
+      <label for="full-name">Full name</label>
+      <input id="full-name" name="full_name" type="text" autocomplete="name" required>
+
+      <label for="email">Email address</label>
+      <input id="email" name="email" type="email" autocomplete="email" required>
+
+      <label for="motivation">Why are you interested in this synthetic role? (long motivation answer)</label>
+      <textarea id="motivation" name="motivation" rows="8" minlength="40" maxlength="2000"></textarea>
+
+      <label for="prefilled">Prefilled text</label>
+      <input id="prefilled" name="prefilled" type="text" value="Synthetic prefilled answer">
+
+      <label for="whitespace-only">Whitespace-only text</label>
+      <input id="whitespace-only" name="whitespace_only" type="text" value="   ">
+
+      <label for="disabled">Disabled text</label>
+      <input id="disabled" type="text" value="Disabled synthetic value" disabled>
+
+      <label for="readonly">Read-only text</label>
+      <input id="readonly" type="text" value="Read-only synthetic value" readonly>
+
+      <label for="password">Password</label>
+      <input id="password" type="password" value="fake-password">
+
+      <label for="search">Search</label>
+      <input id="search" type="search">
+
+      <label for="resume">Resume upload</label>
+      <input id="resume" type="file">
+
+      <label for="work-authorisation">Work authorisation</label>
+      <select id="work-authorisation" name="work_authorisation">
+        <option value="">Choose one</option>
+        <option>Authorized to work</option>
+        <option>Requires sponsorship</option>
+      </select>
+
+      <label for="location">Preferred location</label>
+      <button id="location" type="button" role="combobox" aria-expanded="false" aria-controls="location-options">Choose a location</button>
+      <ul id="location-options" role="listbox" hidden>
+        <li role="option">Synthetic City</li>
+      </ul>
+
+      <p>
+        <button id="replace-motivation" type="button">Replace motivation textarea with same ID</button>
+        <button id="change-motivation-constraints" type="button">Require a longer motivation answer</button>
+      </p>
+    </form>
+  </main>
+  <script>
+    window.inlineAutofillFixture = {
+      fakeCandidates: [
+        {question: 'Full name', answer: 'Synthetic Candidate'},
+        {question: 'Why are you interested in this synthetic role?', answer: 'I am interested in the synthetic role because it tests a reviewed draft.'}
+      ]
+    };
+
+    function motivationField() {
+      return document.getElementById('motivation');
+    }
+
+    document.getElementById('replace-motivation').addEventListener('click', () => {
+      const previous = motivationField();
+      const replacement = document.createElement('textarea');
+      replacement.id = previous.id;
+      replacement.name = previous.name;
+      replacement.minLength = previous.minLength;
+      replacement.maxLength = previous.maxLength;
+      replacement.value = previous.value;
+      previous.replaceWith(replacement);
+    });
+
+    document.getElementById('change-motivation-constraints').addEventListener('click', () => {
+      const field = motivationField();
+      field.required = true;
+      field.minLength = 120;
+      field.maxLength = 2400;
+    });
+
+    if (!new URLSearchParams(location.search).has('child')) {
+      const frame = document.createElement('iframe');
+      frame.title = 'Synthetic child application frame';
+      frame.src = 'inline-autofill.html?child=1';
+      document.body.append(frame);
+    }
+  </script>
+</body>
+</html>

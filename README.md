@@ -14,6 +14,14 @@ Compensation current/expected, component, currency, period and scale are protect
 
 The AI planner receives at most 20 locally selected records. Fields already waiting on saved-evidence approval are excluded from planning. A separate suggestion generator can compose drafts; the planner itself supports only evidence-backed copying and constrained transformations.
 
+## Inline suggestions
+
+Inline suggestions work in eligible native text inputs and textareas: `text`, `email`, `tel`, and `url` controls. Focus an empty field to look up local saved answers with no API key, no panel startup, and no whole-page Fill action. Search, password, file, disabled, read-only, select, and custom controls remain outside this inline scope.
+
+Choose a displayed answer deliberately with ArrowDown or by clicking it. Tab then accepts that selected answer through the normal reviewed fill path; ordinary Tab with no selection keeps the page's native navigation. A second Tab continues native navigation after an accepted answer. Alt+ArrowDown moves into popup controls for **Generate answer**, **Edit in panel**, or **Close**; Escape returns focus to the page field.
+
+**Generate answer** is explicit and uses the configured provider only when requested. **Edit in panel** hands the same selected field and draft to the existing side panel; its toolbar fallback remains available when a browser cannot open the side panel directly. Standalone inline use does not activate whole-page learning. Saved-candidate approval retains existing reviewed save behavior. Applying a generated draft does not automatically create reusable facts.
+
 ## Runtime flow
 
 ```mermaid

@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
+import { JSDOM } from 'jsdom';
 
 const root = new URL('../', import.meta.url);
 
@@ -105,6 +106,50 @@ test('build tooling produces a classic content-script bundle', async () => {
   const source = await readFile(new URL('scripts/build.mjs', root), 'utf8');
   assert.match(source, /dist\/content\.js/);
   assert.match(source, /replace/);
+});
+
+test('inline autofill fixture covers supported and intentionally excluded application controls', async () => {
+  const html = await readFile(new URL('tests/fixtures/inline-autofill.html', root), 'utf8');
+  const parent = new JSDOM(html, {
+    url: 'http://127.0.0.1:8765/tests/fixtures/inline-autofill.html',
+    runScripts: 'dangerously',
+  });
+  const {document} = parent.window;
+  assert.ok(document.querySelector('form[aria-label="Synthetic job application"]'));
+  for (const id of ['full-name', 'email', 'motivation', 'prefilled', 'whitespace-only', 'disabled', 'readonly', 'password', 'search', 'resume', 'work-authorisation', 'location']) {
+    assert.ok(document.getElementById(id), `fixture includes ${id}`);
+  }
+  assert.equal(document.querySelector('#work-authorisation').tagName, 'SELECT');
+  assert.equal(document.querySelector('#location').getAttribute('role'), 'combobox');
+  assert.equal(document.querySelectorAll('iframe[src$="?child=1"]').length, 1);
+  document.querySelector('#replace-motivation').click();
+  assert.equal(document.querySelector('#motivation').tagName, 'TEXTAREA');
+  document.querySelector('#change-motivation-constraints').click();
+  assert.equal(document.querySelector('#motivation').required, true);
+  assert.equal(document.querySelector('#motivation').minLength, 120);
+  parent.window.close();
+
+  const child = new JSDOM(html, {
+    url: 'http://127.0.0.1:8765/tests/fixtures/inline-autofill.html?child=1',
+    runScripts: 'dangerously',
+  });
+  assert.equal(child.window.document.querySelectorAll('iframe').length, 0);
+  child.window.close();
+});
+
+test('README documents deliberate inline review without activating whole-page learning', async () => {
+  const readme = await readFile(new URL('README.md', root), 'utf8');
+  assert.match(readme, /Inline suggestions/i);
+  assert.match(readme, /text inputs and textareas/i);
+  assert.match(readme, /no API key/i);
+  assert.match(readme, /Generate answer/i);
+  assert.match(readme, /ArrowDown.*Tab|Tab.*ArrowDown/i);
+  assert.match(readme, /second Tab|next Tab/i);
+  assert.match(readme, /Alt\+ArrowDown/i);
+  assert.match(readme, /Edit in panel/i);
+  assert.match(readme, /standalone inline use does not activate whole-page learning/i);
+  assert.match(readme, /saved-candidate approval retains existing reviewed save behavior/i);
+  assert.match(readme, /generated draft does not automatically create reusable facts/i);
 });
 
 test('content script keeps the message channel open for asynchronous widget selection', async () => {
