@@ -3,12 +3,14 @@ import {
   clickAction,
   collectAnswerRecords,
   inspectDocument,
+  descriptorForElement,
   validateDocument,
   focusField,
   isFinalApplicationSubmit,
   waitForDocumentSettled,
 } from './form-engine.js';
 import { createLearningSession } from './learning.js';
+import { createInlineAutofill } from './inline-autofill.js';
 
 function notifyNavigation() {
   waitForDocumentSettled(document).then(() => chrome.runtime.sendMessage({ type: 'JOB_APP_NAVIGATED' })).catch(() => {});
@@ -17,6 +19,7 @@ function notifyNavigation() {
 const CONTENT_VERSION = 'reliable-review-1';
 if (!globalThis.__jobApplicationAutofillInstalled) {
   globalThis.__jobApplicationAutofillInstalled = CONTENT_VERSION;
+  const inline = createInlineAutofill(document, {send: message => chrome.runtime.sendMessage(message), describe: descriptorForElement});
   const learning = createLearningSession(document, {
     capture: () => collectAnswerRecords(document),
     send: (message) => chrome.runtime.sendMessage(message),
@@ -44,9 +47,18 @@ if (!globalThis.__jobApplicationAutofillInstalled) {
           waitForDocumentSettled(document, { minWaitMs: 150, quietMs: 75 }).then(() => sendResponse({ ok: true, inspection: inspectDocument(document) }))
             .catch((error) => sendResponse({ ok: false, error: error.message }));
           return true;
+        case 'JOB_APP_INSPECT_INLINE': {
+          const inspection = inspectDocument(document);
+          inspection.page.url = document.location.href;
+          const focused = descriptorForElement(document, inline.activeField());
+          sendResponse({ok: true, inspection, focusedFieldId: focused?.id ?? null, focusedHandle: focused?.handle ?? null,
+            rawValue: focused?.rawValue ?? null, editRevision: focused?.editRevision ?? null});
+          break;
+        }
         case 'JOB_APP_APPLY':
           if (message.applicationId) learning.activate(message.applicationId);
-          applyDecisions(document, message.decisions || [], {deadline: message.deadline ?? Infinity})
+          applyDecisions(document, message.decisions || [], {deadline: message.deadline ?? Infinity,
+            beforeFill: args => inline.beforeFill({...args, acceptanceToken: message.approvalGuard?.acceptanceToken})})
             .then((result) => sendResponse({ ok: true, result }))
             .catch((error) => sendResponse({ ok: false, error: error.message }));
           return true;
@@ -57,7 +69,7 @@ if (!globalThis.__jobApplicationAutofillInstalled) {
           sendResponse({ ok: true, validation: validateDocument(document) });
           break;
         case 'JOB_APP_FOCUS':
-          sendResponse({ ok: focusField(document, message.fieldId) });
+          sendResponse({ ok: inline.withExplicitFocus(() => focusField(document, message.fieldId, message.handle)) });
           break;
         case 'JOB_APP_CLICK_NEXT':
           learning.flush().then(() => {

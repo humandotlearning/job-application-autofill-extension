@@ -45,6 +45,9 @@ const elements = {
   auditList: byId('audit-list'),
   status: byId('status'),
   statusDot: byId('status-dot'),
+  inlineFieldCard: byId('inline-field-card'),
+  inlineFieldList: byId('inline-field-list'),
+  closeInlineField: byId('close-inline-field'),
 };
 
 const STATUS_LABELS = {
@@ -57,6 +60,9 @@ const STATUS_LABELS = {
 
 let activeTabId = null;
 let currentRun = null;
+let currentInlineSession = null;
+let inlineLoadRevision = 0;
+let inlineRenderSignature = '';
 let busy = false;
 let saving = false;
 let currentProfile = null;
@@ -65,6 +71,7 @@ const correctionDrafts = new Map();
 const drafts = new Map();
 
 function draftKey(origin, fieldId) {
+  if (origin?.inlineSessionId) return ['inline', origin.tabId, origin.frameId, origin.inlineSessionId, fieldId || ''].join(':');
   return [origin?.applicationId || '', origin?.pageSignature || '', fieldId || ''].join(':');
 }
 
@@ -102,6 +109,7 @@ function updateDraftAnswer(state, answer) {
 function discardStaleDrafts(run) {
   const origin = `${run?.applicationId || ''}:${run?.pageSignature || ''}:`;
   for (const key of drafts.keys()) {
+    if (key.startsWith('inline:')) continue;
     if (!run || !key.startsWith(origin)) drafts.delete(key);
   }
 }
@@ -110,6 +118,7 @@ function fieldOrigin(item) {
   const suggestion = item.suggestion || item.generatedSuggestion || {};
   const field = suggestion.field || {};
   return {
+    ...((item.inlineSessionId || suggestion.inlineSessionId) ? {inlineSessionId: item.inlineSessionId || suggestion.inlineSessionId} : {}),
     tabId: suggestion.tabId ?? activeTabId,
     frameId: suggestion.frameId ?? item.frameId ?? currentRun?.frame?.frameId ?? currentRun?.frameId,
     applicationId: suggestion.applicationId ?? currentRun?.applicationId,
@@ -117,6 +126,66 @@ function fieldOrigin(item) {
     fieldId: field.id ?? item.fieldId,
     handle: field.handle ?? item.handle,
   };
+}
+
+function sendFieldAction(type, origin, payload = {}) {
+  return chrome.runtime.sendMessage({type, ...origin, ...payload});
+}
+
+function renderInlineField(session, {force = false, preserveDrafts = false, preserveContent = false} = {}) {
+  if (!session?.panelRequested || session.tabId !== activeTabId) session = null;
+  const identity = session ? `${session.tabId}:${session.frameId}:${session.sessionId}` : '';
+  for (const key of drafts.keys()) {
+    if (!preserveDrafts && key.startsWith(`inline:${activeTabId}:`) && !key.startsWith(`inline:${identity}:`)) drafts.delete(key);
+  }
+  currentInlineSession = session;
+  elements.inlineFieldCard.hidden = !session;
+  const signature = JSON.stringify(session && [identity, session.suggestions, session.generatedSuggestions, session.panelCandidateId, session.applied]);
+  if (preserveContent) { inlineRenderSignature = signature; return; }
+  if (!force && signature === inlineRenderSignature) return;
+  // Storage notifications can arrive before the action reply; keep the live
+  // editor until its pending operation settles so typing and selection survive.
+  if (!force && session && drafts.get(`inline:${identity}:${session.field.id}`)?.pending) return;
+  const panelState = capturePanelState();
+  inlineRenderSignature = signature;
+  elements.inlineFieldList.replaceChildren();
+  if (!session) return;
+  const field = session.field;
+  const origin = {inlineSessionId: session.sessionId, tabId: session.tabId, frameId: session.frameId,
+    applicationId: session.attachedRun?.applicationId || session.sessionId, pageSignature: session.pageSignature, field};
+  const suggestion = {...session.suggestions?.[field.id], ...origin};
+  const generated = session.generatedSuggestions?.[field.id] || {suggestions: []};
+  const item = {inlineSessionId: session.sessionId, fieldId: field.id, handle: field.handle, label: field.label,
+    suggestion, generatedSuggestion: {...generated, ...origin}};
+  const state = draftFor(fieldOrigin(item), field.id);
+  if (!state.initialized) {
+    state.initialized = true;
+    const saved = suggestion.candidates?.find(candidate => candidate.candidateId === session.panelCandidateId);
+    const candidate = saved || generated.suggestions?.find(candidate => candidate.candidateId === session.panelCandidateId);
+    if (candidate && !isOpaqueIdentifier(candidate.answer)) {
+      state.answer = candidate.answer;
+      state.sourceKey = saved?.sourceKey || null;
+      state.sourceKeys = saved ? sourceKeysForPanelCandidate(saved) : [];
+      state.candidateKind = saved?.kind || null;
+    }
+    state.editing = true;
+  }
+  elements.inlineFieldList.append(itemRow(item, {focus: true, responseHandler: (response, options = {}) => {
+    if (activeTabId !== session.tabId || currentInlineSession?.sessionId !== session.sessionId) return;
+    renderInlineField(response.inlineSession, {force: true, ...options});
+  }}));
+  restorePanelState(panelState);
+}
+
+function sourceKeysForPanelCandidate(candidate) {
+  return Array.isArray(candidate.sourceKeys) ? candidate.sourceKeys : [candidate.sourceKey].filter(Boolean);
+}
+
+async function loadInlineField() {
+  const revision = ++inlineLoadRevision, tabId = activeTabId;
+  if (!tabId) { renderInlineField(null); return; }
+  const response = await chrome.runtime.sendMessage({type: 'JOB_INLINE_PANEL_STATE', tabId});
+  if (revision === inlineLoadRevision && tabId === activeTabId && response?.ok) renderInlineField(response.inlineSession);
 }
 
 function setSaveFeedback(message = '', state = '') {
@@ -366,10 +435,11 @@ function answerNode(answer, detailKey = '') {
 }
 
 function panelDetailKey(origin, kind, suffix = '') {
+  if (origin.inlineSessionId) return [draftKey(origin, origin.fieldId), kind, suffix].join(':');
   return [origin.applicationId || '', origin.pageSignature || '', origin.fieldId || '', kind, suffix].join(':');
 }
 
-function answerWorkspace(item, displayLabel) {
+function answerWorkspace(item, displayLabel, responseHandler = response => renderRun(response.run)) {
   const origin = fieldOrigin(item);
   const state = draftFor(origin, origin.fieldId);
   const workspace = document.createElement('section');
@@ -421,7 +491,7 @@ function answerWorkspace(item, displayLabel) {
     const hasAnswer = Boolean(state.answer.trim()) && !isOpaqueIdentifier(state.answer);
     const pending = Boolean(state.pending);
     textarea.readOnly = Boolean(item.suggestion && !state.editing);
-    textarea.disabled = pending;
+    textarea.disabled = pending && !origin.inlineSessionId;
     prompt.disabled = pending;
     edit.disabled = pending || !state.answer.trim();
     rewrite.disabled = pending || !state.answer.trim();
@@ -455,7 +525,7 @@ function answerWorkspace(item, displayLabel) {
     state.pending = 'rewrite';
     updateControls();
     try {
-      const response = await chrome.runtime.sendMessage({ type: 'JOB_RUN_REWRITE_ANSWER', ...origin,
+      const response = await sendFieldAction('JOB_RUN_REWRITE_ANSWER', origin, {
         fieldId: origin.fieldId, draft: requestDraft, sourceKey: state.sourceKey, sourceKeys: state.sourceKeys,
         question: displayLabel, instruction });
       if (!response?.ok || typeof response.answer !== 'string') throw new Error(response?.error || 'Could not rewrite the answer.');
@@ -464,8 +534,10 @@ function answerWorkspace(item, displayLabel) {
         return;
       }
       updateDraftAnswer(state, response.answer);
-      state.editing = false;
+      state.editing = Boolean(origin.inlineSessionId);
       textarea.value = state.answer;
+      state.pending = null;
+      if (origin.inlineSessionId) responseHandler(response);
       setStatus('Draft rewritten. Review or edit it before sending it to the form.');
     } catch (error) { setStatus(error.message, 'error'); }
     finally {
@@ -482,16 +554,17 @@ function answerWorkspace(item, displayLabel) {
     updateControls();
     try {
       const type = candidateBacked ? 'JOB_RUN_APPROVE_SUGGESTION' : 'JOB_RUN_APPLY_DRAFT';
-      const response = await chrome.runtime.sendMessage({ type, ...origin, fieldId: origin.fieldId, answer,
+      const response = await sendFieldAction(type, origin, { fieldId: origin.fieldId, answer,
         ...(candidateBacked ? {
           ...(state.sourceKey ? { sourceKey: state.sourceKey } : {}),
           ...(state.sourceKeys.length ? { sourceKeys: state.sourceKeys } : {}),
           ...(state.candidateKind ? { candidateKind: state.candidateKind } : {}),
         } : {}) });
       if (!response?.ok) throw new Error(response?.error || 'Could not send the answer to the form.');
-      if (!response.run) throw new Error('Could not confirm the updated application state. Your draft was kept.');
+      if (origin.inlineSessionId ? response.inlineSession?.sessionId !== origin.inlineSessionId : !response.run) throw new Error('Could not confirm the updated application state. Your draft was kept.');
       if (state.revision === requestRevision) clearDraft(origin, origin.fieldId);
-      renderRun(response.run);
+      state.pending = null;
+      responseHandler(response);
       if (state.revision !== requestRevision) {
         setStatus('The form received the earlier draft. Your newer edit was kept.');
       } else {
@@ -510,7 +583,7 @@ function answerWorkspace(item, displayLabel) {
   return { workspace, state, origin, updateControls, applyAnswer };
 }
 
-function itemRow(item, { focus = false, detail = '' } = {}) {
+function itemRow(item, { focus = false, detail = '', responseHandler = response => renderRun(response.run) } = {}) {
   const row = document.createElement('div');
   row.className = 'result-item';
   const content = document.createElement('div');
@@ -571,10 +644,17 @@ function itemRow(item, { focus = false, detail = '' } = {}) {
     button.className = 'inline-action';
     button.dataset.fieldId = item.fieldId;
     button.textContent = 'Show on page';
+    if (origin.inlineSessionId) button.addEventListener('click', async () => {
+      try {
+        const response = await sendFieldAction('JOB_RUN_FOCUS_FIELD', origin);
+        if (!response?.ok) throw new Error(response?.error || 'Could not show this field on the page.');
+        setStatus('Showing the matching field on the application page.');
+      } catch (error) { setStatus(error.message, 'error'); }
+    });
     content.append(button);
   }
   const workspace = focus && item.fieldId && (!onlyOpaqueSuggestions || hasReadableGeneratedDraft)
-    ? answerWorkspace(item, displayLabel)
+    ? answerWorkspace(item, displayLabel, responseHandler)
     : null;
   if (workspace) content.append(workspace.workspace);
   if (workspace) {
@@ -589,9 +669,11 @@ function itemRow(item, { focus = false, detail = '' } = {}) {
     const results = document.createElement('div');
     button.addEventListener('click', async () => {
       button.disabled = true;
+      if (origin.inlineSessionId) workspace.state.pending = 'search';
       try {
-        const response = await chrome.runtime.sendMessage({ type: 'JOB_RUN_SEARCH_ANSWERS', ...origin, fieldId: origin.fieldId, query: workspace.state.searchQuery.trim() });
+        const response = await sendFieldAction('JOB_RUN_SEARCH_ANSWERS', origin, { fieldId: origin.fieldId, query: workspace.state.searchQuery.trim() });
         if (!response?.ok) throw new Error(response?.error || 'Could not search saved answers.');
+        if (origin.inlineSessionId) responseHandler(response, {preserveContent: true});
         results.replaceChildren();
         for (const candidate of response.candidates || []) {
           if (isOpaqueIdentifier(candidate.answer)) continue;
@@ -604,7 +686,11 @@ function itemRow(item, { focus = false, detail = '' } = {}) {
           results.append(choice);
         }
         if (!results.children.length) results.textContent = 'No saved answers found.';
-      } catch (error) { setStatus(error.message, 'error'); } finally { button.disabled = false; }
+      } catch (error) { setStatus(error.message, 'error'); } finally {
+        if (workspace.state.pending === 'search') workspace.state.pending = null;
+        button.disabled = false;
+        workspace.updateControls();
+      }
     });
     query.addEventListener('input', () => { workspace.state.searchQuery = query.value; });
     search.append(query, button, results); content.append(search);
@@ -675,10 +761,11 @@ function itemRow(item, { focus = false, detail = '' } = {}) {
       workspace.updateControls();
       regenerate.disabled = true;
       try {
-        const response = await chrome.runtime.sendMessage({ type: 'JOB_RUN_GENERATE_SUGGESTIONS', ...workspace.origin, jobDescription });
-        if (!response?.ok || !response.run) throw new Error(response?.error || 'Could not generate answer suggestions.');
-        if (canRenderActionResponse(response.run, actionRevision)) {
-          renderRun(response.run);
+        const response = await sendFieldAction('JOB_RUN_GENERATE_SUGGESTIONS', workspace.origin, { jobDescription });
+        if (!response?.ok || (origin.inlineSessionId ? !response.inlineSession : !response.run)) throw new Error(response?.error || 'Could not generate answer suggestions.');
+        if (origin.inlineSessionId || canRenderActionResponse(response.run, actionRevision)) {
+          workspace.state.pending = null;
+          responseHandler(response);
           setStatus('New suggestions are ready for review.');
         } else setStatus('The page changed while suggestions were prepared. Check the page again.', 'error');
       } catch (error) { setStatus(error.message, 'error'); }
@@ -769,7 +856,7 @@ function itemRow(item, { focus = false, detail = '' } = {}) {
       if (reason.textContent) evidence.append(reason);
       evidence.append(choose, editCandidate);
       const sourceKeys = Array.isArray(candidate.sourceKeys) ? candidate.sourceKeys : [candidate.sourceKey].filter(Boolean);
-      if (candidate.kind !== 'draft' && candidate.kind !== 'planner' && sourceKeys.length === 1) {
+      if (!origin.inlineSessionId && candidate.kind !== 'draft' && candidate.kind !== 'planner' && sourceKeys.length === 1) {
         const dismiss = document.createElement('button');
         dismiss.type = 'button';
         dismiss.dataset.dismissSavedAnswer = 'true';
@@ -1118,6 +1205,7 @@ async function refresh() {
     const response = await chrome.runtime.sendMessage({ type: 'JOB_RUN_STATE', tabId: activeTabId });
     if (response?.ok) renderRun(response.run);
   } else renderRun(null);
+  await loadInlineField();
 }
 
 async function exportDatasource() {
@@ -1223,6 +1311,16 @@ elements.importDatasourceButton.addEventListener('click', () => elements.importD
 elements.importDatasource.addEventListener('change', () => importDatasource(elements.importDatasource.files?.[0]));
 elements.primaryAction.addEventListener('click', runPrimaryAction);
 elements.checkPage.addEventListener('click', () => sendRunAction('JOB_RUN_VALIDATE_PAGE'));
+elements.closeInlineField.addEventListener('click', async () => {
+  const session = currentInlineSession;
+  if (!session) return;
+  ++inlineLoadRevision;
+  renderInlineField(null);
+  try {
+    const response = await chrome.runtime.sendMessage({type: 'JOB_INLINE_PANEL_STATE', tabId: session.tabId, frameId: session.frameId, inlineSessionId: session.sessionId, close: true});
+    if (!response?.ok) throw new Error(response?.error || 'Could not close the selected field.');
+  } catch (error) { setStatus(error.message, 'error'); }
+});
 elements.retryAi.addEventListener('click', () => sendRunAction('JOB_RUN_RETRY_AI'));
 elements.advancePage.addEventListener('click', () => sendRunAction('JOB_RUN_ADVANCE_PAGE'));
 elements.saveAnswers.addEventListener('click', () => sendRunAction('JOB_RUN_SAVE_ANSWERS'));
@@ -1243,11 +1341,13 @@ chrome.storage.onChanged.addListener((changes, area) => {
   if (area === 'local' && changes.coverMessages) elements.coverMessageCount.textContent = `${(changes.coverMessages.newValue || []).length} cover messages`;
   if (area === 'local' && changes.autoAdvancePages) elements.autoAdvance.checked = Boolean(changes.autoAdvancePages.newValue);
   if (area === 'session' && changes.applicationRun && activeTabId) renderRun(changes.applicationRun.newValue?.[String(activeTabId)] || null);
+  if (area === 'session' && changes.inlineFieldSessions) loadInlineField().catch(error => setStatus(error.message, 'error'));
 });
 if (chrome.tabs?.onActivated?.addListener) {
   chrome.tabs.onActivated.addListener(({ tabId }) => {
     setSaveFeedback();
     activeTabId = tabId;
+    renderInlineField(null, {preserveDrafts: true});
     refresh().catch((error) => setStatus(error.message, 'error'));
   });
 }

@@ -3,7 +3,7 @@ import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
-const sources = ['src/concepts.js', 'src/core.js', 'src/form-engine.js', 'src/learning.js', 'src/content.js'];
+const sources = ['src/concepts.js', 'src/core.js', 'src/form-engine.js', 'src/learning.js', 'src/inline-autofill.js', 'src/content.js'];
 
 function convertModuleToClassicScript(source) {
   return source

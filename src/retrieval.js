@@ -111,6 +111,17 @@ export function retrieveEvidence(field, records = [], { limit = 3 } = {}) {
   return searchEvidence(field, records, { limit: Math.min(3, limit) });
 }
 
+export function savedFieldCandidates(field, records, draftRecords = []) {
+  const candidates = retrieveEvidence(field, records);
+  for (const candidate of retrieveEvidence(field, draftRecords)) {
+    if (!candidates.some(saved => saved.answer === candidate.answer)) {
+      candidates.push({...candidate, kind: 'draft',
+        reason: 'Previously entered, not yet saved for reuse — explicit approval required'});
+    }
+  }
+  return candidates.slice(0, 3);
+}
+
 export function searchEvidence(field, records = [], { limit = 20 } = {}) {
   const seen = new Set();
   return rankEvidence(field, records, { limit: records.length }).filter(item => {
