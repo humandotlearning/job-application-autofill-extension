@@ -13,6 +13,7 @@ import {
 } from './datasource.js';
 import { exactVisibleChoice, planDeterministicFill, requiresVisibleChoiceMatch } from './form-engine.js';
 import { buildLearningCandidates, callLearningReviewer } from './learning-review.js';
+import { hostnameFromUrl, isHostnameDisabled, isSupportedSiteUrl, normalizeHostname, normalizeHostnames } from './site-control.js';
 
 const RUN_STORAGE_KEY = 'applicationRun';
 const MAX_PAGES = 20;
@@ -40,6 +41,111 @@ const APPLICATION_TITLE_PATTERN = /\b(?:apply|application|candidate|profile|resu
 const UTILITY_FRAME_PATTERN = /\b(?:search|cookie|job[\s-]?alerts?|talent[\s-]?communities?|subscribe|feedback)\b/i;
 const NO_APPLICATION_FRAME_REASON = 'No unique application form frame was found. Complete the application manually.';
 const AMBIGUOUS_APPLICATION_FRAME_REASON = 'More than one application form frame was found. Complete the application manually.';
+const DISABLED_SITE_REASON = 'The extension is disabled on this site. Re-enable it from the side panel to use autofill.';
+const SITE_SETTINGS_KEY = 'disabledHostnames';
+const siteRevisions = new Map();
+
+function siteRevision(tabId) {
+  return siteRevisions.get(tabId) || 0;
+}
+
+function bumpSiteRevision(tabId) {
+  const next = siteRevision(tabId) + 1;
+  siteRevisions.set(tabId, next);
+  return next;
+}
+
+async function getDisabledHostnames() {
+  const stored = await chrome.storage.local.get({ [SITE_SETTINGS_KEY]: [] });
+  return normalizeHostnames(stored[SITE_SETTINGS_KEY]);
+}
+
+async function tabForSite(tabId, tabHint = null) {
+  if (tabHint?.url) return tabHint;
+  if (typeof chrome.tabs?.get === 'function') {
+    try { return await chrome.tabs.get(tabId); } catch { /* tab may have closed */ }
+  }
+  return null;
+}
+
+async function siteStateForTab(tabId, tabHint = null) {
+  const tab = await tabForSite(tabId, tabHint);
+  const url = typeof tab?.url === 'string' ? tab.url : '';
+  const hostname = isSupportedSiteUrl(url) ? hostnameFromUrl(url) : '';
+  const disabledHostnames = await getDisabledHostnames();
+  return {
+    hostname,
+    supported: Boolean(hostname),
+    disabled: Boolean(hostname && isHostnameDisabled(hostname, disabledHostnames)),
+    disabledHostnames,
+  };
+}
+
+function siteStateReply(state) {
+  return {
+    hostname: state.hostname,
+    supported: state.supported,
+    disabled: state.disabled,
+    disabledHostnames: state.disabledHostnames,
+    enabled: state.supported && !state.disabled,
+  };
+}
+
+async function assertTabSiteEnabled(tabId, expectedRevision = null) {
+  const tabHint = expectedRevision && typeof expectedRevision === 'object' ? expectedRevision : null;
+  if (tabHint) expectedRevision = null;
+  if (expectedRevision !== null && siteRevision(tabId) !== expectedRevision) throw new Error(DISABLED_SITE_REASON);
+  const state = await siteStateForTab(tabId, tabHint);
+  if (!state.supported || state.disabled) throw new Error(DISABLED_SITE_REASON);
+  if (expectedRevision !== null && siteRevision(tabId) !== expectedRevision) throw new Error(DISABLED_SITE_REASON);
+  return state;
+}
+
+function assertRunSiteAuthority(tabId, run) {
+  if (run?.siteRevision != null && siteRevision(tabId) !== run.siteRevision) throw new Error(DISABLED_SITE_REASON);
+}
+
+function siteAuthority(tabId) {
+  const revision = siteRevision(tabId);
+  return () => {
+    if (siteRevision(tabId) !== revision) throw new Error(DISABLED_SITE_REASON);
+  };
+}
+
+async function notifySiteState(tabId, enabled) {
+  let frames = [{ frameId: 0 }];
+  try { frames = await enumerateFrames(tabId); } catch { /* inaccessible tabs have no content listener to notify */ }
+  await Promise.allSettled(frames.map(({ frameId }) => chrome.tabs.sendMessage(
+    tabId,
+    { type: 'JOB_APP_SITE_STATE_CHANGED', enabled },
+    { frameId },
+  )));
+}
+
+async function updateSiteDisabled(tabId, disabled) {
+  const state = await siteStateForTab(tabId);
+  if (!state.supported) throw new Error('Site controls are unavailable on this browser page.');
+  const hostname = normalizeHostname(state.hostname);
+  const disabledHostnames = normalizeHostnames(state.disabledHostnames);
+  const next = disabled
+    ? normalizeHostnames([...disabledHostnames, hostname])
+    : disabledHostnames.filter((item) => item !== hostname);
+  bumpSiteRevision(tabId);
+  await chrome.storage.local.set({ [SITE_SETTINGS_KEY]: next });
+  await invalidateInlineSessions(tabId);
+  await removeRun(tabId);
+  await notifySiteState(tabId, !disabled);
+  return siteStateReply({ ...state, disabled, disabledHostnames: next });
+}
+
+async function removeDisabledHostname(hostname) {
+  const normalized = normalizeHostname(hostname);
+  if (!normalized) throw new Error('A valid hostname is required.');
+  const current = await getDisabledHostnames();
+  const next = current.filter((item) => item !== normalized);
+  await chrome.storage.local.set({ [SITE_SETTINGS_KEY]: next });
+  return next;
+}
 
 function requiredBoundedText(value, label, maxLength) {
   if (typeof value !== 'string') throw new Error(`${label} must be text`);
@@ -56,6 +162,7 @@ async function getRuns() {
 async function getRun(tabId) {
   const runs = await getRuns();
   const run = runs[String(tabId)] || null;
+  if (run?.siteRevision != null && !siteRevisions.has(tabId)) siteRevisions.set(tabId, run.siteRevision);
   if (run && ((run.status === 'running' && run.workerId !== WORKER_ID) || Object.values(run.aiOperations || {}).some(op => op.status === 'pending' && op.workerId !== WORKER_ID))) {
     for (const op of Object.values(run.aiOperations || {})) if (op.status === 'pending' && op.workerId !== WORKER_ID) op.status = 'interrupted';
     run.status = 'waiting_user'; run.progress = 'ready'; run.waitingFor = 'operation_interrupted'; run.nextAction = null;
@@ -66,8 +173,11 @@ async function getRun(tabId) {
 }
 
 async function saveRun(run) {
+  if (run?.siteRevision != null && siteRevision(run.tabId) !== run.siteRevision) throw new Error(DISABLED_SITE_REASON);
   runWriteChain = runWriteChain.catch(() => {}).then(async () => {
+    if (run?.siteRevision != null && siteRevision(run.tabId) !== run.siteRevision) throw new Error(DISABLED_SITE_REASON);
     const runs = await getRuns();
+    if (run?.siteRevision != null && siteRevision(run.tabId) !== run.siteRevision) throw new Error(DISABLED_SITE_REASON);
     runs[String(run.tabId)] = { ...run, revision: (runs[String(run.tabId)]?.revision || 0) + 1, workerId: WORKER_ID, updatedAt: new Date().toISOString() };
     await chrome.storage.session.set({ [RUN_STORAGE_KEY]: runs });
     return runs[String(run.tabId)];
@@ -205,10 +315,13 @@ function saveStats(before = [], after = [], records = []) {
   return { persisted, updated, unchanged, unresolved, savedCount: persisted + updated };
 }
 
-async function persistLearnedRecords(records = [], run = null, { promote = false } = {}) {
+async function persistLearnedRecords(records = [], run = null, { promote = false, assertAuthority = null } = {}) {
+  assertAuthority?.();
   const now = new Date().toISOString();
   datasourceWriteChain = datasourceWriteChain.catch(() => {}).then(async () => {
+    assertAuthority?.();
     const current = await getDatasource();
+    assertAuthority?.();
     let learned = records;
     let changedRecords = null;
     if (run) {
@@ -227,6 +340,7 @@ async function persistLearnedRecords(records = [], run = null, { promote = false
         return !baseline || baseline.answer !== record.answer || baseline.completed !== record.completed || baseline.provenance !== record.provenance;
       });
       drafts[id] = { applicationId: run.startedAt, tabId: run.tabId, frame: run.frame, updatedAt: now, records: upsertAnswerRecords(previous, learned, now) };
+      assertAuthority?.();
       await chrome.storage.local.set({ applicationDrafts: drafts });
     }
     const scoped = scopeEmploymentRecords(promote ? learned : (changedRecords || learned), current.profile);
@@ -239,6 +353,7 @@ async function persistLearnedRecords(records = [], run = null, { promote = false
     const answerRecords = promote
       ? mergeLearnedAnswers(current.answerRecords, promotable, now, { confirm: true })
       : current.answerRecords;
+    assertAuthority?.();
     const state = await saveDatasource({
       ...current,
       answerRecords,
@@ -411,8 +526,10 @@ async function enumerateFrames(tabId) {
   return frames.length ? frames : [{ frameId: 0, title: '', pathname: '' }];
 }
 
-async function ensureContentScripts(tabId, frameIds) {
+async function ensureContentScripts(tabId, frameIds, assertAuthority) {
   if (!frameIds.length) return;
+  await assertTabSiteEnabled(tabId);
+  assertAuthority?.();
   try {
     await chrome.scripting.executeScript({
       target: { tabId, frameIds },
@@ -429,16 +546,20 @@ async function ensureContentScripts(tabId, frameIds) {
 async function sendToFrame(tabId, frameId, message, assertAuthority) {
   const targetFrameId = Number.isInteger(frameId) ? frameId : 0;
   assertAuthority?.();
+  let response;
   try {
-    return await chrome.tabs.sendMessage(tabId, message, { frameId: targetFrameId });
+    response = await chrome.tabs.sendMessage(tabId, message, { frameId: targetFrameId });
   } catch {
+    assertAuthority?.();
     await chrome.scripting.executeScript({
       target: { tabId, frameIds: [targetFrameId] },
       files: ['dist/content.js'],
     });
     assertAuthority?.();
-    return chrome.tabs.sendMessage(tabId, message, { frameId: targetFrameId });
+    response = await chrome.tabs.sendMessage(tabId, message, { frameId: targetFrameId });
   }
+  assertAuthority?.();
+  return response;
 }
 
 function frameInspectionText(context, inspection) {
@@ -465,7 +586,9 @@ function scoreApplicationFrame(context, inspection) {
   return { score, eligible };
 }
 
-async function discoverApplicationFrame(tabId) {
+async function discoverApplicationFrame(tabId, assertAuthority = null) {
+  await assertTabSiteEnabled(tabId);
+  assertAuthority?.();
   let contexts;
   try {
     contexts = await enumerateFrames(tabId);
@@ -475,10 +598,10 @@ async function discoverApplicationFrame(tabId) {
       reason: NO_APPLICATION_FRAME_REASON,
     };
   }
-  await ensureContentScripts(tabId, contexts.map((context) => context.frameId));
+  await ensureContentScripts(tabId, contexts.map((context) => context.frameId), assertAuthority);
   const candidates = (await Promise.all(contexts.map(async (context) => {
     try {
-      const response = await sendToFrame(tabId, context.frameId, { type: 'JOB_APP_INSPECT' });
+      const response = await sendToFrame(tabId, context.frameId, { type: 'JOB_APP_INSPECT' }, assertAuthority);
       if (!response?.ok || !response.inspection) return null;
       const scoring = scoreApplicationFrame(context, response.inspection);
       return { ...context, inspection: response.inspection, ...scoring };
@@ -533,12 +656,13 @@ function frameRoutingError(discovery, cause) {
 
 async function sendToApplicationFrame(tabId, run, message) {
   const frameId = selectedFrame(run);
+  const assertAuthority = () => assertRunSiteAuthority(tabId, run);
   try {
-    return await sendToFrame(tabId, frameId, message);
+    return await sendToFrame(tabId, frameId, message, assertAuthority);
   } catch (error) {
     let discovery;
     try {
-      discovery = await discoverApplicationFrame(tabId);
+      discovery = await discoverApplicationFrame(tabId, assertAuthority);
     } catch {
       discovery = {
         errorCode: 'no_application_frame',
@@ -547,7 +671,7 @@ async function sendToApplicationFrame(tabId, run, message) {
     }
     if (discovery.errorCode) throw frameRoutingError(discovery, error);
     updateSelectedFrame(run, discovery);
-    return sendToFrame(tabId, discovery.frameId, message);
+    return sendToFrame(tabId, discovery.frameId, message, assertAuthority);
   }
 }
 
@@ -570,6 +694,7 @@ function nowRun(tabId) {
   const startedAt = new Date().toISOString();
   return {
     tabId,
+    siteRevision: siteRevision(tabId),
     status: 'running',
     pageNumber: 1,
     pages: [],
@@ -715,9 +840,10 @@ function pageSnapshot(inspection, pageNumber, pageRecords) {
   };
 }
 
-async function recordPageCapture(run, inspection, pageRecords = [], { promote = false } = {}) {
+async function recordPageCapture(run, inspection, pageRecords = [], { promote = false, assertAuthority = null } = {}) {
   pageRecords = pageRecords.map(record => ({ ...record, pageNumber: run.pageNumber }));
-  const saved = await persistLearnedRecords(pageRecords, run, { promote });
+  const saved = await persistLearnedRecords(pageRecords, run, { promote, assertAuthority });
+  assertAuthority?.();
   run.answers = upsertAnswerRecords(run.answers, pageRecords);
   run.pages = [
     ...run.pages.filter((page) => page.pageNumber !== run.pageNumber),
@@ -729,7 +855,7 @@ async function recordPageCapture(run, inspection, pageRecords = [], { promote = 
 
 async function capturePage(tabId, run, inspection) {
   const response = await sendToApplicationFrame(tabId, run, { type: 'JOB_APP_CAPTURE' });
-  const captured = await recordPageCapture(run, inspection, response?.records || []);
+  const captured = await recordPageCapture(run, inspection, response?.records || [], { assertAuthority: () => assertRunSiteAuthority(tabId, run) });
   return captured.run;
 }
 
@@ -921,13 +1047,15 @@ async function approveSuggestion(message) {
       || message.pageSignature !== run.pageSignature || message.handle !== suggestion.field.handle || !message.handle) throw new Error('Stale suggestion; check the page again');
     await reviewedCandidate(suggestion, message);
     // Never rediscover/reroute an approval into another frame.
-    const inspected = await sendToFrame(tabId, message.frameId, { type: 'JOB_APP_INSPECT' });
+    const authority = () => assertRunSiteAuthority(tabId, run);
+    const inspected = await sendToFrame(tabId, message.frameId, { type: 'JOB_APP_INSPECT' }, authority);
     const field = resolveEmploymentFields(run, inspected.inspection?.fields || [], (await getDatasource()).profile).find(item => item.id === fieldId);
     if (!field || field.handle !== message.handle || field.currentValue || JSON.stringify(field.options) !== JSON.stringify(suggestion.field.options)
       || field.label !== suggestion.field.label || field.type !== suggestion.field.type
       || pageSignature(inspected.inspection, run.frame) !== message.pageSignature) throw new Error('Destination changed; check the page again');
     const applied = await applyReviewedField({
       tabId, frameId: message.frameId, applicationId: run.startedAt, field, suggestion, message, approvalGuard: null,
+      assertAuthority: () => assertRunSiteAuthority(tabId, run),
     });
     delete run.suggestions[fieldId];
     categorizeRun(run, applied.inspection, applied.validation);
@@ -1024,8 +1152,8 @@ function compatibleInlineRun(run, inspection, field, frameId) {
   return run;
 }
 
-async function inspectInlineDestination(origin, {fieldId, handle, requireFocus = true}) {
-  const response = await sendToFrame(origin.tabId, origin.frameId, {type: 'JOB_APP_INSPECT_INLINE', fieldId, handle, requireFocus});
+async function inspectInlineDestination(origin, {fieldId, handle, requireFocus = true}, assertAuthority = null) {
+  const response = await sendToFrame(origin.tabId, origin.frameId, {type: 'JOB_APP_INSPECT_INLINE', fieldId, handle, requireFocus}, assertAuthority);
   const inspection = response?.inspection;
   const field = inspection?.fields?.find(field => field.id === fieldId && field.handle === handle);
   if (!response?.ok || !field || inspection.page?.url !== origin.url
@@ -1051,16 +1179,17 @@ async function scopeInlineField(origin, inspection, field) {
 
 async function queryInlineField(message, sender) {
   const origin = inlineOrigin(message, sender);
+  const authority = siteAuthority(origin.tabId);
   if (processingTabs.has(origin.tabId) || saveLocks.has(origin.tabId)) throw new Error('Fill is in progress');
   // Reserve first: a later focus query or navigation must revoke this operation even while inspection awaits.
   const reserved = await mutateInlineSession(origin.tabId, origin.frameId, null, () => ({...origin,
     sessionId: crypto.randomUUID(), field: null, suggestions: {}, generatedSuggestions: {},
     generation: {status: 'idle', requestId: crypto.randomUUID()}, attachedRun: null, panelRequested: false}));
-  const {inspection, field} = await inspectInlineDestination(origin, message);
+  const {inspection, field} = await inspectInlineDestination(origin, message, authority);
   const scoped = await scopeInlineField(origin, inspection, field);
   const [records, drafts] = await Promise.all([getRecords(), draftEvidenceRecords()]);
   const candidates = scoped.field.entityUnresolved ? [] : savedFieldCandidates(scoped.field, records, drafts);
-  const current = await inspectInlineDestination(origin, message);
+  const current = await inspectInlineDestination(origin, message, authority);
   if (pageSignature(current.inspection) !== pageSignature(inspection) || !sameFieldSnapshot(current.field, aiFieldSnapshot(field))
     || current.field.editRevision !== field.editRevision) throw new Error('Inline destination changed. Focus the field again.');
   const session = await mutateInlineSession(origin.tabId, origin.frameId, reserved.sessionId, currentSession => {
@@ -1075,13 +1204,14 @@ async function queryInlineField(message, sender) {
 
 async function guardInlineField(message, sender, {requireFocus = true} = {}) {
   const origin = inlineOrigin(message, sender);
+  const authority = siteAuthority(origin.tabId);
   const session = await writeInlineSessions(sessions => sessions[`${origin.tabId}:${origin.frameId}`]);
   if (!session || session.sessionId !== message.sessionId || !session.field
     || Object.keys(origin).some(key => session[key] !== origin[key])) throw new Error('Inline session expired or destination changed');
   const destination = {fieldId: session.field.id, handle: session.field.handle, pageSignature: session.pageSignature,
     applicationId: session.attachedRun?.applicationId || session.sessionId};
   if (Object.keys(destination).some(key => Object.hasOwn(message, key) && message[key] !== destination[key])) throw new Error('Inline destination origin does not match the session');
-  const {inspection, field} = await inspectInlineDestination(origin, {fieldId: session.field.id, handle: session.field.handle, requireFocus});
+  const {inspection, field} = await inspectInlineDestination(origin, {fieldId: session.field.id, handle: session.field.handle, requireFocus}, authority);
   if (pageSignature(inspection) !== session.pageSignature || !sameFieldSnapshot(field, aiFieldSnapshot(session.field))
     || field.editRevision !== session.field.editRevision || field.rawValue !== session.field.rawValue) throw new Error('Inline destination changed');
   const scoped = await scopeInlineField(origin, inspection, field);
@@ -1091,7 +1221,8 @@ async function guardInlineField(message, sender, {requireFocus = true} = {}) {
   if (session.attachedRun && JSON.stringify(scoped.attachedRun) !== JSON.stringify(session.attachedRun)) throw new Error('The application changed. Focus the field again.');
   const latest = await writeInlineSessions(sessions => sessions[`${origin.tabId}:${origin.frameId}`]);
   if (!latest || latest.sessionId !== session.sessionId || latest.revision !== session.revision) throw new Error('Inline session changed');
-  return {session: latest, inspection, field: scoped.field};
+  authority();
+  return {session: latest, inspection, field: scoped.field, authority};
 }
 
 const PANEL_OPEN_FALLBACK = 'Open the extension toolbar button to continue editing';
@@ -1141,6 +1272,7 @@ async function guardedPanelInline(message) {
   if (!session?.panelRequested || session.sessionId !== message.inlineSessionId) throw new Error('Inline panel session expired or closed');
   const [tab] = await chrome.tabs.query({active: true, currentWindow: true});
   if (tab?.id !== session.tabId) throw new Error('The selected tab changed');
+  await assertTabSiteEnabled(session.tabId, tab);
   if (processingTabs.has(session.tabId) || saveLocks.has(session.tabId)) throw new Error('Fill is in progress');
   const sender = {id: chrome.runtime.id, tab: {id: session.tabId}, frameId: session.frameId, documentId: session.documentId, url: session.url};
   const request = {...message, sessionId: session.sessionId, requestId: crypto.randomUUID()};
@@ -1150,9 +1282,9 @@ async function guardedPanelInline(message) {
 
 async function inlinePanelAction(message) {
   const context = await guardedPanelInline(message);
-  const {session, field, sender, request} = context;
+  const {session, field, sender, request, authority} = context;
   if (message.type === 'JOB_RUN_FOCUS_FIELD') {
-    const response = await sendToFrame(session.tabId, session.frameId, {type: 'JOB_APP_FOCUS', fieldId: field.id, handle: field.handle});
+    const response = await sendToFrame(session.tabId, session.frameId, {type: 'JOB_APP_FOCUS', fieldId: field.id, handle: field.handle}, authority);
     if (!response?.ok) throw new Error(response?.error || 'Could not show this field on the page');
     return {ok: true, inlineSession: session};
   }
@@ -1363,6 +1495,7 @@ async function guardedDraftField(message, { allowSaveLock = false } = {}) {
   if (!Number.isInteger(tabId) || !fieldId || typeof fieldId !== 'string') throw new Error('The application field is unavailable');
   if (processingTabs.has(tabId) || (!allowSaveLock && saveLocks.has(tabId))) throw new Error('Application is busy or unavailable');
   const run = await getRun(tabId);
+  const authority = siteAuthority(tabId);
   const listed = listedRunField(run, fieldId);
   const suggestion = run?.suggestions?.[fieldId] || null;
   if (!run || !listed || !SAVABLE_RUN_STATUSES.has(run.status)
@@ -1371,7 +1504,7 @@ async function guardedDraftField(message, { allowSaveLock = false } = {}) {
     throw new Error('Stale draft; check the page again');
   }
   // Never rediscover/reroute a draft operation into another frame.
-  const inspected = await sendToFrame(tabId, message.frameId, { type: 'JOB_APP_INSPECT' });
+  const inspected = await sendToFrame(tabId, message.frameId, { type: 'JOB_APP_INSPECT' }, authority);
   const field = inspected.inspection?.fields.find((item) => item.id === fieldId);
   if (!field || field.handle !== message.handle
     || !sameFieldSnapshot(field, listed)
@@ -1387,12 +1520,12 @@ async function guardedDraftField(message, { allowSaveLock = false } = {}) {
     throw new Error('Destination changed; check the page again');
   }
   if (field.currentValue) {
-    const validation = await sendToFrame(tabId, message.frameId, { type: 'JOB_APP_VALIDATE' });
+    const validation = await sendToFrame(tabId, message.frameId, { type: 'JOB_APP_VALIDATE' }, authority);
     if (!validation?.validation?.invalid?.some((item) => item.fieldId === fieldId)) {
       throw new Error('Destination changed; check the page again');
     }
   }
-  return { run, listed, suggestion, field };
+  return { run, listed, suggestion, field, authority };
 }
 
 function sourceKeysFromMessage(message = {}) {
@@ -1483,7 +1616,8 @@ async function applyReviewedField({ tabId, frameId, applicationId, field, sugges
     }],
   }, assertAuthority);
   if (!result?.ok) throw new Error(result?.error || 'Could not apply the answer');
-  const verified = await sendToFrame(tabId, frameId, { type: 'JOB_APP_INSPECT' });
+  assertAuthority?.();
+  const verified = await sendToFrame(tabId, frameId, { type: 'JOB_APP_INSPECT' }, assertAuthority);
   if (verified.inspection?.fields.find((item) => item.id === field.id && item.handle === field.handle)?.currentValue !== value) {
     throw new Error(candidate ? 'The page did not retain the approved answer' : 'The page did not retain the entered answer');
   }
@@ -1510,7 +1644,7 @@ async function applyReviewedField({ tabId, frameId, applicationId, field, sugges
     });
     await datasourceWriteChain.catch(error => { throw new Error(`Answer applied, but not saved: ${error.message}`); });
   }
-  const validationResponse = await sendToFrame(tabId, frameId, { type: 'JOB_APP_VALIDATE' });
+  const validationResponse = await sendToFrame(tabId, frameId, { type: 'JOB_APP_VALIDATE' }, assertAuthority);
   return { inspection: verified.inspection, validation: validationResponse?.validation || {}, value };
 }
 
@@ -1538,6 +1672,7 @@ async function applyDraft(message) {
     const { run, field } = await guardedDraftField(message, { allowSaveLock: true });
     const applied = await applyReviewedField({
       tabId, frameId: message.frameId, applicationId: run.startedAt, field, suggestion: null, message: { ...message, answer }, approvalGuard: null,
+      assertAuthority: () => assertRunSiteAuthority(tabId, run),
     });
     categorizeRun(run, applied.inspection, applied.validation);
     return { ok: true, run: await saveRun(run) };
@@ -1581,17 +1716,17 @@ async function generateSuggestions(message) {
   const jobDescription = message.jobDescription == null || (typeof message.jobDescription === 'string' && !message.jobDescription.trim())
     ? ''
     : requiredBoundedText(message.jobDescription, 'Job description', 16_000);
-  const { run, field } = await guardedDraftField(message);
+  const { run, field, authority } = await guardedDraftField(message);
   if (!readableQuestion(field)) throw new Error('The form question is unclear. Use Show on page and enter the answer manually.');
   const settings = await getSettings();
   const apiKey = await getApiKey(settings.aiProvider);
   if (!apiKey) throw new Error(`Add a ${settings.aiProvider === 'fireworks' ? 'Fireworks' : 'OpenAI'} API key before generating answer suggestions`);
-  const [records, datasource, inspected] = await Promise.all([getRecords(), getDatasource(), sendToFrame(message.tabId, message.frameId, { type: 'JOB_APP_INSPECT' })]);
+  const [records, datasource, inspected] = await Promise.all([getRecords(), getDatasource(), sendToFrame(message.tabId, message.frameId, { type: 'JOB_APP_INSPECT' }, authority)]);
   const jobContext = mergeJobContext(run.jobContext, inspected.inspection?.page);
   if (jobDescription) jobContext.jobDescription = jobDescription;
   const snapshot = suggestionRequestSnapshot(run, field, inspected.inspection, datasource, settings, jobContext);
   const generated = await generateFieldDrafts({ field, inspection: inspected.inspection, jobContext, datasource, records, settings, apiKey });
-  const validation = await sendToFrame(message.tabId, message.frameId, { type: 'JOB_APP_VALIDATE' });
+  const validation = await sendToFrame(message.tabId, message.frameId, { type: 'JOB_APP_VALIDATE' }, authority);
   const current = await currentSuggestionDestination(message.tabId, snapshot);
   if (!current) throw new Error('The page or supporting evidence changed. Generate again.');
   const updated = await mutateRun(message.tabId, (run) => {
@@ -1618,6 +1753,12 @@ async function processPage(tabId, { autoAdvance } = { autoAdvance: false }) {
   try {
     let run = await getRun(tabId);
     if (!run || run.status !== 'running') return run;
+    if (run.siteRevision == null) run.siteRevision = siteRevision(tabId);
+    try { await assertTabSiteEnabled(tabId, run.siteRevision); }
+    catch (error) {
+      if (error.message === DISABLED_SITE_REASON) { await removeRun(tabId); return null; }
+      throw error;
+    }
     if (run.pageNumber > MAX_PAGES) {
       run.status = 'waiting_user';
       run.waitingFor = 'page_limit_exceeded';
@@ -1631,9 +1772,10 @@ async function processPage(tabId, { autoAdvance } = { autoAdvance: false }) {
       getCoverMessages(),
       getDatasource(),
     ]);
-    const discovery = await discoverApplicationFrame(tabId);
+    const discovery = await discoverApplicationFrame(tabId, () => assertRunSiteAuthority(tabId, run));
     if (discovery.errorCode) return await saveRun(pauseForFrame(run, discovery));
     updateSelectedFrame(run, discovery);
+    await assertTabSiteEnabled(tabId, run.siteRevision);
     const processed = await applyPageDecisions(
       tabId,
       run,
@@ -1730,6 +1872,7 @@ async function processPage(tabId, { autoAdvance } = { autoAdvance: false }) {
 
 async function startRun(tabId) {
   await invalidateInlineSessions(tabId);
+  await assertTabSiteEnabled(tabId);
   const current = await getRun(tabId);
   if (current && ACTIVE_RUN_STATUSES.has(current.status)) {
     if (current.status !== 'running') return current;
@@ -1785,7 +1928,7 @@ async function focusRunField(tabId, fieldId) {
   if (!fieldId) throw new Error('A fieldId is required');
   const run = await getRun(tabId);
   if (!run) return { ok: false, run: null };
-  const discovery = await discoverApplicationFrame(tabId);
+  const discovery = await discoverApplicationFrame(tabId, () => assertRunSiteAuthority(tabId, run));
   if (discovery.errorCode) return { ok: false, run: await saveRun(pauseForFrame(run, discovery)) };
   updateSelectedFrame(run, discovery);
   try {
@@ -1851,12 +1994,12 @@ async function saveAnswers(tabId) {
     if (!run || !SAVABLE_RUN_STATUSES.has(run.status)) {
       return { ok: false, error: 'The current page is not ready to save answers' };
     }
-    const discovery = await discoverApplicationFrame(tabId);
+    const discovery = await discoverApplicationFrame(tabId, () => assertRunSiteAuthority(tabId, run));
     if (discovery.errorCode) return { ok: false, error: discovery.reason, run: await saveRun(pauseForFrame(run, discovery)) };
     updateSelectedFrame(run, discovery);
     const inspection = discovery.inspection;
     const captured = await sendToApplicationFrame(tabId, run, { type: 'JOB_APP_CAPTURE' });
-    return await saveCapturedAnswers(run, inspection, captured.records || []);
+    return await saveCapturedAnswers(run, inspection, captured.records || [], () => assertRunSiteAuthority(tabId, run));
   } catch (error) {
     if (!error.frameDiscovery) throw error;
     return { ok: false, error: error.message, run: await saveRun(pauseForFrame(run, error.frameDiscovery)) };
@@ -1865,8 +2008,10 @@ async function saveAnswers(tabId) {
   }
 }
 
-async function saveCapturedAnswers(run, inspection, records) {
-  const result = await recordPageCapture(run, inspection, records, { promote: false });
+async function saveCapturedAnswers(run, inspection, records, assertAuthority = null) {
+  assertAuthority?.();
+  const result = await recordPageCapture(run, inspection, records, { promote: false, assertAuthority });
+  assertAuthority?.();
   const learning = await queueLearningReview(records);
   run = result.run;
   if (run.status === 'ready_for_user_submit') {
@@ -1877,11 +2022,12 @@ async function saveCapturedAnswers(run, inspection, records) {
   return { ok: true, run: await saveRun(run), ...result.stats, learningQueued: learning.queued, learningError: learning.error };
 }
 
-async function saveFinalSubmission(message, sender) {
+async function saveFinalSubmission(message, sender, assertAuthority = null) {
   const tabId = sender?.tab?.id;
   const frameId = Number.isInteger(sender?.frameId) ? sender.frameId : 0;
   if (!Number.isInteger(tabId) || !Array.isArray(message.records)) return { ok: false, error: 'The submitted application snapshot is unavailable' };
   const acceptedRun = await getRun(tabId);
+  assertAuthority?.();
   if (!matchesFinalSubmission(acceptedRun, message, sender, frameId)) {
     return { ok: false, error: 'The submitted application is no longer active' };
   }
@@ -1897,9 +2043,10 @@ async function saveFinalSubmission(message, sender) {
   }
   const finishSave = beginSaveOperation(tabId);
   try {
+    assertAuthority?.();
     const previousPage = finalRun.pages?.find((page) => page.pageNumber === finalRun.pageNumber);
     const page = message.page && typeof message.page === 'object' ? message.page : (previousPage?.page || finalRun.jobContext || {});
-    return await saveCapturedAnswers(finalRun, { page }, message.records);
+    return await saveCapturedAnswers(finalRun, { page }, message.records, assertAuthority);
   } finally {
     finishSave();
   }
@@ -1931,6 +2078,12 @@ function beginSaveOperation(tabId) {
 }
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (message?.type === 'JOB_APP_SITE_STATUS') {
+    (async () => siteStateReply(await siteStateForTab(sender?.tab?.id, sender?.tab)))()
+      .then((state) => sendResponse({ ok: true, ...state }))
+      .catch((error) => sendResponse({ ok: false, enabled: false, supported: false, error: error.message }));
+    return true;
+  }
   if (message?.type === 'JOB_INLINE_EDIT_IN_PANEL') {
     try {
       const request = {...message, requestId: message.requestId || crypto.randomUUID()};
@@ -1938,18 +2091,22 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       // Chrome 116+ only; preserve Chrome 114 support. Invoke directly during the
       // content-script user gesture, before storage/inspection awaits consume it.
       // https://developer.chrome.com/docs/extensions/reference/api/sidePanel
-      let opening;
-      try {
-        opening = typeof chrome.sidePanel?.open === 'function'
-          ? Promise.resolve(chrome.sidePanel.open({tabId: origin.tabId})).then(() => null, () => PANEL_OPEN_FALLBACK)
-          : Promise.resolve(PANEL_OPEN_FALLBACK);
-      } catch { opening = Promise.resolve(PANEL_OPEN_FALLBACK); }
-      handoffInlineField(request, sender, opening).then(sendResponse).catch(error => sendResponse({ok: false, error: error.message}));
+      (async () => {
+        await assertTabSiteEnabled(origin.tabId);
+        let opening;
+        try {
+          opening = typeof chrome.sidePanel?.open === 'function'
+            ? Promise.resolve(chrome.sidePanel.open({tabId: origin.tabId})).then(() => null, () => PANEL_OPEN_FALLBACK)
+            : Promise.resolve(PANEL_OPEN_FALLBACK);
+        } catch { opening = Promise.resolve(PANEL_OPEN_FALLBACK); }
+        return handoffInlineField(request, sender, opening);
+      })().then(sendResponse).catch(error => sendResponse({ok: false, error: error.message}));
     } catch (error) { sendResponse({ok: false, error: error.message}); }
     return true;
   }
   if (['JOB_INLINE_QUERY', 'JOB_INLINE_GENERATE', 'JOB_INLINE_ACCEPT', 'JOB_INLINE_CANCEL'].includes(message?.type)) {
     (async () => {
+      await assertTabSiteEnabled(sender?.tab?.id, sender?.tab);
       if (message.type === 'JOB_INLINE_QUERY') return queryInlineField(message, sender);
       if (message.type === 'JOB_INLINE_GENERATE') return generateInlineField(message, sender);
       if (message.type === 'JOB_INLINE_ACCEPT') return acceptInlineField(message, sender);
@@ -1967,25 +2124,31 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message?.type === 'JOB_APP_REVALIDATE') {
     (async()=>{
       const tabId=sender?.tab?.id;const run=Number.isInteger(tabId)?await getRun(tabId):null;
+      await assertTabSiteEnabled(tabId, sender?.tab);
       if(!run || message.applicationId!==run.startedAt || (sender.frameId??0)!==run.frame?.frameId) return {ok:false};
       if(sender.url){const url=new URL(sender.url);if(url.hostname!==run.frame.domain || (run.frame.pathname && url.pathname!==run.frame.pathname))return {ok:false};}
       return {ok:true,run:await validatePageOnly(tabId)};
     })().then(sendResponse).catch(error=>sendResponse({ok:false,error:error.message}));return true;
   }
   if (message?.type === 'JOB_APP_FINAL_SUBMISSION') {
-    saveFinalSubmission(message, sender).then(sendResponse).catch((error) => sendResponse({ ok: false, error: error.message }));
+    (async () => {
+      await assertTabSiteEnabled(sender?.tab?.id, sender?.tab);
+      return saveFinalSubmission(message, sender, siteAuthority(sender?.tab?.id));
+    })()
+      .then(sendResponse).catch((error) => sendResponse({ ok: false, error: error.message }));
     return true;
   }
   if (message?.type === 'JOB_APP_LEARN' || message?.type === 'JOB_APP_LEARNING_STATUS') {
     (async () => {
       const tabId = sender?.tab?.id;
+      await assertTabSiteEnabled(tabId, sender?.tab);
       const run = tabId ? await getRun(tabId) : null;
       if (!run || ![...ACTIVE_RUN_STATUSES, 'answers_saved'].includes(run.status) || run.frame?.frameId !== (sender.frameId ?? 0)) return { ok: false };
       if (sender.url) {
         const url = new URL(sender.url);
         if (run.frame.domain && url.hostname !== run.frame.domain) return { ok: false };
         if (run.frame.pathname && url.pathname !== run.frame.pathname) {
-          const discovery = await discoverApplicationFrame(tabId);
+          const discovery = await discoverApplicationFrame(tabId, () => assertRunSiteAuthority(tabId, run));
           if (discovery.errorCode || discovery.frameId !== (sender.frameId ?? 0) || discovery.context.pathname !== url.pathname) return { ok: false };
           updateSelectedFrame(run, discovery);
           if (run.lastAction !== 'next') {
@@ -1999,7 +2162,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       }
       if (message.type === 'JOB_APP_LEARNING_STATUS') return { ok: true, applicationId: run.startedAt };
       if (message.applicationId !== run.startedAt || !Array.isArray(message.records)) return { ok: false };
-      await persistLearnedRecords(message.records, run);
+      await persistLearnedRecords(message.records, run, { assertAuthority: () => assertRunSiteAuthority(tabId, run) });
       return { ok: true };
     })().then(sendResponse).catch((error) => sendResponse({ ok: false, error: error.message }));
     return true;
@@ -2007,6 +2170,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message?.type === 'JOB_APP_NAVIGATED') {
     const tabId = sender?.tab?.id;
     (async () => {
+      await assertTabSiteEnabled(tabId, sender?.tab);
       if (Number.isInteger(tabId)) await invalidateInlineSessions(tabId, Number.isInteger(sender.frameId) ? sender.frameId : 0);
       const run = tabId ? await getRun(tabId) : null;
       const senderFrameId = Number.isInteger(sender?.frameId) ? sender.frameId : 0;
@@ -2020,6 +2184,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
   if (![
     'JOB_INLINE_PANEL_STATE',
+    'JOB_SITE_CONTROL_STATE',
+    'JOB_SITE_SET_DISABLED',
+    'JOB_SITE_REMOVE_DISABLED',
     'JOB_RUN_APPROVE_SUGGESTION',
     'JOB_RUN_APPLY_DRAFT',
     'JOB_RUN_REWRITE_ANSWER',
@@ -2048,6 +2215,28 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (!chrome.runtime.id || sender?.id !== chrome.runtime.id || sender?.tab
       || typeof sender?.url !== 'string' || !sender.url.startsWith(`chrome-extension://${chrome.runtime.id}/`)) {
       throw new Error('This action must originate in the extension panel');
+    }
+    if (message.type === 'JOB_SITE_CONTROL_STATE') {
+      const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+      const site = await siteStateForTab(tab?.id, tab);
+      return { ok: true, site: siteStateReply(site) };
+    }
+    if (message.type === 'JOB_SITE_SET_DISABLED') {
+      const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+      const tabId = tab?.id;
+      if (!Number.isInteger(tabId) || typeof message.disabled !== 'boolean') throw new Error('A current site and desired state are required.');
+      return { ok: true, site: await updateSiteDisabled(tabId, message.disabled) };
+    }
+    if (message.type === 'JOB_SITE_REMOVE_DISABLED') {
+      const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+      const normalized = normalizeHostname(message.hostname);
+      if (!normalized) throw new Error('A valid hostname is required.');
+      const current = await siteStateForTab(tab?.id, tab);
+      if (current.hostname === normalized && current.disabled) {
+        return { ok: true, site: await updateSiteDisabled(tab.id, false) };
+      }
+      const disabledHostnames = await removeDisabledHostname(normalized);
+      return { ok: true, site: siteStateReply({ ...current, disabledHostnames }) };
     }
     if (message.type === 'JOB_INLINE_PANEL_STATE') return inlinePanelState(message);
     if (message.inlineSessionId) return inlinePanelAction(message);
@@ -2097,11 +2286,15 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
     const tabId = message.tabId || tab?.id;
     if (!tabId) throw new Error('No active browser tab was found');
+    const site = await siteStateForTab(tabId, tab);
+    if (message.type === 'JOB_RUN_STATE') {
+      return { ok: true, run: site.disabled ? null : await getRun(tabId), site: siteStateReply(site) };
+    }
+    await assertTabSiteEnabled(tabId, null);
     if (message.type === 'JOB_RUN_VALIDATE_PAGE') return { ok: true, run: await validatePageOnly(tabId) };
     if (message.type === 'JOB_RUN_RETRY_AI') { await scheduleAi(tabId, { retry: true }); return { ok: true, run: await getRun(tabId) }; }
     if (message.type === 'JOB_RUN_SELECT_EMPLOYMENT') return selectEmployment(message);
     if (message.type === 'JOB_RUN_SEARCH_ANSWERS') return searchSavedAnswers(message);
-    if (message.type === 'JOB_RUN_STATE') return { ok: true, run: await getRun(tabId) };
     if (message.type === 'JOB_RUN_FOCUS_FIELD') return focusRunField(tabId, message.fieldId);
     if (message.type === 'JOB_RUN_ADVANCE_PAGE') return advancePage(tabId);
     if (message.type === 'JOB_RUN_SAVE_ANSWERS') return saveAnswers(tabId);
@@ -2119,6 +2312,8 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
   getRun(tabId)
     .then(async (run) => {
       if (run?.status !== 'running' || run.waitingFor === 'operation_interrupted') return;
+      const site = await siteStateForTab(tabId);
+      if (!site.supported || site.disabled) { await removeRun(tabId); return; }
       run.frame = null;
       await saveRun(run);
       const settings = await getSettings();
@@ -2130,13 +2325,17 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
 chrome.tabs.onRemoved.addListener((tabId) => {
   invalidateInlineSessions(tabId).catch(() => {});
   removeRun(tabId).catch(() => {});
+  siteRevisions.delete(tabId);
 });
 
 chrome.runtime.onInstalled.addListener(async () => {
   await chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true });
   await chrome.storage.session.clear();
-  const settings = await chrome.storage.local.get({ autoAdvancePages: false });
-  await chrome.storage.local.set({ autoAdvancePages: Boolean(settings.autoAdvancePages) });
+  const settings = await chrome.storage.local.get({ autoAdvancePages: false, [SITE_SETTINGS_KEY]: [] });
+  await chrome.storage.local.set({
+    autoAdvancePages: Boolean(settings.autoAdvancePages),
+    [SITE_SETTINGS_KEY]: normalizeHostnames(settings[SITE_SETTINGS_KEY]),
+  });
   let datasourceReady = false;
   try {
     await initializeDatasource();
@@ -2183,7 +2382,8 @@ async function mutateRun(tabId, change) {
   runWriteChain = runWriteChain.catch(() => {}).then(async () => {
     const runs = await getRuns();
     const current = runs[String(tabId)];
-    if (!current || change(current) === false) { result = null; return; }
+    if (!current || (current.siteRevision != null && siteRevision(tabId) !== current.siteRevision)) { result = null; return; }
+    if (change(current) === false || (current.siteRevision != null && siteRevision(tabId) !== current.siteRevision)) { result = null; return; }
     result = {...current, revision:(current.revision || 0)+1,workerId:WORKER_ID,updatedAt:new Date().toISOString()};
     runs[String(tabId)] = result;
     await chrome.storage.session.set({[RUN_STORAGE_KEY]:runs});
@@ -2230,13 +2430,15 @@ async function validatePageOnly(tabId) {
 
 async function selectEmployment(message) {
   const run=await getRun(message.tabId);
+  const authority = () => assertRunSiteAuthority(message.tabId, run);
   if(!run || processingTabs.has(message.tabId) || saveLocks.has(message.tabId) || run.startedAt!==message.applicationId || run.pageSignature!==message.pageSignature || run.frame?.frameId!==message.frameId) throw new Error('Work-history section changed. Check the page again.');
   const profile=(await getDatasource()).profile;
   if(!profile.employment.some(entry=>entry.id===message.employmentId)) throw new Error('Saved employer is unavailable. Update your profile.');
-  const inspected=await sendToFrame(message.tabId,message.frameId,{type:'JOB_APP_INSPECT'});
+  const inspected=await sendToFrame(message.tabId,message.frameId,{type:'JOB_APP_INSPECT'}, authority);
   if(pageSignature(inspected.inspection,run.frame)!==run.pageSignature || !inspected.inspection.fields.some(field=>field.entityType==='employment' && field.entityId===message.sectionId)) throw new Error('Work-history section changed. Check the page again.');
   run.employmentMappings ||= {};
   run.employmentMappings[`${run.pageSignature}:${message.sectionId}`]=message.employmentId;
+  authority();
   await saveRun(run);
   return {ok:true,run:await checkPage(message.tabId)};
 }
@@ -2316,11 +2518,12 @@ function sameSuggestionRun(run, snapshot) {
 async function currentSuggestionDestination(tabId, snapshot) {
   const run = await getRun(tabId);
   if (!sameSuggestionRun(run, snapshot)) return null;
+  const authority = siteAuthority(tabId);
   const settings = await getSettings();
   if (settings.aiProvider !== snapshot.settings.aiProvider || settings.aiModel !== snapshot.settings.aiModel) return null;
   const [datasource, inspected] = await Promise.all([
     getDatasource(),
-    sendToFrame(tabId, snapshot.frameId, { type: 'JOB_APP_INSPECT' }),
+    sendToFrame(tabId, snapshot.frameId, { type: 'JOB_APP_INSPECT' }, authority),
   ]);
   if (!inspected?.ok || pageSignature(inspected.inspection, run.frame) !== snapshot.pageSignature) return null;
   const field = inspected.inspection.fields.find((item) => item.id === snapshot.field.id);
@@ -2384,9 +2587,10 @@ async function scheduleAi(tabId,{retry=false}={}) {
 async function currentAiDestination(tabId,snapshot,field=null) {
   const run=await getRun(tabId);
   if(!run || run.startedAt!==snapshot.startedAt || run.pageSignature!==snapshot.pageSignature || run.frame?.frameId!==snapshot.frameId || run.aiOperations?.[snapshot.operationKey]?.id!==snapshot.id || !SAVABLE_RUN_STATUSES.has(run.status)) return null;
+  const authority = siteAuthority(tabId);
   const settings=await getSettings();
   if(settings.aiProvider!==snapshot.settings.aiProvider || settings.aiModel!==snapshot.settings.aiModel) return null;
-  const [datasource, inspected]=await Promise.all([getDatasource(),sendToFrame(tabId,snapshot.frameId,{type:'JOB_APP_INSPECT'})]);
+  const [datasource, inspected]=await Promise.all([getDatasource(),sendToFrame(tabId,snapshot.frameId,{type:'JOB_APP_INSPECT'}, authority)]);
   if(!inspected?.ok || pageSignature(inspected.inspection,run.frame)!==snapshot.pageSignature) return null;
   if(aiEvidenceRevision(run,inspected.inspection,datasource)!==snapshot.evidenceRevision) return null;
   if(field) {

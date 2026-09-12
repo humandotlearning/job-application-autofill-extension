@@ -7,6 +7,7 @@ import { JSDOM } from 'jsdom';
 function createHarness({
   autoAdvancePages = false,
   waitForAI = true,
+  disabledHostnames = [],
   answerRecords = [{ key: 'full_name', question: 'Full name', answer: 'Nithin', aliases: ['Full name'], type: 'text', sensitivity: 'safe', updatedAt: '2025-01-01T00:00:00.000Z' }],
   coverMessages = [],
   pagesByTab = {},
@@ -14,6 +15,7 @@ function createHarness({
   const localData = {
     openaiApiKey: '',
     autoAdvancePages,
+    disabledHostnames: [...disabledHostnames],
     // Fixture profile represents explicitly reviewed facts unless overridden.
     answerRecords: answerRecords.map(record => ({confirmationState:'confirmed',...record})),
     coverMessages: [...coverMessages],
@@ -39,6 +41,7 @@ function createHarness({
       pages: frame.pages.map((page) => ({ ...page })),
     })),
     pages: (spec.pages || []).map((page) => ({ ...page })),
+    url: spec.url || spec.pages?.[0]?.url || `https://${spec.pages?.[0]?.page?.domain || 'jobs.example.com'}/apply`,
   }]));
 
   function currentTabState(tabId) {
@@ -129,7 +132,8 @@ function createHarness({
       getURL: (path = '') => `chrome-extension://test-extension/${path}`,
     },
     tabs: {
-      query: async () => [{ id: 7 }],
+      query: async () => [{ id: 7, url: tabs.get(7)?.url }],
+      get: async (tabId) => ({ id: tabId, url: tabs.get(tabId)?.url }),
       sendMessage: async (tabId, message, options = {}) => {
         const state = currentTabState(tabId);
         const frameId = options.frameId ?? 0;
@@ -249,6 +253,51 @@ function createHarness({
     },
   };
 }
+
+test('site controls normalize, persist, and match only the active exact hostname', async () => {
+  const harness = createHarness({
+    disabledHostnames: ['Jobs.Example.com', 'jobs.example.com'],
+    pagesByTab: {7: {url: 'https://jobs.example.com/apply?step=1', pages: [{
+      page: {title: 'Job application', domain: 'jobs.example.com'}, fields: [], actions: [],
+    }] }},
+  });
+  await import(`../src/service-worker.js?site-control-state=${Date.now()}`);
+  const state = await harness.dispatch({type: 'JOB_SITE_CONTROL_STATE'});
+  assert.equal(state.ok, true, state.error);
+  assert.deepEqual(state.site.disabledHostnames, ['jobs.example.com']);
+  assert.equal(state.site.hostname, 'jobs.example.com');
+  assert.equal(state.site.disabled, true);
+  const blocked = await harness.dispatch({type: 'JOB_RUN_START', tabId: 7});
+  assert.equal(blocked.ok, false);
+  assert.match(blocked.error, /disabled on this site/i);
+  const enabled = await harness.dispatch({type: 'JOB_SITE_SET_DISABLED', tabId: 7, disabled: false});
+  assert.equal(enabled.ok, true, enabled.error);
+  assert.equal(enabled.site.disabled, false);
+  assert.deepEqual(harness.localData.disabledHostnames, []);
+});
+
+test('disabled site rejects inline requests and prevents a late run write after revocation', async () => {
+  const harness = createHarness({
+    disabledHostnames: [],
+    pagesByTab: {7: {url: 'https://jobs.example.com/apply', pages: [{
+      page: {title: 'Job application', domain: 'jobs.example.com'},
+      fields: [{id: 'name', handle: 'name-h', label: 'Full name', type: 'text'}], actions: [{id: 'submit', label: 'Submit application', kind: 'submit', type: 'submit'}],
+      beforeApply: async () => {
+        await harness.dispatch({type: 'JOB_SITE_SET_DISABLED', tabId: 7, disabled: true});
+      },
+    }] }},
+  });
+  await import(`../src/service-worker.js?site-control-block=${Date.now()}`);
+  const run = await harness.dispatch({type: 'JOB_RUN_START', tabId: 7});
+  assert.equal(run.ok, true, run.error);
+  assert.equal(run.run, null);
+  assert.equal(harness.tabs.get(7).pages[0].values?.name, undefined);
+  const inline = await harness.dispatch({type: 'JOB_INLINE_QUERY', requestId: 'r', fieldId: 'name', handle: 'name-h'}, {
+    id: 'test-extension', tab: {id: 7, url: 'https://jobs.example.com/apply'}, frameId: 0, url: 'https://jobs.example.com/apply', origin: 'https://jobs.example.com',
+  });
+  assert.equal(inline.ok, false);
+  assert.match(inline.error, /disabled on this site/i);
+});
 
 test('inline lookup works with no run and never fills on focus', async () => {
   const harness = createHarness({pagesByTab: {7: {pages: [{

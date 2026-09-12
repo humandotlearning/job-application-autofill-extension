@@ -347,5 +347,5 @@ export function createInlineAutofill(document, {send, describe}) {
     try { return focus(); }
     finally { restoringFocus = previous; }
   }
-  return {activeField, beforeFill, withExplicitFocus, dispose() { if (disposed) return; dismiss(); disposed = true; listeners.forEach(remove => remove()); host?.remove(); }};
+  return {activeField, beforeFill, withExplicitFocus, refresh() { if (!disposed) activate(document.activeElement); }, dispose() { if (disposed) return; dismiss(); disposed = true; listeners.forEach(remove => remove()); host?.remove(); }};
 }

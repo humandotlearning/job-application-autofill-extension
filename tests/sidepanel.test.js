@@ -25,6 +25,7 @@ async function setupPanel({
   run = null,
   inlineSession = null,
   datasource = { answerCount: 3, coverMessageCount: 1 },
+  site = { hostname: 'jobs.example.com', supported: true, disabled: false, disabledHostnames: [] },
   localData = { openaiApiKey: 'sk-test', autoAdvancePages: false },
   applyDraftResponse = { ok: true, run },
   approveSuggestionResponse = { ok: true, run },
@@ -44,6 +45,7 @@ async function setupPanel({
   const revokedUrls = [];
   const clickedDownloads = [];
   const copyCalls = [];
+  let siteState = structuredClone(site);
   const originalCreateElement = dom.window.document.createElement.bind(dom.window.document);
 
   dom.window.document.createElement = function createElement(tagName, options) {
@@ -81,6 +83,15 @@ async function setupPanel({
     runtime: {
       sendMessage: async (message) => {
         sentMessages.push(message);
+        if (message.type === 'JOB_SITE_CONTROL_STATE') return { ok: true, site: siteState };
+        if (message.type === 'JOB_SITE_SET_DISABLED') {
+          siteState = { ...siteState, disabled: Boolean(message.disabled), disabledHostnames: message.disabled ? [...new Set([...siteState.disabledHostnames, siteState.hostname])] : siteState.disabledHostnames.filter(host => host !== siteState.hostname) };
+          return { ok: true, site: siteState };
+        }
+        if (message.type === 'JOB_SITE_REMOVE_DISABLED') {
+          siteState = { ...siteState, disabled: message.hostname === siteState.hostname ? false : siteState.disabled, disabledHostnames: siteState.disabledHostnames.filter(host => host !== message.hostname) };
+          return { ok: true, site: siteState };
+        }
         if (message.type === 'JOB_RUN_STATE') return { ok: true, run };
         if (message.type === 'JOB_INLINE_PANEL_STATE') {
           if (message.close) inlineSession = null;
@@ -461,6 +472,27 @@ test('panel renders grouped sections, collapsed details, and status-specific act
   } finally {
     harness.cleanup();
   }
+});
+
+test('panel disables the active hostname, hides workflow actions, and removes saved exclusions', async () => {
+  const panel = await setupPanel({site: {hostname: 'jobs.example.com', supported: true, disabled: false, disabledHostnames: ['old.example.com']}});
+  const toggle = panel.dom.window.document.querySelector('#site-toggle');
+  assert.equal(toggle.textContent, 'Disable on this site');
+  assert.equal(panel.dom.window.document.querySelector('#site-control-card').hidden, false);
+  toggle.click();
+  await panelTick();
+  assert.equal(toggle.textContent, 'Re-enable on this site');
+  assert.equal(panel.dom.window.document.querySelector('#site-control-state').textContent, 'Disabled');
+  assert.equal(panel.dom.window.document.querySelector('#primary-action').hidden, true);
+  assert.match(panel.dom.window.document.querySelector('#site-control-hint').textContent, /paused on jobs\.example\.com/i);
+  toggle.click();
+  await panelTick();
+  assert.equal(toggle.textContent, 'Disable on this site');
+  const remove = panel.dom.window.document.querySelector('[data-disabled-hostname="old.example.com"]');
+  remove.click();
+  await panelTick();
+  assert.equal(panel.dom.window.document.querySelector('[data-disabled-hostname="old.example.com"]'), null);
+  panel.cleanup();
 });
 
 test('panel uses the accent status treatment when user action is required', async () => {

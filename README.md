@@ -107,7 +107,7 @@ flowchart LR
 
 Learning activates with **Fill this page**. Edits are debounced into local application drafts, not automatically promoted into the reusable profile. **Save answers** and observed final submission capture drafts and queue eligible new user answers in the learning inbox. Approving a learning proposal creates a reusable record. Approving saved evidence can separately save a reviewed equivalent alias or edited answer. Capturing a submit event does not prove the employer accepted the application. Scoped records and backups preserve separate entries and alternatives.
 
-The initial profile is bundled separately in `data/seed-data.json`, extracted from `resume.xlsx`, and imported only when the live datasource is empty. The live `answerRecords`, cover-message templates, and datasource metadata are stored in `chrome.storage.local`; extension updates never replace them. The side panel provides JSON export and non-destructive import for backups.
+The initial profile is bundled separately in `data/seed-data.json`, extracted from `resume.xlsx`, and imported only when the live datasource is empty. The live `answerRecords`, cover-message templates, datasource metadata, and exact-hostname site exclusions are stored in `chrome.storage.local`; extension updates never replace them. The side panel provides JSON export and non-destructive import for datasource backups.
 
 The workbook seed contains the profile links from `Sheet1`, answered rows from `common questions`, and the `email` sheet as a reviewed cover-message template. The first Twitter URL is the autofill value and the second URL is retained as an alternative.
 
@@ -141,7 +141,8 @@ The extension uses the configured AI provider and answer-planner model. Firework
 4. Open a job application and open the extension side panel.
 5. Open **Settings & data**, choose Fireworks or OpenAI, enter that provider’s API key, and select or type a compatible model ID. Local deterministic filling works without a key.
 6. Click **Fill this page**. Complete any highlighted required fields or manual steps, then click **Check again**.
-7. When a page is ready, review it and click **Continue to next page**. On the final page, review the form and submit through the application site; the extension captures the final values automatically. **Save answers** remains available as an optional local checkpoint.
+7. To leave a site untouched, open the side panel on that hostname and click **Disable on this site**. The rule matches that exact hostname (paths and ports are ignored; subdomains are separate). This immediately pauses scans, inline suggestions, filling, learning, and capture; use **Re-enable on this site** or remove the hostname under **Settings & data → Disabled sites** to restore it.
+8. When a page is ready, review it and click **Continue to next page**. On the final page, review the form and submit through the application site; the extension captures the final values automatically. **Save answers** remains available as an optional local checkpoint.
 
 Navigation is manual by default. The **Auto-advance pages** setting permits one validated Next action when the page is ready. It never enables final submission.
 

@@ -39,6 +39,15 @@
       <p id="run-hint" class="hint">Uploads, CAPTCHA, login, inaccessible widgets, and final site submission stay manual.</p>
     </section>
 
+    <section id="site-control-card" class="card site-control-card" aria-labelledby="site-control-title" hidden>
+      <div class="section-heading">
+        <div><span class="step">06</span><h2 id="site-control-title">Site access</h2></div>
+        <span id="site-control-state" class="pill neutral">Unavailable</span>
+      </div>
+      <p id="site-control-hint" class="hint compact">Site controls are unavailable on this browser page.</p>
+      <button id="site-toggle" class="full" type="button" hidden>Disable on this site</button>
+    </section>
+
     <section id="inline-field-card" class="card" aria-labelledby="inline-field-title" hidden>
       <div class="section-heading">
         <h2 id="inline-field-title">Selected field</h2>
@@ -137,6 +146,10 @@
         <details id="learning-inbox-details" class="nested-details">
           <summary><span>Learning inbox</span><span id="learning-inbox-count" class="pill neutral">0</span></summary>
           <div id="learning-inbox-list" class="details-body nested-body"></div>
+        </details>
+        <details id="disabled-sites-details" class="nested-details">
+          <summary><span>Disabled sites</span><span id="disabled-site-count" class="pill neutral">0</span></summary>
+          <div id="disabled-site-list" class="details-body nested-body"></div>
         </details>
       </div>
     </details>

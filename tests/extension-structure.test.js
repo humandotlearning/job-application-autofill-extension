@@ -51,6 +51,9 @@ test('side panel contains the guided workflow, review groups, and settings contr
   assert.match(html, /Selected field/);
   assert.match(html, /id="close-inline-field"/);
   assert.match(html, /id="inline-field-list"/);
+  assert.match(html, /id="site-toggle"/);
+  assert.match(html, /Disable on this site/);
+  assert.match(html, /id="disabled-site-list"/);
   assert.match(html, /id="review-list"/);
   assert.match(html, /id="optional-list"/);
   assert.match(html, /id="audit-list"/);
@@ -83,6 +86,8 @@ test('legacy source and pending-learning workflow is absent', async () => {
     readFile(new URL('src/service-worker.js', root), 'utf8'),
     readFile(new URL('src/sidepanel.js', root), 'utf8'),
   ]);
+  assert.match(worker, /disabledHostnames/);
+  assert.match(worker, /JOB_APP_SITE_STATUS/);
   assert.doesNotMatch(worker, /formSessions|JOB_AUTOFILL_APPROVE_SAFE_LEARNED/);
   assert.doesNotMatch(panel, /Google|CSV|pendingLearnedAnswers|Start learning|overwrite/i);
 });
@@ -181,6 +186,9 @@ test('side panel script wires grouped results, focus controls, and persisted pag
   assert.match(panel, /aiProvider/);
   assert.match(panel, /aiModel/);
   assert.match(panel, /JOB_RUN_SAVE_ANSWERS/);
+  assert.match(panel, /JOB_SITE_CONTROL_STATE/);
+  assert.match(panel, /JOB_SITE_SET_DISABLED/);
+  assert.match(panel, /JOB_SITE_REMOVE_DISABLED/);
   assert.doesNotMatch(panel, /JOB_RUN_CONFIRM_SUBMIT|JOB_RUN_CONTINUE|confirm-submit/i);
   assert.match(panel, /answer-details/);
 });
