@@ -55,6 +55,39 @@ test('classic content listener inspects the live focused descriptor and exact ra
   dom.window.close();
 });
 
+test('disabled site status keeps the content script inert until explicitly re-enabled', async () => {
+  const bundle = await readFile(new URL('../dist/content.js', import.meta.url), 'utf8');
+  const dom = new JSDOM('<form><label>Full name<input id="name"></label></form>', {url: 'https://jobs.example.com/apply', pretendToBeVisual: true});
+  const listeners = [];
+  const messages = [];
+  const context = createContext({document: dom.window.document, setTimeout, clearTimeout, console, chrome: {runtime: {
+    sendMessage: async message => {
+      messages.push(message);
+      if (message.type === 'JOB_APP_SITE_STATUS') return {ok: true, enabled: false, supported: true};
+      return {ok: true, candidates: []};
+    }, onMessage: {addListener: listener => listeners.push(listener)},
+  }}});
+  new Script(bundle).runInContext(context);
+  await new Promise(resolve => setTimeout(resolve, 0));
+  const dispatch = message => new Promise(resolve => listeners[0](message, {}, resolve));
+  const input = dom.window.document.querySelector('#name');
+  input.focus(); input.click();
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.equal(messages.filter(message => message.type === 'JOB_INLINE_QUERY').length, 0);
+  assert.equal(dom.window.document.querySelectorAll('[data-job-inline-autofill]').length, 0);
+  const disabled = await dispatch({type: 'JOB_APP_INSPECT'});
+  assert.equal(disabled.ok, false);
+  assert.equal(disabled.disabled, true);
+  await dispatch({type: 'JOB_APP_SITE_STATE_CHANGED', enabled: true});
+  input.focus(); input.click();
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.equal(messages.filter(message => message.type === 'JOB_INLINE_QUERY').length, 1);
+  assert.equal(listeners.length, 1);
+  await dispatch({type: 'JOB_APP_SITE_STATE_CHANGED', enabled: false});
+  assert.equal(dom.window.document.querySelectorAll('[data-job-inline-autofill]').length, 0);
+  dom.window.close();
+});
+
 test('bundled inline suggestions approve through the live listener once and stay out of page inspection and capture', async () => {
   const bundle = await readFile(new URL('../dist/content.js', import.meta.url), 'utf8');
   const dom = new JSDOM('<form aria-label="Job application"><label>Name<input id="name"></label><label>Existing answer<textarea id="existing">Kept page answer</textarea></label></form>', {url: 'https://jobs.example.com/apply', pretendToBeVisual: true});

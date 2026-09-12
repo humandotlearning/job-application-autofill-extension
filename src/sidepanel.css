@@ -158,6 +158,15 @@ p { margin: 0; color: var(--color-text-muted); }
   border-color: var(--color-border-strong);
   background: linear-gradient(135deg, var(--color-accent-wash), transparent 52%), var(--color-surface);
 }
+.site-control-card[data-disabled="true"] {
+  border-color: var(--color-danger);
+  background: linear-gradient(135deg, rgba(255, 112, 120, .12), transparent 58%), var(--color-surface);
+}
+.site-control-card[data-disabled="true"] #site-control-state { color: var(--color-danger); }
+.disabled-site-row { display: flex; align-items: center; justify-content: space-between; gap: var(--space-2); padding: var(--space-2) 0; border-bottom: var(--border-width) solid var(--color-border); }
+.disabled-site-row:last-child { border-bottom: 0; }
+.disabled-site-row span { min-width: 0; overflow-wrap: anywhere; font: var(--font-sm) var(--font-mono); }
+.disabled-site-row button { min-height: var(--size-compact-control); padding: var(--space-xs) var(--space-sm); }
 .section-heading { justify-content: space-between; gap: var(--space-3); margin-bottom: var(--space-3); }
 .section-heading > div { display: flex; align-items: center; min-width: 0; }
 .step {

@@ -48,6 +48,12 @@ const elements = {
   inlineFieldCard: byId('inline-field-card'),
   inlineFieldList: byId('inline-field-list'),
   closeInlineField: byId('close-inline-field'),
+  siteControlCard: byId('site-control-card'),
+  siteControlState: byId('site-control-state'),
+  siteControlHint: byId('site-control-hint'),
+  siteToggle: byId('site-toggle'),
+  disabledSiteCount: byId('disabled-site-count'),
+  disabledSiteList: byId('disabled-site-list'),
 };
 
 const STATUS_LABELS = {
@@ -67,6 +73,7 @@ let busy = false;
 let saving = false;
 let currentProfile = null;
 let runRevision = 0;
+let currentSite = { hostname: '', supported: false, disabled: false, disabledHostnames: [] };
 const correctionDrafts = new Map();
 const drafts = new Map();
 
@@ -197,6 +204,104 @@ function setSaveFeedback(message = '', state = '') {
 function setStatus(message, state = 'ok') {
   elements.status.textContent = message;
   elements.statusDot.className = `status-dot${state === 'ok' ? '' : ` ${state}`}`;
+}
+
+function renderDisabledSites(hostnames = []) {
+  const sites = [...new Set((Array.isArray(hostnames) ? hostnames : []).filter(Boolean))].sort();
+  elements.disabledSiteCount.textContent = String(sites.length);
+  elements.disabledSiteList.replaceChildren();
+  if (!sites.length) {
+    const empty = document.createElement('p');
+    empty.className = 'hint compact';
+    empty.textContent = 'No sites are disabled.';
+    elements.disabledSiteList.append(empty);
+    return;
+  }
+  for (const hostname of sites) {
+    const row = document.createElement('div');
+    row.className = 'disabled-site-row';
+    const label = document.createElement('span');
+    label.textContent = hostname;
+    const remove = document.createElement('button');
+    remove.type = 'button';
+    remove.textContent = 'Remove';
+    remove.setAttribute('aria-label', `Re-enable ${hostname}`);
+    remove.dataset.disabledHostname = hostname;
+    remove.disabled = busy;
+    row.append(label, remove);
+    elements.disabledSiteList.append(row);
+  }
+}
+
+function renderSiteState(site = {}) {
+  currentSite = {
+    hostname: String(site.hostname || ''),
+    supported: Boolean(site.supported && site.hostname),
+    disabled: Boolean(site.disabled && site.hostname),
+    disabledHostnames: Array.isArray(site.disabledHostnames) ? [...site.disabledHostnames] : [],
+  };
+  renderDisabledSites(currentSite.disabledHostnames);
+  elements.siteControlCard.hidden = false;
+  elements.siteControlCard.dataset.disabled = String(currentSite.disabled);
+  elements.siteControlState.textContent = !currentSite.supported ? 'Unavailable' : (currentSite.disabled ? 'Disabled' : 'Enabled');
+  elements.siteControlState.className = `pill${currentSite.disabled ? '' : ' neutral'}`;
+  elements.siteToggle.hidden = !currentSite.supported;
+  elements.siteToggle.disabled = busy;
+  elements.siteToggle.textContent = currentSite.disabled ? 'Re-enable on this site' : 'Disable on this site';
+  elements.siteControlHint.textContent = !currentSite.supported
+    ? 'Site controls are unavailable on this browser or extension page.'
+    : currentSite.disabled
+    ? `Autofill is paused on ${currentSite.hostname}. No page data is inspected, filled, learned, or captured.`
+    : `Autofill is active on ${currentSite.hostname}. Disable it here whenever this site should stay untouched.`;
+  setActionVisibility(currentRun);
+  if (!currentSite.supported || currentSite.disabled) {
+    renderRun(null);
+    renderInlineField(null);
+  }
+}
+
+async function refreshSiteState() {
+  const response = await chrome.runtime.sendMessage({ type: 'JOB_SITE_CONTROL_STATE' });
+  if (response?.ok && response.site) renderSiteState(response.site);
+}
+
+async function toggleSite() {
+  if (!currentSite.supported || busy) return;
+  busy = true;
+  renderSiteState(currentSite);
+  try {
+    const response = await chrome.runtime.sendMessage({
+      type: 'JOB_SITE_SET_DISABLED',
+      tabId: activeTabId,
+      disabled: !currentSite.disabled,
+    });
+    if (!response?.ok || !response.site) throw new Error(response?.error || 'Could not update this site setting.');
+    renderSiteState(response.site);
+    if (response.site.disabled) renderRun(null);
+    setStatus(response.site.disabled ? `Autofill disabled on ${response.site.hostname}.` : `Autofill re-enabled on ${response.site.hostname}.`);
+  } catch (error) {
+    setStatus(error.message, 'error');
+  } finally {
+    busy = false;
+    renderSiteState(currentSite);
+  }
+}
+
+async function removeDisabledSite(hostname) {
+  if (!hostname || busy) return;
+  busy = true;
+  renderSiteState(currentSite);
+  try {
+    const response = await chrome.runtime.sendMessage({ type: 'JOB_SITE_REMOVE_DISABLED', hostname, tabId: activeTabId });
+    if (!response?.ok || !response.site) throw new Error(response?.error || 'Could not remove the disabled site.');
+    renderSiteState(response.site);
+    setStatus(`Autofill settings updated for ${hostname}.`);
+  } catch (error) {
+    setStatus(error.message, 'error');
+  } finally {
+    busy = false;
+    renderSiteState(currentSite);
+  }
 }
 
 function updateDatasourceSummary(datasource = {}) {
@@ -935,6 +1040,13 @@ function renderList(container, items, options = {}) {
 }
 
 function setActionVisibility(run) {
+  if (!currentSite.supported || currentSite.disabled) {
+    elements.primaryAction.hidden = true;
+    elements.secondaryActions.hidden = true;
+    elements.retryAi.hidden = true;
+    elements.employmentChoices.replaceChildren();
+    return;
+  }
   const status = run?.status;
   const hasRun = Boolean(run);
   elements.primaryAction.disabled = busy || status === 'running';
@@ -997,6 +1109,7 @@ function restorePanelState(state) {
 }
 
 function renderRun(run) {
+  if (!currentSite.supported || currentSite.disabled) run = null;
   const panelState = capturePanelState();
   runRevision += 1;
   const previousOrigin = `${currentRun?.applicationId || ''}:${currentRun?.pageSignature || ''}`;
@@ -1187,6 +1300,7 @@ async function focusField(fieldId) {
 async function refresh() {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
   activeTabId = tab?.id || null;
+  await refreshSiteState();
   const stored = await chrome.storage.local.get({ answerRecords: [], openaiApiKey: '', fireworksApiKey: '', aiProvider: '', aiModel: '', openaiModel: 'gpt-5.6-terra', autoAdvancePages: false });
   const provider = stored.aiProvider === 'openai' || stored.aiProvider === 'fireworks'
     ? stored.aiProvider
@@ -1309,6 +1423,11 @@ for (const [field, key] of [[elements.employerName, 'employerName'], [elements.r
 elements.exportDatasource.addEventListener('click', exportDatasource);
 elements.importDatasourceButton.addEventListener('click', () => elements.importDatasource.click());
 elements.importDatasource.addEventListener('change', () => importDatasource(elements.importDatasource.files?.[0]));
+elements.siteToggle.addEventListener('click', toggleSite);
+elements.disabledSiteList.addEventListener('click', (event) => {
+  const button = event.target.closest?.('[data-disabled-hostname]');
+  if (button?.dataset.disabledHostname) removeDisabledSite(button.dataset.disabledHostname);
+});
 elements.primaryAction.addEventListener('click', runPrimaryAction);
 elements.checkPage.addEventListener('click', () => sendRunAction('JOB_RUN_VALIDATE_PAGE'));
 elements.closeInlineField.addEventListener('click', async () => {
@@ -1340,6 +1459,7 @@ chrome.storage.onChanged.addListener((changes, area) => {
   if (area === 'local' && changes.answerRecords) elements.recordCount.textContent = `${(changes.answerRecords.newValue || []).length} answers`;
   if (area === 'local' && changes.coverMessages) elements.coverMessageCount.textContent = `${(changes.coverMessages.newValue || []).length} cover messages`;
   if (area === 'local' && changes.autoAdvancePages) elements.autoAdvance.checked = Boolean(changes.autoAdvancePages.newValue);
+  if (area === 'local' && changes.disabledHostnames) refreshSiteState().catch(error => setStatus(error.message, 'error'));
   if (area === 'session' && changes.applicationRun && activeTabId) renderRun(changes.applicationRun.newValue?.[String(activeTabId)] || null);
   if (area === 'session' && changes.inlineFieldSessions) loadInlineField().catch(error => setStatus(error.message, 'error'));
 });

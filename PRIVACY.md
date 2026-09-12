@@ -2,11 +2,12 @@
 
 This personal unpacked extension fills job-application forms from an answer profile stored in Chrome extension storage.
 
-- `answerRecords`, application drafts, correction history, cover-message templates, datasource metadata, provider selection, model selection, and provider-specific API keys are stored in `chrome.storage.local`.
+- `answerRecords`, application drafts, correction history, cover-message templates, datasource metadata, provider selection, model selection, provider-specific API keys, and exact-hostname site exclusions are stored in `chrome.storage.local`.
 - The bundled `data/seed-data.json` is imported only into an empty local datasource; extension updates do not overwrite accumulated answers. Legacy pending answers are migrated before obsolete keys are removed.
 - Datasource backups contain answers and templates but never include any API key.
 - The API key is read only by trusted extension contexts and is never sent to a web page.
 - Clicking **Fill this page** activates inspection and learning for the selected application frame. During that application, edits, checkpoints, and navigation can trigger local inspection and draft persistence.
+- A hostname disabled from the side panel pauses all page interaction on that top-level site, including inline suggestions, inspection, filling, learning, and capture. Rules match the normalized hostname only (paths and ports are ignored; subdomains remain independent). Disabled hostnames stay local and are not included in datasource backups; embedded frames inherit the top-level tab's disabled state.
 - Embedded frames are inspected locally during explicit actions and to restore an activated application after navigation; frame routing metadata is not sent to the model.
 - If no unique application frame is identified, the extension pauses without applying values to any frame.
 - The planner receives unresolved field descriptors, title/hostname, and up to 20 selected answer records. Suggestions can receive up to 40 records plus role/company/job-description text; rewriting receives the draft, instruction, job context, and up to 20 records. Learning classification receives up to 10 eligible new user-answer candidates. These inputs may contain personal answer text.
