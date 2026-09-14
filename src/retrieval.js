@@ -122,11 +122,41 @@ export function savedFieldCandidates(field, records, draftRecords = []) {
   return candidates.slice(0, 3);
 }
 
-export function searchEvidence(field, records = [], { limit = 20 } = {}) {
-  const seen = new Set();
-  return rankEvidence(field, records, { limit: records.length }).filter(item => {
-    const answer = String(item.answer).trim().toLowerCase().replace(/\s+/g, ' ');
-    if (seen.has(answer)) return false;
-    seen.add(answer); return true;
-  }).slice(0, limit);
+function explicitSearchEvidence(field, records = [], query = '', limit = 20) {
+  const normalizedQuery = normalizeText(query);
+  if (!normalizedQuery) return searchEvidence(field, records, { limit });
+  const targetKey = suggestionTargetKey(field);
+  const ranked = records.flatMap(record => {
+    const answer = String(record?.answer || '').trim();
+    if (!answer || isOpaqueIdentifier(answer) || isOpaqueIdentifier(record?.question) || isOpaqueIdentifier(record?.key)
+      || record.semantic?.reusePolicy === 'never' || record.reusePolicy === 'never'
+      || targetKey && record.suppressedFor?.includes(targetKey)
+      || !recordScopeCompatible(field, record) || !meaningCompatible(field, record, { numericReview: false })) return [];
+    const sources = [record.question, record.key?.replace(/_/g, ' '), ...(record.aliases || []), answer]
+      .filter(Boolean).map(normalizeText);
+    if (!sources.some(source => source.includes(normalizedQuery))) return [];
+    const score = Math.max(...sources.map(source => source === normalizedQuery ? 3 : source.startsWith(normalizedQuery) ? 2 : source.includes(normalizedQuery) ? 1 : 0));
+    return [{ sourceKey: record.key, sourceId: record.id || record.key, sourceQuestion: record.question,
+      answer, excerpt: answer.slice(0, 400), provenance: record.provenance || 'saved record', kind: 'search',
+      searchQuery: query, requiresApproval: true, score, reason: 'Found by searching saved questions and answers' }];
+  }).sort((a, b) => b.score - a.score);
+  return distinctAnswers(ranked, limit);
+}
+
+function distinctAnswers(items, limit) {
+  const seen = new Set(), result = [];
+  for (const item of items) {
+    // Punctuation and case can distinguish URLs and other literal answers.
+    const identity = String(item.answer).trim().replace(/\s+/g, ' ');
+    if (seen.has(identity)) continue;
+    seen.add(identity);
+    if (result.length >= limit) break;
+    result.push(item);
+  }
+  return result;
+}
+
+export function searchEvidence(field, records = [], { limit = 20, query = '' } = {}) {
+  if (String(query || '').trim()) return explicitSearchEvidence(field, records, query, limit);
+  return distinctAnswers(rankEvidence(field, records, { limit: records.length }), limit);
 }

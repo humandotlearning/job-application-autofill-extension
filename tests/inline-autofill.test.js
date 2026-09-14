@@ -53,6 +53,21 @@ test('generated rows show draft provenance and missing context and require selec
   assert.equal(f.messages.find(message => message.type === 'JOB_INLINE_ACCEPT').candidateId, draft.candidateId);
 });
 
+test('popup searches saved answers from the current question and keeps dismissal outside the popup', async t => {
+  const f = fixture(t);
+  f.field.focus(); await tick();
+  const search = f.root().querySelector('[data-search]');
+  assert.equal(search.getAttribute('aria-label'), 'Search previous answers');
+  assert.equal(f.button('Close'), undefined);
+  search.value = 'linkedin';
+  search.dispatchEvent(new f.dom.window.Event('input', {bubbles: true, composed: true}));
+  await new Promise(resolve => setTimeout(resolve, 250));
+  const request = f.messages.find(message => message.type === 'JOB_INLINE_SEARCH');
+  assert.equal(request.query, 'linkedin');
+  assert.equal(request.sessionId, 's1');
+  assert.equal(f.root().querySelectorAll('[role="option"]').length, candidates.length);
+});
+
 test('busy acceptance keeps the selected answer available for explicit retry', async t => {
   const f = fixture(t, message => message.type === 'JOB_INLINE_ACCEPT'
     ? {ok: false, error: 'Fill is in progress'}
@@ -61,6 +76,58 @@ test('busy acceptance keeps the selected answer available for explicit retry', a
   assert.match(f.root().textContent, /Fill is in progress/);
   assert.equal(f.root().querySelectorAll('[role="option"]').length, 2);
   assert.equal(f.button('Use and save reviewed answer').disabled, false);
+});
+
+test('search serializes requests, invalidates selection during debounce, and ignores obsolete replies', async t => {
+  const pending = [];
+  const f = fixture(t, message => message.type === 'JOB_INLINE_SEARCH'
+    ? new Promise(resolve => pending.push({message, resolve}))
+    : {ok: true, sessionId: 's1', requestId: message.requestId, candidates});
+  f.field.focus(); await tick(); f.key('ArrowDown');
+  f.key('ArrowDown', {altKey: true});
+  const search = f.root().querySelector('[data-search]');
+  const type = value => {search.value = value; search.dispatchEvent(new f.dom.window.Event('input', {bubbles: true, composed: true}));};
+  type('first');
+  assert.equal(f.root().querySelectorAll('[role=option]').length, 0);
+  assert.equal(f.button('Use and save reviewed answer').disabled, true);
+  await new Promise(resolve => setTimeout(resolve, 230));
+  type('second'); await new Promise(resolve => setTimeout(resolve, 230));
+  assert.equal(pending.length, 1);
+  pending[0].resolve({ok: true, sessionId: 's1', requestId: pending[0].message.requestId, candidates}); await tick();
+  assert.equal(f.root().querySelectorAll('[role=option]').length, 0);
+  assert.equal(pending.length, 2);
+  assert.equal(pending[1].message.query, 'second');
+  pending[1].resolve({ok: true, sessionId: 's1', requestId: pending[1].message.requestId, candidates: [{...candidates[0], candidateId: 'fresh'}]}); await tick();
+  f.key('ArrowDown', {}, search);
+  assert.equal(f.root().activeElement.getAttribute('role'), 'listbox');
+  assert.equal(f.field.value, '');
+  f.button('Use and save reviewed answer').click();
+  assert.equal(f.messages.find(message => message.type === 'JOB_INLINE_ACCEPT').candidateId, 'fresh');
+});
+
+test('search preserves early typing, supports IME, retries errors, and reloads empty queries', async t => {
+  let finishQuery, fail = true;
+  const f = fixture(t, message => message.type === 'JOB_INLINE_QUERY'
+    ? new Promise(resolve => {finishQuery = () => resolve({ok: true, sessionId: 's1', requestId: message.requestId, candidates});})
+    : message.type === 'JOB_INLINE_SEARCH' && fail ? {ok: false, error: 'Temporary search failure'}
+      : {ok: true, sessionId: 's1', requestId: message.requestId, candidates});
+  f.field.focus(); f.key('ArrowDown', {altKey: true});
+  const search = f.root().querySelector('[data-search]');
+  search.value = 'early'; search.dispatchEvent(new f.dom.window.Event('input', {bubbles: true, composed: true}));
+  finishQuery(); await tick();
+  assert.equal(search.value, 'early');
+  await new Promise(resolve => setTimeout(resolve, 230));
+  assert.equal(f.button('Retry search').hidden, false);
+  fail = false; f.button('Retry search').click(); await new Promise(resolve => setTimeout(resolve, 230));
+  assert.equal(f.root().querySelectorAll('[role=option]').length, 2);
+  search.dispatchEvent(new f.dom.window.CompositionEvent('compositionstart', {bubbles: true, composed: true}));
+  assert.equal(f.host().hidden, false);
+  search.value = '';
+  search.dispatchEvent(new f.dom.window.CompositionEvent('compositionend', {bubbles: true, composed: true}));
+  await new Promise(resolve => setTimeout(resolve, 230));
+  assert.equal(f.messages.filter(message => message.type === 'JOB_INLINE_SEARCH').at(-1).query, '');
+  f.key('Escape', {}, search);
+  assert.equal(f.host().hidden, true);
 });
 
 test('busy generation and provider errors retain saved choices and busy selection', async t => {
@@ -185,7 +252,7 @@ test('Alt+ArrowDown enters popup controls; Escape restores field focus and close
 test('returning from popup controls to the unchanged field restores ordinary Tab order', async t => {
   const f = fixture(t); f.field.focus(); await tick();
   f.key('ArrowDown', {altKey: true});
-  const controls = [f.root().querySelector('[role="listbox"]'), f.button('Generate answer'), f.button('Edit in panel'), f.button('Close')];
+  const controls = [f.root().querySelector('[role="listbox"]'), f.button('Generate answer'), f.button('Edit in panel'), f.root().querySelector('[data-search]')];
   f.button('Generate answer').focus();
   assert.ok(controls.every(control => control.tabIndex === 0), 'focus within the popup preserves normal control Tab order');
   f.field.focus();
@@ -212,9 +279,9 @@ test('popup focus retains the selected field when application forms have equal s
   assert.equal(f.document.__jobApplicationInlineFocusAnchor, undefined);
 });
 
-test('Close then clicking the same field reopens the single host', async t => {
+test('Escape then clicking the same field reopens the single host', async t => {
   const f = fixture(t); f.field.focus(); await tick();
-  f.button('Close').click(); assert.equal(f.host().hidden, true);
+  f.key('Escape'); assert.equal(f.host().hidden, true);
   f.field.click(); await tick();
   assert.equal(f.host().hidden, false);
   assert.equal(f.document.querySelectorAll('[data-job-inline-autofill]').length, 1);

@@ -336,6 +336,45 @@ async function inlineHarness({ field = {}, page = {}, ...options } = {}) {
 }
 
 const panelOrigin = session => ({tabId: session.tabId, frameId: session.frameId, inlineSessionId: session.sessionId, fieldId: session.field.id, handle: session.field.handle, pageSignature: session.pageSignature, applicationId: session.attachedRun?.applicationId || session.sessionId});
+
+test('inline search registers and approves evidence missed by automatic matching', async () => {
+  const harness = await inlineHarness({field: {label: 'Where can we learn more about you?', type: 'url'}, answerRecords: [
+    {key: 'legacy_profile', question: 'Professional profile', answer: 'https://linkedin.com/in/synthetic', sensitivity: 'safe'},
+  ]});
+  const initial = await harness.dispatch(inlineQuery(), inlineSender());
+  assert.equal(initial.candidates.length, 0);
+  const searched = await harness.dispatch({type: 'JOB_INLINE_SEARCH', sessionId: initial.sessionId, requestId: 'search-1', query: 'linkedin'}, inlineSender());
+  assert.equal(searched.ok, true, searched.error);
+  assert.equal(searched.candidates.length, 1);
+  const applied = await harness.dispatch(inlineAcceptance(searched), inlineSender());
+  assert.equal(applied.ok, true, applied.error);
+});
+
+test('clearing inline search registers fresh automatic candidates and rejects expired IDs', async () => {
+  const harness = await inlineHarness();
+  const initial = await harness.dispatch(inlineQuery(), inlineSender());
+  const search = query => harness.dispatch({type: 'JOB_INLINE_SEARCH', sessionId: initial.sessionId, requestId: `search-${query}`, query}, inlineSender());
+  assert.equal((await search('absent')).candidates.length, 0);
+  const restored = await search('');
+  assert.equal(restored.ok, true, restored.error);
+  assert.notEqual(restored.candidates[0].candidateId, initial.candidates[0].candidateId);
+  assert.equal((await harness.dispatch(inlineAcceptance(initial), inlineSender())).ok, false);
+  // A rejected acceptance intentionally revokes the registry; search again.
+  const refreshed = await search('');
+  const applied = await harness.dispatch(inlineAcceptance(refreshed), inlineSender());
+  assert.equal(applied.ok, true, applied.error);
+});
+
+test('inline search rejects malformed queries and cross-frame requests', async () => {
+  const harness = await inlineHarness();
+  const initial = await harness.dispatch(inlineQuery(), inlineSender());
+  for (const query of [null, {}, 'x'.repeat(201)]) {
+    const reply = await harness.dispatch({type: 'JOB_INLINE_SEARCH', sessionId: initial.sessionId, requestId: 'search-invalid', query}, inlineSender());
+    assert.equal(reply.ok, false);
+  }
+  const reply = await harness.dispatch({type: 'JOB_INLINE_SEARCH', sessionId: initial.sessionId, requestId: 'search-wrong-frame', query: 'name'}, inlineSender({frameId: 3}));
+  assert.equal(reply.ok, false);
+});
 async function handoffInline(harness, query, sender = inlineSender()) {
   return harness.dispatch({type: 'JOB_INLINE_EDIT_IN_PANEL', sessionId: query.sessionId, candidateId: query.candidates[0]?.candidateId}, sender);
 }

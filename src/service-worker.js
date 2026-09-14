@@ -1080,6 +1080,9 @@ function inlineOrigin(message, sender) {
     if (Object.hasOwn(message, 'applicationId') || Object.hasOwn(message, 'pageSignature')) throw new Error('Inline query origin must come from the sender');
     requiredBoundedText(message.fieldId, 'Field ID', 1000);
     requiredBoundedText(message.handle, 'Field handle', 1000);
+  } else if (message.type === 'JOB_INLINE_SEARCH') {
+    requiredBoundedText(message.sessionId, 'Session ID', 200);
+    if (typeof message.query !== 'string' || message.query.length > 200) throw new Error('Search query must be text of at most 200 characters');
   } else {
     requiredBoundedText(message.sessionId, 'Session ID', 200);
     if (message.type === 'JOB_INLINE_ACCEPT') {
@@ -1571,7 +1574,7 @@ async function reviewedCandidate(suggestion, message) {
   const sources = sourceKeys.map((key) => records.find((record) => record.key === key));
   const compatibleEvidence = candidate?.kind === 'planner'
     ? rankSuggestionEvidence(suggestion.field, records, {limit: records.length})
-    : retrieveEvidence(suggestion.field, records, {limit: records.length});
+    : searchEvidence(suggestion.field, sources.filter(Boolean), {limit: sources.length, query: candidate?.searchQuery || ''});
   if (!candidate || !sourceKeys.length || sources.some((source) => !source)
     || sources.some((source) => source.answer !== sourceAnswerSnapshot(candidate, source.key))
     || sources.some((source) => !compatibleEvidence.some((item) => (item.sourceKey || item.key) === source.key))) {
@@ -1655,8 +1658,12 @@ async function rewriteEvidence(suggestion, message) {
   if (!candidate) throw new Error('Saved evidence changed; choose an answer again');
   const records = candidate.kind === 'draft' ? await draftEvidenceRecords() : await getRecords();
   const relevant = records.filter((record) => requestedKeys.includes(record.key));
+  const compatible = candidate.kind === 'planner'
+    ? rankSuggestionEvidence(suggestion.field, records, {limit: records.length})
+    : searchEvidence(suggestion.field, relevant, {limit: relevant.length, query: candidate.searchQuery || ''});
   if (relevant.length !== requestedKeys.length
-    || relevant.some((record) => !retrieveEvidence(suggestion.field, records, {limit: records.length}).some((item) => item.sourceKey === record.key))) {
+    || relevant.some(record => record.answer !== sourceAnswerSnapshot(candidate, record.key)
+      || !compatible.some(item => (item.sourceKey || item.key) === record.key))) {
     throw new Error('Saved evidence changed; choose an answer again');
   }
   return relevant;
@@ -2104,10 +2111,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     } catch (error) { sendResponse({ok: false, error: error.message}); }
     return true;
   }
-  if (['JOB_INLINE_QUERY', 'JOB_INLINE_GENERATE', 'JOB_INLINE_ACCEPT', 'JOB_INLINE_CANCEL'].includes(message?.type)) {
+  if (['JOB_INLINE_QUERY', 'JOB_INLINE_SEARCH', 'JOB_INLINE_GENERATE', 'JOB_INLINE_ACCEPT', 'JOB_INLINE_CANCEL'].includes(message?.type)) {
     (async () => {
       await assertTabSiteEnabled(sender?.tab?.id, sender?.tab);
       if (message.type === 'JOB_INLINE_QUERY') return queryInlineField(message, sender);
+      if (message.type === 'JOB_INLINE_SEARCH') return searchInlineField(message, sender);
       if (message.type === 'JOB_INLINE_GENERATE') return generateInlineField(message, sender);
       if (message.type === 'JOB_INLINE_ACCEPT') return acceptInlineField(message, sender);
       const origin = inlineOrigin(message, sender);
@@ -2445,8 +2453,26 @@ async function selectEmployment(message) {
 
 async function savedSearchCandidates(field, value) {
   const records=await getRecords();
-  const query=String(value || '').trim().toLowerCase().slice(0,200);
-  return searchEvidence(field,records,{limit:20}).filter(item=>!query || `${item.sourceQuestion} ${item.answer}`.toLowerCase().includes(query));
+  const query=String(value || '').trim().slice(0,200);
+  return searchEvidence(field, records, {limit: 20, query});
+}
+
+async function searchInlineField(message, sender) {
+  const {session, field} = await guardInlineField(message, sender, {requireFocus: true});
+  if (processingTabs.has(session.tabId) || saveLocks.has(session.tabId)) throw new Error('Application is busy. Search again.');
+  const candidates = message.query.trim()
+    ? await savedSearchCandidates(field, message.query)
+    : savedFieldCandidates(field, await getRecords(), await draftEvidenceRecords());
+  const {session: latest, authority} = await guardInlineField(message, sender, {requireFocus: true});
+  if (latest.revision !== session.revision) throw new Error('Inline session changed. Search again.');
+  const updated = await mutateInlineSession(session.tabId, session.frameId, session.sessionId, current => {
+    authority();
+    if (processingTabs.has(session.tabId) || saveLocks.has(session.tabId)) throw new Error('Application is busy. Search again.');
+    if (current.revision !== session.revision) throw new Error('Inline session changed. Search again.');
+    const registered = candidates.map(candidate => ({...candidate, candidateId: `search:${current.revision + 1}:${crypto.randomUUID()}`}));
+    return {...current, suggestions: {...current.suggestions, [field.id]: {...current.suggestions[field.id], field, candidates: registered}}};
+  });
+  return inlineReply(updated, message.requestId, {candidates: updated.suggestions[field.id].candidates});
 }
 
 async function searchSavedAnswers(message) {

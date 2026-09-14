@@ -317,6 +317,35 @@ test('extracts an associated Workday label before its verbose button aria-label'
   assert.equal(field.currentValue, '');
 });
 
+test('removes phone country-menu text from accessible labels', () => {
+  const document = makeDocument(`
+    <form>
+      <input id="phone" aria-label="Phone number* Afghanistan (افغانستان)+93Albania (Shqipëri)+355American Samoa +1684">
+    </form>
+  `);
+  const field = collectFieldDescriptors(document)[0];
+  assert.equal(field.label, 'Phone number');
+});
+
+test('phone labels omit nested menus and CSS-hidden content while preserving country options', () => {
+  const document = makeDocument(`<style>.widget-hidden { display: none; }</style><form>
+    <label id="phone-label">Phone number*<span class="widget-hidden">Widget instructions</span>
+      <button type="button" id="country" role="combobox" aria-label="Country code" aria-controls="countries">Select one</button>
+      <ul id="countries" role="listbox" class="iti__country-list"><li role="option">Afghanistan +93</li><li role="option">Albania +355</li></ul>
+      <input id="phone" type="tel" aria-labelledby="phone-label">
+    </label></form>`);
+  const fields = collectFieldDescriptors(document);
+  assert.equal(fields.find(field => field.id === 'phone').label, 'Phone number');
+  assert.deepEqual(fields.find(field => field.id === 'country').options, ['Afghanistan +93', 'Albania +355']);
+  assert.equal(document.querySelectorAll('[role=option]').length, 2);
+});
+
+test('phone instructions with dialing examples are preserved', () => {
+  const question = 'Phone number including country code, for example +91 or +44';
+  const document = makeDocument(`<label>${question}<input type="tel"></label>`);
+  assert.equal(collectFieldDescriptors(document)[0].label, question);
+});
+
 test('pauses for an empty required custom choice field', () => {
   const document = makeDocument(`
     <main>

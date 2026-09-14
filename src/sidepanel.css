@@ -267,7 +267,8 @@ button:disabled { cursor: wait; opacity: .55; }
 .pill.neutral { border-color: var(--color-border); color: var(--color-text-muted); background: var(--color-surface-raised); }
 .result-item { position: relative; padding: var(--space-3) 0; border-top: var(--border-width) solid var(--color-border); }
 .result-item:first-child { border-top: 0; }
-.result-label { margin: 0; color: var(--color-text); font-size: var(--font-lg); line-height: var(--line-tight); font-weight: 800; letter-spacing: var(--tracking-heading); }
+.result-label { max-width: 100%; margin: 0; color: var(--color-text); font-size: var(--font-lg); line-height: var(--line-tight); font-weight: 800; letter-spacing: var(--tracking-heading); overflow-wrap: anywhere; }
+.result-label.collapsed { max-height: 3.2em; overflow: hidden; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; }
 .result-detail,
 .result-reason,
 .result-next-action { display: block; margin-top: var(--space-xxs); color: var(--color-text-muted); font-size: var(--font-xs); overflow-wrap: anywhere; }

@@ -1085,6 +1085,23 @@ test('unanswered fields can search saved answers and use a returned candidate', 
   } finally { harness.cleanup(); }
 });
 
+test('long review questions have a keyboard-accessible expansion', async () => {
+  const question = 'Describe your experience delivering complex projects and explain the decisions you made while working with different teams.';
+  const harness = await setupPanel({run: {status: 'waiting_user', actionRequired: [{fieldId: 'experience', label: question}], optionalUnresolved: [], reviewRequired: [], audit: []}});
+  try {
+    const row = harness.dom.window.document.querySelector('#action-required-list .result-item');
+    const label = row.querySelector('.result-label');
+    const expand = [...row.querySelectorAll('button')].find(button => button.textContent === 'Show full question');
+    assert.equal(label.textContent, question);
+    assert.equal(expand.getAttribute('aria-expanded'), 'false');
+    expand.click();
+    assert.equal(label.classList.contains('collapsed'), false);
+    assert.equal(expand.getAttribute('aria-expanded'), 'true');
+    expand.click();
+    assert.equal(label.classList.contains('collapsed'), true);
+  } finally { harness.cleanup(); }
+});
+
 test('saved-answer search remains available beside a recommendation', async () => {
   const suggestion = {
     tabId: 7, frameId: 3, applicationId: 'run-search-recommendation', pageSignature: 'page-one',

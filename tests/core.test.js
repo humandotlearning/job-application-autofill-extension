@@ -32,6 +32,17 @@ test('keeps phone number, extension, and device type concepts separate', () => {
   assert.equal(chooseRecord({ label: 'Phone Extension' }, [{ key: 'phone_extension', question: 'Phone extension', answer: '123', sensitivity: 'safe' }])?.record.key, 'phone_extension');
 });
 
+test('recognizes common LinkedIn profile-link wording without crossing profile concepts', () => {
+  for (const label of ['Link to your LinkedIn', 'LinkedIn profile link', 'URL for my LinkedIn']) {
+    assert.equal(canonicalConcept(label), 'linkedin_url');
+  }
+  const records = [
+    { key: 'linkedin_url', question: 'LinkedIn URL', answer: 'https://linkedin.com/in/person' },
+    { key: 'github_url', question: 'GitHub URL', answer: 'https://github.com/person' },
+  ];
+  assert.equal(chooseRecord({ label: 'Link to your LinkedIn' }, records)?.record.key, 'linkedin_url');
+});
+
 test('rejects opaque values as semantic fill answers', () => {
   assert.equal(validateFillValue({ type: 'text' }, '4466d54cbeba1000aec278b38cc80000').ok, false);
   assert.equal(chooseRecord({ label: 'Phone Device Type' }, [{ key: 'phone_device_type', question: 'Phone Device Type', answer: '4466d54cbeba1000aec278b38cc80000', sensitivity: 'safe' }]), null);

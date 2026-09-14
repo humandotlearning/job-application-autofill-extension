@@ -106,15 +106,35 @@ export function extractJobContext(document) {
 function textFromIds(document, ids = '') {
   return String(ids)
     .split(/\s+/)
-    .map((id) => document.getElementById(id)?.textContent?.trim() || '')
+    .map((id) => document.getElementById(id) ? labelText(document.getElementById(id)) : '')
     .filter(Boolean)
     .join(' ');
 }
 
+function cleanLabelString(value) {
+  const text = String(value || '').replace(/\s+/g, ' ').trim();
+  // Phone widgets often append their complete country menu to the accessible
+  // name. Keep the question and leave the menu entries in structured options.
+  const phoneMenu = /^((?:phone|mobile|telephone)(?:\s+number)?)\s*[*:]?\s*Afghanistan\b.*\+93\s*Albania\b.*\+355/i.exec(text);
+  if (phoneMenu) return phoneMenu[1];
+  return text.replace(/\s*\*+\s*$/, '').trim();
+}
+
 function labelText(label) {
-  const copy = label.cloneNode(true);
-  for (const child of copy.querySelectorAll('input,textarea,select,button,[role="combobox"],[role="listbox"]')) child.remove();
-  return String(copy.textContent || '').replace(/\s+/g, ' ').trim();
+  const excluded = 'script,style,input,textarea,select,button,[role="combobox"],[role="listbox"],[role="option"],[role="menu"],.iti__country-list,.country-list,[hidden],[aria-hidden="true"]';
+  function read(node) {
+    if (node.nodeType === 3) return node.textContent;
+    if (node.nodeType !== 1) return '';
+    // Explicit aria-labelledby references may themselves be hidden. Exclude
+    // nested widget content without discarding the referenced label root.
+    if (node !== label) {
+      if (node.matches(excluded)) return '';
+      const style = node.ownerDocument.defaultView?.getComputedStyle(node);
+      if (style?.display === 'none' || style?.visibility === 'hidden' || style?.contentVisibility === 'hidden') return '';
+    }
+    return [...node.childNodes].map(read).join('');
+  }
+  return cleanLabelString(read(label));
 }
 
 function nearbyQuestion(element) {
@@ -147,7 +167,7 @@ function questionMetadata(document, element) {
     const nearby = nearbyQuestion(element);
     return { label: nearby || element.name || element.id || '', labelSource: nearby ? 'nearby-question' : 'identity', labelConfidence: nearby ? 'high' : 'low' };
   }
-  const explicit = native || element.getAttribute('aria-label') || textFromIds(document, element.getAttribute('aria-labelledby'));
+  const explicit = cleanLabelString(native || element.getAttribute('aria-label') || textFromIds(document, element.getAttribute('aria-labelledby')));
   const nearby = !explicit && nearbyQuestion(element);
   return { label: explicit || nearby || element.getAttribute('placeholder') || element.name || element.id || '',
     labelSource: explicit ? 'explicit' : nearby ? 'nearby-question' : 'identity', labelConfidence: explicit || nearby ? 'high' : 'low' };
@@ -230,7 +250,7 @@ function customWidgetRequired(element) {
 }
 
 function visibleText(element) {
-  return String(element?.textContent || '').replace(/\s+/g, ' ').trim();
+  return cleanLabelString(element?.textContent || '');
 }
 
 function associatedLabelText(document, element) {
@@ -241,7 +261,7 @@ function associatedLabelText(document, element) {
   if (!element.id) return '';
   const explicit = [...document.querySelectorAll('label')]
     .filter((label) => label.getAttribute('for') === element.id)
-    .map((label) => visibleText(label))
+    .map(labelText)
     .filter(Boolean);
   return explicit.join(' ');
 }
@@ -285,7 +305,7 @@ function customWidgetLabel(document, element) {
   if (fieldGroupLabel) return fieldGroupLabel;
 
   const displayed = customWidgetValue(element);
-  const ariaLabel = String(element.getAttribute('aria-label') || '').replace(/\s+/g, ' ').trim();
+  const ariaLabel = cleanLabelString(element.getAttribute('aria-label') || '');
   const withoutState = ariaLabel.replace(/\b(?:required|optional)\b/gi, ' ').replace(/\s+/g, ' ').trim();
   const normalizedLabel = normalizeText(withoutState);
   const normalizedValue = normalizeText(displayed);

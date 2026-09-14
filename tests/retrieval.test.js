@@ -110,3 +110,23 @@ test('saved-answer search is not capped by the three recommendation slots', asyn
   const candidates = searchEvidence({ label: 'Preferred tool', type: 'text' }, records, { limit: 20 });
   assert.deepEqual(candidates.map((candidate) => candidate.answer), ['First', 'Second', 'Third', 'Fourth']);
 });
+
+test('explicit saved-answer search finds missed question matches and collapses duplicate answers', async () => {
+  const { searchEvidence } = await import('../src/retrieval.js');
+  const records = [
+    { key: 'legacy_profile', question: 'Professional profile', answer: 'https://linkedin.com/in/person', confirmationState: 'confirmed', sensitivity: 'safe' },
+    { key: 'linkedin_url', question: 'LinkedIn URL', answer: 'https://linkedin.com/in/person', confirmationState: 'confirmed', sensitivity: 'safe' },
+    { key: 'github_url', question: 'GitHub URL', answer: 'https://github.com/person', confirmationState: 'confirmed', sensitivity: 'safe' },
+  ];
+  const candidates = searchEvidence({ label: 'Where can we learn more about you?', type: 'url' }, records, { query: 'linkedin', limit: 20 });
+  assert.deepEqual(candidates.map((candidate) => candidate.answer), ['https://linkedin.com/in/person']);
+  assert.equal(candidates[0].sourceKey, 'linkedin_url');
+});
+
+test('search preserves distinct literal URLs and finds aliases beyond the first twenty records', async () => {
+  const { searchEvidence } = await import('../src/retrieval.js');
+  const records = Array.from({length: 25}, (_, i) => ({key: `record_${i}`, question: 'Preferred tool', answer: `Tool ${i}`}));
+  records.push(...['https://example.com/a-b', 'https://example.com/a/b', 'https://example.com/A/b', 'https://example.com/a-b'].map((answer, i) => ({key: `url_${i}`, question: 'Profile address', aliases: ['find profile'], answer})));
+  const results = searchEvidence({label: 'Where can we learn more?', type: 'url'}, records, {query: 'find profile'});
+  assert.deepEqual(results.map(item => item.answer), ['https://example.com/a-b', 'https://example.com/a/b', 'https://example.com/A/b']);
+});

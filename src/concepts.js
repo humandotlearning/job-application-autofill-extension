@@ -12,7 +12,7 @@ export const CONCEPT_REGISTRY = {
   phone_country_code: /^(?:country code|country phone code|phone country code|country calling code|calling code)$/,
   phone_device_type: /^(?:phone|telephone|mobile) (?:device )?type$/,
   github_url: /^(?:github|github profile|github url)$/,
-  linkedin_url: /^(?:linkedin|linkedin profile|linkedin url)$/,
+  linkedin_url: /^(?:(?:link|url) (?:to|for) (?:your |my )?)?linkedin(?: profile)?(?: link| url)?$/,
   portfolio_url: /^(?:portfolio|portfolio url|personal website|website)$/,
   current_employer: /^(?:current|present) (?:employer|company|organization)$/,
   current_location: /^(?:current|present) location$/,
@@ -25,6 +25,7 @@ export const CONCEPT_REGISTRY = {
 };
 
 export function conceptForNormalized(text) {
-  const cleaned = text.replace(/^(?:(?:what is|please enter|enter) )?(?:your )?/, '').replace(/\blinked in\b/g, 'linkedin').replace(/\bgit hub\b/g, 'github');
+  const cleaned = text.replace(/^(?:(?:what is|please enter|enter) )?(?:your )?/, '')
+    .replace(/\blinked in\b/g, 'linkedin').replace(/\bgit hub\b/g, 'github');
   return Object.entries(CONCEPT_REGISTRY).find(([, pattern]) => pattern.test(cleaned))?.[0] || cleaned.replace(/\s+/g, '_');
 }

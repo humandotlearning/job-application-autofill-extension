@@ -14,7 +14,7 @@ const CONCEPT_REGISTRY = {
   phone_country_code: /^(?:country code|country phone code|phone country code|country calling code|calling code)$/,
   phone_device_type: /^(?:phone|telephone|mobile) (?:device )?type$/,
   github_url: /^(?:github|github profile|github url)$/,
-  linkedin_url: /^(?:linkedin|linkedin profile|linkedin url)$/,
+  linkedin_url: /^(?:(?:link|url) (?:to|for) (?:your |my )?)?linkedin(?: profile)?(?: link| url)?$/,
   portfolio_url: /^(?:portfolio|portfolio url|personal website|website)$/,
   current_employer: /^(?:current|present) (?:employer|company|organization)$/,
   current_location: /^(?:current|present) location$/,
@@ -27,7 +27,8 @@ const CONCEPT_REGISTRY = {
 };
 
 function conceptForNormalized(text) {
-  const cleaned = text.replace(/^(?:(?:what is|please enter|enter) )?(?:your )?/, '').replace(/\blinked in\b/g, 'linkedin').replace(/\bgit hub\b/g, 'github');
+  const cleaned = text.replace(/^(?:(?:what is|please enter|enter) )?(?:your )?/, '')
+    .replace(/\blinked in\b/g, 'linkedin').replace(/\bgit hub\b/g, 'github');
   return Object.entries(CONCEPT_REGISTRY).find(([, pattern]) => pattern.test(cleaned))?.[0] || cleaned.replace(/\s+/g, '_');
 }
 
@@ -567,15 +568,35 @@ function extractJobContext(document) {
 function textFromIds(document, ids = '') {
   return String(ids)
     .split(/\s+/)
-    .map((id) => document.getElementById(id)?.textContent?.trim() || '')
+    .map((id) => document.getElementById(id) ? labelText(document.getElementById(id)) : '')
     .filter(Boolean)
     .join(' ');
 }
 
+function cleanLabelString(value) {
+  const text = String(value || '').replace(/\s+/g, ' ').trim();
+  // Phone widgets often append their complete country menu to the accessible
+  // name. Keep the question and leave the menu entries in structured options.
+  const phoneMenu = /^((?:phone|mobile|telephone)(?:\s+number)?)\s*[*:]?\s*Afghanistan\b.*\+93\s*Albania\b.*\+355/i.exec(text);
+  if (phoneMenu) return phoneMenu[1];
+  return text.replace(/\s*\*+\s*$/, '').trim();
+}
+
 function labelText(label) {
-  const copy = label.cloneNode(true);
-  for (const child of copy.querySelectorAll('input,textarea,select,button,[role="combobox"],[role="listbox"]')) child.remove();
-  return String(copy.textContent || '').replace(/\s+/g, ' ').trim();
+  const excluded = 'script,style,input,textarea,select,button,[role="combobox"],[role="listbox"],[role="option"],[role="menu"],.iti__country-list,.country-list,[hidden],[aria-hidden="true"]';
+  function read(node) {
+    if (node.nodeType === 3) return node.textContent;
+    if (node.nodeType !== 1) return '';
+    // Explicit aria-labelledby references may themselves be hidden. Exclude
+    // nested widget content without discarding the referenced label root.
+    if (node !== label) {
+      if (node.matches(excluded)) return '';
+      const style = node.ownerDocument.defaultView?.getComputedStyle(node);
+      if (style?.display === 'none' || style?.visibility === 'hidden' || style?.contentVisibility === 'hidden') return '';
+    }
+    return [...node.childNodes].map(read).join('');
+  }
+  return cleanLabelString(read(label));
 }
 
 function nearbyQuestion(element) {
@@ -608,7 +629,7 @@ function questionMetadata(document, element) {
     const nearby = nearbyQuestion(element);
     return { label: nearby || element.name || element.id || '', labelSource: nearby ? 'nearby-question' : 'identity', labelConfidence: nearby ? 'high' : 'low' };
   }
-  const explicit = native || element.getAttribute('aria-label') || textFromIds(document, element.getAttribute('aria-labelledby'));
+  const explicit = cleanLabelString(native || element.getAttribute('aria-label') || textFromIds(document, element.getAttribute('aria-labelledby')));
   const nearby = !explicit && nearbyQuestion(element);
   return { label: explicit || nearby || element.getAttribute('placeholder') || element.name || element.id || '',
     labelSource: explicit ? 'explicit' : nearby ? 'nearby-question' : 'identity', labelConfidence: explicit || nearby ? 'high' : 'low' };
@@ -691,7 +712,7 @@ function customWidgetRequired(element) {
 }
 
 function visibleText(element) {
-  return String(element?.textContent || '').replace(/\s+/g, ' ').trim();
+  return cleanLabelString(element?.textContent || '');
 }
 
 function associatedLabelText(document, element) {
@@ -702,7 +723,7 @@ function associatedLabelText(document, element) {
   if (!element.id) return '';
   const explicit = [...document.querySelectorAll('label')]
     .filter((label) => label.getAttribute('for') === element.id)
-    .map((label) => visibleText(label))
+    .map(labelText)
     .filter(Boolean);
   return explicit.join(' ');
 }
@@ -746,7 +767,7 @@ function customWidgetLabel(document, element) {
   if (fieldGroupLabel) return fieldGroupLabel;
 
   const displayed = customWidgetValue(element);
-  const ariaLabel = String(element.getAttribute('aria-label') || '').replace(/\s+/g, ' ').trim();
+  const ariaLabel = cleanLabelString(element.getAttribute('aria-label') || '');
   const withoutState = ariaLabel.replace(/\b(?:required|optional)\b/gi, ' ').replace(/\s+/g, ' ').trim();
   const normalizedLabel = normalizeText(withoutState);
   const normalizedValue = normalizeText(displayed);
@@ -1748,10 +1769,12 @@ function createLearningSession(document, { capture, send, onFinalSubmit, onReval
 
 function createInlineAutofill(document, {send, describe}) {
   const view = document.defaultView;
-  let host, shadow, dialog, list, preview, status, use, generate, edit, hint;
+  let host, shadow, dialog, question, searchInput, list, preview, status, use, generate, edit, hint, retrySearch;
   let target = null, snapshot = null, sessionId = null, requestId = null;
   let answers = [], index = -1, epoch = 0, acceptance = null;
   let loading = false, retry = false, composing = false, disposed = false, restoringFocus = false;
+  let searchTimer = null;
+  let searchVersion = 0, searchPending = null, searchReady = false, searching = false;
   let positionFrame = null, mutationObserver = null, resizeObserver = null;
   const listeners = [];
   const requestFrame = callback => view.requestAnimationFrame ? view.requestAnimationFrame(callback) : view.setTimeout(callback, 0);
@@ -1775,7 +1798,9 @@ function createInlineAutofill(document, {send, describe}) {
     return eligible(document.activeElement) ? document.activeElement : null;
   }
   function isCurrent(version, element, expected) {
-    return !disposed && epoch === version && target === element && activeField() === element
+    const focused = document.activeElement;
+    return !disposed && epoch === version && target === element
+      && (focused === element || focused === host && !host.hidden)
       && fingerprint(eligible(element)) === expected;
   }
   function listen(node, type, handler, options) {
@@ -1805,7 +1830,7 @@ function createInlineAutofill(document, {send, describe}) {
       :host([hidden]) { display: none !important; }
       * { box-sizing: border-box; }
       [hidden] { display: none !important; }
-      [role=dialog] { max-height: inherit; overflow: auto; padding: 12px; border: 1px solid #344354;
+      [role=dialog] { display: flex; flex-direction: column; max-height: inherit; overflow: hidden; padding: 12px; border: 1px solid #344354;
         border-radius: 8px; background: #10161d; color: #f4f7fb; box-shadow: 0 10px 24px #0005;
         font: 13px/1.45 Inter, ui-sans-serif, system-ui, sans-serif; }
       p { margin: 0 0 8px; white-space: pre-wrap; overflow-wrap: anywhere; }
@@ -1817,21 +1842,33 @@ function createInlineAutofill(document, {send, describe}) {
       button:disabled { opacity: .5; cursor: default; }
       :focus-visible { outline: 2px solid #ffb21a; outline-offset: 2px; }
       [role=status], small { display: block; color: #9aa7b7; margin-top: 8px; }
+      [data-question] { flex-shrink: 0; max-height: 76px; overflow: auto; margin-bottom: 10px; font-weight: 700; }
+      [data-results] { min-height: 0; overflow: auto; }
+      [data-search] { width: 100%; margin: 0 0 8px; padding: 8px; border: 1px solid #344354; border-radius: 5px;
+        flex-shrink: 0; color: #f4f7fb; background: #161e27; font: inherit; }
+      [data-secondary] { margin-top: 4px; }
     `));
     dialog = node('section', null, {role: 'dialog', 'aria-label': 'Application answer suggestions'});
+    question = node('p', null, {'data-question': ''});
+    searchInput = node('input', null, {type: 'search', maxlength: '200', 'data-search': '', 'aria-label': 'Search previous answers', placeholder: 'Search previous answers'});
+    searchInput.addEventListener('input', scheduleSearch);
     list = node('div', null, {role: 'listbox', 'aria-label': 'Saved answers', tabindex: '-1'});
     preview = node('div', null, {'data-preview': ''});
     use = button('Use and save reviewed answer', accept);
     generate = button('Generate answer', generateAnswer);
     edit = button('Edit in panel', editInPanel);
-    const close = button('Close', () => dismiss({returnFocus: true}));
+    retrySearch = button('Retry search', scheduleSearch);
     status = node('div', '', {role: 'status', 'aria-live': 'polite', 'aria-atomic': 'true'});
     hint = node('small', 'Arrow keys choose an answer; Tab uses the selection. Alt+ArrowDown enters controls. Escape closes.');
-    dialog.append(list, preview, use, generate, edit, close, hint, status);
+    const secondary = node('div', null, {'data-secondary': ''});
+    secondary.append(generate, edit);
+    const results = node('div', null, {'data-results': ''});
+    results.append(list, preview, use, secondary, hint, status, retrySearch);
+    dialog.append(question, searchInput, results);
     shadow.append(dialog);
   }
   function controlsMode(enabled) {
-    for (const element of shadow.querySelectorAll('button, [role="listbox"]')) element.tabIndex = enabled ? 0 : -1;
+    for (const element of shadow.querySelectorAll('button, input, [role="listbox"]')) element.tabIndex = enabled ? 0 : -1;
   }
   function setStatus(text) { status.textContent = text; schedulePosition(); }
   function provenance(answer) {
@@ -1840,12 +1877,17 @@ function createInlineAutofill(document, {send, describe}) {
   }
   function render() {
     const kept = snapshot?.rawValue !== '';
-    list.hidden = preview.hidden = generate.hidden = edit.hidden = hint.hidden = kept;
+    question.hidden = searchInput.hidden = list.hidden = preview.hidden = generate.hidden = edit.hidden = hint.hidden = kept;
+    question.textContent = snapshot?.label || 'Application question';
+    searchInput.disabled = loading && Boolean(sessionId) && !searching;
+    retrySearch.hidden = !retry || !sessionId || kept;
     list.replaceChildren();
     list.removeAttribute('aria-activedescendant');
     answers.forEach((answer, answerIndex) => {
       const option = node('div', null, {role: 'option', id: `inline-answer-${answerIndex}`, 'aria-selected': String(index === answerIndex)});
-      option.append(node('p', String(answer.answer ?? '')), node('small', provenance(answer)));
+      const text = String(answer.answer ?? '');
+      option.append(node('p', answer.sourceQuestion || 'Generated answer'), node('p', text.length > 160 ? `${text.slice(0, 160)}…` : text));
+      if (answer.kind === 'generated') option.append(node('small', provenance(answer)));
       option.addEventListener('click', () => select(answerIndex));
       list.append(option);
     });
@@ -1869,7 +1911,7 @@ function createInlineAutofill(document, {send, describe}) {
     if (loading || !answers.length || !isCurrent(epoch, target, fingerprint(snapshot))) return;
     index = (next + answers.length) % answers.length;
     updateSelection();
-    setStatus(`Answer ${index + 1} of ${answers.length}. ${preview.textContent}`);
+    setStatus(`Answer ${index + 1} of ${answers.length}. Review the full answer, then choose Use.`);
   }
   function cancelSession(id = sessionId, request = requestId) {
     if (id && request) message({type: 'JOB_INLINE_CANCEL', sessionId: id, requestId: request}).catch(() => {});
@@ -1886,12 +1928,52 @@ function createInlineAutofill(document, {send, describe}) {
     delete document.__jobApplicationInlineFocusAnchor;
     if (!retainSession) cancelSession();
     sessionId = requestId = null;
+    if (searchTimer !== null) { view.clearTimeout(searchTimer); searchTimer = null; }
+    if (searchInput) searchInput.value = '';
+    searchVersion++; searchPending = null; searchReady = searching = false;
     target = snapshot = null; answers = []; index = -1; loading = false; retry = false;
     stopObserving();
     if (host) { host.hidden = true; controlsMode(false); }
     if ((returnFocus || popupFocused) && previous?.isConnected) {
       restoringFocus = true; previous.focus({preventScroll: true}); restoringFocus = false;
     }
+  }
+
+  function scheduleSearch() {
+    if (!searchInput || searchInput.disabled || !target || snapshot?.rawValue !== '') return;
+    // Revoke displayed choices immediately, including during the debounce.
+    searchVersion++; searchReady = false; searching = loading = true;
+    answers = []; index = -1; retry = false;
+    if (searchTimer !== null) view.clearTimeout(searchTimer);
+    render(); setStatus('Searching previous answers…');
+    if (composing || !sessionId) return;
+    searchTimer = view.setTimeout(() => {
+      searchTimer = null; searchReady = true; runSearch();
+    }, 200);
+  }
+  function runSearch() {
+    // A session's candidate registry is mutable; serialize requests so the
+    // latest displayed IDs always belong to its latest worker revision.
+    if (!searchReady || searchPending || !sessionId || composing) return;
+    searchReady = false;
+    const version = epoch, queryVersion = searchVersion, element = target;
+    const expected = fingerprint(snapshot), session = sessionId, query = searchInput.value.trim();
+    const pending = {}; searchPending = pending;
+    requestId = uniqueId(); const request = requestId;
+    const current = () => searchVersion === queryVersion && isCurrent(version, element, expected);
+    message({type: 'JOB_INLINE_SEARCH', sessionId: session, fieldId: snapshot.id, handle: snapshot.handle, requestId: request, query}).then(response => {
+      if (!current()) return;
+      if (!response?.ok) throw new Error(response?.error || 'Saved-answer search is unavailable.');
+      if (response.sessionId !== session || response.requestId !== request) throw new Error('Search changed. Retry search.');
+      answers = (response.candidates || []).slice(0, 20); searching = loading = retry = false; render();
+      setStatus(answers.length ? `Found ${answers.length} saved answer${answers.length === 1 ? '' : 's'}. Choose one to review.` : 'No saved answers found.');
+    }).catch(error => {
+      if (!current()) return;
+      searching = loading = false; retry = true; render(); setStatus(error.message);
+    }).finally(() => {
+      if (searchPending !== pending) return;
+      searchPending = null; runSearch();
+    });
   }
   function observe() {
     stopObserving();
@@ -1944,7 +2026,9 @@ function createInlineAutofill(document, {send, describe}) {
       if (!response?.ok || !response.sessionId) throw new Error(response?.error || 'Saved answers are unavailable. Click the field to retry.');
       if (response.requestId !== request) throw new Error('Saved answers changed. Click the field to retry.');
       sessionId = response.sessionId; answers = (response.candidates || []).slice(0, 3); index = -1; loading = false;
-      render(); setStatus(response.error || (answers.length ? 'Choose an answer to review before using it.' : 'No saved answers. Generate an answer or edit in panel.'));
+      render();
+      setStatus(response.error || (answers.length ? 'Choose an answer to review before using it.' : 'No saved answers. Generate an answer or edit in panel.'));
+      if (searching) scheduleSearch();
     }).catch(error => {
       if (!isCurrent(version, element, expected)) return;
       loading = false; retry = true; render(); setStatus(error.message);
@@ -2038,8 +2122,18 @@ function createInlineAutofill(document, {send, describe}) {
     if (event.key === 'Escape' && !event.ctrlKey && !event.altKey && !event.metaKey) {
       event.preventDefault(); dismiss({returnFocus: inPopup}); return;
     }
+    if (inPopup && shadow.activeElement === searchInput && event.key === 'Enter' && !event.ctrlKey && !event.altKey && !event.metaKey && !event.shiftKey) {
+      event.preventDefault();
+      if (retry) scheduleSearch();
+      else if (answers.length && !loading) select(index < 0 ? 0 : index);
+      return;
+    }
+    if (inPopup && shadow.activeElement === searchInput && event.key === 'ArrowDown' && !event.ctrlKey && !event.altKey && !event.metaKey && !event.shiftKey) {
+      if (answers.length && !loading) { event.preventDefault(); select(index < 0 ? 0 : index); list.focus(); }
+      return;
+    }
     if (event.key === 'ArrowDown' && event.altKey && !event.ctrlKey && !event.metaKey && !event.shiftKey && !inPopup) {
-      event.preventDefault(); controlsMode(true); (answers.length ? list : generate.disabled ? edit.disabled ? shadow.querySelector('button:last-of-type') : edit : generate).focus(); return;
+      event.preventDefault(); controlsMode(true); searchInput.focus(); return;
     }
     if (event.ctrlKey || event.altKey || event.metaKey || event.shiftKey) return;
     if (event.key === 'Tab') {
@@ -2080,8 +2174,15 @@ function createInlineAutofill(document, {send, describe}) {
   listen(document, 'change', event => {
     if (event.target === target && !document.__jobApplicationFilling && !event.target.__jobApplicationAutofillDispatch) { acceptance = null; activate(event.target); }
   });
-  listen(document, 'compositionstart', () => { composing = true; dismiss(); });
-  listen(document, 'compositionend', () => { composing = false; });
+  listen(document, 'compositionstart', event => {
+    composing = true;
+    if (event.composedPath().includes(searchInput)) scheduleSearch();
+    else dismiss();
+  });
+  listen(document, 'compositionend', event => {
+    composing = false;
+    if (event.composedPath().includes(searchInput)) scheduleSearch();
+  });
   listen(view, 'pagehide', () => dismiss());
   listen(document, 'scroll', schedulePosition, true);
   listen(view, 'resize', schedulePosition);

@@ -730,6 +730,19 @@ function itemRow(item, { focus = false, detail = '', responseHandler = response 
   else if (unclearQuestion) value.textContent = `${item.nearbyContext ? `Nearby text: ${item.nearbyContext}. ` : ''}Use Show on page to identify this question, then write your answer.`;
   else value.textContent = fieldAction || item.reason || 'Review this field';
   content.append(label, value);
+  if (displayLabel.length > 80) {
+    label.classList.add('collapsed');
+    const expand = document.createElement('button');
+    expand.type = 'button';
+    expand.textContent = 'Show full question';
+    expand.setAttribute('aria-expanded', 'false');
+    expand.addEventListener('click', () => {
+      const collapsed = label.classList.toggle('collapsed');
+      expand.setAttribute('aria-expanded', String(!collapsed));
+      expand.textContent = collapsed ? 'Show full question' : 'Show less';
+    });
+    label.after(expand);
+  }
   if (item.reason && hasPrimaryDetail) {
     const reason = document.createElement('p');
     reason.className = 'result-reason';
@@ -768,21 +781,29 @@ function itemRow(item, { focus = false, detail = '', responseHandler = response 
     const query = document.createElement('input');
     query.dataset.searchQuery = 'true';
     query.placeholder = 'Search saved answers';
+    query.setAttribute('aria-label', 'Search previous answers');
+    query.maxLength = 200;
     query.value = workspace.state.searchQuery;
     const button = document.createElement('button');
     button.type = 'button'; button.dataset.searchAnswers = 'true'; button.textContent = 'Search';
     const results = document.createElement('div');
     button.addEventListener('click', async () => {
+      if (button.disabled) return;
+      const submittedQuery = workspace.state.searchQuery.trim();
       button.disabled = true;
+      query.disabled = true;
+      results.replaceChildren();
       if (origin.inlineSessionId) workspace.state.pending = 'search';
       try {
-        const response = await sendFieldAction('JOB_RUN_SEARCH_ANSWERS', origin, { fieldId: origin.fieldId, query: workspace.state.searchQuery.trim() });
+        const response = await sendFieldAction('JOB_RUN_SEARCH_ANSWERS', origin, { fieldId: origin.fieldId, query: submittedQuery });
+        if (!search.isConnected || workspace.state.searchQuery.trim() !== submittedQuery) return;
         if (!response?.ok) throw new Error(response?.error || 'Could not search saved answers.');
         if (origin.inlineSessionId) responseHandler(response, {preserveContent: true});
         results.replaceChildren();
         for (const candidate of response.candidates || []) {
           if (isOpaqueIdentifier(candidate.answer)) continue;
-          const choice = document.createElement('button'); choice.type = 'button'; choice.dataset.searchResult = 'true'; choice.textContent = candidate.answer;
+          const choice = document.createElement('button'); choice.type = 'button'; choice.dataset.searchResult = 'true';
+          choice.textContent = `${candidate.sourceQuestion || 'Saved answer'} — ${candidate.answer.length > 160 ? `${candidate.answer.slice(0, 160)}…` : candidate.answer}`;
           choice.addEventListener('click', () => {
             updateDraftAnswer(workspace.state, candidate.answer); workspace.state.sourceKey = candidate.sourceKey || null;
             workspace.state.sourceKeys = candidate.sourceKeys || (candidate.sourceKey ? [candidate.sourceKey] : []); workspace.state.candidateKind = candidate.kind || null;
@@ -791,13 +812,14 @@ function itemRow(item, { focus = false, detail = '', responseHandler = response 
           results.append(choice);
         }
         if (!results.children.length) results.textContent = 'No saved answers found.';
-      } catch (error) { setStatus(error.message, 'error'); } finally {
+      } catch (error) { if (search.isConnected) setStatus(error.message, 'error'); } finally {
         if (workspace.state.pending === 'search') workspace.state.pending = null;
         button.disabled = false;
+        query.disabled = false;
         workspace.updateControls();
       }
     });
-    query.addEventListener('input', () => { workspace.state.searchQuery = query.value; });
+    query.addEventListener('input', () => { workspace.state.searchQuery = query.value; results.replaceChildren(); });
     search.append(query, button, results); content.append(search);
   }
   if (generated) {
