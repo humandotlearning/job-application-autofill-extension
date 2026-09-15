@@ -13,7 +13,7 @@ test('fresh classic bundle executes and same-version reinjection preserves value
   new Script(bundle).runInContext(context);
   assert.equal(listeners.size, 1);
   const ping = await new Promise(resolve => [...listeners][0]({ type: 'JOB_APP_PING' }, {}, resolve));
-  assert.equal(ping.version, 'reliable-review-1');
+  assert.equal(ping.version, 'shadow-discovery-2');
   const result = await new Promise(resolve => [...listeners][0]({ type: 'JOB_APP_INSPECT' }, {}, resolve));
   assert.equal(result.ok, true, result.error);
   assert.equal(result.inspection.fields[0].label, 'Current CTC');
@@ -137,4 +137,90 @@ test('bundled inline suggestions approve through the live listener once and stay
   assert.doesNotMatch(JSON.stringify(capturedAfterApply.records), /Application answer suggestions|Saved answers/);
   assert.equal(listeners.length, 1);
   dom.window.close();
+});
+
+
+test('content rejects stale document and region identities without changing a field', async () => {
+  const bundle = await readFile(new URL('../dist/content.js', import.meta.url), 'utf8');
+  const dom = new JSDOM('<form><label>Full name<input id="name"></label><button>Next</button></form>', {url: 'https://jobs.example.com/apply'});
+  const listeners = [];
+  const context = createContext({document: dom.window.document, setTimeout, clearTimeout, console, chrome: {runtime: {
+    sendMessage: async () => ({}), onMessage: {addListener: listener => listeners.push(listener)},
+  }}});
+  new Script(bundle).runInContext(context);
+  const dispatch = message => new Promise(resolve => listeners[0](message, {}, resolve));
+  try {
+    const inspected = await dispatch({type: 'JOB_APP_INSPECT'});
+    assert.equal(inspected.ok, true, inspected.error);
+    const {destination, fields} = inspected.inspection;
+    assert.ok(destination.documentId);
+    for (const changed of [{...destination, documentId: 'old-document'}, {...destination, regionId: 'old-region'}]) {
+      const response = await dispatch({type: 'JOB_APP_APPLY', destination: changed, decisions: [{fieldId: fields[0].id, handle: fields[0].handle, action: 'fill', value: 'Changed'}]});
+      assert.equal(response.code, 'destination_changed');
+      assert.equal(dom.window.document.querySelector('input').value, '');
+    }
+    dom.window.history.pushState({}, '', '/different');
+    assert.equal((await dispatch({type: 'JOB_APP_CAPTURE', destination})).code, 'destination_changed');
+  } finally {dom.window.close();}
+});
+
+test('ambiguous forms expose only the focused control to inline suggestions and refuse bulk fill', async () => {
+  const bundle = await readFile(new URL('../dist/content.js', import.meta.url), 'utf8');
+  const dom = new JSDOM('<form><label>Full name<input id="one"></label></form><form><label>Full name<input id="two"></label></form>', {url: 'https://jobs.example.com/apply'});
+  const listeners = [];
+  const context = createContext({document: dom.window.document, setTimeout, clearTimeout, console, chrome: {runtime: {
+    sendMessage: async () => ({}), onMessage: {addListener: listener => listeners.push(listener)},
+  }}});
+  new Script(bundle).runInContext(context);
+  const dispatch = message => new Promise(resolve => listeners[0](message, {}, resolve));
+  try {
+    const input = dom.window.document.querySelector('#two');
+    input.focus();
+    const inspected = await dispatch({type: 'JOB_APP_INSPECT_INLINE'});
+    assert.equal(inspected.inspection.destination.regionId, null);
+    assert.equal(inspected.inspection.fields.length, 1);
+    assert.equal(inspected.inspection.fields[0].handle, inspected.focusedHandle);
+    const response = await dispatch({type: 'JOB_APP_APPLY', decisions: [{fieldId: inspected.focusedFieldId, handle: inspected.focusedHandle, action: 'fill', value: 'Unsafe bulk fill'}]});
+    assert.equal(response.code, 'destination_changed');
+    assert.equal(input.value, '');
+    const selectedMessages = [];
+    context.chrome.runtime.sendMessage = async message => {selectedMessages.push(message); return {};};
+    await dispatch({type: 'JOB_APP_SELECT_FORM', token: 'test', expiresAt: Date.now() + 60000});
+    input.click();
+    assert.equal(selectedMessages.some(message => message.type === 'JOB_APP_FORM_SELECTED'), false, 'synthetic clicks cannot select a form');
+    await dispatch({type: 'JOB_APP_CANCEL_FORM_SELECTION'});
+  } finally {dom.window.close();}
+});
+
+
+test('armed form selection accepts a custom combobox without a native descriptor', async () => {
+  const bundle = await readFile(new URL('../dist/content.js', import.meta.url), 'utf8');
+  const dom = new JSDOM('<form><div role="combobox" aria-label="Country" tabindex="0"><span>Choose country</span></div><button>Next</button></form><form><label>Full name<input></label><button>Next</button></form>', {url: 'https://jobs.example.com/apply'});
+  const listeners = [], clicks = [], sent = [];
+  const document = dom.window.document;
+  const addListener = document.addEventListener.bind(document);
+  document.addEventListener = (type, callback, options) => {
+    if (type === 'click' && options === true) clicks.push(callback);
+    return addListener(type, callback, options);
+  };
+  const context = createContext({document, setTimeout, clearTimeout, console, chrome: {runtime: {
+    sendMessage: async message => {sent.push(message); return {};}, onMessage: {addListener: listener => listeners.push(listener)},
+  }}});
+  new Script(bundle).runInContext(context);
+  const dispatch = message => new Promise(resolve => listeners[0](message, {}, resolve));
+  try {
+    await dispatch({type: 'JOB_APP_SELECT_FORM', token: 'custom-token', expiresAt: Date.now() + 60000});
+    const control = document.querySelector('[role="combobox"]');
+    // Unit-test the installed callback. Browser trust itself is not synthesized by dispatchEvent.
+    const inner = control.querySelector('span');
+    clicks[0]({isTrusted: true, target: inner, composedPath: () => [inner, control, control.parentElement, document]});
+    const selected = sent.find(message => message.type === 'JOB_APP_FORM_SELECTED');
+    assert.ok(selected, 'custom control selects its application form');
+    assert.equal(selected.token, 'custom-token');
+    assert.equal(selected.fieldOnly, false);
+    assert.ok(selected.destination.regionId);
+  } finally {
+    await dispatch({type: 'JOB_APP_CANCEL_FORM_SELECTION'});
+    dom.window.close();
+  }
 });

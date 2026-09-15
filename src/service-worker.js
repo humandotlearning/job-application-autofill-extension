@@ -39,8 +39,18 @@ let datasourceInitPromise = null;
 
 const APPLICATION_TITLE_PATTERN = /\b(?:apply|application|candidate|profile|resume|experience|education)\b/i;
 const UTILITY_FRAME_PATTERN = /\b(?:search|cookie|job[\s-]?alerts?|talent[\s-]?communities?|subscribe|feedback)\b/i;
-const NO_APPLICATION_FRAME_REASON = 'No unique application form frame was found. Complete the application manually.';
-const AMBIGUOUS_APPLICATION_FRAME_REASON = 'More than one application form frame was found. Complete the application manually.';
+const NO_APPLICATION_FRAME_REASON = 'No supported application controls were found. Retry the scan after the form loads, or complete inaccessible controls manually.';
+const AMBIGUOUS_APPLICATION_FRAME_REASON = 'More than one application form was found. Click Select form, then click a field in the form you want to fill.';
+const formSelections = new Map();
+const FORM_SELECTION_TTL_MS = 60_000;
+const DISCOVERY_REASONS = {
+  no_supported_controls: NO_APPLICATION_FRAME_REASON,
+  ambiguous_form: AMBIGUOUS_APPLICATION_FRAME_REASON,
+  script_unavailable: 'The extension could not access this page. Reload it and retry the scan.',
+  inspection_error: 'The form could not be inspected. Retry the scan.',
+  loading_timeout: 'The form did not finish loading. Wait for it to load, then retry the scan.',
+  destination_changed: 'The selected form changed. Retry the scan before filling more details.',
+};
 const DISABLED_SITE_REASON = 'The extension is disabled on this site. Re-enable it from the side panel to use autofill.';
 const SITE_SETTINGS_KEY = 'disabledHostnames';
 const siteRevisions = new Map();
@@ -550,6 +560,8 @@ async function sendToFrame(tabId, frameId, message, assertAuthority) {
   try {
     response = await chrome.tabs.sendMessage(tabId, message, { frameId: targetFrameId });
   } catch {
+    // Never replay a write after losing its original receiver: it may already have run.
+    if (['JOB_APP_APPLY', 'JOB_APP_CLICK_NEXT', 'JOB_APP_FOCUS'].includes(message.type)) throw new Error('The selected form is no longer available. Retry the scan.');
     assertAuthority?.();
     await chrome.scripting.executeScript({
       target: { tabId, frameIds: [targetFrameId] },
@@ -570,65 +582,109 @@ function frameInspectionText(context, inspection) {
   ].join(' ');
 }
 
-function scoreApplicationFrame(context, inspection) {
+function scoreApplicationFrame(context, inspection, selectedDestination = null) {
   const fields = inspection?.fields || [];
   const actions = inspection?.actions || [];
-  const requiredCount = fields.filter((field) => field.required).length;
-  const applicationActions = actions.filter((action) => action.kind === 'next' || action.kind === 'submit').length;
   const applicationHint = APPLICATION_TITLE_PATTERN.test(frameInspectionText(context, inspection));
-  const utilityText = [context.title, inspection?.page?.title].join(' ');
-  const utilityHint = UTILITY_FRAME_PATTERN.test(utilityText);
-  const score = fields.length + requiredCount * 3 + applicationActions * 40
-    + (applicationHint ? 25 : 0) - (utilityHint ? 80 : 0);
-  const eligible = fields.length > 0
-    && !utilityHint
-    && (applicationActions > 0 || (applicationHint && fields.length >= 2));
-  return { score, eligible };
+  const fieldText = fields.map(field => [field.label, field.autocomplete, field.canonicalKey].filter(Boolean).join(' '));
+  const applicationField = fieldText.some(text => /\b(?:full[ _-]?name|first[ _-]?name|last[ _-]?name|given[ _-]?name|family[ _-]?name|resume|cover[ _-]?letter|work[ _-]?authorization|employment|salary|experience|education)\b/i.test(text));
+  const utilityHint = UTILITY_FRAME_PATTERN.test(fieldText.join(' ')) && !applicationField;
+  const applicationActions = actions.some(action => action.kind === 'next'
+    || (action.kind === 'submit' && (applicationField || /\b(?:application|apply)\b/i.test(action.label || ''))));
+  const explicitSelection = selectedDestination && context.frameId === selectedDestination.frameId
+    && inspection.destination?.documentId === selectedDestination.documentId && inspection.destination?.regionId === selectedDestination.regionId;
+  const ready = !inspection.discovery || (inspection.discovery.code === 'ready' && Boolean(inspection.destination?.regionId));
+  const eligible = ready && fields.length > 0 && (explicitSelection || (!utilityHint
+    && (applicationActions || (applicationHint && fields.length >= 2))));
+  return {eligible};
 }
 
-async function discoverApplicationFrame(tabId, assertAuthority = null) {
+function discoveryFailure(errorCode, diagnostics = []) {
+  return { errorCode, reason: DISCOVERY_REASONS[errorCode] || DISCOVERY_REASONS.inspection_error, diagnostics };
+}
+
+async function cancelFormSelection(tabId) {
+  const request = formSelections.get(tabId);
+  formSelections.delete(tabId);
+  if (request) await Promise.allSettled(request.frames.map(frame => chrome.tabs.sendMessage(tabId, {type: 'JOB_APP_CANCEL_FORM_SELECTION'}, {frameId: frame.frameId})));
+}
+
+async function requestFormSelection(tabId) {
+  await cancelFormSelection(tabId);
+  const run = await getRun(tabId);
+  if (!run || processingTabs.has(tabId)) throw new Error('Check the page before selecting a form.');
+  const contexts = await enumerateFrames(tabId);
+  const request = {token: crypto.randomUUID(), expiresAt: Date.now() + FORM_SELECTION_TTL_MS, applicationId: run.startedAt, frames: []};
+  formSelections.set(tabId, request);
+  await Promise.allSettled(contexts.map(async context => {
+    const response = await sendToFrame(tabId, context.frameId, {type: 'JOB_APP_SELECT_FORM', token: request.token, expiresAt: request.expiresAt});
+    if (response?.ok && response.destination?.documentId) request.frames.push({frameId: context.frameId, documentId: response.destination.documentId});
+  }));
+  if (!request.frames.length) {
+    formSelections.delete(tabId);
+    return {ok: false, run: await saveRun(pauseForFrame(run, discoveryFailure('script_unavailable')))};
+  }
+  run.waitingFor = 'selecting_form';
+  run.progress = null;
+  run.actionRequired = [{code: 'selecting_form', category: 'pause', reason: 'Click a field in the form you want to fill. Selection expires in 60 seconds.'}];
+  return {ok: true, run: await saveRun(run)};
+}
+
+async function acceptFormSelection(message, sender) {
+  const tabId = sender?.tab?.id;
+  const request = formSelections.get(tabId);
+  if (sender?.id !== chrome.runtime.id || !request || request.token !== message.token || Date.now() > request.expiresAt
+    || !request.frames.some(frame => frame.frameId === sender.frameId && frame.documentId === message.destination?.documentId)) throw new Error('Form selection expired. Click Select form again.');
+  await assertTabSiteEnabled(tabId);
+  const run = await getRun(tabId);
+  if (!run || run.startedAt !== request.applicationId || processingTabs.has(tabId)) throw new Error('The application changed. Select the form again.');
+  await cancelFormSelection(tabId);
+  if (message.fieldOnly || !message.destination?.regionId) {
+    pauseForFrame(run, discoveryFailure('no_supported_controls'));
+    run.waitingFor = 'field_only';
+    run.actionRequired = [{code: 'field_only', category: 'pause', reason: 'This field could not be scoped to one form. Use the suggestions beside the field, or complete it manually.'}];
+    return {ok: true, run: await saveRun(run)};
+  }
+  run.status = 'running';
+  run.selectedDestination = {...message.destination, frameId: sender.frameId};
+  await saveRun(run);
+  return {ok: true, run: await processPage(tabId, {autoAdvance: false, selectedDestination: {...message.destination, frameId: sender.frameId}})};
+}
+
+async function discoverApplicationFrame(tabId, assertAuthority = null, selectedDestination = null) {
   await assertTabSiteEnabled(tabId);
   assertAuthority?.();
   let contexts;
-  try {
-    contexts = await enumerateFrames(tabId);
-  } catch {
-    return {
-      errorCode: 'no_application_frame',
-      reason: NO_APPLICATION_FRAME_REASON,
-    };
-  }
-  await ensureContentScripts(tabId, contexts.map((context) => context.frameId), assertAuthority);
-  const candidates = (await Promise.all(contexts.map(async (context) => {
+  try { contexts = await enumerateFrames(tabId); }
+  catch { return discoveryFailure('script_unavailable'); }
+  await ensureContentScripts(tabId, contexts.map(context => context.frameId), assertAuthority);
+  const inspected = await Promise.all(contexts.map(async context => {
     try {
       const response = await sendToFrame(tabId, context.frameId, { type: 'JOB_APP_INSPECT' }, assertAuthority);
-      if (!response?.ok || !response.inspection) return null;
-      const scoring = scoreApplicationFrame(context, response.inspection);
-      return { ...context, inspection: response.inspection, ...scoring };
-    } catch {
-      return null;
-    }
-  }))).filter((candidate) => candidate?.eligible);
-
-  if (!candidates.length) {
-    return {
-      errorCode: 'no_application_frame',
-      reason: NO_APPLICATION_FRAME_REASON,
-    };
+      if (!response?.ok || !response.inspection) return {...context, code: response?.code || 'inspection_error'};
+      return {...context, inspection: response.inspection, ...scoreApplicationFrame(context, response.inspection, selectedDestination), version: response.version};
+    } catch { return {...context, code: 'script_unavailable'}; }
+  }));
+  // Only counts, outcomes and timings are persisted. Never store page text or answers here.
+  const diagnostics = inspected.map(item => ({frameId: item.frameId, code: item.code || item.inspection?.discovery?.code || (item.eligible ? 'ready' : 'no_supported_controls'),
+    controlCount: item.inspection?.discovery?.controlCount ?? item.inspection?.fields?.length ?? 0,
+    regionCount: item.inspection?.discovery?.regionCount ?? 0, shadowRootCount: item.inspection?.discovery?.shadowRootCount ?? 0,
+    elapsedMs: item.inspection?.discovery?.elapsedMs ?? 0, version: item.version || null}));
+  let candidates = inspected.filter(item => item.eligible);
+  if (selectedDestination) {
+    candidates = candidates.filter(item => item.frameId === selectedDestination.frameId
+      && item.inspection?.destination?.documentId === selectedDestination.documentId
+      && item.inspection?.destination?.regionId === selectedDestination.regionId);
+    if (candidates.length !== 1) return discoveryFailure('destination_changed', diagnostics);
+  } else if (candidates.length > 1 || inspected.some(item => item.inspection?.discovery?.code === 'ambiguous_form')) {
+    return discoveryFailure('ambiguous_form', diagnostics);
   }
-  candidates.sort((left, right) => right.score - left.score || left.frameId - right.frameId);
-  if (candidates.length > 1 && candidates[0].score === candidates[1].score) {
-    return {
-      errorCode: 'ambiguous_application_frame',
-      reason: AMBIGUOUS_APPLICATION_FRAME_REASON,
-    };
+  if (!candidates.length) {
+    const code = ['loading_timeout', 'inspection_error', 'script_unavailable'].find(code => diagnostics.some(item => item.code === code)) || 'no_supported_controls';
+    return discoveryFailure(code, diagnostics);
   }
   const selected = candidates[0];
-  return {
-    frameId: selected.frameId,
-    context: { title: selected.title, pathname: selected.pathname },
-    inspection: selected.inspection,
-  };
+  return {frameId: selected.frameId, context: {title: selected.title, pathname: selected.pathname}, inspection: selected.inspection, diagnostics};
 }
 
 function selectedFrame(run) {
@@ -642,9 +698,11 @@ function updateSelectedFrame(run, discovery) {
     title: discovery.context.title,
     pathname: discovery.context.pathname,
     domain: discovery.inspection?.page?.domain || '',
+    destination: discovery.inspection?.destination || null,
   };
   // Keep this alias for panel versions that predate the nested frame shape.
   run.frameId = discovery.frameId;
+  run.discoveryDiagnostics = discovery.diagnostics || [];
 }
 
 function frameRoutingError(discovery, cause) {
@@ -658,25 +716,20 @@ async function sendToApplicationFrame(tabId, run, message) {
   const frameId = selectedFrame(run);
   const assertAuthority = () => assertRunSiteAuthority(tabId, run);
   try {
-    return await sendToFrame(tabId, frameId, message, assertAuthority);
+    const response = await sendToFrame(tabId, frameId, {...message, destination: run.frame.destination}, assertAuthority);
+    if (response?.code === 'destination_changed') throw frameRoutingError(discoveryFailure('destination_changed'));
+    return response;
   } catch (error) {
-    let discovery;
-    try {
-      discovery = await discoverApplicationFrame(tabId, assertAuthority);
-    } catch {
-      discovery = {
-        errorCode: 'no_application_frame',
-        reason: NO_APPLICATION_FRAME_REASON,
-      };
-    }
-    if (discovery.errorCode) throw frameRoutingError(discovery, error);
-    updateSelectedFrame(run, discovery);
-    return sendToFrame(tabId, discovery.frameId, message, assertAuthority);
+    if (error.frameDiscovery) throw error;
+    throw frameRoutingError(discoveryFailure('script_unavailable'), error);
   }
 }
 
 function pauseForFrame(run, discovery) {
   run.status = 'waiting_user';
+  run.progress = null;
+  run.selectedDestination = null;
+  run.discoveryDiagnostics = discovery.diagnostics || [];
   run.frame = null;
   run.frameId = null;
   run.waitingFor = discovery.errorCode;
@@ -687,6 +740,10 @@ function pauseForFrame(run, discovery) {
     code: discovery.errorCode,
     category: 'pause',
   }];
+  run.optionalUnresolved = [];
+  run.reviewRequired = [];
+  run.suggestions = {};
+  run.generatedSuggestions = {};
   return run;
 }
 
@@ -731,6 +788,7 @@ function fieldMap(fields) {
 function pageSignature(inspection, frame = null) {
   return JSON.stringify({
     frame: frame ? [frame.frameId, frame.title, frame.pathname] : [],
+    destination: inspection.destination || null,
     page: [inspection.page?.title, inspection.page?.domain],
     fields: inspection.fields.map((field) => [field.id, field.label, field.type, field.options]),
     actions: inspection.actions.map((action) => [action.kind, action.label]),
@@ -1754,7 +1812,7 @@ function hasBlockingIssues(run, validation) {
   return Boolean(run.actionRequired.length || !validation.ok);
 }
 
-async function processPage(tabId, { autoAdvance } = { autoAdvance: false }) {
+async function processPage(tabId, { autoAdvance, selectedDestination = null } = { autoAdvance: false }) {
   if (processingTabs.has(tabId)) return getRun(tabId);
   processingTabs.add(tabId);
   try {
@@ -1779,7 +1837,7 @@ async function processPage(tabId, { autoAdvance } = { autoAdvance: false }) {
       getCoverMessages(),
       getDatasource(),
     ]);
-    const discovery = await discoverApplicationFrame(tabId, () => assertRunSiteAuthority(tabId, run));
+    const discovery = await discoverApplicationFrame(tabId, () => assertRunSiteAuthority(tabId, run), selectedDestination || run.selectedDestination);
     if (discovery.errorCode) return await saveRun(pauseForFrame(run, discovery));
     updateSelectedFrame(run, discovery);
     await assertTabSiteEnabled(tabId, run.siteRevision);
@@ -1935,7 +1993,8 @@ async function focusRunField(tabId, fieldId) {
   if (!fieldId) throw new Error('A fieldId is required');
   const run = await getRun(tabId);
   if (!run) return { ok: false, run: null };
-  const discovery = await discoverApplicationFrame(tabId, () => assertRunSiteAuthority(tabId, run));
+  if (!Number.isInteger(run.frame?.frameId)) return {ok: false, error: 'Select an application form before focusing a field.', run};
+  const discovery = await discoverApplicationFrame(tabId, () => assertRunSiteAuthority(tabId, run), run.frame?.destination ? {...run.frame.destination, frameId: run.frame.frameId} : run.selectedDestination);
   if (discovery.errorCode) return { ok: false, run: await saveRun(pauseForFrame(run, discovery)) };
   updateSelectedFrame(run, discovery);
   try {
@@ -1998,10 +2057,10 @@ async function saveAnswers(tabId) {
   let run = null;
   try {
     run = await getRun(tabId);
-    if (!run || !SAVABLE_RUN_STATUSES.has(run.status)) {
+    if (!run || !SAVABLE_RUN_STATUSES.has(run.status) || !Number.isInteger(run.frame?.frameId)) {
       return { ok: false, error: 'The current page is not ready to save answers' };
     }
-    const discovery = await discoverApplicationFrame(tabId, () => assertRunSiteAuthority(tabId, run));
+    const discovery = await discoverApplicationFrame(tabId, () => assertRunSiteAuthority(tabId, run), run.frame?.destination ? {...run.frame.destination, frameId: run.frame.frameId} : run.selectedDestination);
     if (discovery.errorCode) return { ok: false, error: discovery.reason, run: await saveRun(pauseForFrame(run, discovery)) };
     updateSelectedFrame(run, discovery);
     const inspection = discovery.inspection;
@@ -2156,7 +2215,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         const url = new URL(sender.url);
         if (run.frame.domain && url.hostname !== run.frame.domain) return { ok: false };
         if (run.frame.pathname && url.pathname !== run.frame.pathname) {
-          const discovery = await discoverApplicationFrame(tabId, () => assertRunSiteAuthority(tabId, run));
+          const discovery = await discoverApplicationFrame(tabId, () => assertRunSiteAuthority(tabId, run), run.frame?.destination ? {...run.frame.destination, frameId: run.frame.frameId} : run.selectedDestination);
           if (discovery.errorCode || discovery.frameId !== (sender.frameId ?? 0) || discovery.context.pathname !== url.pathname) return { ok: false };
           updateSelectedFrame(run, discovery);
           if (run.lastAction !== 'next') {
@@ -2175,10 +2234,15 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     })().then(sendResponse).catch((error) => sendResponse({ ok: false, error: error.message }));
     return true;
   }
+  if (message?.type === 'JOB_APP_FORM_SELECTED') {
+    acceptFormSelection(message, sender).then(sendResponse).catch(error => sendResponse({ok: false, error: error.message}));
+    return true;
+  }
   if (message?.type === 'JOB_APP_NAVIGATED') {
     const tabId = sender?.tab?.id;
     (async () => {
       await assertTabSiteEnabled(tabId, sender?.tab);
+      if (Number.isInteger(tabId)) await cancelFormSelection(tabId);
       if (Number.isInteger(tabId)) await invalidateInlineSessions(tabId, Number.isInteger(sender.frameId) ? sender.frameId : 0);
       const run = tabId ? await getRun(tabId) : null;
       const senderFrameId = Number.isInteger(sender?.frameId) ? sender.frameId : 0;
@@ -2199,6 +2263,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     'JOB_RUN_APPLY_DRAFT',
     'JOB_RUN_REWRITE_ANSWER',
     'JOB_RUN_GENERATE_SUGGESTIONS',
+    'JOB_RUN_SELECT_FORM',
     'JOB_RUN_START',
     'JOB_RUN_CHECK_PAGE',
     'JOB_RUN_ADVANCE_PAGE',
@@ -2299,6 +2364,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       return { ok: true, run: site.disabled ? null : await getRun(tabId), site: siteStateReply(site) };
     }
     await assertTabSiteEnabled(tabId, null);
+    if (message.type === 'JOB_RUN_SELECT_FORM') return requestFormSelection(tabId);
     if (message.type === 'JOB_RUN_VALIDATE_PAGE') return { ok: true, run: await validatePageOnly(tabId) };
     if (message.type === 'JOB_RUN_RETRY_AI') { await scheduleAi(tabId, { retry: true }); return { ok: true, run: await getRun(tabId) }; }
     if (message.type === 'JOB_RUN_SELECT_EMPLOYMENT') return selectEmployment(message);
@@ -2315,6 +2381,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 });
 
 chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
+  if (changeInfo.url || changeInfo.status === 'loading') cancelFormSelection(tabId).catch(() => {});
   if (changeInfo.url || ['loading', 'complete'].includes(changeInfo.status)) invalidateInlineSessions(tabId).catch(() => {});
   if (changeInfo.status !== 'complete') return;
   getRun(tabId)
@@ -2331,6 +2398,7 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
 });
 
 chrome.tabs.onRemoved.addListener((tabId) => {
+  formSelections.delete(tabId);
   invalidateInlineSessions(tabId).catch(() => {});
   removeRun(tabId).catch(() => {});
   siteRevisions.delete(tabId);

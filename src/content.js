@@ -8,7 +8,12 @@ import {
   focusField,
   isFinalApplicationSubmit,
   waitForDocumentSettled,
+  applicationDestination,
+  selectApplicationRegion,
+  selectApplicationField,
+  clearApplicationSelection,
 } from './form-engine.js';
+import { eventControl } from './dom.js';
 import { createLearningSession } from './learning.js';
 import { createInlineAutofill } from './inline-autofill.js';
 
@@ -16,7 +21,7 @@ function notifyNavigation() {
   waitForDocumentSettled(document).then(() => chrome.runtime.sendMessage({ type: 'JOB_APP_NAVIGATED' })).catch(() => {});
 }
 
-const CONTENT_VERSION = 'reliable-review-1';
+const CONTENT_VERSION = 'shadow-discovery-2';
 if (!globalThis.__jobApplicationAutofillInstalled) {
   globalThis.__jobApplicationAutofillInstalled = CONTENT_VERSION;
   let inline = null;
@@ -25,9 +30,54 @@ if (!globalThis.__jobApplicationAutofillInstalled) {
   let resolveReady;
   let ready = false;
   let forcedState = null;
+  let selectionRequest = null;
+  let selectionTimer = null;
   const readyPromise = new Promise(resolve => { resolveReady = resolve; });
 
+  function cancelSelection() {
+    selectionRequest = null;
+    clearTimeout(selectionTimer);
+  }
+
+  function invalidateDestination() {
+    cancelSelection();
+    clearApplicationSelection(document);
+  }
+  document.defaultView.addEventListener('pagehide', invalidateDestination);
+  document.defaultView.addEventListener('popstate', invalidateDestination);
+  document.defaultView.addEventListener('hashchange', invalidateDestination);
+  document.addEventListener('click', event => {
+    const request = selectionRequest;
+    if (!active || !request || !event.isTrusted || Date.now() > request.expiresAt) return;
+    const control = eventControl(event);
+    const destination = selectApplicationRegion(document, control);
+    if (!destination?.regionId && !selectApplicationField(document, control)) return;
+    cancelSelection();
+    chrome.runtime.sendMessage({type: 'JOB_APP_FORM_SELECTED', token: request.token,
+      destination: destination || applicationDestination(document), fieldOnly: !destination?.regionId}).catch(() => {});
+  }, true);
+
+  function destinationMatches(expected) {
+    if (!expected) return true;
+    const current = applicationDestination(document);
+    return expected.documentId === current.documentId && expected.regionId === current.regionId;
+  }
+
+  async function inspectWhenReady() {
+    const start = Date.now();
+    let settled;
+    let inspection;
+    do {
+      settled = await waitForDocumentSettled(document, {minWaitMs: 150, quietMs: 75, timeoutMs: Math.max(1, 2500 - (Date.now() - start))});
+      inspection = inspectDocument(document);
+      if (inspection.fields.length || inspection.discovery?.code === 'ambiguous_form' || settled?.timedOut || Date.now() - start >= 2350) break;
+    } while (Date.now() - start < 2500);
+    if (settled?.timedOut && !inspection.fields.length && inspection.discovery) inspection.discovery.code = 'loading_timeout';
+    return inspection;
+  }
+
   function disable() {
+    invalidateDestination();
     if (inline) inline.dispose();
     if (learning) learning.dispose();
     inline = null;
@@ -61,7 +111,22 @@ if (!globalThis.__jobApplicationAutofillInstalled) {
 
   function handleMessage(message, _sender, sendResponse) {
     try {
+      if (message?.destination && !destinationMatches(message.destination)) {
+        sendResponse({ok: false, code: 'destination_changed', error: 'The selected form changed. Retry the scan.'});
+        return false;
+      }
       switch (message?.type) {
+        case 'JOB_APP_SELECT_FORM':
+          if (!active) { sendResponse({ok: false, disabled: true}); break; }
+          cancelSelection();
+          selectionRequest = {token: message.token, expiresAt: Math.min(message.expiresAt, Date.now() + 60_000)};
+          selectionTimer = setTimeout(cancelSelection, Math.max(0, selectionRequest.expiresAt - Date.now()));
+          sendResponse({ok: true, destination: applicationDestination(document)});
+          break;
+        case 'JOB_APP_CANCEL_FORM_SELECTION':
+          cancelSelection();
+          sendResponse({ok: true});
+          break;
         case 'JOB_APP_SITE_STATE_CHANGED':
           forcedState = Boolean(message.enabled);
           if (message.enabled) enable(); else disable();
@@ -72,26 +137,38 @@ if (!globalThis.__jobApplicationAutofillInstalled) {
           break;
         case 'JOB_APP_INSPECT':
           if (!active) { sendResponse({ok: false, disabled: true}); break; }
-          waitForDocumentSettled(document, { minWaitMs: 150, quietMs: 75 }).then(() => sendResponse({ ok: true, inspection: inspectDocument(document) }))
-            .catch((error) => sendResponse({ ok: false, error: error.message }));
+          inspectWhenReady().then(inspection => sendResponse({ ok: true, inspection, version: CONTENT_VERSION }))
+            .catch((error) => sendResponse({ ok: false, code: 'inspection_error', error: error.message }));
           return true;
         case 'JOB_APP_INSPECT_INLINE': {
           if (!active) { sendResponse({ok: false, disabled: true}); break; }
           const inspection = inspectDocument(document);
           inspection.page.url = document.location.href;
           const focused = descriptorForElement(document, inline.activeField());
+          if (focused && !inspection.fields.some(field => field.handle === focused.handle)) inspection.fields.push(focused);
           sendResponse({ok: true, inspection, focusedFieldId: focused?.id ?? null, focusedHandle: focused?.handle ?? null,
             rawValue: focused?.rawValue ?? null, editRevision: focused?.editRevision ?? null});
           break;
         }
-        case 'JOB_APP_APPLY':
+        case 'JOB_APP_APPLY': {
           if (!active) { sendResponse({ok: false, disabled: true, result: {applied: [], kept: [], reviewRequired: [], unresolved: [], failed: []}}); break; }
+          const destination = message.destination || applicationDestination(document);
+          if (!destination.regionId) {
+            const focused = descriptorForElement(document, inline.activeField());
+            const decisions = message.decisions || [];
+            if (decisions.length !== 1 || !focused || !decisions[0].approved || decisions[0].handle !== focused.handle) {
+              sendResponse({ok: false, code: 'destination_changed', error: 'Select a form, or use suggestions for the focused field.'});
+              break;
+            }
+            selectApplicationField(document, inline.activeField());
+          }
           if (message.applicationId) learning.activate(message.applicationId);
           applyDecisions(document, message.decisions || [], {deadline: message.deadline ?? Infinity,
-            beforeFill: args => inline.beforeFill({...args, acceptanceToken: message.approvalGuard?.acceptanceToken})})
+            beforeFill: args => active && destinationMatches(destination) && inline.beforeFill({...args, acceptanceToken: message.approvalGuard?.acceptanceToken})})
             .then((result) => sendResponse({ ok: true, result }))
             .catch((error) => sendResponse({ ok: false, error: error.message }));
           return true;
+        }
         case 'JOB_APP_CAPTURE':
           if (!active) { sendResponse({ok: false, disabled: true, records: []}); break; }
           sendResponse({ ok: true, records: collectAnswerRecords(document) });
@@ -107,6 +184,7 @@ if (!globalThis.__jobApplicationAutofillInstalled) {
         case 'JOB_APP_CLICK_NEXT':
           if (!active) { sendResponse({ok: false, disabled: true}); break; }
           learning.flush().then(() => {
+            if (!destinationMatches(message.destination)) { sendResponse({ok: false, code: 'destination_changed'}); return; }
             const result = clickAction(document, message.actionId);
             if (result.ok) notifyNavigation();
             sendResponse(result);

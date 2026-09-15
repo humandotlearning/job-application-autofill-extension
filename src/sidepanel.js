@@ -1071,6 +1071,8 @@ function setActionVisibility(run) {
   }
   const status = run?.status;
   const hasRun = Boolean(run);
+  const missingDestination = run?.frame === null;
+  const selectForm = ['ambiguous_form', 'selecting_form'].includes(run?.waitingFor);
   elements.primaryAction.disabled = busy || status === 'running';
   for (const button of [elements.checkPage, elements.advancePage, elements.saveAnswers]) {
     button.disabled = busy || status === 'running';
@@ -1083,13 +1085,15 @@ function setActionVisibility(run) {
   elements.saveAnswers.hidden = !['waiting_user', 'page_ready', 'ready_for_user_submit', 'answers_saved'].includes(status);
   elements.saveAnswers.textContent = saving ? 'Saving…' : (['ready_for_user_submit', 'answers_saved'].includes(status) ? 'Save draft checkpoint' : 'Save filled values');
   elements.saveAnswers.setAttribute('aria-busy', String(saving));
+  elements.saveAnswers.disabled ||= missingDestination;
+  elements.checkPage.textContent = missingDestination ? 'Retry scan' : 'Check again';
   elements.secondaryActions.hidden = !hasRun || (elements.checkPage.hidden && elements.advancePage.hidden && elements.saveAnswers.hidden);
   if (!hasRun) {
     elements.primaryAction.textContent = 'Fill this page';
     return;
   }
   if (status === 'running') elements.primaryAction.textContent = 'Filling this page…';
-  else if (status === 'waiting_user') elements.primaryAction.textContent = 'Fix first issue';
+  else if (status === 'waiting_user') elements.primaryAction.textContent = selectForm ? 'Select form' : missingDestination ? 'Retry scan' : 'Complete this field';
   else if (status === 'page_ready') elements.primaryAction.textContent = 'Continue to next page';
   else if (['ready_for_user_submit', 'answers_saved'].includes(status)) elements.primaryAction.textContent = 'Review on site';
   else elements.primaryAction.textContent = 'Fill this page';
@@ -1176,14 +1180,14 @@ function renderRun(run) {
     const group = document.createElement('div'); group.className = 'employment-choice'; group.append(label, select); elements.employmentChoices.append(group);
   }
   const progressLabels = { checking_fields: 'Checking fields…', local_fill_complete: 'Local fill complete', preparing_suggestions: 'Preparing suggestions…', ready: 'Ready' };
-  elements.runState.textContent = progressLabels[run.progress] || STATUS_LABELS[run.status] || run.status;
+  elements.runState.textContent = (run.status === 'running' && progressLabels[run.progress]) || STATUS_LABELS[run.status] || run.status;
   const accentStatuses = ['waiting_user', 'page_ready', 'ready_for_user_submit', 'answers_saved'];
   elements.runState.className = `pill${accentStatuses.includes(run.status) ? '' : ' neutral'}`;
   setActionVisibility(run);
 
   elements.actionRequiredCount.textContent = String(actionRequired.length);
   elements.actionRequiredCard.hidden = actionRequired.length === 0;
-  renderList(elements.actionRequiredList, actionRequired, { focus: true, emptyDetail: 'No blockers on this page.' });
+  renderList(elements.actionRequiredList, actionRequired, { focus: run.frame !== null, emptyDetail: 'No blockers on this page.' });
 
   elements.reviewCount.textContent = String(reviewRequired.length);
   elements.reviewCard.hidden = reviewRequired.length === 0 && !['ready_for_user_submit', 'answers_saved'].includes(run.status);
@@ -1191,7 +1195,7 @@ function renderRun(run) {
   elements.submitInstructions.hidden = !['ready_for_user_submit', 'answers_saved'].includes(run.status);
 
   elements.optionalCount.textContent = String(optionalUnresolved.length);
-  renderList(elements.optionalList, optionalUnresolved, { focus: true, emptyLabel: 'No optional unanswered fields', emptyDetail: 'Optional questions are complete or not present on this page.' });
+  renderList(elements.optionalList, optionalUnresolved, { focus: run.frame !== null, emptyLabel: 'No optional unanswered fields', emptyDetail: 'Optional questions are complete or not present on this page.' });
 
   elements.auditCount.textContent = String(audit.length);
   renderList(elements.auditList, audit, { detail: '' });
@@ -1199,7 +1203,7 @@ function renderRun(run) {
   if (run.status === 'waiting_user') {
     const waitingLabel = String(run.waitingLabel || '').trim();
     const visibleWaitingLabel = waitingLabel && !isOpaqueIdentifier(waitingLabel) ? waitingLabel : '';
-    elements.runHint.textContent = visibleWaitingLabel
+    elements.runHint.textContent = run.frame === null ? (run.actionRequired?.[0]?.reason || 'Retry the scan to find the application form.') : visibleWaitingLabel
       ? `Complete “${visibleWaitingLabel}” on the application page, then click Check again.`
       : 'Complete the highlighted field or handle the manual step, then click Check again.';
     setStatus(run.llmError ? `Answer planner unavailable: ${run.llmError}` : 'Action is required on the application page.', run.llmError ? 'error' : 'ok');
@@ -1288,6 +1292,8 @@ async function sendRunAction(type) {
 
 async function runPrimaryAction() {
   if (currentRun?.status === 'waiting_user') {
+    if (['ambiguous_form', 'selecting_form'].includes(currentRun.waitingFor)) return sendRunAction('JOB_RUN_SELECT_FORM');
+    if (currentRun.frame === null) return sendRunAction('JOB_RUN_CHECK_PAGE');
     const first = (currentRun.actionRequired || currentRun.unresolved || [])[0];
     if (first?.fieldId) return focusField(first.fieldId);
   }

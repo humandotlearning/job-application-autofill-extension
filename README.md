@@ -146,9 +146,19 @@ The extension uses the configured AI provider and answer-planner model. Firework
 
 Navigation is manual by default. The **Auto-advance pages** setting permits one validated Next action when the page is ready. It never enables final submission.
 
-When updating the unpacked extension, preserve unsaved form values before any browser operation. Run `npm run build`, reload the extension card (not the application page), and reopen the panel. The content PING reports version `reliable-review-1`; verify this before using the new feature on an existing page. Reinjecting the same version is tested to preserve values and avoid duplicate listeners. The old boolean installation guard cannot safely dispose legacy listeners: if the old script still responds without the version, stop rather than resetting its guard or reloading an unsaved application. Legacy live hot-upgrade requires separate browser verification; the automated build is not proof that an already-open tab is updated.
+When updating the unpacked extension, preserve unsaved form values before any browser operation. Run `npm run build`, reload the extension card (not the application page), and reopen the panel. The content PING reports version `shadow-discovery-2`; verify this before using the new feature on an existing page. Reinjecting the same version is tested to preserve values and avoid duplicate listeners. The old boolean installation guard cannot safely dispose legacy listeners: if the old script still responds without the version, stop rather than resetting its guard or reloading an unsaved application. Legacy live hot-upgrade requires separate browser verification; the automated build is not proof that an already-open tab is updated.
 
 Activated applications incrementally extend the local profile. Later equivalent questions reuse compatible confirmed answers. First, full, last, and preferred names remain distinct; full names can be composed from unambiguous first and last names. Ambiguous dates, unsupported transformations, conflicting records, and unmatched employment or education entities remain unresolved for review.
+
+## Form discovery and recovery
+
+The inspector traverses ordinary DOM and open shadow roots, including slotted labels and controls. Filling, validation, focus, and learned answers share the same control identities. It ignores unrendered controls and the extension popup.
+
+If more than one form is plausible, choose **Select form**, then click a field in the intended application within 60 seconds. A selection is limited to that document and region; navigation or replacement invalidates it. **Retry scan** handles loading or inspection failures. A control that cannot be safely operated remains manual while supported fields can still be filled.
+
+Local discovery diagnostics contain counts, timings, script versions, and reason codes, never field values or page HTML. Paused status takes precedence over progress text.
+
+After this update, preserve current unsaved entries before reopening an application tab. The new content script reports `shadow-discovery-2`; a tab retaining an earlier script must be reopened to activate these changes.
 
 ## Boundaries
 
@@ -183,3 +193,7 @@ python -m http.server 8765
 Then open [http://127.0.0.1:8765/examples/demo-form.html](http://127.0.0.1:8765/examples/demo-form.html). The two-step demo covers text, select, radio, long-form, required fields, a file-upload pause, Next navigation, submission, and second-run learning.
 
 See [PRIVACY.md](PRIVACY.md) for storage and model-data handling.
+
+### Chromium regression fixture
+
+Serve this repository with a local static HTTP server and open `/tests/fixtures/shadow-dom-browser.html` in Chromium. The fixture automatically runs nine checks with synthetic data and prints PASS/FAIL. Keep the tab open until all checks finish; it never submits data. Node coverage runs with `node --test tests/shadow-dom.test.js`.

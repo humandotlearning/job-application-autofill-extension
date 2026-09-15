@@ -1,3 +1,4 @@
+import { eventControl, isExtensionElement } from './dom.js';
 // Learning is enabled only by the worker for the selected application frame.
 export function createLearningSession(document, { capture, send, onFinalSubmit, onRevalidate, validationDelayMs = 500, delayMs = 350 }) {
   let applicationId = null;
@@ -21,8 +22,8 @@ export function createLearningSession(document, { capture, send, onFinalSubmit, 
     return queue;
   }
   function schedule(event) {
-    if (!applicationId || document.__jobApplicationFilling || event.target?.__jobApplicationAutofillDispatch) return;
-    if (typeof onRevalidate === 'function' && event.target?.closest?.('input,textarea,select,[role="combobox"],[role="option"],button[aria-haspopup="listbox"]')) {
+    if (isExtensionElement(eventControl(event)) || !applicationId || document.__jobApplicationFilling || eventControl(event)?.__jobApplicationAutofillDispatch) return;
+    if (typeof onRevalidate === 'function' && eventControl(event)?.closest?.('input,textarea,select,[role="combobox"],[role="option"],button[aria-haspopup="listbox"]')) {
       clearTimeout(validationTimer);
       const id=applicationId;
       validationTimer=setTimeout(()=>{if(applicationId===id && !document.__jobApplicationFilling) Promise.resolve(onRevalidate({applicationId:id})).catch(()=>{});},validationDelayMs);

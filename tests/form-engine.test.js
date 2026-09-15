@@ -12,6 +12,7 @@ import {
   isFinalApplicationSubmit,
   planDeterministicFill,
   validateDocument,
+  selectApplicationRegion,
 } from '../src/form-engine.js';
 
 function makeDocument(html) {
@@ -781,8 +782,8 @@ test('reads a populated input combobox as its committed value', () => {
 
 test('keeps repeated same-label entries as distinct learned records', () => {
   const document = makeDocument(`
-    <form><label>Company<input name="company" value="Analytical Engines"></label></form>
-    <form><label>Company<input name="company" value="Ada Computing"></label></form>
+    <form><label>Company<input name="company" value="Analytical Engines"></label>
+    <label>Company<input name="company" value="Ada Computing"></label></form>
   `);
   const records = collectAnswerRecords(document);
   assert.equal(records.length, 2);
@@ -815,23 +816,27 @@ test('selects the application form and excludes a subscription form', () => {
   assert.deepEqual(inspection.actions.map((action) => action.label), ['Submit application']);
 });
 
-test('ambiguous application forms require a focused form before extraction', () => {
+test('ambiguous application forms require explicit selection before extraction', () => {
   const document = makeDocument('<form aria-label="Job application"><label>Name<input id="one"></label></form><form aria-label="Job application"><label>Name<input id="two"></label></form>');
   assert.equal(collectFieldDescriptors(document).length, 0);
   document.querySelector('#two').focus();
+  assert.equal(collectFieldDescriptors(document).length, 0);
+  selectApplicationRegion(document, document.querySelector('#two'));
   assert.deepEqual(collectFieldDescriptors(document).map((field) => field.id), ['two']);
 });
 
-test('a connected inline popup anchor disambiguates forms and never overrides real page focus', () => {
+test('inline focus offers one field without granting bulk form authority', () => {
   const document = makeDocument('<form aria-label="Job application"><label>Name<input id="one"></label></form><form aria-label="Job application"><label>Name<input id="two"></label></form><div id="popup" tabindex="-1"></div>');
   const one = document.querySelector('#one');
   document.querySelector('#popup').focus();
   document.__jobApplicationInlineFocusAnchor = one;
-  assert.deepEqual(collectFieldDescriptors(document).map(field => field.id), ['one']);
-  document.querySelector('#two').focus();
-  assert.deepEqual(collectFieldDescriptors(document).map(field => field.id), ['two']);
-  document.querySelector('#popup').focus(); one.remove();
+  assert.equal(descriptorForElement(document, one).id, 'one');
   assert.equal(collectFieldDescriptors(document).length, 0);
+  document.querySelector('#two').focus();
+  assert.equal(descriptorForElement(document, document.querySelector('#two')).id, 'two');
+  assert.equal(collectFieldDescriptors(document).length, 0);
+  document.querySelector('#popup').focus(); one.remove();
+  assert.deepEqual(collectFieldDescriptors(document).map(field => field.id), ['two']);
   document.defaultView.close();
 });
 
