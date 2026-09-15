@@ -10,42 +10,43 @@
   <header class="app-header">
     <div class="brand-row" aria-label="Job Application Autofill">
       <span class="brand-mark" aria-hidden="true">▣</span>
-      <span class="brand-name">Job Application Autofill</span>
-      <span class="brand-dot" aria-hidden="true"></span>
+      <span class="brand-name">Autofill</span>
     </div>
-    <div class="header-context">
-      <span class="eyebrow">GUIDED COPILOT</span>
-      <span class="header-prompt" aria-hidden="true">›_</span>
-    </div>
-    <h1>Job Application Autofill</h1>
-    <p>Fill one page at a time, review what needs attention, then submit on the application site yourself.</p>
+    <button id="open-settings" class="quiet-button" type="button" aria-controls="settings-data">Settings</button>
   </header>
 
   <main class="app-main">
+    <details id="site-control-card" class="site-control-card collapsible" hidden>
+      <summary>
+        <span id="site-control-title">Site access</span>
+        <span id="site-control-state" class="pill neutral">Unavailable</span>
+      </summary>
+      <div class="details-body">
+        <p id="site-control-hint" class="hint compact">Site controls are unavailable on this browser page.</p>
+        <button id="site-toggle" type="button" hidden>Disable on this site</button>
+      </div>
+    </details>
+
     <section class="card hero-card" aria-labelledby="run-title">
       <div class="section-heading">
-        <div><span class="step">01</span><h2 id="run-title">Current application</h2></div>
+        <span class="eyebrow">Current application</span>
         <span id="run-state" class="pill neutral">Ready</span>
       </div>
+      <h1 id="run-title">Ready to fill this page</h1>
+      <p id="run-summary" class="run-summary" aria-live="polite">Use your saved answers to get started.</p>
       <button id="primary-action" class="primary full" type="button">Fill this page</button>
-      <div id="secondary-actions" class="button-row compact-row" hidden>
+      <details id="secondary-actions" class="secondary-actions" hidden>
+        <summary>More actions</summary>
+        <div class="button-row">
         <button id="check-page" type="button">Check again</button>
         <button id="advance-page" type="button">Continue to next page</button>
         <button id="save-answers" type="button">Save answers</button>
-      </div>
+        </div>
+      </details>
       <p id="save-feedback" class="save-feedback" role="status" aria-live="polite" aria-atomic="true" hidden></p>
       <div id="employment-choices"></div>
       <button id="retry-ai" type="button" data-retry-ai hidden>Retry AI</button>
-      <p id="run-hint" class="hint">Uploads, CAPTCHA, login, inaccessible widgets, and final site submission stay manual.</p>
-    </section>
-
-    <section id="site-control-card" class="card site-control-card" aria-labelledby="site-control-title" hidden>
-      <div class="section-heading">
-        <div><span class="step">06</span><h2 id="site-control-title">Site access</h2></div>
-        <span id="site-control-state" class="pill neutral">Unavailable</span>
-      </div>
-      <p id="site-control-hint" class="hint compact">Site controls are unavailable on this browser page.</p>
-      <button id="site-toggle" class="full" type="button" hidden>Disable on this site</button>
+      <p id="run-hint" class="hint">Review each page before continuing.</p>
     </section>
 
     <section id="inline-field-card" class="card" aria-labelledby="inline-field-title" hidden>
@@ -56,24 +57,26 @@
       <div id="inline-field-list"></div>
     </section>
 
-    <section id="action-required-card" class="card" aria-labelledby="action-required-title" hidden>
-      <div class="section-heading">
-        <div><span class="step">02</span><h2 id="action-required-title">Action required</h2></div>
+    <details id="action-required-card" class="card collapsible" hidden>
+      <summary>
+        <span id="action-required-title">Needs your attention</span>
         <span id="action-required-count" class="pill neutral">0</span>
-      </div>
-      <div id="action-required-list"></div>
-    </section>
+      </summary>
+      <div id="action-required-list" class="details-body"></div>
+    </details>
 
-    <section id="review-card" class="card" aria-labelledby="review-title" hidden>
-      <div class="section-heading">
-        <div><span class="step">03</span><h2 id="review-title">Review before submitting</h2></div>
+    <details id="review-card" class="card collapsible" hidden>
+      <summary>
+        <span id="review-title">Review before submitting</span>
         <span id="review-count" class="pill neutral">0</span>
-      </div>
+      </summary>
+      <div class="details-body">
       <div id="review-list"></div>
       <p id="submit-instructions" class="hint" hidden>Saved answers are local only. Review the application page and click Submit on the site when you are ready; the final values are captured automatically.</p>
-    </section>
+      </div>
+    </details>
 
-    <details id="optional-details" class="card collapsible">
+    <details id="optional-details" class="card collapsible" hidden>
       <summary>
         <span>Optional unanswered</span>
         <span id="optional-count" class="pill neutral">0</span>
@@ -81,9 +84,9 @@
       <div id="optional-list" class="details-body"></div>
     </details>
 
-    <details id="audit-details" class="card collapsible">
+    <details id="audit-details" class="card collapsible" hidden>
       <summary>
-        <span>All filled values</span>
+        <span>Filled values</span>
         <span id="audit-count" class="pill neutral">0</span>
       </summary>
       <div id="audit-list" class="details-body"></div>
@@ -95,7 +98,7 @@
       </summary>
       <div class="details-body">
         <div class="section-heading settings-heading">
-          <div><span class="step">04</span><h2 id="profile-title">Answer profile</h2></div>
+          <h2 id="profile-title">Answer profile</h2>
           <span id="record-count" class="pill neutral">0 answers</span>
         </div>
         <label for="ai-provider">AI provider</label>
@@ -127,7 +130,7 @@
           <span>Auto-advance pages when exactly one valid Next action is found</span>
         </label>
         <div class="section-heading settings-heading inline-top">
-          <div><span class="step">05</span><h2 id="datasource-title">Datasource</h2></div>
+          <h2 id="datasource-title">Saved data</h2>
           <span id="cover-message-count" class="pill neutral">0 cover messages</span>
         </div>
         <p id="datasource-hint" class="hint compact">Saved answers and cover messages stay in trusted Chrome storage.</p>
@@ -153,11 +156,18 @@
         </details>
       </div>
     </details>
+    <p class="manual-note">Uploads, CAPTCHA, login, and final submission stay on the site.</p>
   </main>
 
   <footer>
+    <div class="status-line" role="status" aria-live="polite">
     <span id="status-dot" class="status-dot"></span>
     <span id="status">Ready.</span>
+    </div>
+    <details id="status-details" class="nested-details" hidden>
+      <summary>Technical details</summary>
+      <p id="status-detail"></p>
+    </details>
   </footer>
   <script type="module" src="src/sidepanel.js"></script>
 </body>

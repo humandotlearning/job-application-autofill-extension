@@ -28,6 +28,8 @@ const elements = {
   saveFeedback: byId('save-feedback'),
   employmentChoices: byId('employment-choices'),
   retryAi: byId('retry-ai'),
+  runTitle: byId('run-title'),
+  runSummary: byId('run-summary'),
   runState: byId('run-state'),
   runHint: byId('run-hint'),
   actionRequiredCard: byId('action-required-card'),
@@ -45,10 +47,13 @@ const elements = {
   auditList: byId('audit-list'),
   status: byId('status'),
   statusDot: byId('status-dot'),
+  statusDetails: byId('status-details'),
+  statusDetail: byId('status-detail'),
   inlineFieldCard: byId('inline-field-card'),
   inlineFieldList: byId('inline-field-list'),
   closeInlineField: byId('close-inline-field'),
   siteControlCard: byId('site-control-card'),
+  siteControlTitle: byId('site-control-title'),
   siteControlState: byId('site-control-state'),
   siteControlHint: byId('site-control-hint'),
   siteToggle: byId('site-toggle'),
@@ -60,7 +65,7 @@ const STATUS_LABELS = {
   running: 'Filling…',
   waiting_user: 'Action required',
   page_ready: 'Page ready',
-  ready_for_user_submit: 'Ready to save',
+  ready_for_user_submit: 'Ready to review',
   answers_saved: 'Answers saved',
 };
 
@@ -201,9 +206,12 @@ function setSaveFeedback(message = '', state = '') {
   elements.saveFeedback.hidden = !message;
 }
 
-function setStatus(message, state = 'ok') {
+function setStatus(message, state = 'ok', detail = '') {
   elements.status.textContent = message;
   elements.statusDot.className = `status-dot${state === 'ok' ? '' : ` ${state}`}`;
+  elements.statusDetails.hidden = !detail;
+  elements.statusDetail.textContent = detail;
+  if (!detail) elements.statusDetails.open = false;
 }
 
 function renderDisabledSites(hostnames = []) {
@@ -242,6 +250,7 @@ function renderSiteState(site = {}) {
   };
   renderDisabledSites(currentSite.disabledHostnames);
   elements.siteControlCard.hidden = false;
+  elements.siteControlTitle.textContent = currentSite.hostname || 'Site access';
   elements.siteControlCard.dataset.disabled = String(currentSite.disabled);
   elements.siteControlState.textContent = !currentSite.supported ? 'Unavailable' : (currentSite.disabled ? 'Disabled' : 'Enabled');
   elements.siteControlState.className = `pill${currentSite.disabled ? '' : ' neutral'}`;
@@ -1089,11 +1098,12 @@ function setActionVisibility(run) {
   elements.checkPage.textContent = missingDestination ? 'Retry scan' : 'Check again';
   elements.secondaryActions.hidden = !hasRun || (elements.checkPage.hidden && elements.advancePage.hidden && elements.saveAnswers.hidden);
   if (!hasRun) {
+    elements.retryAi.hidden = true;
     elements.primaryAction.textContent = 'Fill this page';
     return;
   }
   if (status === 'running') elements.primaryAction.textContent = 'Filling this page…';
-  else if (status === 'waiting_user') elements.primaryAction.textContent = selectForm ? 'Select form' : missingDestination ? 'Retry scan' : (run.actionRequired || run.unresolved || [])[0]?.fieldId ? 'Complete this field' : 'Check again';
+  else if (status === 'waiting_user') elements.primaryAction.textContent = selectForm ? 'Select form' : missingDestination ? 'Retry scan' : (run.actionRequired || run.unresolved || [])[0]?.fieldId ? 'Review needed answers' : 'Check again';
   else if (status === 'page_ready') elements.primaryAction.textContent = 'Continue to next page';
   else if (['ready_for_user_submit', 'answers_saved'].includes(status)) elements.primaryAction.textContent = 'Review on site';
   else elements.primaryAction.textContent = 'Fill this page';
@@ -1146,16 +1156,22 @@ function renderRun(run) {
   }
   currentRun = run || null;
   if (!run) {
-    elements.runState.textContent = 'Ready';
+    elements.runTitle.textContent = !currentSite.supported ? 'Open an application' : currentSite.disabled ? 'Autofill is paused' : 'Ready to fill this page';
+    elements.runSummary.textContent = !currentSite.supported ? 'Switch to a job application to get started.' : currentSite.disabled ? 'Re-enable this site using the site access menu above.' : 'Use your saved answers to get started.';
+    elements.runState.textContent = !currentSite.supported ? 'Unavailable' : currentSite.disabled ? 'Paused' : 'Ready';
     elements.runState.className = 'pill neutral';
-    elements.runHint.textContent = 'Fill one page at a time. Uploads, CAPTCHA, login, and final site submission stay manual.';
+    elements.runHint.textContent = 'Review each page before continuing.';
+    elements.runHint.hidden = !currentSite.supported || currentSite.disabled;
     elements.actionRequiredCard.hidden = true;
     elements.reviewCard.hidden = true;
     elements.optionalCount.textContent = '0';
     elements.auditCount.textContent = '0';
+    elements.optionalDetails.hidden = true;
+    elements.auditDetails.hidden = true;
     renderList(elements.optionalList, [], { emptyLabel: 'No optional fields', emptyDetail: 'Optional questions will appear here when unanswered.' });
     renderList(elements.auditList, [], { emptyLabel: 'No captured values', emptyDetail: 'Filled values will appear here after a page check.' });
     setActionVisibility(null);
+    setStatus(currentSite.disabled ? 'Paused on this site.' : !currentSite.supported ? 'Waiting for an application page.' : 'Ready.');
     restorePanelState(panelState);
     return;
   }
@@ -1164,8 +1180,17 @@ function renderRun(run) {
   const optionalUnresolved = run.optionalUnresolved || [];
   const reviewRequired = run.reviewRequired || [];
   const audit = run.audit || [];
+  elements.runHint.hidden = false;
+  elements.runTitle.textContent = run.status === 'running' ? 'Filling this page…'
+    : run.frame === null ? 'Let’s find your form'
+    : run.status === 'waiting_user' ? (actionRequired.length ? `${actionRequired.length} item${actionRequired.length === 1 ? '' : 's'} need${actionRequired.length === 1 ? 's' : ''} your attention` : 'Check the application page')
+    : run.status === 'answers_saved' ? 'Your answers are saved'
+    : ['page_ready', 'ready_for_user_submit'].includes(run.status) ? 'This page is filled'
+    : 'Current application';
+  elements.runSummary.textContent = run.frame === null ? 'Choose or rescan the application form.'
+    : `${audit.length} filled value${audit.length === 1 ? '' : 's'}${reviewRequired.length ? ` · ${reviewRequired.length} to review` : ''}`;
   const failedAi = Object.values(run.aiOperations || {}).some((operation) => ['failed', 'interrupted'].includes(operation?.status || operation));
-  elements.retryAi.hidden = !failedAi;
+  elements.retryAi.hidden = !failedAi && !run.llmError;
   elements.employmentChoices.replaceChildren();
   for (const choice of run.employmentChoices || []) {
     const label = document.createElement('label'); label.textContent = choice.label || 'Choose employment';
@@ -1195,9 +1220,11 @@ function renderRun(run) {
   elements.submitInstructions.hidden = !['ready_for_user_submit', 'answers_saved'].includes(run.status);
 
   elements.optionalCount.textContent = String(optionalUnresolved.length);
+  elements.optionalDetails.hidden = optionalUnresolved.length === 0;
   renderList(elements.optionalList, optionalUnresolved, { focus: run.frame !== null, emptyLabel: 'No optional unanswered fields', emptyDetail: 'Optional questions are complete or not present on this page.' });
 
   elements.auditCount.textContent = String(audit.length);
+  elements.auditDetails.hidden = audit.length === 0;
   renderList(elements.auditList, audit, { detail: '' });
 
   if (run.status === 'waiting_user') {
@@ -1206,15 +1233,15 @@ function renderRun(run) {
     elements.runHint.textContent = run.frame === null ? (run.actionRequired?.[0]?.reason || 'Retry the scan to find the application form.') : visibleWaitingLabel
       ? `Complete “${visibleWaitingLabel}” on the application page, then click Check again.`
       : 'Complete the highlighted field or handle the manual step, then click Check again.';
-    setStatus(run.llmError ? `Answer planner unavailable: ${run.llmError}` : 'Action is required on the application page.', run.llmError ? 'error' : 'ok');
+    setStatus(run.llmError ? 'Couldn’t prepare AI answers. Try Retry AI.' : 'Action is required on the application page.', run.llmError ? 'error' : 'ok', run.llmError || '');
   } else if (run.status === 'page_ready') {
     elements.runHint.textContent = 'This page is filled and validated. Review it, then continue when you are ready.';
     setStatus(`Page ${run.pageNumber || 1} is ready for your approval.`);
   } else if (run.status === 'ready_for_user_submit') {
-    elements.runHint.textContent = 'Review the application and the lists below. Your current values are captured automatically when you submit on the site; Save answers is an optional local checkpoint.';
+    elements.runHint.textContent = 'Review on the site, then submit there. Save a draft checkpoint if needed.';
     setStatus('Final page is ready. Submission stays manual; final values are captured automatically.');
   } else if (run.status === 'answers_saved') {
-    elements.runHint.textContent = 'Answers are saved locally. Review the application and click Submit on the application site when ready; current values are captured automatically when you submit.';
+    elements.runHint.textContent = 'Saved locally. Final values are captured automatically when you submit on the site.';
     setStatus('Answers saved. Submission remains manual.');
   } else if (run.status === 'running') {
     elements.runHint.textContent = elements.autoAdvance.checked
@@ -1296,11 +1323,20 @@ async function runPrimaryAction() {
   if (currentRun?.status === 'waiting_user') {
     if (['ambiguous_form', 'selecting_form'].includes(currentRun.waitingFor)) return sendRunAction('JOB_RUN_SELECT_FORM');
     if (currentRun.frame === null) return sendRunAction('JOB_RUN_CHECK_PAGE');
+    if (!elements.actionRequiredCard.hidden) {
+      elements.actionRequiredCard.open = true;
+      elements.actionRequiredCard.querySelector('summary').focus();
+    }
     const first = (currentRun.actionRequired || currentRun.unresolved || [])[0];
     if (first?.fieldId) return focusField(first.fieldId);
     return sendRunAction('JOB_RUN_VALIDATE_PAGE');
   }
   if (['ready_for_user_submit', 'answers_saved'].includes(currentRun?.status)) {
+    const detail = currentRun.reviewRequired?.length ? elements.reviewCard : elements.auditDetails;
+    if (!detail.hidden) {
+      detail.open = true;
+      detail.querySelector('summary').focus();
+    }
     const first = currentRun.reviewRequired?.[0] || currentRun.audit?.[0];
     if (first?.fieldId || first?.key) return focusField(first.fieldId || first.key);
     setStatus('Review the application on the site before submitting.');
@@ -1461,6 +1497,10 @@ elements.disabledSiteList.addEventListener('click', (event) => {
   if (button?.dataset.disabledHostname) removeDisabledSite(button.dataset.disabledHostname);
 });
 elements.primaryAction.addEventListener('click', runPrimaryAction);
+byId('open-settings').addEventListener('click', () => {
+  byId('settings-data').open = true;
+  byId('settings-data').querySelector('summary').focus();
+});
 elements.checkPage.addEventListener('click', () => sendRunAction('JOB_RUN_VALIDATE_PAGE'));
 elements.closeInlineField.addEventListener('click', async () => {
   const session = currentInlineSession;

@@ -64,22 +64,25 @@ test('side panel contains the guided workflow, review groups, and settings contr
   }
 });
 
-test('side panel exposes a themeable terminal UI token layer', async () => {
+test('side panel exposes Sage Focus theme tokens and accessible disclosures', async () => {
   const [html, css] = await Promise.all([
     readFile(new URL('sidepanel.html', root), 'utf8'),
     readFile(new URL('src/sidepanel.css', root), 'utf8'),
   ]);
   assert.match(html, /class="app-shell"/);
   assert.match(html, /class="brand-row"/);
-  assert.match(html, /GUIDED COPILOT/);
-  for (const token of ['--color-bg', '--color-surface', '--color-surface-raised', '--color-text', '--color-text-muted', '--color-border', '--color-accent', '--color-accent-soft', '--color-focus', '--color-ok', '--color-warning', '--color-danger', '--font-mono', '--line-body', '--line-copy', '--border-width', '--focus-width', '--radius-control', '--size-prompt-textarea']) {
+  assert.doesNotMatch(html, /GUIDED COPILOT/);
+  assert.match(html, /<details id="action-required-card"/);
+  assert.match(html, /aria-controls="settings-data"/);
+  assert.match(css, /color-scheme: light/);
+  for (const token of ['--color-bg', '--color-surface', '--color-surface-raised', '--color-text', '--color-text-muted', '--color-border', '--color-accent', '--color-accent-soft', '--color-focus', '--color-ok', '--color-warning', '--color-danger', '--font-body', '--line-body', '--line-copy', '--border-width', '--focus-width', '--radius-control', '--size-prompt-textarea']) {
     assert.match(css, new RegExp(`${token}:`));
   }
   assert.match(css, /\.app-shell/);
   assert.match(css, /\.brand-row/);
   assert.match(css, /\.pill\s*\{/);
   assert.match(css, /outline:\s*var\(--focus-width\) solid var\(--color-focus\)/);
-  assert.match(css, /\.answer-send::before/);
+  assert.match(css, /summary:focus-visible/);
 });
 
 test('legacy source and pending-learning workflow is absent', async () => {

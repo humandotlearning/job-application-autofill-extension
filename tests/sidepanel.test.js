@@ -1200,3 +1200,54 @@ test('paused discovery overrides progress and offers recovery without saving to 
     } finally {panel.cleanup();}
   }
 });
+
+
+test('Sage Focus opens needed answers and settings without applying a value', async () => {
+  const run = { status: 'waiting_user', frame: { frameId: 0 }, actionRequired: [{ fieldId: 'start', label: 'Start date' }], audit: [{ fieldId: 'name', label: 'Name', value: 'Alex' }] };
+  const panel = await setupPanel({run});
+  try {
+    const doc = panel.dom.window.document;
+    assert.equal(doc.querySelector('#run-title').textContent, '1 item needs your attention');
+    assert.equal(doc.querySelector('#run-summary').textContent, '1 filled value');
+    assert.equal(doc.querySelector('#action-required-card').open, false);
+    assert.equal(doc.querySelector('#optional-details').hidden, true);
+    assert.equal(doc.querySelector('#secondary-actions').open, false);
+    for (const id of ['run-hint', 'save-feedback', 'employment-choices', 'retry-ai']) assert.equal(doc.getElementById(id).closest('#secondary-actions'), null);
+    doc.querySelector('#primary-action').click();
+    await new Promise(resolve => setTimeout(resolve, 0));
+    assert.equal(doc.querySelector('#action-required-card').open, true);
+    assert.equal(pageMutationMessages(panel.sentMessages).length, 0);
+    doc.querySelector('#open-settings').click();
+    assert.equal(doc.querySelector('#settings-data').open, true);
+    assert.equal(doc.activeElement, doc.querySelector('#settings-data > summary'));
+  } finally { panel.cleanup(); }
+});
+
+test('Sage Focus shows recovery guidance and no empty answer lists on unsupported pages', async () => {
+  const panel = await setupPanel({site: {supported: false, hostname: ''}});
+  try {
+    const doc = panel.dom.window.document;
+    assert.equal(doc.querySelector('#run-title').textContent, 'Open an application');
+    assert.equal(doc.querySelector('#run-state').textContent, 'Unavailable');
+    for (const id of ['primary-action', 'optional-details', 'audit-details', 'retry-ai']) assert.equal(doc.getElementById(id).hidden, true);
+    assert.match(doc.querySelector('#status').textContent, /Waiting for an application/);
+  } finally { panel.cleanup(); }
+});
+
+test('Sage Focus keeps planner diagnostics in a disclosure and clears them on a new page', async () => {
+  const run = {status: 'waiting_user', frame: {frameId: 0}, llmError: 'Missing structured output text', actionRequired: []};
+  const panel = await setupPanel({run});
+  try {
+    const doc = panel.dom.window.document;
+    assert.match(doc.querySelector('#status').textContent, /Retry AI/);
+    assert.doesNotMatch(doc.querySelector('#status').textContent, /structured output/);
+    assert.equal(doc.querySelector('#status-details').hidden, false);
+    assert.equal(doc.querySelector('#status-details').open, false);
+    assert.equal(doc.querySelector('#status-detail').textContent, run.llmError);
+    assert.equal(doc.querySelector('#retry-ai').hidden, false);
+    panel.storageListeners.forEach(listener => listener({applicationRun: {newValue: {}}}, 'session'));
+    assert.equal(doc.querySelector('#status-details').hidden, true);
+    assert.equal(doc.querySelector('#retry-ai').hidden, true);
+    assert.equal(doc.querySelector('#run-title').textContent, 'Ready to fill this page');
+  } finally { panel.cleanup(); }
+});
