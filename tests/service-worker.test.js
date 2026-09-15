@@ -82,6 +82,8 @@ function createHarness({
       fields: page.fields.map((field) => materializeField(field, page.values || {})),
       actions: page.actions || [],
       pauseReasons: page.pauseReasons || [],
+      ...(page.destination ? {destination: page.destination} : {}),
+      ...(page.discovery ? {discovery: page.discovery} : {}),
     };
   }
 
@@ -1577,7 +1579,7 @@ test('pauses without applying when no frame looks like an application', async ()
   const started = await harness.dispatch({ type: 'JOB_RUN_START', tabId: 7 });
 
   assert.equal(started.run.status, 'waiting_user');
-  assert.equal(started.run.waitingFor, 'no_application_frame');
+  assert.equal(started.run.waitingFor, 'no_supported_controls');
   assert.equal(harness.tabs.get(7).messages.some((message) => message.type === 'JOB_APP_APPLY'), false);
 });
 
@@ -1640,7 +1642,7 @@ test('pauses without applying when application frames tie', async () => {
   const started = await harness.dispatch({ type: 'JOB_RUN_START', tabId: 7 });
 
   assert.equal(started.run.status, 'waiting_user');
-  assert.equal(started.run.waitingFor, 'ambiguous_application_frame');
+  assert.equal(started.run.waitingFor, 'ambiguous_form');
   assert.equal(harness.tabs.get(7).messages.some((message) => message.type === 'JOB_APP_APPLY'), false);
 });
 
@@ -2782,4 +2784,112 @@ test('worker restart marks pending operations interrupted without replaying navi
   await import(`../src/service-worker.js?restart-${Date.now()}`);
   const response=await h.dispatch({type:'JOB_RUN_STATE',tabId:7});
   assert.equal(response.run.aiOperations.planner.status,'interrupted');assert.equal(response.run.status,'waiting_user');assert.equal(h.tabs.get(7).nextClicks,0);
+});
+
+
+test('discovery reports distinct failures without retaining page text', async () => {
+  for (const code of ['no_supported_controls', 'loading_timeout', 'inspection_error', 'script_unavailable']) {
+    const harness = createHarness({pagesByTab: {7: {pages: [{fields: [], actions: []}]}}});
+    const send = chrome.tabs.sendMessage;
+    chrome.tabs.sendMessage = async (tabId, message, options) => {
+      if (message.type !== 'JOB_APP_INSPECT') return send(tabId, message, options);
+      if (code === 'script_unavailable') throw new Error('private page text');
+      if (code === 'inspection_error') return {ok: false, code, error: 'private page text'};
+      return {ok: true, version: 'test', inspection: {page: {title: 'private page text'}, fields: [], actions: [], pauseReasons: [], discovery: {code, controlCount: 0, regionCount: 0, shadowRootCount: 4, elapsedMs: 12}}};
+    };
+    await import('../src/service-worker.js?discovery=' + code + Date.now());
+    const {run} = await harness.dispatch({type: 'JOB_RUN_START', tabId: 7});
+    assert.equal(run.waitingFor, code);
+    assert.equal(run.progress, null);
+    assert.equal(run.frame, null);
+    assert.equal(JSON.stringify(run.discoveryDiagnostics).includes('private page text'), false);
+    assert.equal(harness.tabs.get(7).messages.some(message => message.type === 'JOB_APP_APPLY'), false);
+  }
+});
+
+test('multiple eligible application frames require selection even with unequal scores', async () => {
+  const harness = createHarness({pagesByTab: {7: {frames: [1, 2].map(frameId => ({frameId, pages: [{
+    fields: Array.from({length: frameId}, (_, index) => ({id: 'name' + index, label: 'Full name', type: 'text', required: true})),
+    actions: [{id: 'submit', label: 'Submit application', kind: 'submit'}],
+  }]}))}}});
+  await import('../src/service-worker.js?unequal=' + Date.now());
+  const {run} = await harness.dispatch({type: 'JOB_RUN_START', tabId: 7});
+  assert.equal(run.waitingFor, 'ambiguous_form');
+  assert.equal(harness.tabs.get(7).messages.some(message => message.type === 'JOB_APP_APPLY'), false);
+});
+
+test('application discovery accepts fields despite a search and alerts page title', async () => {
+  const harness = createHarness({pagesByTab: {7: {pages: [{page: {title: 'Search jobs and alerts'},
+    fields: [{id: 'full_name', label: 'Full name', type: 'text', required: true}],
+    actions: [{id: 'submit', label: 'Submit application', kind: 'submit'}],
+  }]}}});
+  await import('../src/service-worker.js?search-title=' + Date.now());
+  const {run} = await harness.dispatch({type: 'JOB_RUN_START', tabId: 7});
+  assert.equal(run.status, 'ready_for_user_submit');
+});
+
+test('writes carry document and region authority and are not replayed after transport failure', async () => {
+  const destination = {documentId: 'doc-one', regionId: 'form-one'};
+  const harness = createHarness({pagesByTab: {7: {pages: [{destination,
+    discovery: {code: 'ready', regionCount: 1, controlCount: 1},
+    fields: [{id: 'full_name', label: 'Full name', type: 'text', required: true}], actions: [{id: 'next', label: 'Next', kind: 'next'}],
+  }]}}});
+  const send = chrome.tabs.sendMessage;
+  let writes = 0;
+  chrome.tabs.sendMessage = async (tabId, message, options) => {
+    if (message.type === 'JOB_APP_APPLY') {
+      writes++;
+      assert.deepEqual(message.destination, destination);
+      throw new Error('receiver lost');
+    }
+    return send(tabId, message, options);
+  };
+  await import('../src/service-worker.js?lost-write=' + Date.now());
+  const {run} = await harness.dispatch({type: 'JOB_RUN_START', tabId: 7});
+  assert.equal(writes, 1);
+  assert.equal(run.waitingFor, 'script_unavailable');
+  assert.equal(run.frame, null);
+});
+
+test('form selection rejects forged and navigated tokens then resumes only the clicked region', async () => {
+  const harness = createHarness({pagesByTab: {7: {frames: [1, 2].map(frameId => ({frameId, pages: [{
+    destination: {documentId: 'doc-' + frameId, regionId: 'form-' + frameId}, discovery: {code: 'ready', controlCount: 1, regionCount: 1},
+    fields: [{id: 'full_name', label: 'Full name', type: 'text', required: true}], actions: [{id: 'submit', kind: 'submit', label: 'Submit application'}],
+  }]}))}}});
+  const send = chrome.tabs.sendMessage;
+  const tokens = [];
+  chrome.tabs.sendMessage = async (tabId, message, options) => {
+    if (message.type === 'JOB_APP_SELECT_FORM') {
+      tokens.push(message.token);
+      return {ok: true, destination: {documentId: 'doc-' + options.frameId, regionId: null}};
+    }
+    if (message.type === 'JOB_APP_CANCEL_FORM_SELECTION') return {ok: true};
+    return send(tabId, message, options);
+  };
+  await import('../src/service-worker.js?selection=' + Date.now());
+  await harness.dispatch({type: 'JOB_RUN_START', tabId: 7});
+  await harness.dispatch({type: 'JOB_RUN_SELECT_FORM', tabId: 7});
+  const sender = {id: 'test-extension', tab: {id: 7}, frameId: 2, url: 'https://jobs.example.com/apply'};
+  const selected = {type: 'JOB_APP_FORM_SELECTED', token: 'forged', destination: {documentId: 'doc-2', regionId: 'form-2'}};
+  assert.equal((await harness.dispatch(selected, sender)).ok, false);
+  assert.equal((await harness.dispatch({...selected, token: tokens[0], destination: {documentId: 'changed', regionId: 'form-2'}}, sender)).ok, false);
+  const response = await harness.dispatch({...selected, token: tokens[0]}, sender);
+  assert.equal(response.ok, true, response.error);
+  assert.equal(response.run.frame.frameId, 2);
+  assert.equal(harness.tabs.get(7).messageTargets.filter(({message}) => message.type === 'JOB_APP_APPLY').every(({frameId}) => frameId === 2), true);
+  assert.equal((await harness.dispatch({...selected, token: tokens[0]}, sender)).ok, false);
+});
+
+
+test('ready region metadata does not turn an unnamed newsletter into an application', async () => {
+  const harness = createHarness({pagesByTab: {7: {pages: [{
+    destination: {documentId: 'newsletter-doc', regionId: 'newsletter-region'},
+    discovery: {code: 'ready', regionCount: 1, controlCount: 1},
+    fields: [{id: 'email', label: 'Email', type: 'email', required: true}],
+    actions: [{id: 'submit', label: 'Submit', kind: 'submit'}],
+  }]}}});
+  await import('../src/service-worker.js?newsletter=' + Date.now());
+  const {run} = await harness.dispatch({type: 'JOB_RUN_START', tabId: 7});
+  assert.equal(run.waitingFor, 'no_supported_controls');
+  assert.equal(harness.tabs.get(7).messages.some(message => message.type === 'JOB_APP_APPLY'), false);
 });

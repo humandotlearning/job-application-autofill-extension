@@ -9,6 +9,7 @@ import {
   slugify,
   validateFillValue,
 } from './core.js';
+import { composedParent, composedClosest, composedContains, composedText, queryAll, rootElementById, deepActiveElement, eventControl, isExtensionElement, withDomSnapshot, domMemo, createDomIndex } from './dom.js';
 
 const IGNORED_TYPES = new Set(['hidden', 'password', 'file', 'submit', 'button', 'reset', 'image', 'search']);
 const SECRET_MARKER = /(?:password|passcode|passwd|pwd|secret|token|csrf|auth[_-]?token)/i;
@@ -18,6 +19,70 @@ const CUSTOM_WIDGET_PROMPT_LABEL = /^(?:choose|select)(?:\s+(?:one|an?\s+option|
 const trackedDocuments = new WeakSet();
 const controlHandles = new WeakMap();
 const documentHandles = new WeakMap();
+const applicationSelections = new WeakMap();
+const applicationFieldSelections = new WeakMap();
+
+function documentIdentity(document) {
+  controlHandle(document.documentElement);
+  return documentHandles.get(document).id;
+}
+
+export function clearApplicationSelection(document) { applicationSelections.delete(document); applicationFieldSelections.delete(document); }
+
+export function selectApplicationField(document, element) {
+  if (!element?.isConnected || element.ownerDocument !== document || isExtensionElement(element) || !isSupported(element) || !isVisible(element)) return null;
+  clearApplicationSelection(document);
+  applicationFieldSelections.set(document, {element, documentId: documentIdentity(document)});
+  return {documentId: documentIdentity(document), regionId: null};
+}
+
+function isUtilityRegion(region) {
+  const label = [region.id, region.getAttribute('role'), region.getAttribute('aria-label'), region.getAttribute('name'),
+    ...queryAll(region, 'h1,h2,h3,legend').filter(el => composedClosest(el, 'form,[role="form"]') === region).map(composedText),
+    ...queryAll(region, 'button,input[type="submit"]').filter(el => composedClosest(el, 'form,[role="form"]') === region).map(actionLabel)].join(' ');
+  return /\b(?:subscribe|newsletter|job.?alerts?|login|sign.?in)\b/i.test(label)
+    || region.getAttribute('role') === 'search' || /^search$/i.test(region.id || '');
+}
+
+function applicationRegions(document) {
+  return domMemo(document, 'regions', () => {
+    const controls = queryAll(document, 'input,textarea,select,[role="combobox"]')
+      .filter(el => (isSupported(el) || el.matches(CUSTOM_WIDGET_SELECTOR)) && isVisible(el));
+    const forms = queryAll(document, 'form,[role="form"]').filter(isVisible);
+    const candidates = forms.filter(form => {
+      const owned = controls.filter(el => (composedClosest(el, 'form,[role="form"]') || el.form) === form);
+      return owned.length && !isUtilityRegion(form);
+    });
+    const outside = controls.filter(el => !composedClosest(el, 'form,[role="form"],[role="search"],nav'));
+    if (outside.length) {
+      const mains = [...new Set(outside.map(el => composedClosest(el, 'main,[role="main"]') || document))];
+      candidates.push(...mains.filter(root => !candidates.some(form => composedContains(root, form))));
+    }
+    return {candidates, controls};
+  });
+}
+
+export function selectApplicationRegion(document, element) {
+  return withDomSnapshot(document, () => {
+    if (!element?.isConnected || element.ownerDocument !== document || isExtensionElement(element) || !isVisible(element)) return null;
+    const {candidates, controls} = applicationRegions(document);
+    const control = controls.find(el => el === element || composedContains(el, element));
+    if (!control) return null;
+    const owner = composedClosest(control, 'form,[role="form"]') || control.form;
+    const region = candidates.includes(owner) ? owner : candidates.find(root => composedContains(root, control));
+    if (!region) return null;
+    applicationFieldSelections.delete(document);
+    applicationSelections.set(document, {region, documentId: documentIdentity(document)});
+    return {documentId: documentIdentity(document), regionId: region === document ? 'document' : controlHandle(region)};
+  });
+}
+
+export function applicationDestination(document) {
+  return withDomSnapshot(document, () => {
+    const root = applicationRoot(document);
+    return {documentId: documentIdentity(document), regionId: root.nodeType === 11 ? null : root === document ? 'document' : controlHandle(root)};
+  });
+}
 
 function controlHandle(element) {
   const document = element.ownerDocument;
@@ -36,38 +101,43 @@ function controlHandle(element) {
 }
 
 function applicationRoot(document) {
-  const candidates = [...document.querySelectorAll('form')].filter(isVisible).map((form) => {
-    const label = `${form.id} ${form.getAttribute('aria-label') || ''} ${form.getAttribute('name') || ''} ${form.querySelector('h1,h2,legend')?.textContent || ''}`;
-    const action = [...form.querySelectorAll('button,input[type="submit"]')].map(actionLabel).join(' ');
-    const score = /subscribe|search|newsletter|alert/i.test(label + action) ? -1
-      : (/application|candidate|apply|employment|education/i.test(label) ? 5 : 0) + (/submit application|apply now/i.test(action) ? 3 : 0);
-    return { form, score };
-  }).sort((a, b) => b.score - a.score);
-  if (candidates[0]?.score > 0 && candidates[0].score === candidates[1]?.score) {
-    const inlineAnchor = document.__jobApplicationInlineFocusAnchor;
-    const focused = document.activeElement?.closest?.('form')
-      || (inlineAnchor?.isConnected && inlineAnchor.ownerDocument === document ? inlineAnchor.closest('form') : null);
-    return candidates.some((candidate) => candidate.form === focused && candidate.score === candidates[0].score) ? focused : document.createDocumentFragment();
-  }
-  return candidates[0]?.score > 0 && candidates[0].score > (candidates[1]?.score ?? -1) ? candidates[0].form : document;
+  const fieldSelection = applicationFieldSelections.get(document);
+  if (fieldSelection && fieldSelection.documentId === documentIdentity(document) && fieldSelection.element.isConnected) return document.createDocumentFragment();
+  if (fieldSelection) applicationFieldSelections.delete(document);
+  const selection = applicationSelections.get(document);
+  if (selection && selection.documentId === documentIdentity(document)
+    && (selection.region === document || selection.region.isConnected)) return selection.region;
+  if (selection) applicationSelections.delete(document);
+  const {candidates} = applicationRegions(document);
+  if (candidates.length === 1) return candidates[0];
+  if (candidates.length > 1) return document.createDocumentFragment();
+  return document;
 }
 
 function inApplication(document, element) {
   const root = applicationRoot(document);
-  if (root !== document) return root.contains(element) || element.form === root;
-  const owner = element.closest('form,[role="search"],nav');
-  return !owner || !/search|subscribe|newsletter|job.?alert/i.test(`${owner.id} ${owner.getAttribute('role')} ${owner.getAttribute('aria-label') || ''}`);
+  if (isExtensionElement(element)) return false;
+  const selectedField = applicationFieldSelections.get(document)?.element;
+  if (selectedField) return element === selectedField;
+  if (root !== document) {
+    const owner = composedClosest(element, 'form,[role="form"]') || element.form;
+    if (owner && owner !== root && applicationRegions(document).candidates.includes(owner)) return false;
+    return composedContains(root, element) || element.form === root;
+  }
+  const owner = composedClosest(element, 'form,[role="form"],[role="search"],nav');
+  return !owner || !isUtilityRegion(owner);
 }
 
 function ensureEditTracking(document) {
   if (trackedDocuments.has(document)) return;
   const markEdited = (event) => {
-    let element = event.target;
+    let element = eventControl(event);
+    if (isExtensionElement(element)) return;
     if (!element || element.__jobApplicationAutofillDispatch || (document.__jobApplicationFilling && !event.isTrusted)) return;
     if (event.type === 'click') {
-      const listbox = element.closest?.('[role="option"]')?.closest('[role="listbox"]');
+      const listbox = composedClosest(composedClosest(element, '[role="option"]'), '[role="listbox"]');
       if (!listbox?.id) return;
-      element = customWidgetElements(document).find((widget) => String(widget.getAttribute('aria-controls') || widget.getAttribute('aria-owns') || '').split(/\s+/).includes(listbox.id));
+      element = customWidgetElements(document).find((widget) => widget.getRootNode() === listbox.getRootNode() && String(widget.getAttribute('aria-controls') || widget.getAttribute('aria-owns') || '').split(/\s+/).includes(listbox.id));
       if (!element) return;
       delete element.__jobApplicationSearchQuery;
     }
@@ -93,7 +163,7 @@ export function extractJobContext(document) {
     for (const child of copy.querySelectorAll('script,style,nav,footer,form,input,textarea,select,button,[hidden],[aria-hidden="true"]')) child.remove();
     return String(copy.textContent || '').replace(/\s+/g, ' ').trim().slice(0, limit);
   };
-  const description = [...document.querySelectorAll('[itemprop="description"],.job-description,#job-description,[data-testid="job-description"],.posting-page .section-wrapper,.posting-description')]
+  const description = [...queryAll(document, '[itemprop="description"],.job-description,#job-description,[data-testid="job-description"],.posting-page .section-wrapper,.posting-description')]
     .map(node => readable(node)).filter(Boolean).join('\n').slice(0, 16000);
   return {
     title: document.title || '', domain: document.location?.hostname || '',
@@ -103,10 +173,10 @@ export function extractJobContext(document) {
   };
 }
 
-function textFromIds(document, ids = '') {
+function textFromIds(element, ids = '') {
   return String(ids)
     .split(/\s+/)
-    .map((id) => document.getElementById(id) ? labelText(document.getElementById(id)) : '')
+    .map((id) => rootElementById(element, id) ? labelText(rootElementById(element, id)) : '')
     .filter(Boolean)
     .join(' ');
 }
@@ -132,18 +202,19 @@ function labelText(label) {
       const style = node.ownerDocument.defaultView?.getComputedStyle(node);
       if (style?.display === 'none' || style?.visibility === 'hidden' || style?.contentVisibility === 'hidden') return '';
     }
-    return [...node.childNodes].map(read).join('');
+    const assigned = node.tagName === 'SLOT' ? node.assignedNodes?.({flatten: true}) : null;
+    return [...(assigned?.length ? assigned : node.shadowRoot?.childNodes || node.childNodes)].map(read).join('');
   }
   return cleanLabelString(read(label));
 }
 
 function nearbyQuestion(element) {
   const controls = 'input:not([type="hidden"]),textarea,select,[role="combobox"],button[aria-haspopup="listbox"]';
-  for (let wrapper = element.parentElement, depth = 0; wrapper && depth < 6; wrapper = wrapper.parentElement, depth++) {
+  for (let wrapper = composedParent(element), depth = 0; wrapper && depth < 6; wrapper = composedParent(wrapper), depth++) {
     if (wrapper.matches('form,section,main,body')) break;
-    const peers = [...wrapper.querySelectorAll(controls)].filter(isVisible);
+    const peers = [...queryAll(wrapper, controls)].filter(isVisible);
     if (peers.some(peer => peer !== element && !(element.type === 'radio' && peer.type === 'radio' && peer.name === element.name))) break;
-    const candidates = [...wrapper.querySelectorAll('.application-label .text,h3,h4,[role="heading"],legend,label')]
+    const candidates = [...queryAll(wrapper, '.application-label .text,h3,h4,[role="heading"],legend,label')]
       .filter(node => isVisible(node) && !node.contains(element) && !node.querySelector(controls)
         && !node.matches('[for]') && !node.closest('[role="alert"],.error,.help,.hint')
         && Boolean(node.compareDocumentPosition(element) & 4));
@@ -157,17 +228,17 @@ function nearbyQuestion(element) {
 function questionMetadata(document, element) {
   const native = [...(element.labels || [])].map(labelText).filter(Boolean).join(' ');
   if (element.type === 'radio') {
-    const group = element.closest('fieldset,[role="radiogroup"],[role="group"]');
-    const explicit = group && (textFromIds(document, group.getAttribute('aria-labelledby')) || group.getAttribute('aria-label') || group.querySelector(':scope > legend')?.textContent?.trim());
+    const group = composedClosest(element, 'fieldset,[role="radiogroup"],[role="group"]');
+    const explicit = group && (textFromIds(group, group.getAttribute('aria-labelledby')) || group.getAttribute('aria-label') || group.querySelector(':scope > legend')?.textContent?.trim());
     if (explicit) return { label: explicit, labelSource: 'group', labelConfidence: 'high' };
     const peers = radioGroup(document, element);
-    const aria = peer => textFromIds(document, peer.getAttribute('aria-labelledby')) || peer.getAttribute('aria-label') || '';
+    const aria = peer => textFromIds(peer, peer.getAttribute('aria-labelledby')) || peer.getAttribute('aria-label') || '';
     const shared = aria(element);
     if (shared && peers.length > 1 && peers.every(peer => aria(peer) === shared)) return { label: shared, labelSource: 'shared-aria', labelConfidence: 'high' };
     const nearby = nearbyQuestion(element);
     return { label: nearby || element.name || element.id || '', labelSource: nearby ? 'nearby-question' : 'identity', labelConfidence: nearby ? 'high' : 'low' };
   }
-  const explicit = cleanLabelString(native || element.getAttribute('aria-label') || textFromIds(document, element.getAttribute('aria-labelledby')));
+  const explicit = cleanLabelString(native || element.getAttribute('aria-label') || textFromIds(element, element.getAttribute('aria-labelledby')));
   const nearby = !explicit && nearbyQuestion(element);
   return { label: explicit || nearby || element.getAttribute('placeholder') || element.name || element.id || '',
     labelSource: explicit ? 'explicit' : nearby ? 'nearby-question' : 'identity', labelConfidence: explicit || nearby ? 'high' : 'low' };
@@ -175,7 +246,7 @@ function questionMetadata(document, element) {
 
 function labelFor(document, element) {
   if (element.type === 'radio') {
-    const legend = element.closest('fieldset')?.querySelector('legend')?.textContent?.trim();
+    const legend = composedClosest(element, 'fieldset')?.querySelector('legend')?.textContent?.trim();
     if (legend) return legend;
   }
   const nativeLabel = [...(element.labels || [])]
@@ -184,7 +255,7 @@ function labelFor(document, element) {
     .join(' ');
   return nativeLabel
     || element.getAttribute('aria-label')
-    || textFromIds(document, element.getAttribute('aria-labelledby'))
+    || textFromIds(element, element.getAttribute('aria-labelledby'))
     || element.getAttribute('placeholder')
     || element.getAttribute('name')
     || element.id
@@ -194,13 +265,22 @@ function labelFor(document, element) {
 function isSupported(element) {
   if (!['INPUT', 'TEXTAREA', 'SELECT'].includes(element.tagName)) return false;
   if (element.getAttribute('role') === 'combobox' || element.getAttribute('aria-haspopup') === 'listbox') return false;
-  if (element.disabled || element.readOnly) return false;
+  if (composedClosest(composedParent(element), CUSTOM_WIDGET_SELECTOR)) return false;
+  if (isControlDisabled(element) || element.readOnly || element.getAttribute('aria-readonly') === 'true') return false;
   if (IGNORED_TYPES.has(String(element.type || '').toLowerCase())) return false;
   return !SECRET_MARKER.test(`${element.name || ''} ${element.id || ''} ${element.autocomplete || ''}`);
 }
 
+function isControlDisabled(element) {
+  return Boolean(element.disabled || element.matches(':disabled') || composedClosest(element, '[aria-disabled="true"],[inert]'));
+}
+
 function isVisible(element) {
-  for (let current = element; current; current = current.parentElement) {
+  return domMemo(element.ownerDocument, element, () => isVisibleUncached(element));
+}
+
+function isVisibleUncached(element) {
+  for (let current = element; current; current = composedParent(current)) {
     if (current.hidden || current.getAttribute('aria-hidden') === 'true') return false;
     const style = current.getAttribute('style') || '';
     if (/(?:^|;)\s*(?:display\s*:\s*none|visibility\s*:\s*hidden)/i.test(style)) return false;
@@ -213,18 +293,18 @@ function isVisible(element) {
 function hasNativeFormAction(element) {
   // Use the live native type/form owner: missing or invalid button types submit,
   // and the form attribute can associate a control outside the form subtree.
-  const control = element.closest?.('button, input');
+  const control = composedClosest(element, 'button, input');
   return Boolean(control?.form && ['submit', 'reset', 'image'].includes(control.type));
 }
 
 function customWidgetElements(document) {
-  return [...document.querySelectorAll(CUSTOM_WIDGET_SELECTOR)]
+  return domMemo(document, 'customWidgets', () => [...queryAll(document, CUSTOM_WIDGET_SELECTOR)]
     .filter((element) => !hasNativeFormAction(element))
-    .filter((element) => inApplication(document, element) && !element.disabled && !element.readOnly)
+    .filter((element) => inApplication(document, element) && !isControlDisabled(element) && !element.readOnly && element.getAttribute('aria-readonly') !== 'true')
     .filter((element) => isVisible(element))
-    .filter((element) => element.closest('form, main, [role="main"]') || hasNearbyFormControl(element))
+    .filter((element) => composedClosest(element, 'form, main, [role="main"]') || hasNearbyFormControl(element))
     .filter((element) => element.getAttribute('aria-label') || element.getAttribute('name')
-      || textFromIds(document, element.getAttribute('aria-labelledby')) || associatedLabelText(document, element) || hasNearbyFormControl(element));
+      || textFromIds(element, element.getAttribute('aria-labelledby')) || associatedLabelText(document, element) || hasNearbyFormControl(element)));
 }
 
 function hasNearbyFormControl(element) {
@@ -233,12 +313,14 @@ function hasNearbyFormControl(element) {
 }
 
 function customWidgetValue(element) {
+  const liveState = JSON.stringify([element.value || '', element.getAttribute('aria-valuetext') || '', composedText(element)]);
+  if (element.__jobApplicationCommittedState !== liveState) delete element.__jobApplicationCommittedLabel;
   const selectedOptions = customWidgetOptions(element.ownerDocument, element)
     .filter((option) => option.getAttribute('aria-selected') === 'true')
     .map(customOptionText)
     .filter(Boolean);
   const typedValue = element.__jobApplicationSearchQuery || (element.getAttribute('aria-expanded') === 'true' && element.__jobApplicationUserEdited) ? '' : element.value;
-  const value = String(selectedOptions.length ? selectedOptions.join(', ') : (element.getAttribute('aria-valuetext') || element.__jobApplicationCommittedLabel || typedValue || element.textContent || ''))
+  const value = String(selectedOptions.length ? selectedOptions.join(', ') : (element.getAttribute('aria-valuetext') || element.__jobApplicationCommittedLabel || typedValue || composedText(element) || ''))
     .replace(/\s+/g, ' ').trim();
   return EMPTY_CUSTOM_WIDGET_VALUE.test(value) || isOpaqueIdentifier(value) ? '' : value;
 }
@@ -259,18 +341,18 @@ function associatedLabelText(document, element) {
     .filter(Boolean);
   if (labels.length) return labels.join(' ');
   if (!element.id) return '';
-  const explicit = [...document.querySelectorAll('label')]
-    .filter((label) => label.getAttribute('for') === element.id)
+  const explicit = [...queryAll(document, 'label')]
+    .filter((label) => label.getRootNode() === element.getRootNode() && label.getAttribute('for') === element.id)
     .map(labelText)
     .filter(Boolean);
   return explicit.join(' ');
 }
 
 function nearestFieldGroupLabel(element) {
-  const group = element.closest('fieldset, [role="group"]');
+  const group = composedClosest(element, 'fieldset, [role="group"]');
   if (!group) return '';
   for (const current of [group]) {
-    const candidates = [...current.querySelectorAll('label, legend')]
+    const candidates = [...queryAll(current, 'label, legend')]
       .map((candidate) => visibleText(candidate))
       .filter(Boolean);
     const unique = [...new Set(candidates)];
@@ -280,7 +362,7 @@ function nearestFieldGroupLabel(element) {
 }
 
 function fieldContext(element) {
-  const group = element.closest('fieldset, [role="group"], section, form');
+  const group = composedClosest(element, 'fieldset, [role="group"], section, form');
   if (!group) return {};
   const heading = group.querySelector(':scope > legend, :scope > h1, :scope > h2, :scope > h3, :scope > [role="heading"]');
   const section = visibleText(heading);
@@ -288,7 +370,7 @@ function fieldContext(element) {
   const entityType = /employment|work.?experience|work.?history/i.test(contextText) ? 'employment'
     : /education|school|university/i.test(contextText) ? 'education' : '';
   const entityId = group.getAttribute('data-entity-id') || (entityType || /reference|referee|emergency|supervisor/i.test(contextText) ? group.id || group.getAttribute('name') : '')
-    || (entityType ? `${entityType}-${[...element.ownerDocument.querySelectorAll('fieldset,[role="group"],section')].indexOf(group) + 1}` : '');
+    || (entityType ? `${entityType}-${[...queryAll(element.ownerDocument, 'fieldset,[role="group"],section')].indexOf(group) + 1}` : '');
   return {
     ...(section ? { section } : {}),
     ...(entityId ? { entityId } : {}),
@@ -299,7 +381,7 @@ function fieldContext(element) {
 function customWidgetLabel(document, element) {
   const associated = associatedLabelText(document, element);
   if (associated) return associated;
-  const labelledBy = textFromIds(document, element.getAttribute('aria-labelledby'));
+  const labelledBy = textFromIds(element, element.getAttribute('aria-labelledby'));
   if (labelledBy) return labelledBy;
   const fieldGroupLabel = nearestFieldGroupLabel(element) || nearbyQuestion(element);
   if (fieldGroupLabel) return fieldGroupLabel;
@@ -320,7 +402,7 @@ function customWidgetLabel(document, element) {
 }
 
 function customOptionText(element) {
-  return String(element.textContent || element.getAttribute('aria-label') || '').replace(/\s+/g, ' ').trim();
+  return String(element.getAttribute('aria-label') || composedText(element) || '').replace(/\s+/g, ' ').trim();
 }
 
 function customOptionValue(element) {
@@ -330,7 +412,7 @@ function customOptionValue(element) {
 function customOptionAliases(option) {
   const label = customOptionText(option);
   // SuccessFactors picklists prefix display labels with an ordinal ("4 - Bachelor's degree").
-  const unnumbered = option.closest('.sf-list-select') ? label.replace(/^\d+\s+[-–—]\s+(?=[A-Za-z])/, '') : label;
+  const unnumbered = composedClosest(option, '.sf-list-select') ? label.replace(/^\d+\s+[-–—]\s+(?=[A-Za-z])/, '') : label;
   return [label, unnumbered, customOptionValue(option)].filter(Boolean).map(normalizeText);
 }
 
@@ -342,13 +424,13 @@ function matchingCustomOptions(options, value) {
 function customWidgetOptions(document, element) {
   const ids = String(element.getAttribute('aria-controls') || element.getAttribute('aria-owns') || '').split(/\s+/).filter(Boolean);
   const listboxes = ids.length
-    ? ids.map((id) => document.getElementById(id)).filter(Boolean).flatMap((node) => node.matches('[role="listbox"]') ? [node] : [...node.querySelectorAll('[role="listbox"]')])
-    : [...document.querySelectorAll('[role="listbox"]')];
+    ? ids.map((id) => rootElementById(element, id)).filter(Boolean).flatMap((node) => node.matches('[role="listbox"]') ? [node] : [...queryAll(node, '[role="listbox"]')])
+    : [...queryAll(document, '[role="listbox"]')];
   const visibleListboxes = listboxes
     .filter((listbox) => isVisible(listbox))
-    .filter((listbox) => ids.length || (listboxes.length === 1 && ![...document.querySelectorAll(CUSTOM_WIDGET_SELECTOR)].some((owner) => owner !== element && String(owner.getAttribute('aria-controls') || owner.getAttribute('aria-owns') || '').split(/\s+/).includes(listbox.id))));
+    .filter((listbox) => ids.length || (listboxes.length === 1 && ![...queryAll(document, CUSTOM_WIDGET_SELECTOR)].some((owner) => owner !== element && String(owner.getAttribute('aria-controls') || owner.getAttribute('aria-owns') || '').split(/\s+/).includes(listbox.id))));
   return visibleListboxes
-    .flatMap((listbox) => [...listbox.querySelectorAll('[role="option"]')])
+    .flatMap((listbox) => [...queryAll(listbox, '[role="option"]')])
     .filter((option) => isVisible(option) && option.getAttribute('aria-disabled') !== 'true' && !option.disabled);
 }
 
@@ -361,7 +443,7 @@ function fieldIdentity(element, index, collection = []) {
 }
 
 function formElements(document) {
-  return [...document.querySelectorAll('input, textarea, select')].filter((element) => isSupported(element) && isVisible(element) && inApplication(document, element));
+  return domMemo(document, 'formElements', () => queryAll(document, 'input, textarea, select').filter((element) => isSupported(element) && isVisible(element) && inApplication(document, element)));
 }
 
 function uniqueFields(document) {
@@ -436,18 +518,18 @@ function constraintsFor(element) {
 function describeField(document, element, index) {
   const type = element.tagName === 'SELECT' ? 'select' : element.tagName === 'TEXTAREA' ? 'textarea' : (element.type || 'text');
   const descriptor = {
-    id: fieldIdentity(element, index, formElements(document)),
+    id: fieldIdentity(element, index, [...formElements(document), ...customWidgetElements(document)]),
     handle: controlHandle(element),
     multiple: Boolean(element.multiple),
     selectedValues: element.tagName === 'SELECT' ? [...element.selectedOptions].filter((option) => option.value).map((option) => option.value) : [],
     structuredOptions: element.tagName === 'SELECT' ? [...element.options].map((option) => ({ label: option.textContent.trim(), value: option.value, selected: option.selected, disabled: option.disabled })) : [],
     ...questionMetadata(document, element),
-    helpText: textFromIds(document, element.getAttribute('aria-describedby')).slice(0, 2000),
+    helpText: textFromIds(element, element.getAttribute('aria-describedby')).slice(0, 2000),
     nearbyContext: nearbyQuestion(element).slice(0, 1000),
     type,
     autocomplete: element.autocomplete || '',
     placeholder: element.getAttribute('placeholder') || '',
-    required: Boolean(element.required),
+    required: Boolean(element.required) || element.getAttribute('aria-required') === 'true',
     currentValue: fieldValue(document, element),
     options: fieldOptions(document, element),
     constraints: constraintsFor(element),
@@ -461,15 +543,19 @@ function describeField(document, element, index) {
 }
 
 export function collectFieldDescriptors(document) {
+  return withDomSnapshot(document, () => collectFieldDescriptorsImpl(document));
+}
+
+function collectFieldDescriptorsImpl(document) {
   ensureEditTracking(document);
   const nativeFields = uniqueFields(document).map(({ element, index }) => ({ element, field: describeField(document, element, index) }));
   const customElements = customWidgetElements(document);
   const customFields = customElements
-    .filter((element, index) => !nativeFields.some(({ field }) => field.id === fieldIdentity(element, index, customElements)))
+    .filter(element => !nativeFields.some(({element: native}) => native === element))
     .map((element, index) => ({ element, field: {
-      id: fieldIdentity(element, index, customElements),
+      id: fieldIdentity(element, formElements(document).length + index, [...formElements(document), ...customElements]),
       handle: controlHandle(element),
-      multiple: element.getAttribute('aria-multiselectable') === 'true' || document.getElementById(element.getAttribute('aria-controls'))?.getAttribute('aria-multiselectable') === 'true',
+      multiple: element.getAttribute('aria-multiselectable') === 'true' || rootElementById(element, element.getAttribute('aria-controls'))?.getAttribute('aria-multiselectable') === 'true',
       structuredOptions: customWidgetOptions(document, element).map((option) => ({ label: customOptionText(option), value: customOptionValue(option), selected: option.getAttribute('aria-selected') === 'true', disabled: option.getAttribute('aria-disabled') === 'true' })),
       label: customWidgetLabel(document, element),
       labelSource: nearbyQuestion(element) === customWidgetLabel(document, element) ? 'nearby-question' : 'custom-widget',
@@ -485,17 +571,16 @@ export function collectFieldDescriptors(document) {
     } }));
   const fields = [...nativeFields, ...customFields]
     .sort(({ element: left }, { element: right }) => {
-      const position = left.compareDocumentPosition?.(right) || 0;
-      if (position & 4) return -1;
-      if (position & 2) return 1;
-      return 0;
+      return withDomSnapshot(document, index => index.order.get(left) - index.order.get(right));
     })
     .map(({ field }, formOrder) => ({ ...field, formOrder }));
   const groupKey = (field) => `${canonicalConcept(field.label)}:${field.entityId || ''}`;
+  const confirmation = field => !field.entityType && canonicalConcept(field.label) === 'email' && /confirm|repeat|re.?enter/i.test(field.label);
   const counts = new Map();
   const occurrences = new Map();
-  for (const field of fields) counts.set(groupKey(field), (counts.get(groupKey(field)) || 0) + 1);
+  for (const field of fields) if (!confirmation(field)) counts.set(groupKey(field), (counts.get(groupKey(field)) || 0) + 1);
   return fields.map((field) => {
+    if (confirmation(field)) return field;
     const key = groupKey(field);
     const occurrence = (occurrences.get(key) || 0) + 1;
     occurrences.set(key, occurrence);
@@ -506,7 +591,18 @@ export function collectFieldDescriptors(document) {
 export function descriptorForElement(document, element) {
   if (!element || element.ownerDocument !== document || !element.isConnected) return null;
   const handle = controlHandle(element);
-  return collectFieldDescriptors(document).find((field) => field.handle === handle) || null;
+  const described = collectFieldDescriptors(document).find((field) => field.handle === handle);
+  if (described) return described;
+  // Inline focus can scope one field without granting bulk-fill authority.
+  if (deepActiveElement(document) !== element && document.__jobApplicationInlineFocusAnchor !== element) return null;
+  const previous = applicationFieldSelections.get(document);
+  const previousRegion = applicationSelections.get(document);
+  if (!selectApplicationField(document, element)) return null;
+  try { return collectFieldDescriptors(document).find(field => field.handle === handle) || null; }
+  finally {
+    if (previous) applicationFieldSelections.set(document, previous); else applicationFieldSelections.delete(document);
+    if (previousRegion) applicationSelections.set(document, previousRegion);
+  }
 }
 
 function dispatchFormEvents(element) {
@@ -514,7 +610,7 @@ function dispatchFormEvents(element) {
   element.__jobApplicationAutofillDispatch = true;
   try {
     for (const eventName of ['input', 'change', 'blur']) {
-      element.dispatchEvent(new view.Event(eventName, { bubbles: true }));
+      element.dispatchEvent(new view.Event(eventName, { bubbles: true, composed: true }));
     }
   } finally {
     delete element.__jobApplicationAutofillDispatch;
@@ -542,6 +638,7 @@ function checkValidityWithoutPattern(element) {
 }
 
 function checkValiditySafely(element) {
+  if (element?.getAttribute('aria-invalid') === 'true') return false;
   if (typeof element?.checkValidity !== 'function') return true;
   const pattern = element.getAttribute('pattern');
   if (pattern !== null) {
@@ -585,7 +682,7 @@ function setSelectValue(element, answer) {
 }
 
 function radioGroup(document, element) {
-  return formElements(document).filter((candidate) => candidate.type === 'radio' && (element.name ? candidate.name === element.name && candidate.form === element.form : candidate === element));
+  return formElements(document).filter((candidate) => candidate.type === 'radio' && (element.name ? candidate.name === element.name && candidate.form === element.form && candidate.getRootNode() === element.getRootNode() : candidate === element));
 }
 
 function setRadioGroup(document, element, answer) {
@@ -663,7 +760,11 @@ async function setCustomChoiceValue(document, element, answer, deadline = Infini
     || (!element.__jobApplicationSearchQuery && (normalizeText(element.textContent || '') !== initialText
       || String(element.value || '') !== initialValue
       || Boolean(element.getAttribute('aria-valuetext'))));
-  if (selectionCommitted) element.__jobApplicationCommittedLabel = customOptionText(matches[0]);
+  if (!selectionCommitted && element.tagName !== 'INPUT') return {ok: false, unresolved: true, reason: 'The custom widget did not accept the selected option'};
+  if (selectionCommitted) {
+    element.__jobApplicationCommittedLabel = customOptionText(matches[0]);
+    element.__jobApplicationCommittedState = JSON.stringify([element.value || '', element.getAttribute('aria-valuetext') || '', composedText(element)]);
+  }
   const backingInput = [...(element.parentElement?.querySelectorAll('input, textarea') || [])].find((input) => input !== element);
   const acceptedSingleValues = multiple ? [expected] : [...new Set([expected, ...customOptionAliases(matches[0])])];
   if (element.tagName === 'INPUT') {
@@ -702,10 +803,10 @@ async function fillElement(document, element, answer, deadline = Infinity) {
 
 function elementsForField(document, fieldId) {
   const nativeElements = formElements(document);
-  const nativeMatch = nativeElements.find((element, index) => fieldIdentity(element, index, nativeElements) === fieldId);
+  const nativeMatch = nativeElements.find((element, index) => fieldIdentity(element, index, [...nativeElements, ...customWidgetElements(document)]) === fieldId);
   if (nativeMatch) return [nativeMatch];
   const customFields = customWidgetElements(document);
-  const generatedCustomIndex = customFields.findIndex((element, index) => fieldIdentity(element, index, customFields) === fieldId);
+  const generatedCustomIndex = customFields.findIndex((element, index) => fieldIdentity(element, nativeElements.length + index, [...nativeElements, ...customFields]) === fieldId);
   if (generatedCustomIndex >= 0) return [customFields[generatedCustomIndex]];
   const byId = document.getElementById(fieldId);
   if (byId && (isSupported(byId) || customFields.includes(byId))) return [byId];
@@ -1047,7 +1148,7 @@ export async function applyDecisions(document, decisions = [], { deadline = Infi
 }
 
 function actionLabel(element) {
-  return String(element.textContent || element.value || element.getAttribute('aria-label') || '').replace(/\s+/g, ' ').trim();
+  return String(element.getAttribute('aria-label') || composedText(element) || element.value || '').replace(/\s+/g, ' ').trim();
 }
 
 function actionKind(element, label = actionLabel(element)) {
@@ -1063,9 +1164,9 @@ function actionKind(element, label = actionLabel(element)) {
 
 function collectActions(document) {
   const actions = [];
-  const candidates = [...document.querySelectorAll('button, input[type="submit"], input[type="button"], a, [role="button"]')];
+  const candidates = [...queryAll(document, 'button, input[type="submit"], input[type="button"], a, [role="button"]')];
   for (const [index, element] of candidates.entries()) {
-    if (element.disabled || !isVisible(element) || !inApplication(document, element)) continue;
+    if (isControlDisabled(element) || !isVisible(element) || !inApplication(document, element)) continue;
     const label = actionLabel(element);
     if (!label) continue;
     const type = String(element.type || '').toLowerCase();
@@ -1081,7 +1182,7 @@ export function isFinalApplicationSubmit(document, event) {
   const root = applicationRoot(document);
   if (root !== document && root !== form) return false;
   if (root === document && !inApplication(document, form)) return false;
-  const formActions = [...document.querySelectorAll('button, input[type="submit"], input[type="button"]')]
+  const formActions = [...queryAll(document, 'button, input[type="submit"], input[type="button"]')]
     .filter((control) => control.form === form && !control.disabled && isVisible(control))
     .map((control) => actionKind(control));
   const hasSingleFinalAction = formActions.filter((kind) => kind === 'submit').length === 1;
@@ -1096,20 +1197,17 @@ export function isFinalApplicationSubmit(document, event) {
 
 function pauseReasons(document) {
   const reasons = [];
-  const visibleText = [...(document.body?.querySelectorAll('*') || [])]
-    .filter(isVisible)
-    .map((element) => element.textContent || '')
-    .join(' ');
-  if ([...document.querySelectorAll('input[type="file"]:not([disabled])')].some((element) => isVisible(element) && !(element.files?.length || element.value))) reasons.push('file_upload');
-  const captchaElement = [...document.querySelectorAll('[id*="captcha" i], [class*="captcha" i], [id*="recaptcha" i], [class*="recaptcha" i]')].some(isVisible);
+  const visibleText = composedText(document.body);
+  if ([...queryAll(document, 'input[type="file"]:not([disabled])')].some((element) => isVisible(element) && !(element.files?.length || element.value))) reasons.push('file_upload');
+  const captchaElement = [...queryAll(document, '[id*="captcha" i], [class*="captcha" i], [id*="recaptcha" i], [class*="recaptcha" i]')].some(isVisible);
   if (captchaElement || /\bcaptcha\b/i.test(visibleText)) reasons.push('captcha');
   const loginPath = /(?:^|\/)(?:login|signin|sign-in)(?:\/|$)/i.test(document.location?.pathname || '');
-  const loginForm = [...document.querySelectorAll('form[action]')].some((form) => /login|signin|sign-in/i.test(form.action || form.getAttribute('action') || ''));
-  const loginHeading = [...document.querySelectorAll('h1, h2, h3')].some((element) => isVisible(element) && /^(?:sign in|log in|login)$/i.test(element.textContent.trim()));
-  if ([...document.querySelectorAll('input[type="password"]:not([disabled])')].some(isVisible) || loginPath || loginForm || loginHeading) reasons.push('login');
+  const loginForm = [...queryAll(document, 'form[action]')].some((form) => /login|signin|sign-in/i.test(form.action || form.getAttribute('action') || ''));
+  const loginHeading = [...queryAll(document, 'h1, h2, h3')].some((element) => isVisible(element) && /^(?:sign in|log in|login)$/i.test(element.textContent.trim()));
+  if ([...queryAll(document, 'input[type="password"]:not([disabled])')].some(isVisible) || loginPath || loginForm || loginHeading) reasons.push('login');
   const unresolvedCustomWidget = customWidgetElements(document)
     .some((element) => customWidgetRequired(element) && !customWidgetValue(element));
-  const contentEditable = [...document.querySelectorAll('[contenteditable="true"]')].some(isVisible);
+  const contentEditable = [...queryAll(document, '[contenteditable="true"]')].some(isVisible);
   if (contentEditable || unresolvedCustomWidget) reasons.push('unsupported_widget');
   const nextCount = collectActions(document).filter((action) => action.kind === 'next').length;
   const submitCount = collectActions(document).filter((action) => action.kind === 'submit').length;
@@ -1118,16 +1216,35 @@ function pauseReasons(document) {
 }
 
 export function inspectDocument(document) {
+  const started = Date.now();
+  const inspection = withDomSnapshot(document, () => inspectDocumentImpl(document));
+  inspection.discovery.elapsedMs = Date.now() - started;
+  return inspection;
+}
+
+function inspectDocumentImpl(document) {
+  const started = Date.now();
   const actions = collectActions(document);
+  const fields = collectFieldDescriptors(document);
+  const destination = applicationDestination(document);
+  const {candidates, controls} = applicationRegions(document);
   return {
     page: extractJobContext(document),
-    fields: collectFieldDescriptors(document),
+    fields,
     actions,
     pauseReasons: pauseReasons(document),
+    destination,
+    discovery: {code: !destination.regionId ? 'ambiguous_form' : fields.length ? 'ready' : 'no_supported_controls',
+      regionCount: candidates.length, controlCount: controls.length,
+      shadowRootCount: withDomSnapshot(document, index => index.roots.length - 1), elapsedMs: Date.now() - started},
   };
 }
 
 export function validateDocument(document) {
+  return withDomSnapshot(document, () => validateDocumentImpl(document));
+}
+
+function validateDocumentImpl(document) {
   const requiredEmpty = [];
   const invalid = [];
   for (const field of collectFieldDescriptors(document)) {
@@ -1139,6 +1256,10 @@ export function validateDocument(document) {
 }
 
 export function collectAnswerRecords(document) {
+  return withDomSnapshot(document, () => collectAnswerRecordsImpl(document));
+}
+
+function collectAnswerRecordsImpl(document) {
   ensureEditTracking(document);
   const fields = collectFieldDescriptors(document);
   const invalidIds = new Set(validateDocument(document).invalid.map((field) => field.fieldId));
@@ -1180,25 +1301,26 @@ export function focusField(document, fieldId, expectedHandle) {
   const element = elementForField(document, fieldId);
   if (!element || (expectedHandle !== undefined && controlHandle(element) !== expectedHandle)) return false;
   const className = 'job-autofill-focus-highlight';
-  for (const highlighted of document.querySelectorAll(`.${className}`)) highlighted.classList.remove(className);
+  for (const highlighted of queryAll(document, `.${className}`)) highlighted.classList.remove(className);
   const targets = new Set([element]);
   for (const label of element.labels || []) targets.add(label);
   if (element.id) {
-    for (const label of document.querySelectorAll('label')) {
-      if (label.htmlFor === element.id) targets.add(label);
+    for (const label of queryAll(document, 'label')) {
+      if (label.getRootNode() === element.getRootNode() && label.htmlFor === element.id) targets.add(label);
     }
   }
   if (element.type === 'radio' || element.type === 'checkbox') {
-    const group = element.closest('fieldset,[role="radiogroup"],[role="group"]');
+    const group = composedClosest(element, 'fieldset,[role="radiogroup"],[role="group"]');
     if (group) targets.add(group);
   }
   for (const target of targets) target.classList?.add(className);
   const styleId = 'job-autofill-focus-highlight-style';
-  if (!document.getElementById(styleId)) {
+  const styleRoot = element.getRootNode();
+  if (!styleRoot.getElementById(styleId)) {
     const style = document.createElement('style');
     style.id = styleId;
     style.textContent = `.${className}{outline:3px solid #d7ff45!important;outline-offset:4px!important;box-shadow:0 0 0 6px rgba(215,255,69,.28)!important;border-radius:4px!important;}`;
-    document.head?.append(style);
+    (styleRoot === document ? document.head : styleRoot)?.append(style);
   }
   element.scrollIntoView?.({ block: 'center', inline: 'nearest' });
   element.focus?.({ preventScroll: true });
@@ -1209,10 +1331,10 @@ export function focusField(document, fieldId, expectedHandle) {
 }
 
 function findActionElement(document, actionId) {
-  const actions = [...document.querySelectorAll('button, input[type="submit"], input[type="button"], a, [role="button"]')];
+  const actions = [...queryAll(document, 'button, input[type="submit"], input[type="button"], a, [role="button"]')];
   let index = 0;
   for (const element of actions) {
-    if (element.disabled || !isVisible(element) || !actionLabel(element) || !inApplication(document, element)) continue;
+    if (isControlDisabled(element) || !isVisible(element) || !actionLabel(element) || !inApplication(document, element)) continue;
     const action = collectActions(document).find((candidate) => candidate.id === `action_${index}`);
     if (action?.id === actionId) return { element, action };
     index += 1;
@@ -1232,14 +1354,32 @@ export function waitForDocumentSettled(document, { quietMs = 150, minWaitMs = 40
     const started = Date.now();
     let changed = started;
     let timer;
-    const observer = document.defaultView?.MutationObserver ? new document.defaultView.MutationObserver(() => { changed = Date.now(); }) : null;
-    const finish = () => { clearTimeout(timer); observer?.disconnect(); resolve(); };
+    const roots = new Set();
+    const changedAt = () => { changed = Date.now(); };
+    const observer = document.defaultView?.MutationObserver ? new document.defaultView.MutationObserver(records => {
+      if (records.some(record => !isExtensionElement(record.target))) changedAt();
+    }) : null;
+    const refreshRoots = () => {
+      for (const root of createDomIndex(document).roots) if (!roots.has(root)) {
+        roots.add(root);
+        observer?.observe(root === document ? document.documentElement : root, {childList: true, subtree: true, attributes: true, characterData: true});
+        root.addEventListener('slotchange', changedAt);
+        changedAt();
+      }
+    };
+    const finish = (timedOut) => {
+      clearTimeout(timer); observer?.disconnect();
+      for (const root of roots) root.removeEventListener('slotchange', changedAt);
+      resolve({timedOut});
+    };
+    let lastScan = 0;
     const check = () => {
       const now = Date.now();
-      if (now - started >= timeoutMs || (now - started >= minWaitMs && now - changed >= quietMs)) return finish();
+      if (now - started >= timeoutMs) return finish(true);
+      if (now - lastScan >= 100) { refreshRoots(); lastScan = Date.now(); }
+      if (now - started >= minWaitMs && now - changed >= quietMs) return finish(false);
       timer = setTimeout(check, 25);
     };
-    if (document.documentElement) observer?.observe(document.documentElement, { childList: true, subtree: true, attributes: true });
     check();
   });
 }

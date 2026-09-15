@@ -1,3 +1,4 @@
+import { composedParent, deepActiveElement, eventControl, isExtensionElement } from './dom.js';
 export function createInlineAutofill(document, {send, describe}) {
   const view = document.defaultView;
   let host, shadow, dialog, question, searchInput, list, preview, status, use, generate, edit, hint, retrySearch;
@@ -14,7 +15,7 @@ export function createInlineAutofill(document, {send, describe}) {
   const message = payload => { try { return Promise.resolve(send(payload)); } catch (error) { return Promise.reject(error); } };
 
   function eligible(element) {
-    if (!element?.isConnected || element.getRootNode() !== document
+    if (!element?.isConnected || element.ownerDocument !== document || isExtensionElement(element)
       || !((element.tagName === 'INPUT' && ['text', 'email', 'tel', 'url'].includes(element.type)) || element.tagName === 'TEXTAREA')) return null;
     const field = describe(document, element);
     return field && !field.widget && !field.multiple && ['text', 'textarea', 'email', 'tel', 'url'].includes(field.type) ? field : null;
@@ -25,11 +26,11 @@ export function createInlineAutofill(document, {send, describe}) {
       field.options || [], field.constraints || {}, Boolean(field.multiple), field.widget || null]);
   }
   function activeField() {
-    if (document.activeElement === host && !host.hidden && eligible(target)) return target;
-    return eligible(document.activeElement) ? document.activeElement : null;
+    if (deepActiveElement(document) === host && !host.hidden && eligible(target)) return target;
+    return eligible(deepActiveElement(document)) ? deepActiveElement(document) : null;
   }
   function isCurrent(version, element, expected) {
-    const focused = document.activeElement;
+    const focused = deepActiveElement(document);
     return !disposed && epoch === version && target === element
       && (focused === element || focused === host && !host.hidden)
       && fingerprint(eligible(element)) === expected;
@@ -154,7 +155,7 @@ export function createInlineAutofill(document, {send, describe}) {
   }
   function dismiss({retainSession = false, returnFocus = false} = {}) {
     const previous = target;
-    const popupFocused = host && document.activeElement === host;
+    const popupFocused = host && deepActiveElement(document) === host;
     acceptance = null; epoch++;
     delete document.__jobApplicationInlineFocusAnchor;
     if (!retainSession) cancelSession();
@@ -214,7 +215,7 @@ export function createInlineAutofill(document, {send, describe}) {
     });
     // Observe only the open anchor and its ancestor chain, not every page subtree.
     mutationObserver.observe(target, {attributes: true});
-    for (let ancestor = target.parentElement; ancestor; ancestor = ancestor.parentElement) mutationObserver.observe(ancestor, {childList: true});
+    for (let ancestor = composedParent(target); ancestor; ancestor = composedParent(ancestor)) mutationObserver.observe(ancestor, {childList: true});
     if (view.ResizeObserver) { resizeObserver = new view.ResizeObserver(schedulePosition); resizeObserver.observe(target); }
     schedulePosition();
   }
@@ -338,11 +339,11 @@ export function createInlineAutofill(document, {send, describe}) {
     const version = epoch;
     response.then(reply => {
       if (!reply?.error) return;
-      if (disposed || epoch !== version || document.activeElement !== element || fingerprint(eligible(element)) !== expected) return;
+      if (disposed || epoch !== version || deepActiveElement(document) !== element || fingerprint(eligible(element)) !== expected) return;
       target = element; snapshot = field; retry = true; host.hidden = false;
       observe(); render(); setStatus(reply.error);
     }).catch(() => {
-      if (disposed || epoch !== version || document.activeElement !== element || fingerprint(eligible(element)) !== expected) return;
+      if (disposed || epoch !== version || deepActiveElement(document) !== element || fingerprint(eligible(element)) !== expected) return;
       target = element; snapshot = field; retry = true; host.hidden = false;
       observe(); render(); setStatus('Open the extension toolbar button to continue editing');
     });
@@ -385,11 +386,11 @@ export function createInlineAutofill(document, {send, describe}) {
       delete document.__jobApplicationInlineFocusAnchor;
       if (shadow) controlsMode(false);
     }
-    activate(event.target);
+    activate(event.composedPath().includes(host) ? host : eventControl(event));
   });
-  listen(document, 'click', event => { if (!event.composedPath().includes(host)) activate(event.target); });
+  listen(document, 'click', event => { if (!event.composedPath().includes(host)) activate(event.composedPath().includes(host) ? host : eventControl(event)); });
   listen(document, 'pointerdown', event => {
-    if (target && event.target !== target && !event.composedPath().includes(host)) dismiss();
+    if (target && eventControl(event) !== target && !event.composedPath().includes(host)) dismiss();
   }, true);
   listen(document, 'focusout', event => {
     if (restoringFocus || !target) return;
@@ -399,11 +400,11 @@ export function createInlineAutofill(document, {send, describe}) {
   });
   listen(document, 'keydown', keydown, true);
   listen(document, 'input', event => {
-    if (document.__jobApplicationFilling || event.target?.__jobApplicationAutofillDispatch || composing) return;
-    if (event.target === target || event.target === document.activeElement) { acceptance = null; activate(event.target); }
+    if (document.__jobApplicationFilling || eventControl(event)?.__jobApplicationAutofillDispatch || composing) return;
+    if (eventControl(event) === target || eventControl(event) === deepActiveElement(document)) { acceptance = null; activate(event.composedPath().includes(host) ? host : eventControl(event)); }
   });
   listen(document, 'change', event => {
-    if (event.target === target && !document.__jobApplicationFilling && !event.target.__jobApplicationAutofillDispatch) { acceptance = null; activate(event.target); }
+    if (eventControl(event) === target && !document.__jobApplicationFilling && !eventControl(event).__jobApplicationAutofillDispatch) { acceptance = null; activate(event.composedPath().includes(host) ? host : eventControl(event)); }
   });
   listen(document, 'compositionstart', event => {
     composing = true;
@@ -427,5 +428,5 @@ export function createInlineAutofill(document, {send, describe}) {
     try { return focus(); }
     finally { restoringFocus = previous; }
   }
-  return {activeField, beforeFill, withExplicitFocus, refresh() { if (!disposed) activate(document.activeElement); }, dispose() { if (disposed) return; dismiss(); disposed = true; listeners.forEach(remove => remove()); host?.remove(); }};
+  return {activeField, beforeFill, withExplicitFocus, refresh() { if (!disposed) activate(deepActiveElement(document)); }, dispose() { if (disposed) return; dismiss(); disposed = true; listeners.forEach(remove => remove()); host?.remove(); }};
 }

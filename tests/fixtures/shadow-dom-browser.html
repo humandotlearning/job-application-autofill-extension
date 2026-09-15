@@ -1,0 +1,150 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<title>RUNNING: Shadow DOM regression</title>
+<style>body{font:16px system-ui;margin:24px}pre{white-space:pre-wrap}test-component{display:block;margin:8px}input,button{font:inherit;padding:6px}</style>
+<h1>Shadow DOM browser regression</h1>
+<p>Synthetic local form. This fixture never submits data.</p>
+<pre id="results" role="status">RUNNING</pre>
+<main id="fixture"></main>
+<script type="module">
+import {
+  inspectDocument, collectFieldDescriptors, descriptorForElement, applyDecisions,
+  collectAnswerRecords, focusField, clickAction, validateDocument,
+  selectApplicationRegion, clearApplicationSelection, waitForDocumentSettled,
+} from '../../src/form-engine.js';
+
+const output = document.querySelector('#results');
+const fixture = document.querySelector('#fixture');
+const results = [];
+function assert(condition, message) { if (!condition) throw new Error(message); }
+function shadow(parent, html) {
+  const host = document.createElement('test-component');
+  parent.append(host);
+  const root = host.attachShadow({mode: 'open'});
+  root.innerHTML = html;
+  return root;
+}
+function decision(field, value) {
+  return {fieldId: field.id, handle: field.handle, action: 'fill', approved: true,
+    confidence: 'high', sensitivity: 'safe', value,
+    ...(Object.hasOwn(field, 'rawValue') ? {expectedRawValue: field.rawValue, expectedEditRevision: field.editRevision} : {})};
+}
+async function check(name, run) {
+  fixture.replaceChildren();
+  clearApplicationSelection(document);
+  try { await run(); results.push(`PASS ${name}`); }
+  catch (error) { results.push(`FAIL ${name}: ${error.message}`); }
+  output.textContent = results.join('\n');
+}
+
+await check('Nested roots, slotted accessible label and Next', async () => {
+  const outer = shadow(fixture, '<section></section>');
+  const root = shadow(outer.querySelector('section'), '<label for="email"><slot name="label"></slot></label><input id="email" type="email" aria-required="true"><button type="button"><slot name="action"></slot></button>');
+  root.host.innerHTML = '<span slot="label">Email</span><span slot="action">Next</span>';
+  const snapshot = inspectDocument(document);
+  assert(snapshot.fields.length === 1 && snapshot.fields[0].label === 'Email', 'Slotted label was not discovered');
+  assert(snapshot.fields[0].required, 'ARIA required missing');
+  assert(snapshot.actions.some(a => a.kind === 'next' && a.label === 'Next'), 'Slotted Next missing');
+  assert(!validateDocument(document).ok, 'Empty required field accepted');
+});
+
+await check('Duplicate root IDs, composed events, deep focus and saved answers', async () => {
+  const first = shadow(fixture, '<label for="name">First name</label><input id="name">');
+  const last = shadow(fixture, '<label for="name">Last name</label><input id="name">');
+  const fields = collectFieldDescriptors(document);
+  let reachedHost = false;
+  last.host.addEventListener('input', e => { reachedHost = e.composedPath()[0] === last.querySelector('input'); });
+  const result = await applyDecisions(document, [decision(fields.find(f => f.label === 'Last name'), 'Lovelace')]);
+  assert(result.applied.length === 1 && reachedHost, 'Composed fill did not reach host');
+  assert(first.querySelector('input').value === '' && last.querySelector('input').value === 'Lovelace', 'Wrong root was filled');
+  const target = collectFieldDescriptors(document).find(f => f.label === 'Last name');
+  assert(focusField(document, target.id, target.handle), 'Focus rejected');
+  assert(last.activeElement === last.querySelector('input'), 'Deep focus failed');
+  const focused = last.activeElement;
+  const focusStyle = getComputedStyle(focused);
+  assert(parseFloat(focusStyle.outlineWidth) > 0 && focusStyle.outlineStyle === 'solid' && focusStyle.outlineColor === 'rgb(215, 255, 69)', `Shadow focus highlight is not visible: width=${focusStyle.outlineWidth}, style=${focusStyle.outlineStyle}, color=${focusStyle.outlineColor}, class=${focused.className}, rootStyle=${last.querySelector('style')?.textContent || 'missing'}, zoom=${devicePixelRatio}`);
+  assert(collectAnswerRecords(document)[0]?.answer === 'Lovelace', 'Saved answer missing');
+});
+
+await check('Hidden hosts and extension popup excluded', () => {
+  const hidden = shadow(fixture, '<input aria-label="Hidden name">');
+  hidden.host.hidden = true;
+  const popup = shadow(fixture, '<input aria-label="Private extension answer" value="Ignored">');
+  popup.host.setAttribute('data-job-inline-autofill', '');
+  const unslotted = shadow(fixture, '<span>No slot for light controls</span>');
+  unslotted.host.innerHTML = '<input aria-label="Invisible light answer" value="Ignored">';
+  shadow(fixture, '<input aria-label="First name">');
+  assert(collectFieldDescriptors(document).length === 1, 'Hidden or extension fields leaked');
+  assert(collectAnswerRecords(document).length === 0, 'Popup answer leaked into learning');
+});
+
+await check('Framework rollback and ARIA validation rejected after settling', async () => {
+  const root = shadow(fixture, '<input aria-label="First name"><input type="email" aria-label="Email">');
+  const [name, email] = root.querySelectorAll('input');
+  name.addEventListener('input', () => setTimeout(() => {name.value = '';}, 20));
+  email.addEventListener('input', () => setTimeout(() => email.setAttribute('aria-invalid', 'true'), 20));
+  const fields = collectFieldDescriptors(document);
+  const result = await applyDecisions(document, fields.map(f => decision(f, f.type === 'email' ? 'ada@example.test' : 'Ada')));
+  assert(result.applied.length === 0 && result.failed.length === 2, 'Rejected values reported applied');
+});
+
+await check('Composed manual editing invalidates stale suggestions', async () => {
+  const root = shadow(fixture, '<label>Name<input></label>');
+  const input = root.querySelector('input');
+  const stale = decision(descriptorForElement(document, input), 'Ada');
+  input.value = 'Manual choice';
+  input.dispatchEvent(new Event('input', {bubbles: true, composed: true}));
+  input.dispatchEvent(new Event('change', {bubbles: true, composed: true}));
+  const result = await applyDecisions(document, [stale]);
+  assert(result.applied.length === 0 && input.value === 'Manual choice', 'Stale fill overwrote edit');
+  assert(collectAnswerRecords(document)[0]?.provenance === 'user', 'Manual answer provenance missing');
+});
+
+await check('Delayed attached root discovered within settling budget', async () => {
+  const host = document.createElement('test-component');
+  fixture.append(host);
+  setTimeout(() => {host.attachShadow({mode: 'open'}).innerHTML = '<input aria-label="First name">';}, 30);
+  const result = await waitForDocumentSettled(document, {minWaitMs: 120, quietMs: 50, timeoutMs: 2500});
+  assert(!result.timedOut && collectFieldDescriptors(document).length === 1, 'Delayed root missing: ' + JSON.stringify({settled: result, fields: collectFieldDescriptors(document).map(f => f.label), attached: !!host.shadowRoot}));
+});
+
+await check('Ambiguous forms resolve by selecting a field', () => {
+  fixture.innerHTML = '<form aria-label="Job application"><input aria-label="First name"></form><form aria-label="Candidate profile"><input aria-label="Last name"></form>';
+  assert(inspectDocument(document).discovery.code === 'ambiguous_form', 'Ambiguity not reported');
+  assert(selectApplicationRegion(document, fixture.querySelectorAll('input')[1]), 'Region selection failed');
+  assert(collectFieldDescriptors(document)[0]?.label === 'Last name', 'Wrong form selected');
+});
+
+await check('Shadow combobox commits exact option and rejects uncommitted text', async () => {
+  const root = shadow(fixture, '<button type="button" role="combobox" aria-label="Country" aria-controls="choices">Select one</button><div id="choices" role="listbox"><div role="option">India</div></div>');
+  const button = root.querySelector('button');
+  const option = root.querySelector('[role="option"]');
+  option.onclick = () => {button.textContent = 'India';};
+  const result = await applyDecisions(document, [decision(collectFieldDescriptors(document)[0], 'India')]);
+  assert(result.applied.length === 1 && button.textContent === 'India', 'Committed option missing');
+  button.textContent = 'Select one';
+  option.onclick = () => {};
+  const rejected = await applyDecisions(document, [decision(collectFieldDescriptors(document)[0], 'India')]);
+  assert(rejected.applied.length === 0 && rejected.unresolved.length === 1, 'Uncommitted choice accepted');
+});
+
+await check('Slotted Next works and final submit is never activated', () => {
+  const root = shadow(fixture, '<button type="button"><slot></slot></button><button type="button">Submit application</button>');
+  root.host.textContent = 'Next';
+  let next = 0, submitted = 0;
+  root.querySelectorAll('button')[0].onclick = () => next++;
+  root.querySelectorAll('button')[1].onclick = () => submitted++;
+  const actions = inspectDocument(document).actions;
+  assert(clickAction(document, actions.find(a => a.kind === 'next').id).ok, 'Next rejected');
+  assert(!clickAction(document, actions.find(a => a.kind === 'submit').id).ok, 'Submit accepted');
+  assert(next === 1 && submitted === 0, 'Unexpected button activation');
+});
+
+const failed = results.filter(line => line.startsWith('FAIL')).length;
+const summary = `${failed ? 'FAIL' : 'PASS'}: ${results.length - failed}/${results.length} Chromium component regressions`;
+document.title = summary;
+output.textContent = `${summary}\n\n${results.join('\n')}`;
+output.dataset.status = failed ? 'fail' : 'pass';
+</script>
+</html>

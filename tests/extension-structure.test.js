@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { JSDOM } from 'jsdom';
+import { Script, createContext } from 'node:vm';
 
 const root = new URL('../', import.meta.url);
 
@@ -164,8 +165,37 @@ test('content script keeps the message channel open for asynchronous widget sele
     readFile(new URL('dist/content.js', root), 'utf8'),
   ]);
   assert.match(engine, /export async function applyDecisions/);
-  assert.match(content, /applyDecisions\(document, message\.decisions \|\| \[\], \{deadline: message\.deadline \?\? Infinity,\s*beforeFill: args => inline\.beforeFill\(\{\.\.\.args, acceptanceToken: message\.approvalGuard\?\.acceptanceToken\}\)\}\)\s*\.then/);
-  assert.match(content, /return true;/);
+  const start = content.indexOf('function handleMessage(');
+  const end = content.indexOf('chrome.runtime.onMessage.addListener', start);
+  let finishApply, options, response;
+  let destinationValid = true;
+  let forwardedToken;
+  const pending = new Promise(resolve => { finishApply = resolve; });
+  const context = createContext({
+    active: true,
+    document: {},
+    destinationMatches: () => destinationValid,
+    applyDecisions: (_document, _decisions, suppliedOptions) => { options = suppliedOptions; return pending; },
+    inline: { beforeFill: ({acceptanceToken}) => { forwardedToken = acceptanceToken; return true; } },
+  });
+  new Script(content.slice(start, end) + ';globalThis.listener = handleMessage;').runInContext(context);
+  const channelOpen = context.listener({type: 'JOB_APP_APPLY', destination: {documentId: 'doc', regionId: 'form'},
+    decisions: [], deadline: 12345, approvalGuard: {acceptanceToken: 'review-token'}}, {}, value => {response = value;});
+  assert.equal(channelOpen, true, 'the response channel stays open while widget selection awaits');
+  assert.equal(response, undefined, 'success is not reported before the asynchronous apply completes');
+  assert.equal(options.deadline, 12345);
+  assert.equal(options.beforeFill({}), true);
+  assert.equal(forwardedToken, 'review-token');
+  destinationValid = false;
+  assert.equal(options.beforeFill({}), false, 'a changed destination revokes pending writes');
+  destinationValid = true;
+  context.active = false;
+  assert.equal(options.beforeFill({}), false, 'disabling the extension revokes pending writes');
+  finishApply({applied: []});
+  await pending;
+  await Promise.resolve();
+  assert.equal(response.ok, true);
+  assert.deepEqual(response.result, {applied: []});
   assert.match(bundle, /CUSTOM_WIDGET_SELECTOR|button\[aria-haspopup="listbox"\]/);
   assert.match(bundle, /unique exact option/);
   assert.doesNotMatch(content, /JOB_APP_SUBMIT|submitDocument/);

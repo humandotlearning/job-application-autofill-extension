@@ -1154,3 +1154,20 @@ test('editing a default preserves every employment entry and marks the changed d
     assert.equal(message.profile.defaultsConfirmation.relatedToHiringCompany, 'confirmed');
   } finally { harness.cleanup(); }
 });
+
+
+test('paused discovery overrides progress and offers recovery without saving to an unknown form', async () => {
+  for (const waitingFor of ['ambiguous_form', 'loading_timeout']) {
+    const panel = await setupPanel({run: {status: 'waiting_user', progress: 'checking_fields', frame: null, waitingFor,
+      actionRequired: [{reason: 'Form needs attention'}], optionalUnresolved: [], reviewRequired: [], audit: []}});
+    try {
+      const document = panel.dom.window.document;
+      assert.doesNotMatch(document.querySelector('#run-state').textContent, /checking/i);
+      assert.equal(document.querySelector('#save-answers').disabled, true);
+      assert.equal(document.querySelector('#primary-action').textContent, waitingFor === 'ambiguous_form' ? 'Select form' : 'Retry scan');
+      document.querySelector('#primary-action').click();
+      await panelTick();
+      assert.ok(panel.sentMessages.some(message => message.type === (waitingFor === 'ambiguous_form' ? 'JOB_RUN_SELECT_FORM' : 'JOB_RUN_CHECK_PAGE')));
+    } finally {panel.cleanup();}
+  }
+});
