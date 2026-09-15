@@ -2086,7 +2086,8 @@ async function saveAnswers(tabId) {
     updateSelectedFrame(run, discovery);
     const inspection = discovery.inspection;
     const captured = await sendToApplicationFrame(tabId, run, { type: 'JOB_APP_CAPTURE' });
-    return await saveCapturedAnswers(run, inspection, captured.records || [], () => assertRunSiteAuthority(tabId, run));
+    if (!captured?.ok) throw new Error(captured?.error || 'Could not read the current form values.');
+    return await saveCapturedAnswers(run, inspection, captured.records || [], () => assertRunSiteAuthority(tabId, run), { promote: true });
   } catch (error) {
     if (!error.frameDiscovery) throw error;
     return { ok: false, error: error.message, run: await saveRun(pauseForFrame(run, error.frameDiscovery)) };
@@ -2095,9 +2096,9 @@ async function saveAnswers(tabId) {
   }
 }
 
-async function saveCapturedAnswers(run, inspection, records, assertAuthority = null) {
+async function saveCapturedAnswers(run, inspection, records, assertAuthority = null, { promote = false } = {}) {
   assertAuthority?.();
-  const result = await recordPageCapture(run, inspection, records, { promote: false, assertAuthority });
+  const result = await recordPageCapture(run, inspection, records, { promote, assertAuthority });
   assertAuthority?.();
   const learning = await queueLearningReview(records);
   run = result.run;

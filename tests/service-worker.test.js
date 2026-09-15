@@ -1998,8 +1998,8 @@ test('final save persists answers without any submit message or site submit clic
   const saved = await harness.dispatch({ type: 'JOB_RUN_SAVE_ANSWERS', tabId: 7 });
   assert.equal(saved.ok, true);
   assert.equal(saved.run.status, 'answers_saved');
-  assert.equal(harness.localData.answerRecords.some((record) => record.key === 'github'), false);
-  assert.equal(saved.persisted, 0);
+  assert.equal(harness.localData.answerRecords.some((record) => record.key === 'github'), true);
+  assert.equal(saved.persisted, 1);
   assert.equal(harness.tabs.get(7).submitCalls, 0);
   assert.equal(harness.tabs.get(7).messages.some((message) => message.type === 'JOB_APP_SUBMIT'), false);
 });
@@ -2160,9 +2160,9 @@ test('saves manually filled values on an incomplete page without changing its st
 
   assert.equal(saved.ok, true);
   assert.equal(saved.run.status, 'waiting_user');
-  assert.equal(saved.savedCount, 0);
-  assert.equal(saved.unresolved, 1);
-  assert.equal(harness.localData.answerRecords.some((record) => record.key === 'github'), false);
+  assert.equal(saved.savedCount, 1);
+  assert.equal(saved.unresolved, 0);
+  assert.equal(harness.localData.answerRecords.some((record) => record.key === 'github'), true);
   assert.equal(harness.tabs.get(7).submitCalls, 0);
   assert.equal(harness.tabs.get(7).messages.some((message) => message.type === 'JOB_APP_SUBMIT'), false);
 });
@@ -2188,8 +2188,8 @@ test('keeps user-entered values as drafts until Save while excluding provisional
   assert.equal(harness.localData.answerRecords.some((record) => record.key === 'manual_answer'), false);
   assert.equal(harness.localData.answerRecords.some((record) => record.key === 'provisional_answer'), false);
   const saved = await harness.dispatch({ type: 'JOB_RUN_SAVE_ANSWERS', tabId: 7 });
-  assert.equal(saved.persisted, 0);
-  assert.equal(harness.localData.answerRecords.some((record) => record.key === 'manual_answer'), false);
+  assert.equal(saved.persisted, 1);
+  assert.equal(harness.localData.answerRecords.some((record) => record.key === 'manual_answer'), true);
 });
 
 test('field focus requests target the matching control and tab runs stay isolated', async () => {
@@ -2311,8 +2311,8 @@ test('restored provisional values remain drafts until a user explicitly saves th
   harness.tabs.get(7).frames[0].pages[0].fields[0].currentValue = 'User correction';
   harness.tabs.get(7).frames[0].pages[0].fields[0].provenance = 'user';
   const saved = await harness.dispatch({ type: 'JOB_RUN_SAVE_ANSWERS', tabId: 7 });
-  assert.equal(saved.persisted, 0);
-  assert.equal(harness.localData.answerRecords.find((record) => record.key === 'detail'), undefined);
+  assert.equal(saved.persisted, 1);
+  assert.equal(harness.localData.answerRecords.find((record) => record.key === 'detail').answer, 'User correction');
 });
 
 test('reactivates learning after native site navigation within the application', async () => {
@@ -2892,4 +2892,29 @@ test('ready region metadata does not turn an unnamed newsletter into an applicat
   const {run} = await harness.dispatch({type: 'JOB_RUN_START', tabId: 7});
   assert.equal(run.waitingFor, 'no_supported_controls');
   assert.equal(harness.tabs.get(7).messages.some(message => message.type === 'JOB_APP_APPLY'), false);
+});
+
+test('explicit Save updates a correction already captured in the draft and keeps its history', async () => {
+  const harness = createHarness({
+    answerRecords: [{ key: 'address_line_2', question: 'Address Line 2', answer: 'Wrong section value', type: 'text', sensitivity: 'safe', confirmationState: 'confirmed' }],
+    pagesByTab: { 7: { pages: [{ fields: [
+      { id: 'address_line_2', label: 'Address Line 2', type: 'text', currentValue: 'Apartment 4', provenance: 'user' },
+      { id: 'required', label: 'Required detail', type: 'text', required: true },
+    ], actions: [{ id: 'next', label: 'Next', kind: 'next' }] }] } },
+  });
+  await import(`../src/service-worker.js?save-correction=${Date.now()}`);
+  const { run } = await harness.dispatch({ type: 'JOB_RUN_START', tabId: 7 });
+  await harness.dispatch({ type: 'JOB_APP_LEARN', applicationId: run.startedAt, records: [{ key: 'address_line_2', question: 'Address Line 2', answer: 'Apartment 4', type: 'text', provenance: 'user', userEdited: true, completed: true }] }, { tab: { id: 7 }, frameId: 0 });
+  assert.equal(harness.localData.answerRecords.find(record => record.key === 'address_line_2').answer, 'Wrong section value');
+  const saved = await harness.dispatch({ type: 'JOB_RUN_SAVE_ANSWERS', tabId: 7 });
+  assert.equal(saved.ok, true, saved.error);
+  assert.equal(saved.updated, 1);
+  const record = harness.localData.answerRecords.find(record => record.key === 'address_line_2');
+  assert.equal(record.answer, 'Apartment 4');
+  assert.equal(record.confirmationState, 'confirmed');
+  assert.ok(record.history.some(item => item.answer === 'Wrong section value'));
+  const repeated = await harness.dispatch({ type: 'JOB_RUN_SAVE_ANSWERS', tabId: 7 });
+  assert.equal(repeated.updated, 0);
+  assert.ok(repeated.unchanged >= 1);
+  assert.equal(harness.tabs.get(7).submitCalls, 0);
 });

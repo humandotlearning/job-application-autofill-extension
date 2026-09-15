@@ -206,8 +206,12 @@ Street/Address Line 1, numbered address lines, local-language address fields, Lo
 
 Inline suggestions use a light, high-contrast surface, visible status and retry messages, and a blue confirmation button outside the scrolling answers. Field-change failures explain how to try again. This presentation change does not relax destination validation.
 
-To update an unpacked installation, extract the release into its existing extension folder, then reload that extension in Chrome. Use a new application tab for the updated content script; preserve any unsaved form in the old tab. Version: 0.1.6; content build: autofill-ux-5.
+To update an unpacked installation, extract the release into its existing extension folder, then reload that extension in Chrome. Use a new application tab for the updated content script; preserve any unsaved form in the old tab. Version: 0.1.7; content build: autofill-ux-5.
 
 ### 0.1.6 — extension reload recovery
 
 Content-to-extension messages catch synchronous disconnection failures. Inline suggestions explain how to open a fresh application tab or refresh after saving progress, instead of showing an internal invalidation error. The extension never refreshes your application automatically. Reloading the extension does not reconnect scripts already running in old tabs.
+
+### Explicit saving of corrected values
+
+Save filled values promotes the current captured user values to reusable answers, even when an automatic checkpoint has already captured those same edits. Corrections replace the saved value and retain the previous answer in history. Automatic checkpoints and final-submit capture remain drafts; untouched extension-generated values are excluded from promotion. Save reports new, updated, unchanged and unresolved counts.
