@@ -1,4 +1,4 @@
-import { normalizeAnswerRecord, normalizeText, slugify, upsertAnswerRecords } from './core.js';
+import { normalizeAnswerRecord, normalizeText, slugify, timestamp, uniqueStrings } from './core.js';
 
 export const DATASOURCE_SCHEMA_VERSION = 3;
 export const DATASOURCE_FORMAT = 'job-application-autofill-datasource';
@@ -12,17 +12,6 @@ export const DEFAULT_PROFILE = Object.freeze({
     phoneDeviceType: 'Mobile',
   },
 });
-
-function uniqueStrings(values = []) {
-  const seen = new Set();
-  return values
-    .map((value) => String(value ?? '').trim())
-    .filter((value) => value && !seen.has(normalizeText(value)) && seen.add(normalizeText(value)));
-}
-
-function timestamp(value, fallback = new Date().toISOString()) {
-  return typeof value === 'string' && !Number.isNaN(Date.parse(value)) ? value : fallback;
-}
 
 export function normalizeCoverMessage(message = {}) {
   const label = String(message.label || message.question || message.id || 'Cover message').trim();
@@ -88,7 +77,7 @@ function isNewer(left, right) {
   return Date.parse(left.updatedAt) > Date.parse(right.updatedAt);
 }
 
-function mergeRecords(current = [], imported = []) {
+export function mergeAnswerRecords(current = [], imported = []) {
   const merged = new Map();
   for (const candidate of [...current, ...imported].map(normalizeAnswerRecord).filter((record) => record.key && record.answer)) {
     const previous = merged.get(candidate.key);
@@ -126,17 +115,10 @@ function mergeCoverMessages(current = [], imported = []) {
   const merged = new Map(current.map((message) => [message.id, normalizeCoverMessage(message)]));
   for (const candidate of imported.map(normalizeCoverMessage).filter((message) => message.id && message.body)) {
     const previous = merged.get(candidate.id);
-    if (!previous || isNewer(candidate, previous)) {
-      merged.set(candidate.id, {
-        ...candidate,
-        aliases: uniqueStrings([...(previous?.aliases || []), ...(candidate.aliases || [])]),
-      });
-    } else {
-      merged.set(candidate.id, {
-        ...previous,
-        aliases: uniqueStrings([...(previous.aliases || []), ...(candidate.aliases || [])]),
-      });
-    }
+    merged.set(candidate.id, {
+      ...(!previous || isNewer(candidate, previous) ? candidate : previous),
+      aliases: uniqueStrings([...(previous?.aliases || []), ...(candidate.aliases || [])]),
+    });
   }
   return [...merged.values()];
 }
@@ -146,7 +128,7 @@ export function mergeDatasource(current = {}, imported = {}, updatedAt = new Dat
   const incoming = createDatasourceState(imported);
   return {
     schemaVersion: DATASOURCE_SCHEMA_VERSION,
-    answerRecords: mergeRecords(existing.answerRecords, incoming.answerRecords),
+    answerRecords: mergeAnswerRecords(existing.answerRecords, incoming.answerRecords),
     coverMessages: mergeCoverMessages(existing.coverMessages, incoming.coverMessages),
     learningInbox: imported?.learningInbox ? incoming.learningInbox : existing.learningInbox,
     // A v1 backup has no profile, so it must not reset defaults the applicant
@@ -224,8 +206,4 @@ export function confirmBundledPublicLinks(state = {}, seed = null, confirmedAt =
     answerRecords,
     datasourceMeta: { ...state.datasourceMeta, bundledPublicLinksMigrationAt: confirmedAt, ...(changed ? { bundledPublicLinksConfirmedAt: confirmedAt } : {}) },
   };
-}
-
-export function mergeAnswerRecords(current = [], imported = []) {
-  return mergeRecords(current, imported);
 }

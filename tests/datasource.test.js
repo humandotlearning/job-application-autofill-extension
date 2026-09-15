@@ -130,6 +130,18 @@ test('merges datasource records without losing newer values or alternatives', ()
   assert.equal(merged.answerRecords.some((record) => record.key === 'github'), true);
 });
 
+test('merges cover messages by date while preserving unique aliases from both sources', () => {
+  const current = { id: 'cover', label: 'Current', body: 'Current body', aliases: ['Résumé', 'Current'], updatedAt: '2026-09-03T12:00:00.000Z' };
+  for (const updatedAt of ['2026-09-02T12:00:00.000Z', current.updatedAt, '2026-09-04T12:00:00.000Z']) {
+    const incoming = { ...current, label: 'Imported', body: 'Imported body', aliases: ['resume', 'Imported'], updatedAt };
+    const { coverMessages } = mergeDatasource({ coverMessages: [current] }, { coverMessages: [incoming] });
+    assert.equal(coverMessages.length, 1);
+    assert.equal(coverMessages[0].body, updatedAt > current.updatedAt ? incoming.body : current.body);
+    assert.deepEqual(coverMessages[0].aliases, ['Résumé', 'Current', 'Imported']);
+    assert.deepEqual(mergeDatasource({}, { coverMessages: [incoming] }).coverMessages, [incoming]);
+  }
+});
+
 test('exports a backup without the API key and imports only valid backup data', () => {
   const state = createDatasourceState({
     answerRecords: [{ key: 'email', question: 'Email', answer: 'person@example.com' }],

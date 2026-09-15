@@ -39,7 +39,7 @@ function recordConceptFor(record) {
 
 const SENSITIVITIES = new Set(['safe', 'review', 'legal']);
 
-function timestamp(value, fallback = new Date().toISOString()) {
+export function timestamp(value, fallback = new Date().toISOString()) {
   return typeof value === 'string' && !Number.isNaN(Date.parse(value)) ? value : fallback;
 }
 
@@ -71,7 +71,7 @@ export function inferSensitivity(question, key = '') {
   return 'safe';
 }
 
-function uniqueStrings(values = []) {
+export function uniqueStrings(values = []) {
   const seen = new Set();
   return values
     .map((value) => String(value ?? '').trim())
@@ -92,9 +92,7 @@ export function normalizeAnswerRecord(record = {}) {
     .filter((value) => normalizeText(value) !== normalizeText(answer));
   if (!aliases.length && question) aliases.push(question);
   const sensitivity = SENSITIVITIES.has(record.sensitivity) ? record.sensitivity : inferSensitivity(question, key);
-  const updatedAt = typeof record.updatedAt === 'string' && !Number.isNaN(Date.parse(record.updatedAt))
-    ? record.updatedAt
-    : new Date().toISOString();
+  const updatedAt = timestamp(record.updatedAt);
   const normalized = {
     key,
     question: question || key.replace(/_/g, ' '),
@@ -408,6 +406,8 @@ export function upsertAnswerRecords(existing = [], incoming = [], updatedAt = ne
         ? [{ answer: previous.answer, updatedAt: previous.updatedAt, provenance: previous.provenance || 'unknown' }]
         : []),
     ];
+    const alternatives = uniqueStrings([...(previous.alternatives || []), ...(next.alternatives || [])])
+      .filter((value) => normalizeText(value) !== normalizeText(next.answer));
     merged.set(next.key, {
       ...next,
       aliases: uniqueStrings([
@@ -416,11 +416,7 @@ export function upsertAnswerRecords(existing = [], incoming = [], updatedAt = ne
         previous.question,
         next.question,
       ]),
-      ...(uniqueStrings([...(previous.alternatives || []), ...(next.alternatives || [])])
-        .filter((value) => normalizeText(value) !== normalizeText(next.answer)).length
-        ? { alternatives: uniqueStrings([...(previous.alternatives || []), ...(next.alternatives || [])])
-          .filter((value) => normalizeText(value) !== normalizeText(next.answer)) }
-        : {}),
+      ...(alternatives.length ? { alternatives } : {}),
       ...(history.length ? { history } : {}),
     });
   }

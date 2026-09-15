@@ -135,9 +135,7 @@ function normalizeAnswerRecord(record = {}) {
     .filter((value) => normalizeText(value) !== normalizeText(answer));
   if (!aliases.length && question) aliases.push(question);
   const sensitivity = SENSITIVITIES.has(record.sensitivity) ? record.sensitivity : inferSensitivity(question, key);
-  const updatedAt = typeof record.updatedAt === 'string' && !Number.isNaN(Date.parse(record.updatedAt))
-    ? record.updatedAt
-    : new Date().toISOString();
+  const updatedAt = timestamp(record.updatedAt);
   const normalized = {
     key,
     question: question || key.replace(/_/g, ' '),
@@ -451,6 +449,8 @@ function upsertAnswerRecords(existing = [], incoming = [], updatedAt = new Date(
         ? [{ answer: previous.answer, updatedAt: previous.updatedAt, provenance: previous.provenance || 'unknown' }]
         : []),
     ];
+    const alternatives = uniqueStrings([...(previous.alternatives || []), ...(next.alternatives || [])])
+      .filter((value) => normalizeText(value) !== normalizeText(next.answer));
     merged.set(next.key, {
       ...next,
       aliases: uniqueStrings([
@@ -459,11 +459,7 @@ function upsertAnswerRecords(existing = [], incoming = [], updatedAt = new Date(
         previous.question,
         next.question,
       ]),
-      ...(uniqueStrings([...(previous.alternatives || []), ...(next.alternatives || [])])
-        .filter((value) => normalizeText(value) !== normalizeText(next.answer)).length
-        ? { alternatives: uniqueStrings([...(previous.alternatives || []), ...(next.alternatives || [])])
-          .filter((value) => normalizeText(value) !== normalizeText(next.answer)) }
-        : {}),
+      ...(alternatives.length ? { alternatives } : {}),
       ...(history.length ? { history } : {}),
     });
   }
