@@ -434,3 +434,14 @@ test('coordinates flip and clamp to the frame viewport and update after scroll',
   top = 20; f.document.dispatchEvent(new f.dom.window.Event('scroll')); await new Promise(resolve => setTimeout(resolve, 25));
   assert.equal(parseFloat(f.host().style.top), 56);
 });
+
+test('invalidated extension shows recovery instructions and preserves form entries', async t => {
+  const f = fixture(t, () => { throw new Error('Extension context invalidated.'); });
+  f.document.querySelector('#bio').value = 'Unsaved application text';
+  f.field.focus(); await tick();
+  assert.match(f.root().querySelector('[role="status"]').textContent, /open the application in a new tab/);
+  assert.equal(f.button('Retry search').hidden, true);
+  assert.equal(f.button('Generate answer').disabled, true);
+  assert.equal(f.field.value, '');
+  assert.equal(f.document.querySelector('#bio').value, 'Unsaved application text');
+});

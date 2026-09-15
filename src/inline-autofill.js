@@ -110,6 +110,11 @@ export function createInlineAutofill(document, {send, describe}) {
     for (const element of shadow.querySelectorAll('button, input, [role="listbox"]')) element.tabIndex = enabled ? 0 : -1;
   }
   function setStatus(text, state = 'info') {
+    if (/Extension context invalidated/i.test(text)) {
+      text = 'The extension was reloaded or disconnected. Keep this form open to preserve unsaved entries, then open the application in a new tab. If your progress is saved, you can refresh this page instead.';
+      retrySearch.hidden = true;
+      searchInput.disabled = generate.disabled = edit.disabled = use.disabled = true;
+    }
     status.textContent = /^Inline destination changed/.test(text)
       ? 'This field changed. Click it again to load suggestions.' : text;
     status.dataset.state = state;

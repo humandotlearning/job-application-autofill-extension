@@ -148,7 +148,7 @@ The extension uses the configured AI provider and answer-planner model. Firework
 
 Navigation is manual by default. The **Auto-advance pages** setting permits one validated Next action when the page is ready. It never enables final submission.
 
-When updating the unpacked extension, preserve unsaved form values before any browser operation. Run `npm run build`, reload the extension card (not the application page), and reopen the panel. The content PING reports version `autofill-ux-4`; verify this before using the new feature on an existing page. Reinjecting the same version is tested to preserve values and avoid duplicate listeners. The old boolean installation guard cannot safely dispose legacy listeners: if the old script still responds without the version, stop rather than resetting its guard or reloading an unsaved application. Legacy live hot-upgrade requires separate browser verification; the automated build is not proof that an already-open tab is updated.
+When updating the unpacked extension, preserve unsaved form values before any browser operation. Run `npm run build`, reload the extension card (not the application page), and reopen the panel. The content PING reports version `autofill-ux-5`; verify this before using the new feature on an existing page. Reinjecting the same version is tested to preserve values and avoid duplicate listeners. The old boolean installation guard cannot safely dispose legacy listeners: if the old script still responds without the version, stop rather than resetting its guard or reloading an unsaved application. Legacy live hot-upgrade requires separate browser verification; the automated build is not proof that an already-open tab is updated.
 
 Activated applications incrementally extend the local profile. Later equivalent questions reuse compatible confirmed answers. First, full, last, and preferred names remain distinct; full names can be composed from unambiguous first and last names. Ambiguous dates, unsupported transformations, conflicting records, and unmatched employment or education entities remain unresolved for review.
 
@@ -160,7 +160,7 @@ If more than one form is plausible, choose **Select form**, then click a field i
 
 Local discovery diagnostics contain counts, timings, script versions, and reason codes, never field values or page HTML. Paused status takes precedence over progress text.
 
-After this update, preserve current unsaved entries before reopening an application tab. The new content script reports `autofill-ux-4`; a tab retaining an earlier script must be reopened to activate these changes.
+After this update, preserve current unsaved entries before reopening an application tab. The new content script reports `autofill-ux-5`; a tab retaining an earlier script must be reopened to activate these changes.
 
 ## Boundaries
 
@@ -206,4 +206,8 @@ Street/Address Line 1, numbered address lines, local-language address fields, Lo
 
 Inline suggestions use a light, high-contrast surface, visible status and retry messages, and a blue confirmation button outside the scrolling answers. Field-change failures explain how to try again. This presentation change does not relax destination validation.
 
-To update an unpacked installation, extract the release into its existing extension folder, then reload that extension in Chrome. Use a new application tab for the updated content script; preserve any unsaved form in the old tab. Version: 0.1.5; content build: autofill-ux-4.
+To update an unpacked installation, extract the release into its existing extension folder, then reload that extension in Chrome. Use a new application tab for the updated content script; preserve any unsaved form in the old tab. Version: 0.1.6; content build: autofill-ux-5.
+
+### 0.1.6 — extension reload recovery
+
+Content-to-extension messages catch synchronous disconnection failures. Inline suggestions explain how to open a fresh application tab or refresh after saving progress, instead of showing an internal invalidation error. The extension never refreshes your application automatically. Reloading the extension does not reconnect scripts already running in old tabs.

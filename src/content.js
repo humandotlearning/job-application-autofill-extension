@@ -17,11 +17,22 @@ import { eventControl } from './dom.js';
 import { createLearningSession } from './learning.js';
 import { createInlineAutofill } from './inline-autofill.js';
 
-function notifyNavigation() {
-  waitForDocumentSettled(document).then(() => chrome.runtime.sendMessage({ type: 'JOB_APP_NAVIGATED' })).catch(() => {});
+let runtimeDisconnected = false;
+async function sendRuntimeMessage(message) {
+  if (runtimeDisconnected) throw new Error('Extension context invalidated.');
+  try {
+    return await chrome.runtime.sendMessage(message);
+  } catch (error) {
+    if (/Extension context invalidated/i.test(error.message)) runtimeDisconnected = true;
+    throw error;
+  }
 }
 
-const CONTENT_VERSION = 'autofill-ux-4';
+function notifyNavigation() {
+  waitForDocumentSettled(document).then(() => sendRuntimeMessage({ type: 'JOB_APP_NAVIGATED' })).catch(() => {});
+}
+
+const CONTENT_VERSION = 'autofill-ux-5';
 if (!globalThis.__jobApplicationAutofillInstalled) {
   globalThis.__jobApplicationAutofillInstalled = CONTENT_VERSION;
   let inline = null;
@@ -53,7 +64,7 @@ if (!globalThis.__jobApplicationAutofillInstalled) {
     const destination = selectApplicationRegion(document, control);
     if (!destination?.regionId && !selectApplicationField(document, control)) return;
     cancelSelection();
-    chrome.runtime.sendMessage({type: 'JOB_APP_FORM_SELECTED', token: request.token,
+    sendRuntimeMessage({type: 'JOB_APP_FORM_SELECTED', token: request.token,
       destination: destination || applicationDestination(document), fieldOnly: !destination?.regionId}).catch(() => {});
   }, true);
 
@@ -88,14 +99,14 @@ if (!globalThis.__jobApplicationAutofillInstalled) {
   function enable() {
     if (active) return;
     active = true;
-    inline = createInlineAutofill(document, {send: message => chrome.runtime.sendMessage(message), describe: descriptorForElement});
+    inline = createInlineAutofill(document, {send: message => sendRuntimeMessage(message), describe: descriptorForElement});
     learning = createLearningSession(document, {
       capture: () => collectAnswerRecords(document),
-      send: (message) => chrome.runtime.sendMessage(message),
-      onRevalidate: ({applicationId}) => chrome.runtime.sendMessage({type:'JOB_APP_REVALIDATE',applicationId}),
+      send: (message) => sendRuntimeMessage(message),
+      onRevalidate: ({applicationId}) => sendRuntimeMessage({type:'JOB_APP_REVALIDATE',applicationId}),
       onFinalSubmit: ({ applicationId, records, event }) => {
         if (!isFinalApplicationSubmit(document, event)) return null;
-        return chrome.runtime.sendMessage({
+        return sendRuntimeMessage({
           type: 'JOB_APP_FINAL_SUBMISSION',
           applicationId,
           page: inspectDocument(document).page,
@@ -104,7 +115,7 @@ if (!globalThis.__jobApplicationAutofillInstalled) {
       },
     });
     inline.refresh();
-    chrome.runtime.sendMessage({ type: 'JOB_APP_LEARNING_STATUS' }).then((response) => {
+    sendRuntimeMessage({ type: 'JOB_APP_LEARNING_STATUS' }).then((response) => {
       if (active && response?.applicationId) learning.activate(response.applicationId);
     }).catch(() => {});
   }
@@ -207,7 +218,7 @@ if (!globalThis.__jobApplicationAutofillInstalled) {
     return handleMessage(message, sender, sendResponse);
   });
 
-  chrome.runtime.sendMessage({ type: 'JOB_APP_SITE_STATUS' }).then((response) => {
+  sendRuntimeMessage({ type: 'JOB_APP_SITE_STATUS' }).then((response) => {
     const enabled = forcedState == null
       ? response?.enabled !== false && response?.supported !== false
       : forcedState;

@@ -13,7 +13,7 @@ test('fresh classic bundle executes and same-version reinjection preserves value
   new Script(bundle).runInContext(context);
   assert.equal(listeners.size, 1);
   const ping = await new Promise(resolve => [...listeners][0]({ type: 'JOB_APP_PING' }, {}, resolve));
-  assert.equal(ping.version, 'autofill-ux-4');
+  assert.equal(ping.version, 'autofill-ux-5');
   const result = await new Promise(resolve => [...listeners][0]({ type: 'JOB_APP_INSPECT' }, {}, resolve));
   assert.equal(result.ok, true, result.error);
   assert.equal(result.inspection.fields[0].label, 'Current CTC');
@@ -223,4 +223,17 @@ test('armed form selection accepts a custom combobox without a native descriptor
     await dispatch({type: 'JOB_APP_CANCEL_FORM_SELECTION'});
     dom.window.close();
   }
+});
+
+test('synchronous invalidation during startup is caught without changing page values', async () => {
+  const bundle = await readFile(new URL('../dist/content.js', import.meta.url), 'utf8');
+  const dom = new JSDOM('<form><label>Name<input value="Unsaved name"></label></form>');
+  const context = createContext({document: dom.window.document, setTimeout, clearTimeout, console, chrome: {runtime: {
+    sendMessage() { throw new Error('Extension context invalidated.'); },
+    onMessage: {addListener() {}},
+  }}});
+  assert.doesNotThrow(() => new Script(bundle).runInContext(context));
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.equal(dom.window.document.querySelector('input').value, 'Unsaved name');
+  dom.window.close();
 });
