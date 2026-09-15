@@ -12,6 +12,9 @@ const AUTOCOMPLETE_KEYS = {
   'address level2': ['city'],
   'postal code': ['postal_code', 'zip_code', 'pincode'],
   'street address': ['address', 'street_address'],
+  'address line1': ['address_line_1'],
+  'address line2': ['address_line_2'],
+  'address line3': ['address_line_3'],
   organization: ['current_employer', 'employer', 'company'],
   url: ['website', 'linkedin', 'portfolio', 'github'],
 };
@@ -157,6 +160,20 @@ function candidateLabels(record) {
     .filter(Boolean);
 }
 
+function profileUrlCompatible(concept, value) {
+  if (!['github_url', 'linkedin_url'].includes(concept)) return true;
+  let url;
+  try { url = new URL(String(value)); } catch { return false; }
+  if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password) return false;
+  const hostname = url.hostname.toLowerCase();
+  if (concept === 'github_url') {
+    return ['github.com', 'www.github.com'].includes(hostname)
+      && /^\/[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?\/?$/.test(url.pathname);
+  }
+  return (hostname === 'linkedin.com' || hostname.endsWith('.linkedin.com'))
+    && /^\/(?:in\/[^/]+\/?|pub\/[^/]+(?:\/[^/]+)*\/?)$/i.test(url.pathname);
+}
+
 export function recordScopeCompatible(field, record) {
   if (record.semantic?.reusePolicy === 'never' || record.reusePolicy === 'never') return false;
   if (record.suppressedFor?.includes(suggestionTargetKey(field))) return false;
@@ -180,6 +197,15 @@ export function meaningCompatible(field, record, { numericReview = true } = {}) 
   const right = normalizeText(record.question || record.key);
   const fieldConcept = canonicalConcept(field.label || field.question || field.name || field.id || '');
   const recordConcept = recordConceptFor(record);
+  if ([fieldConcept, recordConcept].some(concept => /^(?:address_line_[123]|city)_local$/.test(concept)) && fieldConcept !== recordConcept) return false;
+  const addressConcepts = new Set(['address', 'address_line_1_local', 'address_line_2_local', 'address_line_3_local', 'address_line_1', 'address_line_2', 'address_line_3', 'city_local', 'city', 'postal_code', 'state']);
+  if (addressConcepts.has(fieldConcept) && addressConcepts.has(recordConcept)) {
+    if (fieldConcept !== recordConcept) return false;
+  }
+  const profileConcept = [fieldConcept, recordConcept].find((concept) => ['github_url', 'linkedin_url'].includes(concept));
+  if (profileConcept && !profileUrlCompatible(profileConcept, record.answer)) return false;
+  if (recordConcept === 'github_url'
+    && ((normalizeText(field.type) === 'textarea' && fieldConcept !== 'github_url') || /\b(username|repository|repo|project)\b/.test(left))) return false;
   const phoneConcepts = new Set(['phone_number', 'phone_extension', 'phone_country_code', 'phone_device_type']);
   if (phoneConcepts.has(fieldConcept) || phoneConcepts.has(recordConcept)) return fieldConcept === recordConcept;
   const protectedConcepts = ['first_name', 'last_name', 'full_name', 'preferred_name', 'github_url', 'linkedin_url', 'portfolio_url', 'date_of_birth'];

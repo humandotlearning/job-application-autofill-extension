@@ -111,6 +111,8 @@ The initial profile is bundled separately in `data/seed-data.json`, extracted fr
 
 The workbook seed contains the profile links from `Sheet1`, answered rows from `common questions`, and the `email` sheet as a reviewed cover-message template. The first Twitter URL is the autofill value and the second URL is retained as an alternative.
 
+The supplied bundled LinkedIn and GitHub links are reusable short profile facts. A one-time migration confirms only unchanged safe links from the matching bundled datasource; edited, conflicting, scoped, suppressed, and explicitly marked records retain their existing review state. Other legacy answers still require review. Common prompts such as “GitHub Profile URL” and “Please provide your LinkedIn URL” resolve to the corresponding profile link.
+
 ## Data sent to the model
 
 AI has four separate roles; a page can cause multiple requests:
@@ -146,7 +148,7 @@ The extension uses the configured AI provider and answer-planner model. Firework
 
 Navigation is manual by default. The **Auto-advance pages** setting permits one validated Next action when the page is ready. It never enables final submission.
 
-When updating the unpacked extension, preserve unsaved form values before any browser operation. Run `npm run build`, reload the extension card (not the application page), and reopen the panel. The content PING reports version `shadow-discovery-2`; verify this before using the new feature on an existing page. Reinjecting the same version is tested to preserve values and avoid duplicate listeners. The old boolean installation guard cannot safely dispose legacy listeners: if the old script still responds without the version, stop rather than resetting its guard or reloading an unsaved application. Legacy live hot-upgrade requires separate browser verification; the automated build is not proof that an already-open tab is updated.
+When updating the unpacked extension, preserve unsaved form values before any browser operation. Run `npm run build`, reload the extension card (not the application page), and reopen the panel. The content PING reports version `autofill-ux-4`; verify this before using the new feature on an existing page. Reinjecting the same version is tested to preserve values and avoid duplicate listeners. The old boolean installation guard cannot safely dispose legacy listeners: if the old script still responds without the version, stop rather than resetting its guard or reloading an unsaved application. Legacy live hot-upgrade requires separate browser verification; the automated build is not proof that an already-open tab is updated.
 
 Activated applications incrementally extend the local profile. Later equivalent questions reuse compatible confirmed answers. First, full, last, and preferred names remain distinct; full names can be composed from unambiguous first and last names. Ambiguous dates, unsupported transformations, conflicting records, and unmatched employment or education entities remain unresolved for review.
 
@@ -158,7 +160,7 @@ If more than one form is plausible, choose **Select form**, then click a field i
 
 Local discovery diagnostics contain counts, timings, script versions, and reason codes, never field values or page HTML. Paused status takes precedence over progress text.
 
-After this update, preserve current unsaved entries before reopening an application tab. The new content script reports `shadow-discovery-2`; a tab retaining an earlier script must be reopened to activate these changes.
+After this update, preserve current unsaved entries before reopening an application tab. The new content script reports `autofill-ux-4`; a tab retaining an earlier script must be reopened to activate these changes.
 
 ## Boundaries
 
@@ -197,3 +199,11 @@ See [PRIVACY.md](PRIVACY.md) for storage and model-data handling.
 ### Chromium regression fixture
 
 Serve this repository with a local static HTTP server and open `/tests/fixtures/shadow-dom-browser.html` in Chromium. The fixture automatically runs nine checks with synthetic data and prints PASS/FAIL. Keep the tab open until all checks finish; it never submits data. Node coverage runs with `node --test tests/shadow-dom.test.js`.
+
+## 0.1.5 — address matching and visual clarity
+
+Street/Address Line 1, numbered address lines, local-language address fields, Locality/City, Postcode, and State or Territory now have distinct matching concepts. Existing populated fields are preserved. A generic saved Address does not establish its numbered components.
+
+Inline suggestions use a light, high-contrast surface, visible status and retry messages, and a blue confirmation button outside the scrolling answers. Field-change failures explain how to try again. This presentation change does not relax destination validation.
+
+To update an unpacked installation, extract the release into its existing extension folder, then reload that extension in Chrome. Use a new application tab for the updated content script; preserve any unsaved form in the old tab. Version: 0.1.5; content build: autofill-ux-4.

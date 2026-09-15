@@ -123,6 +123,24 @@ test('explicit saved-answer search finds missed question matches and collapses d
   assert.equal(candidates[0].sourceKey, 'linkedin_url');
 });
 
+test('inline profile candidates exclude wrong-purpose URLs but preserve valid conflicts', async () => {
+  const { savedFieldCandidates } = await import('../src/retrieval.js');
+  const records = [
+    { key: 'github', question: 'GitHub', answer: 'https://github.com/person', confirmationState: 'confirmed', sensitivity: 'safe' },
+    { key: 'github_repo', question: 'GitHub URL', answer: 'https://github.com/person/project', confirmationState: 'confirmed', sensitivity: 'safe' },
+    { key: 'portfolio', question: 'GitHub URL', answer: 'https://person.github.io/', confirmationState: 'confirmed', sensitivity: 'safe' },
+    { key: 'linkedin', question: 'LinkedIn', answer: 'https://www.linkedin.com/in/person', confirmationState: 'confirmed', sensitivity: 'safe' },
+    { key: 'linkedin_username', question: 'LinkedIn profile URL', answer: 'person1357', confirmationState: 'confirmed', sensitivity: 'safe' },
+    { key: 'linkedin_conflict', question: 'LinkedIn profile URL', answer: 'https://www.linkedin.com/pub/person-profile', confirmationState: 'confirmed', sensitivity: 'safe' },
+  ];
+  const githubCandidates = savedFieldCandidates({ label: 'GitHub URL', type: 'url' }, records);
+  assert.deepEqual(githubCandidates.map((candidate) => candidate.answer), ['https://github.com/person']);
+  const linkedinCandidates = savedFieldCandidates({ label: 'LinkedIn URL', type: 'url' }, records);
+  assert.deepEqual(linkedinCandidates.map((candidate) => candidate.answer), ['https://www.linkedin.com/in/person', 'https://www.linkedin.com/pub/person-profile']);
+  assert.equal(records[1].answer, 'https://github.com/person/project');
+  assert.equal(records[4].answer, 'person1357');
+});
+
 test('search preserves distinct literal URLs and finds aliases beyond the first twenty records', async () => {
   const { searchEvidence } = await import('../src/retrieval.js');
   const records = Array.from({length: 25}, (_, i) => ({key: `record_${i}`, question: 'Preferred tool', answer: `Tool ${i}`}));

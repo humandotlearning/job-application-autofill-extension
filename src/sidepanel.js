@@ -1093,7 +1093,7 @@ function setActionVisibility(run) {
     return;
   }
   if (status === 'running') elements.primaryAction.textContent = 'Filling this page…';
-  else if (status === 'waiting_user') elements.primaryAction.textContent = selectForm ? 'Select form' : missingDestination ? 'Retry scan' : 'Complete this field';
+  else if (status === 'waiting_user') elements.primaryAction.textContent = selectForm ? 'Select form' : missingDestination ? 'Retry scan' : (run.actionRequired || run.unresolved || [])[0]?.fieldId ? 'Complete this field' : 'Check again';
   else if (status === 'page_ready') elements.primaryAction.textContent = 'Continue to next page';
   else if (['ready_for_user_submit', 'answers_saved'].includes(status)) elements.primaryAction.textContent = 'Review on site';
   else elements.primaryAction.textContent = 'Fill this page';
@@ -1217,7 +1217,9 @@ function renderRun(run) {
     elements.runHint.textContent = 'Answers are saved locally. Review the application and click Submit on the application site when ready; current values are captured automatically when you submit.';
     setStatus('Answers saved. Submission remains manual.');
   } else if (run.status === 'running') {
-    elements.runHint.textContent = `Filling page ${run.pageNumber || 1}. The panel will stop for your review before navigation.`;
+    elements.runHint.textContent = elements.autoAdvance.checked
+      ? `Filling page ${run.pageNumber || 1}. Completed pages will advance automatically; final submission stays manual.`
+      : `Filling page ${run.pageNumber || 1}. The panel will stop for your review before navigation.`;
     setStatus(`Filling page ${run.pageNumber || 1}…`, 'busy');
   }
   restorePanelState(panelState);
@@ -1296,6 +1298,7 @@ async function runPrimaryAction() {
     if (currentRun.frame === null) return sendRunAction('JOB_RUN_CHECK_PAGE');
     const first = (currentRun.actionRequired || currentRun.unresolved || [])[0];
     if (first?.fieldId) return focusField(first.fieldId);
+    return sendRunAction('JOB_RUN_VALIDATE_PAGE');
   }
   if (['ready_for_user_submit', 'answers_saved'].includes(currentRun?.status)) {
     const first = currentRun.reviewRequired?.[0] || currentRun.audit?.[0];
@@ -1412,6 +1415,7 @@ async function saveProvider() {
 
 async function saveSettings() {
   await chrome.storage.local.set({ autoAdvancePages: Boolean(elements.autoAdvance.checked) });
+  if (currentRun?.status === 'running') renderRun(currentRun);
   setStatus(elements.autoAdvance.checked ? 'Automatic page advance enabled.' : 'Automatic page advance disabled.');
 }
 
@@ -1486,7 +1490,10 @@ chrome.storage.onChanged.addListener((changes, area) => {
   }
   if (area === 'local' && changes.answerRecords) elements.recordCount.textContent = `${(changes.answerRecords.newValue || []).length} answers`;
   if (area === 'local' && changes.coverMessages) elements.coverMessageCount.textContent = `${(changes.coverMessages.newValue || []).length} cover messages`;
-  if (area === 'local' && changes.autoAdvancePages) elements.autoAdvance.checked = Boolean(changes.autoAdvancePages.newValue);
+  if (area === 'local' && changes.autoAdvancePages) {
+    elements.autoAdvance.checked = Boolean(changes.autoAdvancePages.newValue);
+    if (currentRun?.status === 'running') renderRun(currentRun);
+  }
   if (area === 'local' && changes.disabledHostnames) refreshSiteState().catch(error => setStatus(error.message, 'error'));
   if (area === 'session' && changes.applicationRun && activeTabId) renderRun(changes.applicationRun.newValue?.[String(activeTabId)] || null);
   if (area === 'session' && changes.inlineFieldSessions) loadInlineField().catch(error => setStatus(error.message, 'error'));

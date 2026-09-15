@@ -19,7 +19,7 @@ test('seeds an empty datasource once and preserves edits afterward', async () =>
   globalThis.chrome = {
     storage: {
       local: {
-        get: async (defaults) => ({ ...defaults, ...localData }),
+        get: async (defaults) => Object.fromEntries(Object.entries(defaults).map(([key, fallback]) => [key, Object.hasOwn(localData, key) ? localData[key] : fallback])),
         set: async (values) => Object.assign(localData, values),
       },
       session: {
@@ -50,12 +50,34 @@ test('seeds an empty datasource once and preserves edits afterward', async () =>
   assert.equal(localData.datasourceMeta.seedId, 'resume.xlsx');
   assert.equal(seedLoads, 1);
 
+  for (const key of ['github', 'linkedin']) {
+    assert.equal(localData.answerRecords.find(record => record.key === key).confirmationState, 'confirmed');
+  }
+  // Reproduce an installed seed from before the migration, with a profile already present.
+  const customProfile = { employment: [{ id: 'custom_employer', company: 'Custom Employer', roles: [] }], defaults: { relatedToHiringCompany: 'Yes', knownAtHiringCompany: 'Yes', phoneDeviceType: 'Landline' } };
+  localData.profile = structuredClone(customProfile);
+  localData.learningInbox = [{ id: 'saved-proposal', candidate: { question: 'Team size', answer: '5' } }];
+  delete localData.datasourceMeta.bundledPublicLinksMigrationAt;
+  delete localData.datasourceMeta.bundledPublicLinksConfirmedAt;
+  const legacyGithub = localData.answerRecords.find(record => record.key === 'github');
+  delete legacyGithub.confirmationState;
+  delete legacyGithub.confirmedAt;
+  delete legacyGithub.provenance;
+  await dispatch({ type: 'JOB_DATASOURCE_STATE' });
+  assert.equal(localData.answerRecords.find(record => record.key === 'github').confirmationState, 'confirmed');
+  assert.ok(localData.datasourceMeta.bundledPublicLinksMigrationAt);
+  assert.deepEqual(localData.profile, customProfile);
+  assert.equal(seedLoads, 1);
+
   localData.answerRecords = localData.answerRecords.map((record, index) => index === 0
     ? { ...record, answer: 'edited-local-answer', updatedAt: '2026-09-03T12:00:00.000Z' }
     : record);
   const reread = await dispatch({ type: 'JOB_DATASOURCE_STATE' });
   assert.equal(reread.datasource.answerCount, 36);
   assert.equal(localData.answerRecords[0].answer, 'edited-local-answer');
+  assert.deepEqual(reread.datasource.profile, customProfile);
+  const exported = await dispatch({ type: 'JOB_DATASOURCE_EXPORT' });
+  assert.deepEqual(exported.backup.learningInbox, localData.learningInbox);
   assert.equal(seedLoads, 1);
 });
 

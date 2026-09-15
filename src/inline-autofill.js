@@ -58,26 +58,32 @@ export function createInlineAutofill(document, {send, describe}) {
     document.documentElement.append(host);
     shadow = host.attachShadow({mode: 'open'});
     shadow.append(node('style', `
-      :host { all: initial; position: fixed; z-index: 2147483647; color-scheme: dark; }
+      :host { all: initial; position: fixed; z-index: 2147483647; color-scheme: light; }
       :host([hidden]) { display: none !important; }
       * { box-sizing: border-box; }
       [hidden] { display: none !important; }
-      [role=dialog] { display: flex; flex-direction: column; max-height: inherit; overflow: hidden; padding: 12px; border: 1px solid #344354;
-        border-radius: 8px; background: #10161d; color: #f4f7fb; box-shadow: 0 10px 24px #0005;
-        font: 13px/1.45 Inter, ui-sans-serif, system-ui, sans-serif; }
-      p { margin: 0 0 8px; white-space: pre-wrap; overflow-wrap: anywhere; }
-      [role=option] { padding: 8px; margin: 4px 0; border: 1px solid #202b37; border-radius: 5px; cursor: pointer; }
-      [aria-selected=true] { border-color: #f5a000; background: #f5a00012; }
-      [data-preview] { white-space: pre-wrap; overflow-wrap: anywhere; margin: 8px 0; }
-      button { padding: 6px 9px; margin: 4px 4px 0 0; border: 1px solid #344354; border-radius: 5px;
-        color: #f4f7fb; background: #161e27; font: inherit; cursor: pointer; }
-      button:disabled { opacity: .5; cursor: default; }
-      :focus-visible { outline: 2px solid #ffb21a; outline-offset: 2px; }
-      [role=status], small { display: block; color: #9aa7b7; margin-top: 8px; }
-      [data-question] { flex-shrink: 0; max-height: 76px; overflow: auto; margin-bottom: 10px; font-weight: 700; }
-      [data-results] { min-height: 0; overflow: auto; }
-      [data-search] { width: 100%; margin: 0 0 8px; padding: 8px; border: 1px solid #344354; border-radius: 5px;
-        flex-shrink: 0; color: #f4f7fb; background: #161e27; font: inherit; }
+      [role=dialog] { display: flex; flex-direction: column; max-height: inherit; overflow: hidden; padding: 12px; border: 1px solid #cbd5e1;
+        border-radius: 10px; background: #fff; color: #17212b; box-shadow: 0 10px 30px #17212b30;
+        font: 14px/1.45 ui-sans-serif, system-ui, sans-serif; }
+      p { margin: 0 0 7px; white-space: pre-wrap; overflow-wrap: anywhere; }
+      [role=option] { padding: 9px 10px; margin: 5px 0; border: 1px solid #d7dfe8; border-radius: 7px; background: #fff; cursor: pointer; }
+      [role=option]:hover { background: #f5f8fc; }
+      [aria-selected=true] { border-color: #2563eb; background: #eff6ff; box-shadow: inset 3px 0 #2563eb; }
+      [data-preview] { white-space: pre-wrap; overflow-wrap: anywhere; margin: 9px 0; padding: 9px 10px; border-radius: 7px; background: #f5f8fc; }
+      button { padding: 8px 10px; margin: 5px 5px 0 0; border: 1px solid #bdcad8; border-radius: 7px;
+        color: #17212b; background: #fff; font: inherit; cursor: pointer; }
+      button:hover:not(:disabled) { background: #f5f8fc; }
+      [data-primary]:not(:disabled) { color: #fff; background: #1d4ed8; border-color: #1d4ed8; }
+      [data-primary]:hover:not(:disabled) { background: #1e40af; }
+      button:disabled { color: #64748b; background: #f5f8fc; cursor: default; }
+      :focus-visible { outline: 2px solid #2563eb; outline-offset: 2px; }
+      [role=status] { flex-shrink: 0; color: #334155; padding: 7px 0; overflow-wrap: anywhere; }
+      [role=status][data-state=error] { color: #9f1d1d; background: #fff1f2; border: 1px solid #fecdd3; border-radius: 7px; padding: 8px 10px; margin-bottom: 7px; }
+      small { display: block; color: #475569; margin-top: 8px; font-size: 12px; }
+      [data-question] { flex-shrink: 0; max-height: 76px; overflow: auto; margin-bottom: 8px; font-weight: 700; }
+      [data-results] { min-height: 0; overflow-y: auto; }
+      [data-search] { width: 100%; margin: 0; padding: 9px 10px; border: 1px solid #bdcad8; border-radius: 7px;
+        flex-shrink: 0; color: #17212b; background: #fff; font: inherit; }
       [data-secondary] { margin-top: 4px; }
     `));
     dialog = node('section', null, {role: 'dialog', 'aria-label': 'Application answer suggestions'});
@@ -87,6 +93,7 @@ export function createInlineAutofill(document, {send, describe}) {
     list = node('div', null, {role: 'listbox', 'aria-label': 'Saved answers', tabindex: '-1'});
     preview = node('div', null, {'data-preview': ''});
     use = button('Use and save reviewed answer', accept);
+    use.setAttribute('data-primary', '');
     generate = button('Generate answer', generateAnswer);
     edit = button('Edit in panel', editInPanel);
     retrySearch = button('Retry search', scheduleSearch);
@@ -95,14 +102,19 @@ export function createInlineAutofill(document, {send, describe}) {
     const secondary = node('div', null, {'data-secondary': ''});
     secondary.append(generate, edit);
     const results = node('div', null, {'data-results': ''});
-    results.append(list, preview, use, secondary, hint, status, retrySearch);
-    dialog.append(question, searchInput, results);
+    results.append(list, preview, secondary, hint);
+    dialog.append(question, searchInput, status, retrySearch, results, use);
     shadow.append(dialog);
   }
   function controlsMode(enabled) {
     for (const element of shadow.querySelectorAll('button, input, [role="listbox"]')) element.tabIndex = enabled ? 0 : -1;
   }
-  function setStatus(text) { status.textContent = text; schedulePosition(); }
+  function setStatus(text, state = 'info') {
+    status.textContent = /^Inline destination changed/.test(text)
+      ? 'This field changed. Click it again to load suggestions.' : text;
+    status.dataset.state = state;
+    schedulePosition();
+  }
   function provenance(answer) {
     return answer.kind === 'generated' ? `Draft · Evidence: ${(answer.evidenceKeys || []).join(', ') || 'No candidate facts cited'}`
       : `Source: ${answer.sourceQuestion || 'Reviewed answer'} · ${answer.kind || 'saved'}`;
@@ -131,6 +143,7 @@ export function createInlineAutofill(document, {send, describe}) {
   function updateSelection() {
     [...list.children].forEach((option, optionIndex) => option.setAttribute('aria-selected', String(index === optionIndex)));
     const answer = answers[index];
+    preview.hidden = !answer;
     preview.textContent = answer ? `${answer.answer}\n${provenance(answer)}\n${answer.requiresApproval === false ? 'Review this draft before use.' : 'Using this answer also saves it as a reviewed answer.'}` : '';
     if (answer) list.setAttribute('aria-activedescendant', `inline-answer-${index}`);
     else list.removeAttribute('aria-activedescendant');
@@ -201,7 +214,7 @@ export function createInlineAutofill(document, {send, describe}) {
       setStatus(answers.length ? `Found ${answers.length} saved answer${answers.length === 1 ? '' : 's'}. Choose one to review.` : 'No saved answers found.');
     }).catch(error => {
       if (!current()) return;
-      searching = loading = false; retry = true; render(); setStatus(error.message);
+      searching = loading = false; retry = true; render(); setStatus(error.message, 'error');
     }).finally(() => {
       if (searchPending !== pending) return;
       searchPending = null; runSearch();
@@ -259,11 +272,11 @@ export function createInlineAutofill(document, {send, describe}) {
       if (response.requestId !== request) throw new Error('Saved answers changed. Click the field to retry.');
       sessionId = response.sessionId; answers = (response.candidates || []).slice(0, 3); index = -1; loading = false;
       render();
-      setStatus(response.error || (answers.length ? 'Choose an answer to review before using it.' : 'No saved answers. Generate an answer or edit in panel.'));
+      setStatus(response.error || (answers.length ? 'Choose an answer to review before using it.' : 'No saved answers. Generate an answer or edit in panel.'), response.error ? 'error' : 'info');
       if (searching) scheduleSearch();
     }).catch(error => {
       if (!isCurrent(version, element, expected)) return;
-      loading = false; retry = true; render(); setStatus(error.message);
+      loading = false; retry = true; render(); setStatus(error.message, 'error');
     });
   }
   function activate(element) {
@@ -298,7 +311,7 @@ export function createInlineAutofill(document, {send, describe}) {
       retry = !busy;
       if (busy) index = answers.indexOf(answer);
       else answers = [];
-      render(); setStatus(error.message);
+      render(); setStatus(error.message, 'error');
     });
   }
   function beforeFill({field, element, decision, acceptanceToken} = {}) {
@@ -321,11 +334,11 @@ export function createInlineAutofill(document, {send, describe}) {
       if (response.sessionId !== session || response.requestId !== request) return;
       if (Array.isArray(response.candidates)) answers = response.candidates;
       loading = false; render();
-      setStatus(response.error || response.generatedSuggestion?.missingContext || 'Choose a draft to review before using it.');
+      setStatus(response.error || response.generatedSuggestion?.missingContext || 'Choose a draft to review before using it.', response.error ? 'error' : 'info');
     }).catch(error => {
       if (!isCurrent(version, element, expected)) return;
       if (/Fill is in progress|Application is busy/i.test(error.message)) index = selected;
-      loading = false; render(); setStatus(error.message);
+      loading = false; render(); setStatus(error.message, 'error');
     });
   }
   function editInPanel() {
@@ -341,11 +354,11 @@ export function createInlineAutofill(document, {send, describe}) {
       if (!reply?.error) return;
       if (disposed || epoch !== version || deepActiveElement(document) !== element || fingerprint(eligible(element)) !== expected) return;
       target = element; snapshot = field; retry = true; host.hidden = false;
-      observe(); render(); setStatus(reply.error);
+      observe(); render(); setStatus(reply.error, 'error');
     }).catch(() => {
       if (disposed || epoch !== version || deepActiveElement(document) !== element || fingerprint(eligible(element)) !== expected) return;
       target = element; snapshot = field; retry = true; host.hidden = false;
-      observe(); render(); setStatus('Open the extension toolbar button to continue editing');
+      observe(); render(); setStatus('Open the extension toolbar button to continue editing', 'error');
     });
   }
   function keydown(event) {

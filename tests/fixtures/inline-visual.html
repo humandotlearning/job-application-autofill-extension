@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Address suggestions — visual check</title>
+<style>
+  body { margin: 0; background: #f5f7fa; color: #182536; font: 16px/1.5 system-ui, sans-serif; }
+  main { max-width: 620px; margin: 40px auto; padding: 28px; background: white; border: 1px solid #d8e0e8; border-radius: 12px; }
+  h1 { font-size: 24px; margin: 0 0 8px; } p { color: #526174; }
+  label { display: block; margin-top: 24px; font-size: 14px; font-weight: 600; }
+  input { display: block; width: min(100%, 340px); box-sizing: border-box; margin-top: 6px; padding: 10px; border: 1px solid #8795a6; border-radius: 5px; font: inherit; }
+  select { padding: 8px; font: inherit; } .spacer { height: 340px; }
+</style>
+<main>
+  <h1>Address suggestions</h1>
+  <p>Visual check of the actual inline component, using synthetic answers.</p>
+  <label for="mode">Preview state</label>
+  <select id="mode"><option value="answers">Saved answers</option><option value="error">Field changed error</option><option value="empty">No saved answer</option></select>
+  <form aria-label="Application address" onsubmit="return false">
+    <label for="street">Street</label><input id="street" autocomplete="address-line1">
+    <label for="line2">Address Line 2</label><input id="line2" autocomplete="address-line2">
+    <label for="city">Locality</label><input id="city" autocomplete="address-level2">
+    <div class="spacer"></div>
+  </form>
+</main>
+<script type="module">
+  import { createInlineAutofill } from '../../src/inline-autofill.js';
+  import { descriptorForElement } from '../../src/form-engine.js';
+  if (window === window.top) {
+    const frame = document.createElement('iframe');
+    frame.title = 'Isolated inline component preview';
+    frame.style.cssText = 'display:block;width:100%;height:100vh;border:0';
+    frame.srcdoc = document.documentElement.outerHTML;
+    document.body.replaceChildren(frame);
+  } else {
+  const field = document.querySelector('#street');
+  const component = createInlineAutofill(document, { describe: descriptorForElement, send: async message => {
+    if (message.type === 'JOB_INLINE_CANCEL') return { ok: true };
+    if (message.type === 'JOB_INLINE_ACCEPT') return { ok: false, error: 'Preview only. No address was changed.' };
+    const mode = document.querySelector('#mode').value;
+    if (mode === 'error') return { ok: false, error: 'Inline destination changed. Focus an empty field again.' };
+    return { ok: true, sessionId: 'visual-preview', requestId: message.requestId, candidates: mode === 'empty' ? [] : [
+      { candidateId: 'street-a', answer: '12 Oak Road', sourceQuestion: 'Street address', kind: 'equivalent', requiresApproval: true },
+      { candidateId: 'street-b', answer: '48 Cedar Lane, Building A, near Central Park', sourceQuestion: 'Address Line 1', kind: 'equivalent', requiresApproval: true }
+    ] };
+  }});
+  document.querySelector('#mode').addEventListener('change', () => { field.focus(); component.refresh(); });
+  }
+</script>
+</html>

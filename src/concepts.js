@@ -11,7 +11,17 @@ export const CONCEPT_REGISTRY = {
   phone_extension: /^(?:(?:phone|telephone|mobile) )?extension$/,
   phone_country_code: /^(?:country code|country phone code|phone country code|country calling code|calling code)$/,
   phone_device_type: /^(?:phone|telephone|mobile) (?:device )?type$/,
-  github_url: /^(?:github|github profile|github url)$/,
+  address_line_1_local: /^(?:address )?line 1 local$|^street local$/,
+  address_line_2_local: /^(?:address )?line 2 local$/,
+  address_line_3_local: /^(?:address )?line 3 local$/,
+  address_line_1: /^(?:address )?line 1$|^street(?: address)?$/,
+  address_line_2: /^(?:address )?line 2$/,
+  address_line_3: /^(?:address )?line 3$/,
+  city_local: /^city local$|^locality local$/,
+  city: /^city$|^locality$/,
+  postal_code: /^(?:postal|post|zip|pin) code$|^postcode$|^pincode$/,
+  state: /^(?:state|state or territory|territory|region)$/,
+  github_url: /^(?:(?:link|url) (?:to|for) (?:your |my )?)?github(?: profile)?(?: link| url)?$/,
   linkedin_url: /^(?:(?:link|url) (?:to|for) (?:your |my )?)?linkedin(?: profile)?(?: link| url)?$/,
   portfolio_url: /^(?:portfolio|portfolio url|personal website|website)$/,
   current_employer: /^(?:current|present) (?:employer|company|organization)$/,
@@ -25,7 +35,7 @@ export const CONCEPT_REGISTRY = {
 };
 
 export function conceptForNormalized(text) {
-  const cleaned = text.replace(/^(?:(?:what is|please enter|enter) )?(?:your )?/, '')
+  const cleaned = text.replace(/^(?:(?:what is|please enter|please provide|provide|enter) )?(?:your )?/, '')
     .replace(/\blinked in\b/g, 'linkedin').replace(/\bgit hub\b/g, 'github');
   return Object.entries(CONCEPT_REGISTRY).find(([, pattern]) => pattern.test(cleaned))?.[0] || cleaned.replace(/\s+/g, '_');
 }

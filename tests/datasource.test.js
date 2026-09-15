@@ -5,9 +5,11 @@ import { readFile } from 'node:fs/promises';
 import {
   DATASOURCE_SCHEMA_VERSION,
   createDatasourceState,
+  confirmBundledPublicLinks,
   mergeDatasource,
   parseDatasourceBackup,
   serializeDatasourceBackup,
+  seedDatasource,
   shouldSeedDatasource,
 } from '../src/datasource.js';
 import { planDeterministicFill } from '../src/form-engine.js';
@@ -58,6 +60,41 @@ test('seeds only an uninitialized empty datasource', () => {
   assert.equal(shouldSeedDatasource({ answerRecords: [{ key: 'email', answer: 'a@b.com' }], coverMessages: [], datasourceMeta: null }), false);
   assert.equal(shouldSeedDatasource({ answerRecords: [], coverMessages: [{ id: 'cover' }], datasourceMeta: null }), false);
   assert.equal(shouldSeedDatasource({ answerRecords: [], coverMessages: [], datasourceMeta: { initializedAt: '2026-01-01T00:00:00.000Z' } }), false);
+});
+
+test('confirms only untouched bundled public links', async () => {
+  const seed = await readSeed();
+  const seeded = seedDatasource(seed, '2026-09-03T00:00:00.000Z');
+  assert.equal(seeded.answerRecords.find((record) => record.key === 'github').confirmationState, 'confirmed');
+  assert.equal(seeded.answerRecords.find((record) => record.key === 'linkedin').confirmationState, 'confirmed');
+  const legacy = {
+    ...seeded,
+    answerRecords: seeded.answerRecords.map((record) => ['github', 'linkedin'].includes(record.key)
+      ? { ...record, confirmationState: undefined, confirmedAt: undefined, provenance: undefined }
+      : record),
+    datasourceMeta: { schemaVersion: 3, seedId: 'resume.xlsx' },
+  };
+  const migrated = confirmBundledPublicLinks(legacy, seed, '2026-09-04T00:00:00.000Z');
+  assert.equal(migrated.answerRecords.find((record) => record.key === 'github').confirmationState, 'confirmed');
+  assert.equal(migrated.answerRecords.find((record) => record.key === 'linkedin').confirmationState, 'confirmed');
+  assert.equal(migrated.answerRecords.find((record) => record.key === 'about_me').confirmationState, undefined);
+  assert.equal(migrated.datasourceMeta.bundledPublicLinksMigrationAt, '2026-09-04T00:00:00.000Z');
+  assert.equal(migrated.datasourceMeta.bundledPublicLinksConfirmedAt, '2026-09-04T00:00:00.000Z');
+  for (const changes of [
+    { answer: 'https://github.com/edited' },
+    { confirmationState: 'pending' },
+    { alternatives: ['https://github.com/old'] },
+    { history: [{ answer: 'old' }] },
+    { entityId: 'employment-1' },
+    { suppressedFor: ['github url|url'] },
+    { provenance: 'user' },
+  ]) {
+    const record = { ...legacy.answerRecords.find((item) => item.key === 'github'), ...changes };
+    const result = confirmBundledPublicLinks({ ...legacy, answerRecords: [record] }, seed, '2026-09-04T00:00:00.000Z');
+    assert.equal(result.answerRecords[0].confirmationState, changes.confirmationState || undefined);
+    assert.equal(result.datasourceMeta.bundledPublicLinksMigrationAt, '2026-09-04T00:00:00.000Z');
+    assert.equal(result.datasourceMeta.bundledPublicLinksConfirmedAt, undefined);
+  }
 });
 
 test('merges datasource records without losing newer values or alternatives', () => {

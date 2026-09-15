@@ -504,6 +504,35 @@ test('panel uses the accent status treatment when user action is required', asyn
   } finally { harness.cleanup(); }
 });
 
+test('primary action checks again for a blocker without a field', async () => {
+  const run = { status: 'waiting_user', waitingFor: 'no_submit_control',
+    actionRequired: [{ reason: 'No submit control was found' }] };
+  const harness = await setupPanel({ run });
+  try {
+    const primary = harness.dom.window.document.querySelector('#primary-action');
+    assert.equal(primary.textContent, 'Check again');
+    primary.click();
+    await panelTick();
+    assert.ok(harness.sentMessages.some(({ type }) => type === 'JOB_RUN_VALIDATE_PAGE'));
+    assert.ok(!harness.sentMessages.some(({ type }) => type === 'JOB_RUN_START'));
+  } finally { harness.cleanup(); }
+});
+
+test('running guidance follows automatic page advance while final submission stays manual', async () => {
+  const run = { status: 'running', pageNumber: 2 };
+  const harness = await setupPanel({ run, localData: { autoAdvancePages: true } });
+  try {
+    const document = harness.dom.window.document;
+    assert.match(document.querySelector('#run-hint').textContent, /advance automatically/i);
+    assert.match(document.querySelector('#run-hint').textContent, /final submission stays manual/i);
+    const checkbox = document.querySelector('#auto-advance-pages');
+    checkbox.checked = false;
+    checkbox.dispatchEvent(new harness.dom.window.Event('change', { bubbles: true }));
+    await panelTick();
+    assert.match(document.querySelector('#run-hint').textContent, /stop for your review before navigation/i);
+  } finally { harness.cleanup(); }
+});
+
 test('panel persists settings, focuses blockers, and saves answers without any submit control', async () => {
   const run = {
     status: 'ready_for_user_submit',

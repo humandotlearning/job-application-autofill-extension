@@ -235,6 +235,25 @@ test('popup is an isolated dialog outside the form and preserves site ARIA', asy
   assert.match(f.root().textContent, /Alt\+ArrowDown/);
 });
 
+test('long answer review scrolls separately while an inline error stays visible', async t => {
+  const longAnswer = 'Full answer. '.repeat(100);
+  const error = 'Inline destination changed. Focus an empty field again.';
+  const f = fixture(t, message => ({ok: true, sessionId: 's1', requestId: message.requestId,
+    candidates: [{...candidates[0], answer: longAnswer}], error}));
+  f.field.focus(); await tick();
+  const status = f.root().querySelector('[role="status"]');
+  const results = f.root().querySelector('[data-results]');
+  assert.equal(status.parentElement, results.parentElement);
+  assert.equal(results.contains(status), false);
+  assert.equal(status.dataset.state, 'error');
+  assert.equal(status.textContent, 'This field changed. Click it again to load suggestions.');
+  assert.match(f.root().querySelector('style').textContent, /\[data-results\]\s*\{[^}]*overflow-y:\s*auto/);
+  f.key('ArrowDown');
+  assert.match(f.root().querySelector('[data-preview]').textContent, /Full answer/);
+  assert.equal(results.contains(f.button('Use and save reviewed answer')), false);
+  assert.equal(f.root().querySelector('[role="dialog"]').getAttribute('aria-label'), 'Application answer suggestions');
+});
+
 test('Alt+ArrowDown enters popup controls; Escape restores field focus and closes', async t => {
   const f = fixture(t); f.field.focus(); await tick();
   assert.equal(f.key('ArrowDown', {altKey: true}).defaultPrevented, true);

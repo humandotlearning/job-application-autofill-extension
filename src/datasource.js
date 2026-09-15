@@ -2,6 +2,7 @@ import { normalizeAnswerRecord, normalizeText, slugify, upsertAnswerRecords } fr
 
 export const DATASOURCE_SCHEMA_VERSION = 3;
 export const DATASOURCE_FORMAT = 'job-application-autofill-datasource';
+export const BUNDLED_SEED_ID = 'resume.xlsx';
 
 export const DEFAULT_PROFILE = Object.freeze({
   employment: [{ id: 'deepsight-ai-labs', company: 'DeepSight AI Labs' }],
@@ -183,7 +184,7 @@ export function parseDatasourceBackup(value) {
 
 export function seedDatasource(seed, initializedAt = new Date().toISOString()) {
   const normalized = createDatasourceState(seed);
-  return {
+  return confirmBundledPublicLinks({
     ...normalized,
     datasourceMeta: {
       schemaVersion: DATASOURCE_SCHEMA_VERSION,
@@ -191,6 +192,37 @@ export function seedDatasource(seed, initializedAt = new Date().toISOString()) {
       seededAt: timestamp(initializedAt),
       initializedAt: timestamp(initializedAt),
     },
+  }, seed, initializedAt);
+}
+
+export function confirmBundledPublicLinks(state = {}, seed = null, confirmedAt = new Date().toISOString()) {
+  if (state.datasourceMeta?.seedId !== BUNDLED_SEED_ID || state.datasourceMeta?.bundledPublicLinksMigrationAt || !seed) return state;
+  const expected = new Map((seed.answerRecords || [])
+    .filter((record) => ['github', 'linkedin'].includes(record.key))
+    .map((record) => [record.key, record.answer]));
+  let changed = false;
+  const answerRecords = (state.answerRecords || []).map((record) => {
+    const expectedAnswer = expected.get(record.key);
+    const untouched = expectedAnswer
+      && record.answer === expectedAnswer
+      && record.sensitivity === 'safe'
+      && !record.confirmationState
+      && !record.pendingAnswer
+      && !record.alternatives?.length
+      && !record.history?.length
+      && !record.entityId
+      && !record.entityType
+      && !record.employmentId
+      && !record.suppressedFor?.length
+      && !record.provenance;
+    if (!untouched) return record;
+    changed = true;
+    return { ...record, confirmationState: 'confirmed', confirmedAt, provenance: 'seed' };
+  });
+  return {
+    ...state,
+    answerRecords,
+    datasourceMeta: { ...state.datasourceMeta, bundledPublicLinksMigrationAt: confirmedAt, ...(changed ? { bundledPublicLinksConfirmedAt: confirmedAt } : {}) },
   };
 }
 

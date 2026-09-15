@@ -9,6 +9,8 @@ import {
   parseDatasourceBackup,
   serializeDatasourceBackup,
   seedDatasource,
+  confirmBundledPublicLinks,
+  BUNDLED_SEED_ID,
   shouldSeedDatasource,
 } from './datasource.js';
 import { exactVisibleChoice, planDeterministicFill, requiresVisibleChoiceMatch } from './form-engine.js';
@@ -28,6 +30,7 @@ const reviewedCandidateCache = new WeakMap();
 const MAX_DRAFT_CHARS = 4_000;
 const MAX_REWRITE_INSTRUCTION_CHARS = 4_000;
 let datasourceWriteChain = Promise.resolve();
+let bundledSeedPromise = null;
 let runWriteChain = Promise.resolve();
 const INLINE_STORAGE_KEY = 'inlineFieldSessions';
 const INLINE_TTL_MS = 10 * 60 * 1000;
@@ -208,11 +211,21 @@ async function loadSeedData() {
   return response.json();
 }
 
+function loadSeedDataOnce() {
+  if (!bundledSeedPromise) bundledSeedPromise = loadSeedData().catch((error) => {
+    bundledSeedPromise = null;
+    throw error;
+  });
+  return bundledSeedPromise;
+}
+
 async function initializeDatasource() {
   const stored = await chrome.storage.local.get({
     answerRecords: [],
     coverMessages: [],
     datasourceMeta: null,
+    profile: null,
+    learningInbox: [],
     pendingLearnedAnswers: [],
     answerSource: '',
     sheetUrl: '',
@@ -221,8 +234,9 @@ async function initializeDatasource() {
   const legacyRecords = Array.isArray(stored.pendingLearnedAnswers)
     ? stored.pendingLearnedAnswers
     : [];
-  const current = createDatasourceState({
+  let current = createDatasourceState({
     ...stored,
+    profile: stored.profile || {},
     answerRecords: mergeAnswerRecords(stored.answerRecords, legacyRecords),
     datasourceMeta: stored.datasourceMeta || (legacyRecords.length ? {
       schemaVersion: 1,
@@ -234,7 +248,8 @@ async function initializeDatasource() {
     } : null),
   });
   if (shouldSeedDatasource(current)) {
-    const seeded = seedDatasource(await loadSeedData());
+    const seed = await loadSeedDataOnce();
+    const seeded = seedDatasource(seed);
     await chrome.storage.local.set({
       answerRecords: seeded.answerRecords,
       coverMessages: seeded.coverMessages,
@@ -243,7 +258,13 @@ async function initializeDatasource() {
     });
     return seeded;
   }
-  if (legacyRecords.length || !stored.datasourceMeta || !stored.profile) {
+  const seed = current.datasourceMeta?.seedId === BUNDLED_SEED_ID && !current.datasourceMeta?.bundledPublicLinksMigrationAt
+    ? await loadSeedDataOnce()
+    : null;
+  const migrated = confirmBundledPublicLinks(current, seed);
+  const migrationChanged = migrated !== current;
+  if (migrationChanged) current = migrated;
+  if (migrationChanged || legacyRecords.length || !stored.datasourceMeta || !stored.profile) {
     current.datasourceMeta ||= { schemaVersion: current.schemaVersion, initializedAt: new Date().toISOString() };
     await chrome.storage.local.set({
       answerRecords: current.answerRecords,

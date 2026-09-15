@@ -43,6 +43,26 @@ test('recognizes common LinkedIn profile-link wording without crossing profile c
   assert.equal(chooseRecord({ label: 'Link to your LinkedIn' }, records)?.record.key, 'linkedin_url');
 });
 
+test('recognizes GitHub profile-link wording and strips request prefixes', () => {
+  const records = [{ key: 'github', question: 'github', answer: 'https://github.com/person' }];
+  for (const label of ['GitHub Profile URL', 'GitHub profile link', 'URL to your GitHub profile', 'Please provide your GitHub URL']) {
+    assert.equal(canonicalConcept(label), 'github_url');
+    assert.equal(chooseRecord({ label, type: 'url' }, records)?.record.key, 'github');
+  }
+  assert.equal(chooseRecord({ label: 'GitHub Profile URL', type: 'textarea' }, records)?.record.key, 'github');
+  assert.equal(chooseRecord({ label: 'Please provide your LinkedIn URL', type: 'url' },
+    [{ key: 'linkedin', answer: 'https://linkedin.com/in/person' }])?.record.key, 'linkedin');
+});
+
+test('does not reuse a GitHub URL for usernames, repositories, or narrative fields', () => {
+  const records = [{ key: 'github', question: 'github', answer: 'https://github.com/person' }];
+  for (const field of [
+    { label: 'GitHub username', type: 'text' },
+    { label: 'GitHub repository', type: 'text' },
+    { label: 'Tell us about your GitHub project', type: 'textarea' },
+  ]) assert.equal(chooseRecord(field, records), null);
+});
+
 test('rejects opaque values as semantic fill answers', () => {
   assert.equal(validateFillValue({ type: 'text' }, '4466d54cbeba1000aec278b38cc80000').ok, false);
   assert.equal(chooseRecord({ label: 'Phone Device Type' }, [{ key: 'phone_device_type', question: 'Phone Device Type', answer: '4466d54cbeba1000aec278b38cc80000', sensitivity: 'safe' }]), null);
@@ -61,11 +81,50 @@ test('matches autocomplete metadata before labels and aliases', () => {
 test('normalizes hyphenated autocomplete tokens and refuses misleading URL matches', () => {
   const records = [
     { key: 'given_name', question: 'First name', answer: 'Ada', sensitivity: 'safe' },
-    { key: 'linkedin', question: 'LinkedIn profile', answer: 'https://linkedin.example/ada', sensitivity: 'safe' },
-    { key: 'github', question: 'GitHub profile', answer: 'https://github.example/ada', sensitivity: 'safe' },
+    { key: 'linkedin', question: 'LinkedIn profile', answer: 'https://www.linkedin.com/in/ada', sensitivity: 'safe' },
+    { key: 'github', question: 'GitHub profile', answer: 'https://github.com/ada', sensitivity: 'safe' },
   ];
   assert.equal(chooseRecord({ label: 'Applicant', autocomplete: 'given-name' }, records)?.record.key, 'given_name');
   assert.equal(chooseRecord({ label: 'GitHub URL', autocomplete: 'url' }, records)?.record.key, 'github');
+});
+
+test('rejects profile URLs with the wrong host, purpose, or URL credentials', () => {
+  const github = (answer) => chooseRecord({ label: 'GitHub URL', type: 'url' }, [{ key: 'github', question: 'GitHub profile', answer }]);
+  const linkedin = (answer) => chooseRecord({ label: 'LinkedIn URL', type: 'url' }, [{ key: 'linkedin', question: 'LinkedIn profile', answer }]);
+  assert.equal(github('https://github.com/ada')?.record.answer, 'https://github.com/ada');
+  assert.equal(github('https://github.com/ada?tab=repositories')?.record.answer, 'https://github.com/ada?tab=repositories');
+  assert.equal(github('https://github.com/ada/repo'), null);
+  assert.equal(github('https://ada.github.io/'), null);
+  assert.equal(github('https://ada@github.com/ada'), null);
+  assert.equal(linkedin('https://in.linkedin.com/in/ada')?.record.answer, 'https://in.linkedin.com/in/ada');
+  assert.equal(linkedin('https://www.linkedin.com/in/ada?trk=profile#about')?.record.answer, 'https://www.linkedin.com/in/ada?trk=profile#about');
+  assert.equal(linkedin('https://www.linkedin.com/in/%E6%9D%8E')?.record.answer, 'https://www.linkedin.com/in/%E6%9D%8E');
+  assert.equal(linkedin('https://www.linkedin.com/in/ada')?.record.answer, 'https://www.linkedin.com/in/ada');
+  assert.equal(linkedin('https://www.linkedin.com/pub/ada-profile')?.record.answer, 'https://www.linkedin.com/pub/ada-profile');
+  assert.equal(linkedin('ada1357'), null);
+});
+
+test('keeps address lines, local-script fields, city, postal code, and state concepts separate', () => {
+  const records = [
+    { key: 'address_line_1', question: 'Street address', answer: '12 Oak Road' },
+    { key: 'address_line_2', question: 'Address Line 2', answer: 'Apartment 4' },
+    { key: 'city', question: 'City', answer: 'Pune' },
+    { key: 'postal_code', question: 'Postal code', answer: '411001' },
+    { key: 'state', question: 'State', answer: 'Maharashtra' },
+  ];
+  assert.equal(chooseRecord({ label: 'Address Line 1' }, records)?.record.key, 'address_line_1');
+  assert.equal(chooseRecord({ label: 'House', autocomplete: 'address-line1' }, records)?.record.key, 'address_line_1');
+  assert.equal(chooseRecord({ label: 'Address Line 2' }, records)?.record.key, 'address_line_2');
+  assert.equal(chooseRecord({ label: 'Address Line 3' }, records), null);
+  assert.equal(chooseRecord({ label: 'Address Line 1 - Local' }, records), null);
+  assert.equal(chooseRecord({ label: 'City - Local' }, records), null);
+  assert.equal(chooseRecord({ label: 'City - Local' }, [{ key: 'current_city', question: 'Current city', aliases: ['City - Local'], answer: 'Pune' }]), null);
+  assert.equal(chooseRecord({ label: 'Locality' }, records)?.record.key, 'city');
+  assert.equal(chooseRecord({ label: 'Postcode' }, records)?.record.key, 'postal_code');
+  assert.equal(chooseRecord({ label: 'Zip code' }, records)?.record.key, 'postal_code');
+  assert.equal(chooseRecord({ label: 'PIN code' }, records)?.record.key, 'postal_code');
+  assert.equal(chooseRecord({ label: 'State or Territory' }, records)?.record.key, 'state');
+  assert.equal(chooseRecord({ label: 'Address' }, records), null);
 });
 
 test('does not fill a generic name field from a first-name-only record', () => {

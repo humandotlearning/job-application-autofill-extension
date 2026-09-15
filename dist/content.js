@@ -13,7 +13,17 @@ const CONCEPT_REGISTRY = {
   phone_extension: /^(?:(?:phone|telephone|mobile) )?extension$/,
   phone_country_code: /^(?:country code|country phone code|phone country code|country calling code|calling code)$/,
   phone_device_type: /^(?:phone|telephone|mobile) (?:device )?type$/,
-  github_url: /^(?:github|github profile|github url)$/,
+  address_line_1_local: /^(?:address )?line 1 local$|^street local$/,
+  address_line_2_local: /^(?:address )?line 2 local$/,
+  address_line_3_local: /^(?:address )?line 3 local$/,
+  address_line_1: /^(?:address )?line 1$|^street(?: address)?$/,
+  address_line_2: /^(?:address )?line 2$/,
+  address_line_3: /^(?:address )?line 3$/,
+  city_local: /^city local$|^locality local$/,
+  city: /^city$|^locality$/,
+  postal_code: /^(?:postal|post|zip|pin) code$|^postcode$|^pincode$/,
+  state: /^(?:state|state or territory|territory|region)$/,
+  github_url: /^(?:(?:link|url) (?:to|for) (?:your |my )?)?github(?: profile)?(?: link| url)?$/,
   linkedin_url: /^(?:(?:link|url) (?:to|for) (?:your |my )?)?linkedin(?: profile)?(?: link| url)?$/,
   portfolio_url: /^(?:portfolio|portfolio url|personal website|website)$/,
   current_employer: /^(?:current|present) (?:employer|company|organization)$/,
@@ -27,7 +37,7 @@ const CONCEPT_REGISTRY = {
 };
 
 function conceptForNormalized(text) {
-  const cleaned = text.replace(/^(?:(?:what is|please enter|enter) )?(?:your )?/, '')
+  const cleaned = text.replace(/^(?:(?:what is|please enter|please provide|provide|enter) )?(?:your )?/, '')
     .replace(/\blinked in\b/g, 'linkedin').replace(/\bgit hub\b/g, 'github');
   return Object.entries(CONCEPT_REGISTRY).find(([, pattern]) => pattern.test(cleaned))?.[0] || cleaned.replace(/\s+/g, '_');
 }
@@ -45,6 +55,9 @@ const AUTOCOMPLETE_KEYS = {
   'address level2': ['city'],
   'postal code': ['postal_code', 'zip_code', 'pincode'],
   'street address': ['address', 'street_address'],
+  'address line1': ['address_line_1'],
+  'address line2': ['address_line_2'],
+  'address line3': ['address_line_3'],
   organization: ['current_employer', 'employer', 'company'],
   url: ['website', 'linkedin', 'portfolio', 'github'],
 };
@@ -190,6 +203,20 @@ function candidateLabels(record) {
     .filter(Boolean);
 }
 
+function profileUrlCompatible(concept, value) {
+  if (!['github_url', 'linkedin_url'].includes(concept)) return true;
+  let url;
+  try { url = new URL(String(value)); } catch { return false; }
+  if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password) return false;
+  const hostname = url.hostname.toLowerCase();
+  if (concept === 'github_url') {
+    return ['github.com', 'www.github.com'].includes(hostname)
+      && /^\/[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?\/?$/.test(url.pathname);
+  }
+  return (hostname === 'linkedin.com' || hostname.endsWith('.linkedin.com'))
+    && /^\/(?:in\/[^/]+\/?|pub\/[^/]+(?:\/[^/]+)*\/?)$/i.test(url.pathname);
+}
+
 function recordScopeCompatible(field, record) {
   if (record.semantic?.reusePolicy === 'never' || record.reusePolicy === 'never') return false;
   if (record.suppressedFor?.includes(suggestionTargetKey(field))) return false;
@@ -213,6 +240,15 @@ function meaningCompatible(field, record, { numericReview = true } = {}) {
   const right = normalizeText(record.question || record.key);
   const fieldConcept = canonicalConcept(field.label || field.question || field.name || field.id || '');
   const recordConcept = recordConceptFor(record);
+  if ([fieldConcept, recordConcept].some(concept => /^(?:address_line_[123]|city)_local$/.test(concept)) && fieldConcept !== recordConcept) return false;
+  const addressConcepts = new Set(['address', 'address_line_1_local', 'address_line_2_local', 'address_line_3_local', 'address_line_1', 'address_line_2', 'address_line_3', 'city_local', 'city', 'postal_code', 'state']);
+  if (addressConcepts.has(fieldConcept) && addressConcepts.has(recordConcept)) {
+    if (fieldConcept !== recordConcept) return false;
+  }
+  const profileConcept = [fieldConcept, recordConcept].find((concept) => ['github_url', 'linkedin_url'].includes(concept));
+  if (profileConcept && !profileUrlCompatible(profileConcept, record.answer)) return false;
+  if (recordConcept === 'github_url'
+    && ((normalizeText(field.type) === 'textarea' && fieldConcept !== 'github_url') || /\b(username|repository|repo|project)\b/.test(left))) return false;
   const phoneConcepts = new Set(['phone_number', 'phone_extension', 'phone_country_code', 'phone_device_type']);
   if (phoneConcepts.has(fieldConcept) || phoneConcepts.has(recordConcept)) return fieldConcept === recordConcept;
   const protectedConcepts = ['first_name', 'last_name', 'full_name', 'preferred_name', 'github_url', 'linkedin_url', 'portfolio_url', 'date_of_birth'];
@@ -2066,26 +2102,32 @@ function createInlineAutofill(document, {send, describe}) {
     document.documentElement.append(host);
     shadow = host.attachShadow({mode: 'open'});
     shadow.append(node('style', `
-      :host { all: initial; position: fixed; z-index: 2147483647; color-scheme: dark; }
+      :host { all: initial; position: fixed; z-index: 2147483647; color-scheme: light; }
       :host([hidden]) { display: none !important; }
       * { box-sizing: border-box; }
       [hidden] { display: none !important; }
-      [role=dialog] { display: flex; flex-direction: column; max-height: inherit; overflow: hidden; padding: 12px; border: 1px solid #344354;
-        border-radius: 8px; background: #10161d; color: #f4f7fb; box-shadow: 0 10px 24px #0005;
-        font: 13px/1.45 Inter, ui-sans-serif, system-ui, sans-serif; }
-      p { margin: 0 0 8px; white-space: pre-wrap; overflow-wrap: anywhere; }
-      [role=option] { padding: 8px; margin: 4px 0; border: 1px solid #202b37; border-radius: 5px; cursor: pointer; }
-      [aria-selected=true] { border-color: #f5a000; background: #f5a00012; }
-      [data-preview] { white-space: pre-wrap; overflow-wrap: anywhere; margin: 8px 0; }
-      button { padding: 6px 9px; margin: 4px 4px 0 0; border: 1px solid #344354; border-radius: 5px;
-        color: #f4f7fb; background: #161e27; font: inherit; cursor: pointer; }
-      button:disabled { opacity: .5; cursor: default; }
-      :focus-visible { outline: 2px solid #ffb21a; outline-offset: 2px; }
-      [role=status], small { display: block; color: #9aa7b7; margin-top: 8px; }
-      [data-question] { flex-shrink: 0; max-height: 76px; overflow: auto; margin-bottom: 10px; font-weight: 700; }
-      [data-results] { min-height: 0; overflow: auto; }
-      [data-search] { width: 100%; margin: 0 0 8px; padding: 8px; border: 1px solid #344354; border-radius: 5px;
-        flex-shrink: 0; color: #f4f7fb; background: #161e27; font: inherit; }
+      [role=dialog] { display: flex; flex-direction: column; max-height: inherit; overflow: hidden; padding: 12px; border: 1px solid #cbd5e1;
+        border-radius: 10px; background: #fff; color: #17212b; box-shadow: 0 10px 30px #17212b30;
+        font: 14px/1.45 ui-sans-serif, system-ui, sans-serif; }
+      p { margin: 0 0 7px; white-space: pre-wrap; overflow-wrap: anywhere; }
+      [role=option] { padding: 9px 10px; margin: 5px 0; border: 1px solid #d7dfe8; border-radius: 7px; background: #fff; cursor: pointer; }
+      [role=option]:hover { background: #f5f8fc; }
+      [aria-selected=true] { border-color: #2563eb; background: #eff6ff; box-shadow: inset 3px 0 #2563eb; }
+      [data-preview] { white-space: pre-wrap; overflow-wrap: anywhere; margin: 9px 0; padding: 9px 10px; border-radius: 7px; background: #f5f8fc; }
+      button { padding: 8px 10px; margin: 5px 5px 0 0; border: 1px solid #bdcad8; border-radius: 7px;
+        color: #17212b; background: #fff; font: inherit; cursor: pointer; }
+      button:hover:not(:disabled) { background: #f5f8fc; }
+      [data-primary]:not(:disabled) { color: #fff; background: #1d4ed8; border-color: #1d4ed8; }
+      [data-primary]:hover:not(:disabled) { background: #1e40af; }
+      button:disabled { color: #64748b; background: #f5f8fc; cursor: default; }
+      :focus-visible { outline: 2px solid #2563eb; outline-offset: 2px; }
+      [role=status] { flex-shrink: 0; color: #334155; padding: 7px 0; overflow-wrap: anywhere; }
+      [role=status][data-state=error] { color: #9f1d1d; background: #fff1f2; border: 1px solid #fecdd3; border-radius: 7px; padding: 8px 10px; margin-bottom: 7px; }
+      small { display: block; color: #475569; margin-top: 8px; font-size: 12px; }
+      [data-question] { flex-shrink: 0; max-height: 76px; overflow: auto; margin-bottom: 8px; font-weight: 700; }
+      [data-results] { min-height: 0; overflow-y: auto; }
+      [data-search] { width: 100%; margin: 0; padding: 9px 10px; border: 1px solid #bdcad8; border-radius: 7px;
+        flex-shrink: 0; color: #17212b; background: #fff; font: inherit; }
       [data-secondary] { margin-top: 4px; }
     `));
     dialog = node('section', null, {role: 'dialog', 'aria-label': 'Application answer suggestions'});
@@ -2095,6 +2137,7 @@ function createInlineAutofill(document, {send, describe}) {
     list = node('div', null, {role: 'listbox', 'aria-label': 'Saved answers', tabindex: '-1'});
     preview = node('div', null, {'data-preview': ''});
     use = button('Use and save reviewed answer', accept);
+    use.setAttribute('data-primary', '');
     generate = button('Generate answer', generateAnswer);
     edit = button('Edit in panel', editInPanel);
     retrySearch = button('Retry search', scheduleSearch);
@@ -2103,14 +2146,19 @@ function createInlineAutofill(document, {send, describe}) {
     const secondary = node('div', null, {'data-secondary': ''});
     secondary.append(generate, edit);
     const results = node('div', null, {'data-results': ''});
-    results.append(list, preview, use, secondary, hint, status, retrySearch);
-    dialog.append(question, searchInput, results);
+    results.append(list, preview, secondary, hint);
+    dialog.append(question, searchInput, status, retrySearch, results, use);
     shadow.append(dialog);
   }
   function controlsMode(enabled) {
     for (const element of shadow.querySelectorAll('button, input, [role="listbox"]')) element.tabIndex = enabled ? 0 : -1;
   }
-  function setStatus(text) { status.textContent = text; schedulePosition(); }
+  function setStatus(text, state = 'info') {
+    status.textContent = /^Inline destination changed/.test(text)
+      ? 'This field changed. Click it again to load suggestions.' : text;
+    status.dataset.state = state;
+    schedulePosition();
+  }
   function provenance(answer) {
     return answer.kind === 'generated' ? `Draft · Evidence: ${(answer.evidenceKeys || []).join(', ') || 'No candidate facts cited'}`
       : `Source: ${answer.sourceQuestion || 'Reviewed answer'} · ${answer.kind || 'saved'}`;
@@ -2139,6 +2187,7 @@ function createInlineAutofill(document, {send, describe}) {
   function updateSelection() {
     [...list.children].forEach((option, optionIndex) => option.setAttribute('aria-selected', String(index === optionIndex)));
     const answer = answers[index];
+    preview.hidden = !answer;
     preview.textContent = answer ? `${answer.answer}\n${provenance(answer)}\n${answer.requiresApproval === false ? 'Review this draft before use.' : 'Using this answer also saves it as a reviewed answer.'}` : '';
     if (answer) list.setAttribute('aria-activedescendant', `inline-answer-${index}`);
     else list.removeAttribute('aria-activedescendant');
@@ -2209,7 +2258,7 @@ function createInlineAutofill(document, {send, describe}) {
       setStatus(answers.length ? `Found ${answers.length} saved answer${answers.length === 1 ? '' : 's'}. Choose one to review.` : 'No saved answers found.');
     }).catch(error => {
       if (!current()) return;
-      searching = loading = false; retry = true; render(); setStatus(error.message);
+      searching = loading = false; retry = true; render(); setStatus(error.message, 'error');
     }).finally(() => {
       if (searchPending !== pending) return;
       searchPending = null; runSearch();
@@ -2267,11 +2316,11 @@ function createInlineAutofill(document, {send, describe}) {
       if (response.requestId !== request) throw new Error('Saved answers changed. Click the field to retry.');
       sessionId = response.sessionId; answers = (response.candidates || []).slice(0, 3); index = -1; loading = false;
       render();
-      setStatus(response.error || (answers.length ? 'Choose an answer to review before using it.' : 'No saved answers. Generate an answer or edit in panel.'));
+      setStatus(response.error || (answers.length ? 'Choose an answer to review before using it.' : 'No saved answers. Generate an answer or edit in panel.'), response.error ? 'error' : 'info');
       if (searching) scheduleSearch();
     }).catch(error => {
       if (!isCurrent(version, element, expected)) return;
-      loading = false; retry = true; render(); setStatus(error.message);
+      loading = false; retry = true; render(); setStatus(error.message, 'error');
     });
   }
   function activate(element) {
@@ -2306,7 +2355,7 @@ function createInlineAutofill(document, {send, describe}) {
       retry = !busy;
       if (busy) index = answers.indexOf(answer);
       else answers = [];
-      render(); setStatus(error.message);
+      render(); setStatus(error.message, 'error');
     });
   }
   function beforeFill({field, element, decision, acceptanceToken} = {}) {
@@ -2329,11 +2378,11 @@ function createInlineAutofill(document, {send, describe}) {
       if (response.sessionId !== session || response.requestId !== request) return;
       if (Array.isArray(response.candidates)) answers = response.candidates;
       loading = false; render();
-      setStatus(response.error || response.generatedSuggestion?.missingContext || 'Choose a draft to review before using it.');
+      setStatus(response.error || response.generatedSuggestion?.missingContext || 'Choose a draft to review before using it.', response.error ? 'error' : 'info');
     }).catch(error => {
       if (!isCurrent(version, element, expected)) return;
       if (/Fill is in progress|Application is busy/i.test(error.message)) index = selected;
-      loading = false; render(); setStatus(error.message);
+      loading = false; render(); setStatus(error.message, 'error');
     });
   }
   function editInPanel() {
@@ -2349,11 +2398,11 @@ function createInlineAutofill(document, {send, describe}) {
       if (!reply?.error) return;
       if (disposed || epoch !== version || deepActiveElement(document) !== element || fingerprint(eligible(element)) !== expected) return;
       target = element; snapshot = field; retry = true; host.hidden = false;
-      observe(); render(); setStatus(reply.error);
+      observe(); render(); setStatus(reply.error, 'error');
     }).catch(() => {
       if (disposed || epoch !== version || deepActiveElement(document) !== element || fingerprint(eligible(element)) !== expected) return;
       target = element; snapshot = field; retry = true; host.hidden = false;
-      observe(); render(); setStatus('Open the extension toolbar button to continue editing');
+      observe(); render(); setStatus('Open the extension toolbar button to continue editing', 'error');
     });
   }
   function keydown(event) {
@@ -2447,7 +2496,7 @@ function notifyNavigation() {
   waitForDocumentSettled(document).then(() => chrome.runtime.sendMessage({ type: 'JOB_APP_NAVIGATED' })).catch(() => {});
 }
 
-const CONTENT_VERSION = 'shadow-discovery-2';
+const CONTENT_VERSION = 'autofill-ux-4';
 if (!globalThis.__jobApplicationAutofillInstalled) {
   globalThis.__jobApplicationAutofillInstalled = CONTENT_VERSION;
   let inline = null;
