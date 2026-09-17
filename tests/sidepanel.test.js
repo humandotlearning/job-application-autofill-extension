@@ -811,7 +811,7 @@ test('answer workspace stays blank until a readable candidate is chosen', async 
   } finally { harness.cleanup(); }
 });
 
-test('AI Use answer applies the selected draft in one click', async () => {
+test('AI Use answer loads the selected draft for review before sending', async () => {
   const generatedSuggestion = {
     tabId: 7, frameId: 3, applicationId: 'run-ai', pageSignature: 'page-one',
     field: { id: 'summary', handle: 'handle-summary' },
@@ -824,6 +824,10 @@ test('AI Use answer applies the selected draft in one click', async () => {
     const row = harness.dom.window.document.querySelector('#action-required-list .result-item');
     assert.equal(row.querySelector('.result-label').textContent, 'Why are you a good fit?');
     row.querySelector('[data-choose-generated-answer]').click();
+    await new Promise(resolve => setTimeout(resolve, 0));
+    assert.equal(row.querySelector('[data-answer-draft]').value, 'I built event processing systems that match this role.');
+    assert.equal(pageMutationMessages(harness.sentMessages).length, 0);
+    row.querySelector('[data-send-answer]').click();
     await new Promise(resolve => setTimeout(resolve, 0));
     const sent = harness.sentMessages.find(message => message.type === 'JOB_RUN_APPLY_DRAFT');
     assert.equal(sent.answer, 'I built event processing systems that match this role.');
@@ -1296,4 +1300,66 @@ test('standalone save controls stay hidden on paused sites', async () => {
     assert.equal(doc.querySelector('#save-answers').hidden, true);
     assert.equal(doc.querySelector('#save-hint').hidden, true);
   } finally { panel.cleanup(); }
+});
+
+test('first rewrite completes in the visible editor after a background run refresh', async () => {
+  let resolveRewrite;
+  const run = {status: 'waiting_user', applicationId: 'race', pageSignature: 'one', frameId: 0,
+    actionRequired: [{fieldId: 'why', label: 'Why this company?'}], optionalUnresolved: [], reviewRequired: [], audit: []};
+  const harness = await setupPanel({run, rewriteResponse: () => new Promise(resolve => { resolveRewrite = resolve; })});
+  try {
+    const doc = harness.dom.window.document;
+    const draft = doc.querySelector('[data-answer-draft]');
+    draft.value = 'I built reliable systems.'; draft.dispatchEvent(new Event('input'));
+    doc.querySelector('[data-rewrite-answer]').click();
+    const prompt = doc.querySelector('[data-rewrite-prompt]');
+    prompt.value = 'Tailor to this company'; prompt.dispatchEvent(new Event('input'));
+    doc.querySelector('[data-submit-rewrite]').click();
+    harness.storageListeners.forEach(listener => listener({applicationRun: {newValue: {'7': {...run}}}}, 'session'));
+    assert.equal(doc.querySelector('[data-submit-rewrite]').textContent, 'Rewriting…');
+    resolveRewrite({ok: true, answer: 'I can apply my systems experience here.'});
+    await panelTick();
+    const visible = doc.querySelector('[data-answer-draft]');
+    assert.equal(visible.value, 'I can apply my systems experience here.');
+    assert.equal(visible.disabled, false);
+    assert.equal(visible.readOnly, false);
+    assert.equal(doc.querySelector('[data-send-answer]').disabled, false);
+    assert.match(doc.querySelector('[data-draft-status]').textContent, /Draft rewritten/);
+    assert.equal(harness.sentMessages.filter(message => message.type === 'JOB_RUN_REWRITE_ANSWER').length, 1);
+    assert.equal(pageMutationMessages(harness.sentMessages).length, 0);
+  } finally { harness.cleanup(); }
+});
+
+test('empty drafts can generate directly, retry failure, and rewrite the generated answer', async () => {
+  const run = {status: 'waiting_user', applicationId: 'generate', pageSignature: 'one', frameId: 0,
+    actionRequired: [{fieldId: 'why', label: 'Why this company?'}], optionalUnresolved: [], reviewRequired: [], audit: []};
+  let fail = true;
+  const generated = {...run, generatedSuggestions: {why: {suggestions: [{answer: 'I built relevant systems.'}], missingContext: ''}}};
+  const harness = await setupPanel({run, generateResponse: () => fail ? {ok: false, error: 'Service unavailable. Try again.'} : {ok: true, run: generated}});
+  try {
+    const doc = harness.dom.window.document;
+    doc.querySelector('[data-generate-suggestions]').click(); await panelTick();
+    assert.match(doc.querySelector('[data-draft-status]').textContent, /Service unavailable/);
+    assert.equal(doc.querySelector('[data-generate-suggestions]').disabled, false);
+    fail = false;
+    doc.querySelector('[data-generate-suggestions]').click(); await panelTick();
+    assert.equal(doc.querySelector('[data-answer-draft]').value, 'I built relevant systems.');
+    assert.equal(doc.querySelector('[data-rewrite-answer]').disabled, false);
+    assert.equal(doc.querySelector('[data-answer-draft]').readOnly, false);
+    assert.equal(pageMutationMessages(harness.sentMessages).length, 0);
+  } finally { harness.cleanup(); }
+});
+
+test('Phoenix setting loads, persists and follows changes from another panel', async () => {
+  const harness = await setupPanel({localData: {phoenixTracing: false}});
+  try {
+    const checkbox = harness.dom.window.document.getElementById('phoenix-tracing');
+    assert.equal(checkbox.checked, false);
+    checkbox.checked = true;
+    checkbox.dispatchEvent(new harness.dom.window.Event('change'));
+    await panelTick();
+    assert.equal(harness.localData.phoenixTracing, true);
+    for (const listener of harness.storageListeners) listener({phoenixTracing: {newValue: false}}, 'local');
+    assert.equal(checkbox.checked, false);
+  } finally { harness.cleanup(); }
 });

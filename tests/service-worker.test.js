@@ -3046,3 +3046,26 @@ test('submission saves reusable answers even when panel still waits for a manual
   assert.equal(harness.localData.answerRecords.find(record => record.key === 'portfolio_url')?.answer, 'https://example.com/work');
   assert.equal(harness.tabs.get(7).submitCalls, 0);
 });
+
+test('direct AI generation uses saved cover answers and current company context', async () => {
+  const harness = createHarness({coverMessages: [{id: 'closing', label: 'Closing answer', body: 'I built and led a team delivering reliable AI systems.'}], pagesByTab: {7: {pages: [{
+    page: {title: 'Application', domain: 'example.test', company: 'AiPrise', role: 'Software engineer'},
+    fields: [{id: 'why', handle: 'why-h', label: 'Why are you a good fit?', type: 'textarea', required: true}],
+    actions: [{id: 'submit', label: 'Submit application', kind: 'submit'}],
+  }]}}});
+  await import(`../src/service-worker.js?closing-generation=${Date.now()}`);
+  const started = await harness.dispatch({type: 'JOB_RUN_START', tabId: 7});
+  assert.ok(started.run.frame, JSON.stringify(started));
+  harness.localData.openaiApiKey = 'synthetic-test-key';
+  const requests = [];
+  globalThis.fetch = async (url, options) => {
+    requests.push(JSON.parse(options.body));
+    return generatedResponse([{answer: 'My experience building AI systems fits this role.', evidenceKeys: ['cover:closing']}]);
+  };
+  const response = await harness.dispatch({type: 'JOB_RUN_GENERATE_SUGGESTIONS', ...draftOrigin(started.run, {id: 'why', handle: 'why-h'})});
+  assert.equal(response.ok, true, response.error);
+  const input = JSON.parse(requests[0].input[1].content[0].text);
+  assert.equal(input.records.find(record => record.key === 'cover:closing').answer, 'I built and led a team delivering reliable AI systems.');
+  assert.match(JSON.stringify(input.page), /AiPrise/);
+  assert.equal(response.run.generatedSuggestions.why.suggestions.length, 1);
+});
