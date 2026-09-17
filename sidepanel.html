@@ -126,6 +126,12 @@
           <option value="accounts/fireworks/models/glm-5p3-flash"></option>
         </datalist>
         <p class="muted">Choose Fireworks above to use its model IDs, or enter any compatible model ID.</p>
+        <label class="checkbox-row" for="phoenix-tracing">
+          <input id="phoenix-tracing" type="checkbox" checked>
+          <span>Save AI traces to local Phoenix</span>
+        </label>
+        <p class="muted">Saves full prompts, answers, and included screenshots on this computer while Phoenix is running.</p>
+        <p><a href="http://127.0.0.1:6006" target="_blank" rel="noreferrer">Open AI trace dashboard</a></p>
         <label class="checkbox-row" for="include-form-screenshot">
           <input id="include-form-screenshot" type="checkbox">
           <span>Include form screenshot for AI interpretation</span>

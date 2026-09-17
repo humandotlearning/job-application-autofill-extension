@@ -215,3 +215,7 @@ Content-to-extension messages catch synchronous disconnection failures. Inline s
 ### Explicit saving of corrected values
 
 Save filled values promotes the current captured user values to reusable answers, even when an automatic checkpoint has already captured those same edits. Corrections replace the saved value and retain the previous answer in history. Automatic checkpoints and final-submit capture remain drafts; untouched extension-generated values are excluded from promotion. Save reports new, updated, unchanged and unresolved counts.
+
+## Inspect AI inputs and outputs
+
+Run `powershell -ExecutionPolicy Bypass -File scripts/start-phoenix.ps1`, reload the extension, then open http://127.0.0.1:6006 and select **job-autofill**. The Settings checkbox **Save AI traces to local Phoenix** controls capture. See [Phoenix setup and storage details](docs/phoenix.md).

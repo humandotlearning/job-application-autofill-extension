@@ -2828,7 +2828,7 @@ async function prepareAi(tabId,snapshot,plannerFields,suggestionFields,allFields
   const plannerRecords=selectPlannerEvidence(plannerFields,datasource.answerRecords,{limit:20});
   let decisions=[]; let plannerError='';
   if(plannerFields.length) {
-    try { decisions=(await callAnswerPlanner({apiKey,fields:plannerFields,records:plannerRecords,page:snapshot.jobContext},{provider,model,allowPartial:true})).decisions; }
+    try { decisions=(await callAnswerPlanner({apiKey,fields:plannerFields,records:plannerRecords,page:snapshot.jobContext},{provider,model,allowPartial:true,sessionId:`${tabId}:${snapshot.startedAt}`})).decisions; }
     catch(error) {plannerError=error.message;}
   }
   const proposed=new Set();
@@ -2855,7 +2855,7 @@ async function prepareAi(tabId,snapshot,plannerFields,suggestionFields,allFields
     if(!(await currentAiDestination(tabId,snapshot,field))) {releaseDraftField(draftFieldKey(tabId,snapshot.frameId,field),snapshot.id);continue;}
     await mutateRun(tabId,current=>{if(current.aiOperations?.[snapshot.operationKey]?.id!==snapshot.id)return false;current.aiOperations[key]={status:'pending',workerId:WORKER_ID,id:snapshot.id,cacheKey:snapshot.cacheKey};});
     try {
-      const generated=await callAnswerSuggestions({apiKey,field,page:snapshot.jobContext,records:[...savedClosingEvidence(field,datasource),...rankSuggestionEvidence(field,evidence,{limit:40})]},{provider,model});
+      const generated=await callAnswerSuggestions({apiKey,field,page:snapshot.jobContext,records:[...savedClosingEvidence(field,datasource),...rankSuggestionEvidence(field,evidence,{limit:40})]},{provider,model,sessionId:`${tabId}:${snapshot.startedAt}`});
       if(!(await currentAiDestination(tabId,snapshot,field))) {
         await mutateRun(tabId,current=>{if(current.aiOperations?.[key]?.id!==snapshot.id)return false;current.aiOperations[key].status='interrupted';}); continue;
       }

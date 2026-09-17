@@ -14,6 +14,7 @@ function createHarness({
   pagesByTab = {},
 } = {}) {
   const localData = {
+    phoenixTracing: false, // Transport tracing has its own tests; keep provider mocks isolated.
     openaiApiKey: '',
     autoAdvancePages,
     includeFormScreenshot,

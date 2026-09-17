@@ -1,3 +1,4 @@
+import { createPhoenixFetch } from './phoenix.js';
 import { inferSensitivity, normalizeText } from './core.js';
 import { DEFAULT_FIREWORKS_MODEL, DEFAULT_OPENAI_MODEL } from './llm.js';
 
@@ -154,7 +155,7 @@ export function sanitizeLearningProposals(payload = {}, candidates = [], { model
   });
 }
 
-export async function callLearningReviewer({ apiKey, candidates = [] }, { fetchImpl = fetch, provider = 'openai', model = '', timeoutMs = 30000 } = {}) {
+export async function callLearningReviewer({ apiKey, candidates = [] }, { sessionId = '', fetchImpl = createPhoenixFetch(sessionId), provider = 'openai', model = '', timeoutMs = 30000 } = {}) {
   if (!candidates.length) return [];
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
