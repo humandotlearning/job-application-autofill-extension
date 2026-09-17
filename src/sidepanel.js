@@ -568,7 +568,7 @@ function answerWorkspace(item, displayLabel, responseHandler = response => rende
   textarea.value = state.answer;
   textarea.placeholder = item.generatedSuggestion ? 'Choose an AI draft, or write your own.' : item.suggestion ? 'Choose a saved answer, or write your own.' : 'Write the answer you want to send to the form.';
   textarea.setAttribute('aria-label', `Answer for ${displayLabel}`);
-  textarea.readOnly = Boolean(item.suggestion && !state.editing);
+  textarea.readOnly = Boolean(state.answer.trim() && item.suggestion && !state.editing);
   workspaceLabel.htmlFor = `answer-draft-${draftKey(origin, origin.fieldId)}`;
   textarea.id = workspaceLabel.htmlFor;
 
@@ -582,6 +582,14 @@ function answerWorkspace(item, displayLabel, responseHandler = response => rende
   rewrite.type = 'button';
   rewrite.dataset.rewriteAnswer = 'true';
   rewrite.textContent = 'Ask AI to rewrite';
+  const generate = document.createElement('button');
+  generate.type = 'button';
+  generate.dataset.generateSuggestions = 'true';
+  generate.textContent = 'Generate AI answer';
+  const feedback = document.createElement('p');
+  feedback.className = 'result-detail';
+  feedback.dataset.draftStatus = 'true';
+  feedback.setAttribute('role', 'status');
   const send = document.createElement('button');
   send.type = 'button';
   send.dataset.sendAnswer = 'true';
@@ -590,7 +598,7 @@ function answerWorkspace(item, displayLabel, responseHandler = response => rende
 
   const promptRow = document.createElement('div');
   promptRow.className = 'rewrite-prompt-row';
-  promptRow.hidden = true;
+  promptRow.hidden = !state.promptOpen;
   const prompt = document.createElement('textarea');
   prompt.dataset.rewritePrompt = 'true';
   prompt.value = state.rewriteInstruction;
@@ -606,13 +614,24 @@ function answerWorkspace(item, displayLabel, responseHandler = response => rende
   const updateControls = () => {
     const hasAnswer = Boolean(state.answer.trim()) && !isOpaqueIdentifier(state.answer);
     const pending = Boolean(state.pending);
-    textarea.readOnly = Boolean(item.suggestion && !state.editing);
+    textarea.readOnly = Boolean(state.answer.trim() && item.suggestion && !state.editing);
     textarea.disabled = pending && !origin.inlineSessionId;
     prompt.disabled = pending;
     edit.disabled = pending || !state.answer.trim();
     rewrite.disabled = pending || !state.answer.trim();
     submitRewrite.disabled = pending || !state.answer.trim() || !prompt.value.trim();
     send.disabled = pending || !hasAnswer;
+    generate.disabled = pending;
+    generate.textContent = state.pending === 'generate' ? 'Generating…' : 'Generate AI answer';
+    submitRewrite.textContent = state.pending === 'rewrite' ? 'Rewriting…' : 'Rewrite draft';
+    workspace.setAttribute('aria-busy', String(pending));
+    feedback.textContent = state.feedback || 'Generate from saved answers, or write a draft. Review before sending.';
+  };
+  // A storage refresh can replace this editor before an AI request returns.
+  // Always refresh the current editor, not the detached request-time nodes.
+  state.refresh = () => {
+    textarea.value = state.answer;
+    updateControls();
   };
   textarea.addEventListener('input', () => {
     updateDraftAnswer(state, textarea.value);
@@ -626,6 +645,7 @@ function answerWorkspace(item, displayLabel, responseHandler = response => rende
     textarea.focus();
   });
   rewrite.addEventListener('click', () => {
+    state.promptOpen = true;
     promptRow.hidden = false;
     prompt.focus();
   });
@@ -635,10 +655,11 @@ function answerWorkspace(item, displayLabel, responseHandler = response => rende
   });
   submitRewrite.addEventListener('click', async () => {
     const instruction = prompt.value.trim();
-    if (!instruction || !state.answer.trim()) return;
+    if (state.pending || !instruction || !state.answer.trim()) return;
     const requestRevision = state.revision;
     const requestDraft = state.answer;
     state.pending = 'rewrite';
+    state.feedback = 'Rewriting your draft…';
     updateControls();
     try {
       const response = await sendFieldAction('JOB_RUN_REWRITE_ANSWER', origin, {
@@ -646,20 +667,49 @@ function answerWorkspace(item, displayLabel, responseHandler = response => rende
         question: displayLabel, instruction });
       if (!response?.ok || typeof response.answer !== 'string') throw new Error(response?.error || 'Could not rewrite the answer.');
       if (state.revision !== requestRevision) {
-        setStatus('Draft changed while the rewrite was running. Your latest edit was kept.');
+        state.feedback = 'Draft changed while the rewrite was running. Your latest edit was kept.';
+        setStatus(state.feedback);
         return;
       }
       updateDraftAnswer(state, response.answer);
-      state.editing = Boolean(origin.inlineSessionId);
+      state.editing = true;
       textarea.value = state.answer;
       state.pending = null;
       if (origin.inlineSessionId) responseHandler(response);
-      setStatus('Draft rewritten. Review or edit it before sending it to the form.');
-    } catch (error) { setStatus(error.message, 'error'); }
+      state.feedback = 'Draft rewritten. Review or edit it before sending it to the form.';
+      setStatus(state.feedback);
+    } catch (error) { state.feedback = error.message; setStatus(error.message, 'error'); }
     finally {
       if (state.pending === 'rewrite') state.pending = null;
-      updateControls();
+      state.refresh();
     }
+  });
+  generate.addEventListener('click', async () => {
+    if (state.pending) return;
+    state.jobDescription = String(workspace.parentElement?.querySelector('[data-job-description]')?.value ?? state.jobDescription);
+    const actionRevision = runRevision;
+    const requestRevision = state.revision;
+    state.pending = 'generate';
+    state.feedback = 'Generating from your saved answers and this application…';
+    updateControls();
+    try {
+      const response = await sendFieldAction('JOB_RUN_GENERATE_SUGGESTIONS', origin, { jobDescription: state.jobDescription.trim() });
+      if (!response?.ok || (origin.inlineSessionId ? !response.inlineSession : !response.run)) throw new Error(response?.error || 'Could not generate an answer. Try again.');
+      if (!origin.inlineSessionId && !canRenderActionResponse(response.run, actionRevision)) throw new Error('The page changed while suggestions were prepared. Check the page again.');
+      const generated = origin.inlineSessionId
+        ? response.inlineSession.generatedSuggestions?.[origin.fieldId]
+        : response.run.generatedSuggestions?.[origin.fieldId] || [...(response.run.actionRequired || []), ...(response.run.optionalUnresolved || [])].find(field => field.fieldId === origin.fieldId)?.generatedSuggestion;
+      if (state.revision === requestRevision && !state.answer.trim() && generated?.suggestions?.[0]?.answer) {
+        updateDraftAnswer(state, generated.suggestions[0].answer);
+        state.sourceKey = null; state.sourceKeys = []; state.candidateKind = null;
+        state.editing = true;
+      }
+      state.pending = null;
+      state.feedback = generated?.missingContext || 'AI answers are ready. Review or rewrite before sending.';
+      responseHandler(response);
+      setStatus(state.feedback);
+    } catch (error) { state.feedback = error.message; setStatus(error.message, 'error'); }
+    finally { state.pending = null; state.refresh(); }
   });
   const applyAnswer = async () => {
     const answer = state.answer;
@@ -689,12 +739,12 @@ function answerWorkspace(item, displayLabel, responseHandler = response => rende
     } catch (error) { setStatus(error.message, 'error'); }
     finally {
       if (state.pending === 'apply') state.pending = null;
-      updateControls();
+      state.refresh();
     }
   };
   send.addEventListener('click', applyAnswer);
-  controls.append(edit, rewrite, send);
-  workspace.append(workspaceLabel, textarea, controls, promptRow);
+  controls.append(generate, edit, rewrite, send);
+  workspace.append(workspaceLabel, textarea, controls, promptRow, feedback);
   updateControls();
   return { workspace, state, origin, updateControls, applyAnswer };
 }
@@ -885,33 +935,6 @@ function itemRow(item, { focus = false, detail = '', responseHandler = response 
       context.textContent = generated.missingContext;
       draftList.append(context);
     }
-    const regenerate = document.createElement('button');
-    regenerate.type = 'button';
-    regenerate.className = 'inline-action';
-    regenerate.dataset.generateSuggestions = 'true';
-    regenerate.textContent = drafts.length ? 'Generate again' : 'Generate suggestions';
-    regenerate.addEventListener('click', async () => {
-      if (!workspace) return;
-      const jobDescription = String(draftList.querySelector('[data-job-description]')?.value ?? workspace.state.jobDescription).trim();
-      workspace.state.jobDescription = jobDescription;
-      const actionRevision = runRevision;
-      workspace.state.pending = 'generate';
-      workspace.updateControls();
-      regenerate.disabled = true;
-      try {
-        const response = await sendFieldAction('JOB_RUN_GENERATE_SUGGESTIONS', workspace.origin, { jobDescription });
-        if (!response?.ok || (origin.inlineSessionId ? !response.inlineSession : !response.run)) throw new Error(response?.error || 'Could not generate answer suggestions.');
-        if (origin.inlineSessionId || canRenderActionResponse(response.run, actionRevision)) {
-          workspace.state.pending = null;
-          responseHandler(response);
-          setStatus('New suggestions are ready for review.');
-        } else setStatus('The page changed while suggestions were prepared. Check the page again.', 'error');
-      } catch (error) { setStatus(error.message, 'error'); }
-      finally {
-        workspace.state.pending = null;
-        workspace.updateControls();
-      }
-    });
     if (generated.missingContext && !currentRun?.jobContext?.jobDescription) {
       const details = document.createElement('details');
       details.className = 'job-description-editor';
@@ -928,7 +951,6 @@ function itemRow(item, { focus = false, detail = '', responseHandler = response 
       details.append(summary, input);
       draftList.append(details);
     }
-    draftList.append(regenerate);
     content.insertBefore(draftList, workspace?.workspace || null);
   }
   if (item.suggestion) {

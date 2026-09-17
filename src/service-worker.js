@@ -1879,6 +1879,14 @@ async function rewriteAnswer(message, inlineContext = null) {
   return { ok: true, answer: requiredBoundedText(rewritten.answer, 'Rewritten answer', MAX_DRAFT_CHARS) };
 }
 
+function savedClosingEvidence(field, datasource) {
+  if (field.type !== 'textarea' && !/why|interest|motivation|cover letter|additional information/i.test(field.label || '')) return [];
+  return (datasource.coverMessages || []).slice(0, 10).map(message => ({
+    key: `cover:${message.id}`, question: message.label, answer: message.body,
+    provenance: 'saved cover answer', confirmationState: 'confirmed', sensitivity: 'safe',
+  }));
+}
+
 async function generateFieldDrafts({ field, inspection, jobContext, datasource, records, settings, apiKey }) {
   const pageRecords = (inspection?.fields || [])
     .filter((item) => item.currentValue && readableQuestion(item))
@@ -1887,7 +1895,7 @@ async function generateFieldDrafts({ field, inspection, jobContext, datasource, 
     apiKey,
     field,
     page: jobContext,
-    records: rankSuggestionEvidence(field, [...records, ...profileEvidenceRecords(datasource.profile), ...pageRecords], {limit:40}),
+    records: [...savedClosingEvidence(field, datasource), ...rankSuggestionEvidence(field, [...records, ...profileEvidenceRecords(datasource.profile), ...pageRecords], {limit:40})],
   }, { provider: settings.aiProvider, model: settings.aiModel });
 }
 
@@ -2696,6 +2704,7 @@ function aiEvidenceRevision(run, inspection, datasource) {
     context: run.jobContext || {},
     profile: datasource?.profile || {},
     records: datasource?.answerRecords || [],
+    coverMessages: datasource?.coverMessages || [],
     pageFacts: (inspection?.fields || []).map((field) => aiFieldSnapshot(field)),
   });
 }
@@ -2846,7 +2855,7 @@ async function prepareAi(tabId,snapshot,plannerFields,suggestionFields,allFields
     if(!(await currentAiDestination(tabId,snapshot,field))) {releaseDraftField(draftFieldKey(tabId,snapshot.frameId,field),snapshot.id);continue;}
     await mutateRun(tabId,current=>{if(current.aiOperations?.[snapshot.operationKey]?.id!==snapshot.id)return false;current.aiOperations[key]={status:'pending',workerId:WORKER_ID,id:snapshot.id,cacheKey:snapshot.cacheKey};});
     try {
-      const generated=await callAnswerSuggestions({apiKey,field,page:snapshot.jobContext,records:rankSuggestionEvidence(field,evidence,{limit:40})},{provider,model});
+      const generated=await callAnswerSuggestions({apiKey,field,page:snapshot.jobContext,records:[...savedClosingEvidence(field,datasource),...rankSuggestionEvidence(field,evidence,{limit:40})]},{provider,model});
       if(!(await currentAiDestination(tabId,snapshot,field))) {
         await mutateRun(tabId,current=>{if(current.aiOperations?.[key]?.id!==snapshot.id)return false;current.aiOperations[key].status='interrupted';}); continue;
       }
