@@ -603,6 +603,7 @@ function frameInspectionText(context, inspection) {
   return [
     context.title,
     inspection?.page?.title,
+    inspection?.applicationLabel,
     ...(inspection?.actions || []).map((action) => action.label || ''),
   ].join(' ');
 }

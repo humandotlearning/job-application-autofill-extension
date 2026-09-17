@@ -19,6 +19,27 @@ function makeDocument(html) {
   return new JSDOM(html, { url: 'https://jobs.example.com/apply' }).window.document;
 }
 
+test('application discovery reads only the selected form and its visible dialog heading', () => {
+  const document = makeDocument(`
+    <h1>Apply for other jobs</h1>
+    <div role="dialog" aria-labelledby="application-title">
+      <h3 id="application-title">Apply to Andromeda Surgical</h3>
+      <h3 hidden>Hidden heading</h3>
+      <form><input placeholder="First Name"><input placeholder="Last Name"><button>Send Message</button></form>
+    </div>
+    <div role="dialog" hidden><h3>Other application</h3></div>
+  `);
+  try {
+    assert.match(inspectDocument(document).applicationLabel, /Apply to Andromeda Surgical/);
+    assert.doesNotMatch(inspectDocument(document).applicationLabel, /other jobs|Hidden heading|Other application/);
+    const form = document.querySelector('form');
+    document.body.append(form);
+    assert.equal(inspectDocument(document).applicationLabel, '');
+    form.setAttribute('aria-label', 'Candidate application');
+    assert.equal(inspectDocument(document).applicationLabel, 'Candidate application');
+  } finally { document.defaultView.close(); }
+});
+
 test('an approved stale text decision cannot replace typing', async () => {
   const document = makeDocument('<label>Full name<input id="name"></label>');
   const input = document.querySelector('input');

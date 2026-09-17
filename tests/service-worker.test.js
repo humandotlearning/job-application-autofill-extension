@@ -2854,7 +2854,8 @@ test('application discovery accepts fields despite a search and alerts page titl
   assert.equal(run.status, 'ready_for_user_submit');
 });
 
-test('LLM interprets the YC Send Message form despite an unrelated frame timeout', async () => {
+for (const discoveryMode of ['modal heading without AI', 'AI fallback without a heading']) {
+test(`YC Send Message form fills using ${discoveryMode} despite an unrelated frame timeout`, async () => {
   const {inspectDocument, applyDecisions, validateDocument, clickAction, isFinalApplicationSubmit} = await import('../src/form-engine.js');
   // Reduced from the live YC application modal: placeholder labels, a portal,
   // and a native submit button whose label is "Send Message".
@@ -2862,6 +2863,7 @@ test('LLM interprets the YC Send Message form despite an unrelated frame timeout
     {url: 'https://www.ycombinator.com/companies/vahan/jobs/7zvIddz-lead-ai-engineer'});
   try {
     const document = dom.window.document;
+    if (discoveryMode.startsWith('AI')) document.querySelector('h3').remove();
     let submissions = 0;
     document.addEventListener('submit', event => { submissions++; event.preventDefault(); });
     const answerRecords = [
@@ -2871,7 +2873,7 @@ test('LLM interprets the YC Send Message form despite an unrelated frame timeout
     const harness = createHarness({answerRecords, pagesByTab: {7: {frames: [
       {frameId: 0, pages: [{fields: []}]}, {frameId: 1, pages: [{fields: []}]},
     ]}}});
-    harness.localData.openaiApiKey = 'synthetic-key';
+    harness.localData.openaiApiKey = discoveryMode.startsWith('AI') ? 'synthetic-key' : '';
     const liveInspection = inspectDocument(document);
     const interpretedFields = liveInspection.fields.filter(field => ['first_name', 'last_name', 'email', 'linkedin_url'].includes(field.id))
       .map(field => ({handle: field.handle, meaning: field.id === 'linkedin_url' ? 'linkedin_url' : field.id, question: field.label, required: true}));
@@ -2909,6 +2911,7 @@ test('LLM interprets the YC Send Message form despite an unrelated frame timeout
     assert.equal(harness.tabs.get(7).nextClicks, 0);
   } finally { dom.window.close(); }
 });
+}
 
 test('form screenshot capture follows the default-on preference and explicit opt-out', async () => {
   for (const enabled of [true, false]) {

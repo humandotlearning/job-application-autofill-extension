@@ -1235,6 +1235,15 @@ function inspectDocumentImpl(document) {
   const actions = collectActions(document);
   const fields = collectFieldDescriptors(document);
   const destination = applicationDestination(document);
+  const root = applicationRoot(document);
+  const dialog = composedClosest(root, 'dialog,[role="dialog"]');
+  // Portal dialogs often put the application heading outside the form.
+  // Restrict this hint to the selected region and its dialog, not the whole page.
+  const applicationLabel = [...new Set([root, dialog].filter(node => node?.nodeType === 1))]
+    .filter(isVisible)
+    .flatMap(node => [node.getAttribute('aria-label'), textFromIds(node, node.getAttribute('aria-labelledby')),
+      ...queryAll(node, 'h1,h2,h3,legend').filter(isVisible).map(labelText)])
+    .filter(Boolean).join(' ').slice(0, 1000);
   const {candidates, controls} = applicationRegions(document);
   const view = document.defaultView;
   const regions = candidates.map(region => ({
@@ -1245,6 +1254,7 @@ function inspectDocumentImpl(document) {
     .filter(isVisible).map(visualRect).filter(Boolean);
   return {
     page: extractJobContext(document),
+    applicationLabel,
     fields,
     actions,
     pauseReasons: pauseReasons(document),
