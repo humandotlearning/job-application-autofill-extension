@@ -206,8 +206,8 @@ test('sends one sanitized structured-output request and returns decisions', asyn
   assert.equal(body.text.format.schema.type, 'object');
   const plannerInput = JSON.parse(body.input[1].content[0].text);
   assert.deepEqual(plannerInput.page, { title: 'Senior Engineer Application', domain: 'jobs.example.com' });
-  assert.equal(plannerInput.fields[0].autocomplete, '');
-  assert.deepEqual(plannerInput.fields[0].constraints, {});
+  assert.equal(plannerInput.fields[0].autocomplete, undefined);
+  assert.equal(plannerInput.fields[0].constraints, undefined);
   assert.equal(JSON.stringify(body).includes('test-api-key'), false);
   assert.equal(JSON.stringify(body).includes('<form>secret</form>'), false);
   assert.equal(JSON.stringify(body).includes('<input>'), false);
@@ -249,11 +249,11 @@ test('uses Fireworks chat completions with the default provider and model', asyn
   assert.equal(request.options.headers.Authorization, 'Bearer fireworks-test-key');
   const body = JSON.parse(request.options.body);
   assert.equal(body.model, DEFAULT_FIREWORKS_MODEL);
-  assert.equal(body.max_tokens, 512);
+  assert.equal(body.max_tokens, 4096);
   assert.equal(body.top_k, 40);
   assert.equal(body.response_format.type, 'json_schema');
   assert.deepEqual(body.response_format.json_schema.schema, body.response_format.json_schema.schema);
-  assert.match(body.messages[0].content, /JSON schema/);
+  assert.doesNotMatch(body.messages[0].content, /additionalProperties/);
   assert.match(body.messages[0].content, /evidenceKeys/);
   assert.equal(body.messages[0].role, 'system');
   assert.equal(body.messages[1].role, 'user');
