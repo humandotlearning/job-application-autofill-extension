@@ -533,6 +533,22 @@ test('running guidance follows automatic page advance while final submission sta
   } finally { harness.cleanup(); }
 });
 
+test('visual form context defaults on and persists an explicit opt-out', async () => {
+  const enabled = await setupPanel({localData: {}});
+  try { assert.equal(enabled.dom.window.document.querySelector('#include-form-screenshot').checked, true); }
+  finally { enabled.cleanup(); }
+
+  const disabled = await setupPanel({localData: {includeFormScreenshot: false}});
+  try {
+    const checkbox = disabled.dom.window.document.querySelector('#include-form-screenshot');
+    assert.equal(checkbox.checked, false);
+    checkbox.checked = true;
+    checkbox.dispatchEvent(new disabled.dom.window.Event('change', {bubbles: true}));
+    await panelTick();
+    assert.equal(disabled.localData.includeFormScreenshot, true);
+  } finally { disabled.cleanup(); }
+});
+
 test('panel persists settings, focuses blockers, and saves answers without any submit control', async () => {
   const run = {
     status: 'ready_for_user_submit',

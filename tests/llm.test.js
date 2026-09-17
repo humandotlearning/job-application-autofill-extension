@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { callAnswerPlanner, callAnswerRewriter, callAnswerSuggestions, DEFAULT_FIREWORKS_MODEL, DEFAULT_PROVIDER } from '../src/llm.js';
+import { callAnswerPlanner, callAnswerRewriter, callAnswerSuggestions, callFormInterpreter, DEFAULT_FIREWORKS_MODEL, DEFAULT_PROVIDER } from '../src/llm.js';
 
 function createInput() {
   return {
@@ -53,6 +53,54 @@ function createResponse(payload, ok = true, status = 200, statusText = 'OK') {
     json: async () => payload,
   };
 }
+
+function formSnapshot() {
+  return {frames: [{frameId: 0, inspection: {
+    page: {title: 'Lead AI Engineer at Vahan', domain: 'ycombinator.com'},
+    destination: {documentId: 'doc-1', regionId: 'form-1'},
+    fields: [{handle: 'field-1', label: 'First Name', placeholder: 'First Name *', type: 'text', required: false, currentValue: 'Private Name'}],
+    actions: [{handle: 'action-1', label: 'Send Message', type: 'submit', kind: 'other'}],
+  }}]};
+}
+
+function formResponse(overrides = {}) {
+  return createResponse({output: [{content: [{type: 'output_text', text: JSON.stringify({
+    status: 'ready', frameId: 0, regionId: 'form-1',
+    fields: [{handle: 'field-1', meaning: 'first_name', question: 'First Name', required: true}],
+    actions: [{handle: 'action-1', role: 'final_submit'}], reason: 'Application form', ...overrides,
+  })}]}]});
+}
+
+test('form interpreter sends masked visual context without field values and validates handles', async () => {
+  const calls = [];
+  const result = await callFormInterpreter({apiKey: 'synthetic-key', snapshot: formSnapshot(), screenshot: {dataUrl: 'data:image/jpeg;base64,AA=='}}, {
+    fetchImpl: async (url, options) => { calls.push({url, body: JSON.parse(options.body)}); return formResponse(); },
+  });
+  assert.equal(result.contextMode, 'visual');
+  assert.equal(result.actions[0].role, 'final_submit');
+  const request = JSON.stringify(calls[0].body);
+  assert.match(request, /input_image/);
+  assert.doesNotMatch(request, /Private Name/);
+});
+
+test('form interpreter retries text-only when the provider specifically rejects images', async () => {
+  const bodies = [];
+  const result = await callFormInterpreter({apiKey: 'synthetic-key', snapshot: formSnapshot(), screenshot: {dataUrl: 'data:image/jpeg;base64,AA=='}}, {
+    fetchImpl: async (_url, options) => {
+      bodies.push(JSON.parse(options.body));
+      return bodies.length === 1 ? createResponse({error: {message: 'image input unsupported'}}, false, 400, 'Bad Request') : formResponse();
+    },
+  });
+  assert.equal(result.contextMode, 'text');
+  assert.equal(bodies.length, 2);
+  assert.doesNotMatch(JSON.stringify(bodies[1]), /input_image/);
+});
+
+test('form interpreter rejects invented element handles', async () => {
+  await assert.rejects(() => callFormInterpreter({apiKey: 'synthetic-key', snapshot: formSnapshot()}, {
+    fetchImpl: async () => formResponse({fields: [{handle: 'invented', meaning: 'first_name', question: 'First Name', required: true}]}),
+  }), /invalid field/);
+});
 
 test('planner copy cannot bypass compensation meaning facets', async () => {
   await assert.rejects(callAnswerPlanner({ apiKey: 'synthetic-key', fields: [{ id: 'pay', label: 'Expected salary', type: 'text' }], records: [{ key: 'current_salary', question: 'Current salary', answer: 'Synthetic explanation', sensitivity: 'review' }] }, {

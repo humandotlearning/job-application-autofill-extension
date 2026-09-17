@@ -40,6 +40,7 @@ test('side panel contains the guided workflow, review groups, and settings contr
   assert.match(html, /id="ai-model"/);
   assert.match(html, /accounts\/fireworks\/models\/glm-5p3-flash/);
   assert.match(html, /id="auto-advance-pages"/);
+  assert.match(html, /id="include-form-screenshot"/);
   assert.match(html, /id="export-datasource"/);
   assert.match(html, /id="import-datasource-button"/);
   assert.match(html, /id="import-datasource"/);

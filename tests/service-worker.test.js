@@ -6,6 +6,7 @@ import { JSDOM } from 'jsdom';
 
 function createHarness({
   autoAdvancePages = false,
+  includeFormScreenshot = true,
   waitForAI = true,
   disabledHostnames = [],
   answerRecords = [{ key: 'full_name', question: 'Full name', answer: 'Nithin', aliases: ['Full name'], type: 'text', sensitivity: 'safe', updatedAt: '2025-01-01T00:00:00.000Z' }],
@@ -15,6 +16,7 @@ function createHarness({
   const localData = {
     openaiApiKey: '',
     autoAdvancePages,
+    includeFormScreenshot,
     disabledHostnames: [...disabledHostnames],
     // Fixture profile represents explicitly reviewed facts unless overridden.
     answerRecords: answerRecords.map(record => ({confirmationState:'confirmed',...record})),
@@ -25,6 +27,7 @@ function createHarness({
   const listeners = [];
   const updatedListeners = [];
   const removedListeners = [];
+  let captureCalls = 0;
   const tabs = new Map(Object.entries(pagesByTab).map(([tabId, spec]) => [Number(tabId), {
     currentPage: 0,
     nextClicks: 0,
@@ -84,6 +87,7 @@ function createHarness({
       pauseReasons: page.pauseReasons || [],
       ...(page.destination ? {destination: page.destination} : {}),
       ...(page.discovery ? {discovery: page.discovery} : {}),
+      ...(page.visualContext ? {visualContext: page.visualContext} : {}),
     };
   }
 
@@ -135,7 +139,8 @@ function createHarness({
     },
     tabs: {
       query: async () => [{ id: 7, url: tabs.get(7)?.url }],
-      get: async (tabId) => ({ id: tabId, url: tabs.get(tabId)?.url }),
+      get: async (tabId) => ({ id: tabId, url: tabs.get(tabId)?.url, active: true, windowId: 1 }),
+      captureVisibleTab: async () => { captureCalls += 1; return 'data:image/png;base64,AA=='; },
       sendMessage: async (tabId, message, options = {}) => {
         const state = currentTabState(tabId);
         const frameId = options.frameId ?? 0;
@@ -244,6 +249,7 @@ function createHarness({
     tabs,
     updatedListeners,
     removedListeners,
+    get captureCalls() { return captureCalls; },
     dispatch: async (message, sender = { id: 'test-extension', url: 'chrome-extension://test-extension/sidepanel.html' }) => {
       const response=await new Promise(resolve=>{const handled=listeners[0](message,sender,resolve);if(handled===false)resolve({ok:false,unhandled:true});});
       if(waitForAI && response.run && !['JOB_RUN_STATE','JOB_RUN_VALIDATE_PAGE'].includes(message.type)) {
@@ -2818,6 +2824,26 @@ test('multiple eligible application frames require selection even with unequal s
   assert.equal(harness.tabs.get(7).messages.some(message => message.type === 'JOB_APP_APPLY'), false);
 });
 
+test('LLM can resolve multiple eligible application frames', async () => {
+  const pages = [1, 2].map(frameId => ({frameId, pages: [{
+    destination: {documentId: `doc-${frameId}`, regionId: `form-${frameId}`},
+    discovery: {code: 'ready', controlCount: 1, regionCount: 1},
+    fields: [{id: `name-${frameId}`, handle: `field-${frameId}`, label: 'Full name', type: 'text', required: true}],
+    actions: [{id: `submit-${frameId}`, handle: `action-${frameId}`, label: 'Submit application', kind: 'submit'}],
+  }]}));
+  const harness = createHarness({answerRecords: [{key: 'full_name', question: 'Full name', answer: 'Ada Lovelace', sensitivity: 'safe'}], pagesByTab: {7: {frames: pages}}});
+  harness.localData.openaiApiKey = 'synthetic-key';
+  globalThis.fetch = async () => ({ok: true, status: 200, statusText: 'OK', json: async () => ({output: [{content: [{type: 'output_text', text: JSON.stringify({
+    status: 'ready', frameId: 2, regionId: 'form-2',
+    fields: [{handle: 'field-2', meaning: 'full_name', question: 'Full name', required: true}],
+    actions: [{handle: 'action-2', role: 'final_submit'}], reason: 'The second frame is the application form.',
+  })}]}]})});
+  await import('../src/service-worker.js?llm-frame-choice=' + Date.now());
+  const {run} = await harness.dispatch({type: 'JOB_RUN_START', tabId: 7});
+  assert.equal(run.frame?.frameId, 2);
+  assert.notEqual(run.waitingFor, 'ambiguous_form');
+});
+
 test('application discovery accepts fields despite a search and alerts page title', async () => {
   const harness = createHarness({pagesByTab: {7: {pages: [{page: {title: 'Search jobs and alerts'},
     fields: [{id: 'full_name', label: 'Full name', type: 'text', required: true}],
@@ -2826,6 +2852,85 @@ test('application discovery accepts fields despite a search and alerts page titl
   await import('../src/service-worker.js?search-title=' + Date.now());
   const {run} = await harness.dispatch({type: 'JOB_RUN_START', tabId: 7});
   assert.equal(run.status, 'ready_for_user_submit');
+});
+
+test('LLM interprets the YC Send Message form despite an unrelated frame timeout', async () => {
+  const {inspectDocument, applyDecisions, validateDocument, clickAction, isFinalApplicationSubmit} = await import('../src/form-engine.js');
+  // Reduced from the live YC application modal: placeholder labels, a portal,
+  // and a native submit button whose label is "Send Message".
+  const dom = new JSDOM(await readFile(new URL('./fixtures/ycombinator.html', import.meta.url), 'utf8'),
+    {url: 'https://www.ycombinator.com/companies/vahan/jobs/7zvIddz-lead-ai-engineer'});
+  try {
+    const document = dom.window.document;
+    let submissions = 0;
+    document.addEventListener('submit', event => { submissions++; event.preventDefault(); });
+    const answerRecords = [
+      ['first_name', 'First Name', 'Ada'], ['last_name', 'Last Name', 'Lovelace'],
+      ['email', 'Email Address', 'ada@example.com'], ['linkedin', 'LinkedIn URL', 'https://linkedin.com/in/synthetic'],
+    ].map(([key, question, answer]) => ({key, question, answer, sensitivity: 'safe'}));
+    const harness = createHarness({answerRecords, pagesByTab: {7: {frames: [
+      {frameId: 0, pages: [{fields: []}]}, {frameId: 1, pages: [{fields: []}]},
+    ]}}});
+    harness.localData.openaiApiKey = 'synthetic-key';
+    const liveInspection = inspectDocument(document);
+    const interpretedFields = liveInspection.fields.filter(field => ['first_name', 'last_name', 'email', 'linkedin_url'].includes(field.id))
+      .map(field => ({handle: field.handle, meaning: field.id === 'linkedin_url' ? 'linkedin_url' : field.id, question: field.label, required: true}));
+    const sendMessage = liveInspection.actions.find(action => action.label === 'Send Message');
+    globalThis.fetch = async () => ({ok: true, status: 200, statusText: 'OK', json: async () => ({output: [{content: [{type: 'output_text', text: JSON.stringify({
+      status: 'ready', frameId: 0, regionId: liveInspection.destination.regionId, fields: interpretedFields,
+      actions: [{handle: sendMessage.handle, role: 'final_submit'}], reason: 'Application dialog with applicant fields.',
+    })}]}]})});
+    const send = chrome.tabs.sendMessage;
+    chrome.tabs.sendMessage = async (tabId, message, options) => {
+      if (message.type === 'JOB_APP_INSPECT') return {ok: true, inspection: options.frameId === 0
+        ? inspectDocument(document)
+        : {page: {title: 'hCaptcha'}, fields: [], actions: [], pauseReasons: [], discovery: {code: 'loading_timeout'}}};
+      if (message.type === 'JOB_APP_APPLY') {
+        assert.equal(options.frameId, 0);
+        return {ok: true, result: await applyDecisions(document, message.decisions)};
+      }
+      if (message.type === 'JOB_APP_VALIDATE') return {ok: true, validation: validateDocument(document)};
+      return send(tabId, message, options);
+    };
+    await import('../src/service-worker.js?yc-send-message=' + Date.now());
+    const {run} = await harness.dispatch({type: 'JOB_RUN_START', tabId: 7});
+    assert.equal(run.frame?.frameId, 0, `Expected application frame; got ${run.waitingFor}`);
+    for (const record of answerRecords) {
+      const id = record.key === 'linkedin' ? 'linkedin_url' : record.key;
+      assert.equal(document.getElementById(id).value, record.answer);
+    }
+    const submit = inspectDocument(document).actions.find(action => action.label === 'Send Message');
+    assert.equal(submit.kind, 'other');
+    assert.equal(clickAction(document, submit.id).ok, false);
+    assert.equal(isFinalApplicationSubmit(document, {target: document.querySelector('form'), submitter: document.querySelector('[type="submit"]')}), false);
+    assert.equal(document.querySelector('[type="file"]').value, '');
+    assert.equal(document.querySelector('[name="h-captcha-response"]').value, '');
+    assert.equal(submissions, 0);
+    assert.equal(harness.tabs.get(7).nextClicks, 0);
+  } finally { dom.window.close(); }
+});
+
+test('form screenshot capture follows the default-on preference and explicit opt-out', async () => {
+  for (const enabled of [true, false]) {
+    const page = {
+      page: {title: 'Lead AI Engineer at Vahan', domain: 'ycombinator.com'},
+      destination: {documentId: `doc-${enabled}`, regionId: 'form-1'},
+      discovery: {code: 'ready', regionCount: 1, controlCount: 1},
+      fields: [{id: 'first_name', handle: 'field-1', label: 'First Name', type: 'text', required: true}],
+      actions: [{id: 'action_0', handle: 'action-1', label: 'Send Message', type: 'submit', kind: 'other'}],
+      visualContext: {viewport: {width: 1000, height: 800}, regions: [{regionId: 'form-1', rect: {x: 100, y: 50, width: 400, height: 500}}], redactions: []},
+    };
+    const harness = createHarness({includeFormScreenshot: enabled, answerRecords: [{key: 'first_name', question: 'First Name', answer: 'Ada', sensitivity: 'safe'}], pagesByTab: {7: {pages: [page]}}});
+    harness.localData.openaiApiKey = 'synthetic-key';
+    globalThis.fetch = async () => ({ok: true, status: 200, statusText: 'OK', json: async () => ({output: [{content: [{type: 'output_text', text: JSON.stringify({
+      status: 'ready', frameId: 0, regionId: 'form-1', fields: [{handle: 'field-1', meaning: 'first_name', question: 'First Name', required: true}],
+      actions: [{handle: 'action-1', role: 'final_submit'}], reason: 'Application form',
+    })}]}]})});
+    await import(`../src/service-worker.js?screenshot-setting=${enabled}-${Date.now()}`);
+    const response = await harness.dispatch({type: 'JOB_RUN_START', tabId: 7});
+    assert.equal(response.run.status, 'ready_for_user_submit');
+    assert.equal(harness.captureCalls, enabled ? 1 : 0);
+  }
 });
 
 test('writes carry document and region authority and are not replayed after transport failure', async () => {
