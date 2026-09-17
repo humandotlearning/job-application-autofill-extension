@@ -5,6 +5,7 @@ const elements = {
   openaiApiKey: byId('openai-api-key'),
   apiKey: byId('openai-api-key'),
   apiModel: byId('ai-model'),
+  includeFormScreenshot: byId('include-form-screenshot'),
   autoAdvance: byId('auto-advance-pages'),
   employerName: byId('employer-name'),
   relatedDefault: byId('related-default'),
@@ -1188,7 +1189,7 @@ function renderRun(run) {
     : ['page_ready', 'ready_for_user_submit'].includes(run.status) ? 'This page is filled'
     : 'Current application';
   elements.runSummary.textContent = run.frame === null ? 'Choose or rescan the application form.'
-    : `${audit.length} filled value${audit.length === 1 ? '' : 's'}${reviewRequired.length ? ` · ${reviewRequired.length} to review` : ''}`;
+    : `${audit.length} filled value${audit.length === 1 ? '' : 's'}${reviewRequired.length ? ` · ${reviewRequired.length} to review` : ''}${run.frame?.interpretationMode ? ` · AI ${run.frame.interpretationMode} context` : ''}`;
   const failedAi = Object.values(run.aiOperations || {}).some((operation) => ['failed', 'interrupted'].includes(operation?.status || operation));
   elements.retryAi.hidden = !failedAi && !run.llmError;
   elements.employmentChoices.replaceChildren();
@@ -1368,7 +1369,7 @@ async function refresh() {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
   activeTabId = tab?.id || null;
   await refreshSiteState();
-  const stored = await chrome.storage.local.get({ answerRecords: [], openaiApiKey: '', fireworksApiKey: '', aiProvider: '', aiModel: '', openaiModel: 'gpt-5.6-terra', autoAdvancePages: false });
+  const stored = await chrome.storage.local.get({ answerRecords: [], openaiApiKey: '', fireworksApiKey: '', aiProvider: '', aiModel: '', openaiModel: 'gpt-5.6-terra', includeFormScreenshot: true, autoAdvancePages: false });
   const provider = stored.aiProvider === 'openai' || stored.aiProvider === 'fireworks'
     ? stored.aiProvider
     : (stored.openaiApiKey ? 'openai' : 'fireworks');
@@ -1378,6 +1379,7 @@ async function refresh() {
   elements.fireworksApiKey.value = stored.fireworksApiKey || '';
   elements.openaiApiKey.value = stored.openaiApiKey || '';
   elements.apiModel.value = stored.aiModel || (provider === 'openai' ? stored.openaiModel : '') || defaultModel;
+  elements.includeFormScreenshot.checked = stored.includeFormScreenshot !== false;
   elements.autoAdvance.checked = Boolean(stored.autoAdvancePages);
   updateDatasourceSummary({ answerCount: stored.answerRecords.length });
   const datasourceResponse = await chrome.runtime.sendMessage({ type: 'JOB_DATASOURCE_STATE' });
@@ -1455,6 +1457,11 @@ async function saveSettings() {
   setStatus(elements.autoAdvance.checked ? 'Automatic page advance enabled.' : 'Automatic page advance disabled.');
 }
 
+async function saveScreenshotSetting() {
+  await chrome.storage.local.set({ includeFormScreenshot: Boolean(elements.includeFormScreenshot.checked) });
+  setStatus(elements.includeFormScreenshot.checked ? 'Visual form context enabled.' : 'Using text form context only.');
+}
+
 async function saveProfile(changedField) {
   try {
     const company = elements.employerName.value.trim() || 'DeepSight AI Labs';
@@ -1487,6 +1494,7 @@ elements.provider.addEventListener('change', saveProvider);
 elements.apiModel.addEventListener('change', saveModel);
 elements.apiModel.addEventListener('blur', saveModel);
 elements.autoAdvance.addEventListener('change', saveSettings);
+elements.includeFormScreenshot.addEventListener('change', saveScreenshotSetting);
 for (const [field, key] of [[elements.employerName, 'employerName'], [elements.relatedDefault, 'relatedToHiringCompany'], [elements.knownDefault, 'knownAtHiringCompany'], [elements.phoneDeviceDefault, 'phoneDeviceType']]) field.addEventListener('change', () => saveProfile(key));
 elements.exportDatasource.addEventListener('click', exportDatasource);
 elements.importDatasourceButton.addEventListener('click', () => elements.importDatasource.click());
@@ -1534,6 +1542,7 @@ chrome.storage.onChanged.addListener((changes, area) => {
     elements.autoAdvance.checked = Boolean(changes.autoAdvancePages.newValue);
     if (currentRun?.status === 'running') renderRun(currentRun);
   }
+  if (area === 'local' && changes.includeFormScreenshot) elements.includeFormScreenshot.checked = changes.includeFormScreenshot.newValue !== false;
   if (area === 'local' && changes.disabledHostnames) refreshSiteState().catch(error => setStatus(error.message, 'error'));
   if (area === 'session' && changes.applicationRun && activeTabId) renderRun(changes.applicationRun.newValue?.[String(activeTabId)] || null);
   if (area === 'session' && changes.inlineFieldSessions) loadInlineField().catch(error => setStatus(error.message, 'error'));

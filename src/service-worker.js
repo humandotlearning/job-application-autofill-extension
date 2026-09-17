@@ -1,6 +1,7 @@
 import { retrieveEvidence, savedFieldCandidates, searchEvidence, selectPlannerEvidence, rankSuggestionEvidence } from './retrieval.js';
 import { inferSensitivity, isOpaqueIdentifier, validateFillValue, meaningCompatible, suggestionTargetKey } from './core.js';
-import { callAnswerPlanner, callAnswerRewriter, callAnswerSuggestions, DEFAULT_FIREWORKS_MODEL, DEFAULT_OPENAI_MODEL, DEFAULT_PROVIDER } from './llm.js';
+import { callAnswerPlanner, callAnswerRewriter, callAnswerSuggestions, callFormInterpreter, DEFAULT_FIREWORKS_MODEL, DEFAULT_OPENAI_MODEL, DEFAULT_PROVIDER } from './llm.js';
+import { prepareFormScreenshot } from './form-screenshot.js';
 import { upsertAnswerRecords, mergeLearnedAnswers, normalizeAnswerRecord } from './core.js';
 import {
   createDatasourceState,
@@ -45,6 +46,8 @@ const UTILITY_FRAME_PATTERN = /\b(?:search|cookie|job[\s-]?alerts?|talent[\s-]?c
 const NO_APPLICATION_FRAME_REASON = 'No supported application controls were found. Retry the scan after the form loads, or complete inaccessible controls manually.';
 const AMBIGUOUS_APPLICATION_FRAME_REASON = 'More than one application form was found. Click Select form, then click a field in the form you want to fill.';
 const formSelections = new Map();
+const formInterpretationCache = new Map();
+const activeFormInterpretations = new Map();
 const FORM_SELECTION_TTL_MS = 60_000;
 const DISCOVERY_REASONS = {
   no_supported_controls: NO_APPLICATION_FRAME_REASON,
@@ -411,7 +414,7 @@ async function getCoverMessages() {
 }
 
 async function getSettings() {
-  const stored = await chrome.storage.local.get({ autoAdvancePages: false, aiProvider: '', aiModel: '', openaiModel: '', openaiApiKey: '', fireworksApiKey: '' });
+  const stored = await chrome.storage.local.get({ autoAdvancePages: false, includeFormScreenshot: true, aiProvider: '', aiModel: '', openaiModel: '', openaiApiKey: '', fireworksApiKey: '' });
   const aiProvider = stored.aiProvider === 'openai' || stored.aiProvider === 'fireworks'
     ? stored.aiProvider
     : (String(stored.openaiApiKey || '').trim() ? 'openai' : DEFAULT_PROVIDER);
@@ -419,6 +422,7 @@ async function getSettings() {
   const aiModel = String(stored.aiModel || (aiProvider === 'openai' ? stored.openaiModel : '') || fallbackModel).trim() || fallbackModel;
   return {
     autoAdvancePages: Boolean(stored.autoAdvancePages),
+    includeFormScreenshot: stored.includeFormScreenshot !== false,
     aiProvider,
     aiModel,
     openaiModel: aiModel,
@@ -620,6 +624,83 @@ function scoreApplicationFrame(context, inspection, selectedDestination = null) 
   return {eligible};
 }
 
+function interpretationSignature(tabId, inspected, settings) {
+  return JSON.stringify({
+    tabId, provider: settings.aiProvider, model: settings.aiModel, image: settings.includeFormScreenshot,
+    frames: inspected.filter(item => item.inspection).map(item => ({
+      frameId: item.frameId, destination: item.inspection.destination,
+      fields: item.inspection.fields.map(field => [field.handle, field.label, field.placeholder, field.type, field.required, field.options]),
+      actions: item.inspection.actions.map(action => [action.handle, action.label, action.type]),
+    })),
+  });
+}
+
+async function formScreenshot(tabId, inspected, enabled) {
+  if (!enabled || typeof chrome.tabs.captureVisibleTab !== 'function') return null;
+  const top = inspected.find(item => item.frameId === 0)?.inspection?.visualContext;
+  if (!top?.regions?.length) return null;
+  try {
+    const before = await chrome.tabs.get(tabId);
+    if (!before?.active || !Number.isInteger(before.windowId)) return null;
+    const dataUrl = await chrome.tabs.captureVisibleTab(before.windowId, {format: 'png'});
+    const after = await chrome.tabs.get(tabId);
+    if (!after?.active || after.windowId !== before.windowId || after.url !== before.url) return null;
+    return await prepareFormScreenshot({dataUrl, ...top});
+  } catch { return null; }
+}
+
+function interpretInspection(inspection, interpretation) {
+  const fieldMeanings = new Map(interpretation.fields.map(field => [field.handle, field]));
+  const actionRoles = new Map(interpretation.actions.map(action => [action.handle, action.role]));
+  return {
+    ...inspection,
+    fields: inspection.fields.map(field => {
+      const meaning = fieldMeanings.get(field.handle);
+      return meaning ? {...field, label: meaning.question || field.label, labelSource: 'ai-interpretation', labelConfidence: 'high',
+        canonicalKey: meaning.meaning || field.canonicalKey, required: Boolean(field.required || meaning.required)} : field;
+    }),
+    actions: inspection.actions.map(action => {
+      const role = actionRoles.get(action.handle);
+      return role ? {...action, kind: role === 'next' ? 'next' : role === 'final_submit' ? 'submit' : 'other'} : action;
+    }),
+    interpretation: {mode: interpretation.contextMode, reason: interpretation.reason},
+    formInterpretation: interpretation,
+  };
+}
+
+function applyFormInterpretation(item, interpretation) {
+  const inspection = interpretInspection(item.inspection, interpretation);
+  return {...item, inspection, ...scoreApplicationFrame(item, inspection)};
+}
+
+async function interpretApplicationFrames(tabId, inspected) {
+  const frames = inspected.filter(item => item.inspection?.fields?.length);
+  if (!frames.length) return null;
+  const settings = await getSettings();
+  const apiKey = await getApiKey(settings.aiProvider);
+  if (!apiKey) return null;
+  const signature = interpretationSignature(tabId, frames, settings);
+  let interpretation = formInterpretationCache.get(signature);
+  if (!interpretation) {
+    const screenshot = await formScreenshot(tabId, frames, settings.includeFormScreenshot);
+    interpretation = await callFormInterpreter({apiKey, snapshot: {frames}, screenshot}, {provider: settings.aiProvider, model: settings.aiModel});
+    if (interpretation.status === 'ready') formInterpretationCache.set(signature, interpretation);
+  }
+  if (interpretation.status !== 'ready') return null;
+  const currentSettings = await getSettings();
+  if (currentSettings.aiProvider !== settings.aiProvider || currentSettings.aiModel !== settings.aiModel
+    || currentSettings.includeFormScreenshot !== settings.includeFormScreenshot) return null;
+  let selected = frames.find(item => item.frameId === interpretation.frameId);
+  if (!selected) return null;
+  const refreshed = await sendToFrame(tabId, selected.frameId, {type: 'JOB_APP_INSPECT'});
+  if (!refreshed?.ok || !refreshed.inspection) return null;
+  const freshItem = {...selected, inspection: refreshed.inspection};
+  if (interpretationSignature(tabId, [selected], settings) !== interpretationSignature(tabId, [freshItem], settings)) return null;
+  selected = freshItem;
+  const interpreted = selected ? applyFormInterpretation(selected, interpretation) : null;
+  return interpreted?.eligible ? interpreted : null;
+}
+
 function discoveryFailure(errorCode, diagnostics = []) {
   return { errorCode, reason: DISCOVERY_REASONS[errorCode] || DISCOVERY_REASONS.inspection_error, diagnostics };
 }
@@ -697,11 +778,18 @@ async function discoverApplicationFrame(tabId, assertAuthority = null, selectedD
       && item.inspection?.destination?.documentId === selectedDestination.documentId
       && item.inspection?.destination?.regionId === selectedDestination.regionId);
     if (candidates.length !== 1) return discoveryFailure('destination_changed', diagnostics);
-  } else if (candidates.length > 1 || inspected.some(item => item.inspection?.discovery?.code === 'ambiguous_form')) {
-    return discoveryFailure('ambiguous_form', diagnostics);
+  } else if (candidates.length !== 1 || inspected.some(item => item.inspection?.discovery?.code === 'ambiguous_form')) {
+    let interpreted = null;
+    try {
+      interpreted = await interpretApplicationFrames(tabId, inspected);
+      if (interpreted) candidates = [interpreted];
+    } catch { /* deterministic discovery and manual selection remain available */ }
+    if (!interpreted && (candidates.length > 1 || inspected.some(item => item.inspection?.discovery?.code === 'ambiguous_form'))) return discoveryFailure('ambiguous_form', diagnostics);
   }
   if (!candidates.length) {
-    const code = ['loading_timeout', 'inspection_error', 'script_unavailable'].find(code => diagnostics.some(item => item.code === code)) || 'no_supported_controls';
+    const controls = diagnostics.filter(item => item.controlCount > 0);
+    const relevant = controls.length ? controls : diagnostics;
+    const code = ['loading_timeout', 'inspection_error', 'script_unavailable'].find(code => relevant.some(item => item.code === code)) || 'no_supported_controls';
     return discoveryFailure(code, diagnostics);
   }
   const selected = candidates[0];
@@ -713,14 +801,17 @@ function selectedFrame(run) {
   return run.frame.frameId;
 }
 
-function updateSelectedFrame(run, discovery) {
+function updateSelectedFrame(tabId, run, discovery) {
   run.frame = {
     frameId: discovery.frameId,
     title: discovery.context.title,
     pathname: discovery.context.pathname,
     domain: discovery.inspection?.page?.domain || '',
     destination: discovery.inspection?.destination || null,
+    interpretationMode: discovery.inspection?.interpretation?.mode || null,
   };
+  if (discovery.inspection?.formInterpretation) activeFormInterpretations.set(tabId, discovery.inspection.formInterpretation);
+  else activeFormInterpretations.delete(tabId);
   // Keep this alias for panel versions that predate the nested frame shape.
   run.frameId = discovery.frameId;
   run.discoveryDiagnostics = discovery.diagnostics || [];
@@ -1089,7 +1180,8 @@ async function applyPageDecisions(tabId, run, inspection, records, coverMessages
     appliedReviews.push(...(localResult.result?.reviewRequired || []));
     unresolvedResults.push(...(localResult.result?.unresolved || []));
     const refreshed = await sendToApplicationFrame(tabId, run, { type: 'JOB_APP_INSPECT' });
-    currentInspection = refreshed.inspection;
+    const interpretation = activeFormInterpretations.get(tabId);
+    currentInspection = interpretation ? interpretInspection(refreshed.inspection, interpretation) : refreshed.inspection;
     const after = JSON.stringify(currentInspection.fields.map(field => [field.id, field.handle, field.currentValue, field.options]));
     if (after === before) break;
   }
@@ -1860,7 +1952,7 @@ async function processPage(tabId, { autoAdvance, selectedDestination = null } = 
     ]);
     const discovery = await discoverApplicationFrame(tabId, () => assertRunSiteAuthority(tabId, run), selectedDestination || run.selectedDestination);
     if (discovery.errorCode) return await saveRun(pauseForFrame(run, discovery));
-    updateSelectedFrame(run, discovery);
+    updateSelectedFrame(tabId, run, discovery);
     await assertTabSiteEnabled(tabId, run.siteRevision);
     const processed = await applyPageDecisions(
       tabId,
@@ -2017,7 +2109,7 @@ async function focusRunField(tabId, fieldId) {
   if (!Number.isInteger(run.frame?.frameId)) return {ok: false, error: 'Select an application form before focusing a field.', run};
   const discovery = await discoverApplicationFrame(tabId, () => assertRunSiteAuthority(tabId, run), run.frame?.destination ? {...run.frame.destination, frameId: run.frame.frameId} : run.selectedDestination);
   if (discovery.errorCode) return { ok: false, run: await saveRun(pauseForFrame(run, discovery)) };
-  updateSelectedFrame(run, discovery);
+  updateSelectedFrame(tabId, run, discovery);
   try {
     const focused = await sendToApplicationFrame(tabId, run, { type: 'JOB_APP_FOCUS', fieldId });
     return { ok: Boolean(focused?.ok), run: await saveRun(run) };
@@ -2083,7 +2175,7 @@ async function saveAnswers(tabId) {
     }
     const discovery = await discoverApplicationFrame(tabId, () => assertRunSiteAuthority(tabId, run), run.frame?.destination ? {...run.frame.destination, frameId: run.frame.frameId} : run.selectedDestination);
     if (discovery.errorCode) return { ok: false, error: discovery.reason, run: await saveRun(pauseForFrame(run, discovery)) };
-    updateSelectedFrame(run, discovery);
+    updateSelectedFrame(tabId, run, discovery);
     const inspection = discovery.inspection;
     const captured = await sendToApplicationFrame(tabId, run, { type: 'JOB_APP_CAPTURE' });
     if (!captured?.ok) throw new Error(captured?.error || 'Could not read the current form values.');
@@ -2239,7 +2331,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         if (run.frame.pathname && url.pathname !== run.frame.pathname) {
           const discovery = await discoverApplicationFrame(tabId, () => assertRunSiteAuthority(tabId, run), run.frame?.destination ? {...run.frame.destination, frameId: run.frame.frameId} : run.selectedDestination);
           if (discovery.errorCode || discovery.frameId !== (sender.frameId ?? 0) || discovery.context.pathname !== url.pathname) return { ok: false };
-          updateSelectedFrame(run, discovery);
+          updateSelectedFrame(tabId, run, discovery);
           if (run.lastAction !== 'next') {
             run.status = 'waiting_user';
             run.waitingFor = 'page_changed';
@@ -2403,6 +2495,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 });
 
 chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
+  if (changeInfo.url || changeInfo.status === 'loading') activeFormInterpretations.delete(tabId);
+  if (changeInfo.url || changeInfo.status === 'loading') for (const key of formInterpretationCache.keys()) if (key.includes(`\"tabId\":${tabId},`)) formInterpretationCache.delete(key);
   if (changeInfo.url || changeInfo.status === 'loading') cancelFormSelection(tabId).catch(() => {});
   if (changeInfo.url || ['loading', 'complete'].includes(changeInfo.status)) invalidateInlineSessions(tabId).catch(() => {});
   if (changeInfo.status !== 'complete') return;
@@ -2420,6 +2514,8 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
 });
 
 chrome.tabs.onRemoved.addListener((tabId) => {
+  activeFormInterpretations.delete(tabId);
+  for (const key of formInterpretationCache.keys()) if (key.includes(`\"tabId\":${tabId},`)) formInterpretationCache.delete(key);
   formSelections.delete(tabId);
   invalidateInlineSessions(tabId).catch(() => {});
   removeRun(tabId).catch(() => {});
@@ -2429,9 +2525,10 @@ chrome.tabs.onRemoved.addListener((tabId) => {
 chrome.runtime.onInstalled.addListener(async () => {
   await chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true });
   await chrome.storage.session.clear();
-  const settings = await chrome.storage.local.get({ autoAdvancePages: false, [SITE_SETTINGS_KEY]: [] });
+  const settings = await chrome.storage.local.get({ autoAdvancePages: false, includeFormScreenshot: true, [SITE_SETTINGS_KEY]: [] });
   await chrome.storage.local.set({
     autoAdvancePages: Boolean(settings.autoAdvancePages),
+    includeFormScreenshot: settings.includeFormScreenshot !== false,
     [SITE_SETTINGS_KEY]: normalizeHostnames(settings[SITE_SETTINGS_KEY]),
   });
   let datasourceReady = false;

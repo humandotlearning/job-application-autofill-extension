@@ -240,8 +240,10 @@ function questionMetadata(document, element) {
   }
   const explicit = cleanLabelString(native || element.getAttribute('aria-label') || textFromIds(element, element.getAttribute('aria-labelledby')));
   const nearby = !explicit && nearbyQuestion(element);
-  return { label: explicit || nearby || element.getAttribute('placeholder') || element.name || element.id || '',
-    labelSource: explicit ? 'explicit' : nearby ? 'nearby-question' : 'identity', labelConfidence: explicit || nearby ? 'high' : 'low' };
+  const placeholder = cleanLabelString(element.getAttribute('placeholder'));
+  return { label: explicit || nearby || placeholder || element.name || element.id || '',
+    labelSource: explicit ? 'explicit' : nearby ? 'nearby-question' : placeholder ? 'placeholder' : 'identity',
+    labelConfidence: explicit || nearby || (placeholder && !isOpaqueIdentifier(placeholder)) ? 'high' : 'low' };
 }
 
 function labelFor(document, element) {
@@ -288,6 +290,12 @@ function isVisibleUncached(element) {
     if (computed && (computed.display === 'none' || computed.visibility === 'hidden' || computed.contentVisibility === 'hidden')) return false;
   }
   return true;
+}
+
+function visualRect(element) {
+  const rect = element?.getBoundingClientRect?.();
+  if (!rect || ![rect.x, rect.y, rect.width, rect.height].every(Number.isFinite) || rect.width <= 0 || rect.height <= 0) return null;
+  return {x: rect.x, y: rect.y, width: rect.width, height: rect.height};
 }
 
 function hasNativeFormAction(element) {
@@ -1171,7 +1179,7 @@ function collectActions(document) {
     if (!label) continue;
     const type = String(element.type || '').toLowerCase();
     const kind = actionKind(element, label);
-    actions.push({ id: `action_${actions.length}`, label, kind, type: type || element.tagName.toLowerCase() });
+    actions.push({ id: `action_${actions.length}`, handle: controlHandle(element), label, kind, type: type || element.tagName.toLowerCase() });
   }
   return actions;
 }
@@ -1228,12 +1236,24 @@ function inspectDocumentImpl(document) {
   const fields = collectFieldDescriptors(document);
   const destination = applicationDestination(document);
   const {candidates, controls} = applicationRegions(document);
+  const view = document.defaultView;
+  const regions = candidates.map(region => ({
+    regionId: region === document ? 'document' : controlHandle(region),
+    rect: visualRect(region === document ? document.documentElement : region),
+  })).filter(region => region.rect);
+  const redactions = queryAll(document, 'input,textarea,select,[contenteditable="true"],iframe')
+    .filter(isVisible).map(visualRect).filter(Boolean);
   return {
     page: extractJobContext(document),
     fields,
     actions,
     pauseReasons: pauseReasons(document),
     destination,
+    visualContext: {
+      viewport: {width: Number(view?.innerWidth) || 0, height: Number(view?.innerHeight) || 0},
+      regions,
+      redactions,
+    },
     discovery: {code: !destination.regionId ? 'ambiguous_form' : fields.length ? 'ready' : 'no_supported_controls',
       regionCount: candidates.length, controlCount: controls.length,
       shadowRootCount: withDomSnapshot(document, index => index.roots.length - 1), elapsedMs: Date.now() - started},
