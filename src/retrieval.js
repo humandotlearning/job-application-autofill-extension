@@ -1,6 +1,7 @@
 import { canonicalConcept, chooseRecord, inferSensitivity, isOpaqueIdentifier, meaningCompatible, normalizeText, recordScopeCompatible, suggestionTargetKey } from './core.js';
 
 const EXPERIENCE_TAGS = {
+  accomplishments: /\b(impressive|accomplishments?|proud|achievements?)\b/,
   ml: /\b(ml|machine learning|models?|computer vision)\b/,
   ai: /\b(ai|artificial intelligence)\b/,
   agents: /\b(llm|agents?|large language)\b/,
@@ -33,6 +34,7 @@ function rankEvidence(field, records = [], { limit = 40 } = {}) {
   return records.flatMap(record => {
     if (record.semantic?.reusePolicy === 'never' || record.reusePolicy === 'never') return [];
     if (isOpaqueIdentifier(record.answer) || isOpaqueIdentifier(record.question) || isOpaqueIdentifier(record.key)
+      || /^[\w-]+\[/.test(String(record.question || ''))
       || !recordScopeCompatible(field, record) || !meaningCompatible(field, record, { numericReview: false }) || !String(record.answer || '').trim()) return [];
     if (targetKey && record.suppressedFor?.includes(targetKey)) return [];
     const exact = chooseRecord(field, [record]);
@@ -44,10 +46,10 @@ function rankEvidence(field, records = [], { limit = 40 } = {}) {
       && field.options.some((option) => typeof option === 'string' && option.trim() && !isOpaqueIdentifier(option));
     const choiceMapping = choiceField && visibleOptions && !equivalent && !reviewEquivalent && Number(exact?.score || 0) >= 0.6;
     const text = normalizeText(`${record.question} ${(record.aliases || []).join(' ')} ${String(record.answer).slice(0, 4000)}`);
-    const overlap = tags.length ? tags.filter(tag => EXPERIENCE_TAGS[tag].test(text)) : narrativeOverlap(field, record);
+    const overlap = tags.length ? tags.filter(tag => EXPERIENCE_TAGS[tag].test(tag === 'accomplishments' ? normalizeText(record.question) : text)) : narrativeOverlap(field, record);
     if (!equivalent && !reviewEquivalent && !fuzzyEquivalent && !choiceMapping && ((record.confirmationState && record.confirmationState !== 'confirmed') || record.sensitivity === 'legal' || inferSensitivity(record.question) !== 'safe'
       || /\b(no|not|never|without|lack)\b/.test(normalizeText(record.answer)) || record.answer.trim().split(/\s+/).length < 5
-      || /why.*(?:join|company|work)|motivat/.test(normalizeText(record.question))
+      || /why.*(?:join|company|work|role)|motivat|what interests you|why are you interested/.test(normalizeText(record.question))
       || !overlap.length || (tags.length > 0 && overlap.length !== tags.length))) return [];
     return [{ sourceKey: record.key, sourceId: record.id || record.key, sourceQuestion: record.question, answer: record.answer, excerpt: record.answer.slice(0, 400), provenance: record.provenance || 'saved record', kind: equivalent ? 'equivalent' : reviewEquivalent ? 'review' : choiceMapping ? 'choice_mapping' : fuzzyEquivalent ? 'review' : 'related', requiresApproval: true,
       reason: !record.confirmationState ? 'Unconfirmed saved evidence — explicit approval required' : equivalent ? 'Saved answer requires confirmation' : reviewEquivalent ? 'Saved answer has units/context to review; no conversion performed' : choiceMapping ? 'Saved answer may support a visible option mapping; explicit approval required' : `Related saved evidence: ${overlap.join(', ')}; not an asserted qualification`, score: equivalent ? 100 : fuzzyEquivalent ? Math.round(exact.score * 100) : choiceMapping ? Math.round((exact?.score || 0) * 100) : overlap.length }];
@@ -92,7 +94,22 @@ function isSafeNarrativeEvidence(field, record, targetKey) {
 }
 
 export function selectPlannerEvidence(fields = [], records = [], { limit = 20 } = {}) {
-  const queues = fields.map(field => rankSuggestionEvidence(field, records, { limit }));
+  // Planning reuses answers; narrative drafting has a separate, broader pool.
+  const queues = fields.map(field => {
+    const matches = rankEvidence(field, records, { limit: records.length });
+    const keys = new Set(matches.map(item => item.sourceKey));
+    const name = ['full_name', 'generic_name'].includes(canonicalConcept(field.label));
+    const seen = new Set();
+    return records.filter(record => keys.has(record.key) || (name && recordScopeCompatible(field, record)
+      && ['full_name', 'generic_name', 'first_name', 'last_name'].includes(canonicalConcept(record.concept || record.question || record.key))))
+      .sort((a, b) => (matches.find(item => item.sourceKey === b.key)?.score || 0) - (matches.find(item => item.sourceKey === a.key)?.score || 0))
+      .filter(record => {
+        const identity = JSON.stringify([canonicalConcept(record.question || record.key), record.answer, record.sensitivity, record.entityId, record.entityType, record.context]);
+        if (seen.has(identity)) return false;
+        seen.add(identity);
+        return true;
+      }).slice(0, limit);
+  });
   const selected = [], seen = new Set();
   for (let depth = 0; selected.length < limit && queues.some(queue => depth < queue.length); depth++) {
     for (const queue of queues) {

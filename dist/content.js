@@ -488,6 +488,7 @@ function mergeLearnedAnswers(existing = [], incoming = [], now = new Date().toIS
     } else if (changed) {
       result = result.map((record) => record.key === next.key ? {
         ...record,
+        changeReviewedAt: undefined,
         pendingAnswer: next.answer,
         confirmationState: 'pending',
         alternatives: uniqueStrings([...(record.alternatives || []), next.answer]),
