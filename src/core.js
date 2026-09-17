@@ -321,7 +321,8 @@ export function validateFillValue(field = {}, value) {
   if (isOpaqueIdentifier(text)) return { ok: false, reason: 'value is an opaque internal identifier' };
   const constraints = field.constraints || {};
   if (Array.isArray(field.options) && field.options.length) {
-    const values = field.multiple ? text.split(/\s*[,;]\s*/) : [text];
+    const exactOption = field.options.some(option => normalizeText(option) === normalizeText(text));
+    const values = field.multiple && !exactOption ? text.split(/\s*[,;]\s*/) : [text];
     if (!values.every((value) => field.options.some((option) => normalizeText(option) === normalizeText(value)))) {
       return { ok: false, reason: 'value is not one of the available options' };
     }

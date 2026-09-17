@@ -187,7 +187,7 @@ function cleanLabelString(value) {
   // name. Keep the question and leave the menu entries in structured options.
   const phoneMenu = /^((?:phone|mobile|telephone)(?:\s+number)?)\s*[*:]?\s*Afghanistan\b.*\+93\s*Albania\b.*\+355/i.exec(text);
   if (phoneMenu) return phoneMenu[1];
-  return text.replace(/\s*\*+\s*$/, '').trim();
+  return text.replace(/\s*[*✱]+\s*$/, '').trim();
 }
 
 function labelText(label) {
@@ -213,7 +213,8 @@ function nearbyQuestion(element) {
   for (let wrapper = composedParent(element), depth = 0; wrapper && depth < 6; wrapper = composedParent(wrapper), depth++) {
     if (wrapper.matches('form,section,main,body')) break;
     const peers = [...queryAll(wrapper, controls)].filter(isVisible);
-    if (peers.some(peer => peer !== element && !(element.type === 'radio' && peer.type === 'radio' && peer.name === element.name))) break;
+    if (peers.some(peer => peer !== element && !(['radio', 'checkbox'].includes(element.type) && peer.type === element.type
+      && element.name && peer.name === element.name && peer.form === element.form))) break;
     const candidates = [...queryAll(wrapper, '.application-label .text,h3,h4,[role="heading"],legend,label')]
       .filter(node => isVisible(node) && !node.contains(element) && !node.querySelector(controls)
         && !node.matches('[for]') && !node.closest('[role="alert"],.error,.help,.hint')
@@ -227,6 +228,14 @@ function nearbyQuestion(element) {
 
 function questionMetadata(document, element) {
   const native = [...(element.labels || [])].map(labelText).filter(Boolean).join(' ');
+  if (checkboxGroup(document, element).length > 1) {
+    const container = checkboxContainer(element);
+    const heading = container?.querySelector(':scope > legend,.application-label');
+    const question = container && (textFromIds(container, container.getAttribute('aria-labelledby'))
+      || container.getAttribute('aria-label') || (heading && labelText(heading)));
+    const nearby = question || nearbyQuestion(element);
+    return {label: nearby || '', labelSource: nearby ? 'group' : 'identity', labelConfidence: nearby ? 'high' : 'low'};
+  }
   if (element.type === 'radio') {
     const group = composedClosest(element, 'fieldset,[role="radiogroup"],[role="group"]');
     const explicit = group && (textFromIds(group, group.getAttribute('aria-labelledby')) || group.getAttribute('aria-label') || group.querySelector(':scope > legend')?.textContent?.trim());
@@ -458,6 +467,7 @@ function uniqueFields(document) {
   const fields = [];
   const seenRadioGroups = new Set();
   for (const [index, element] of formElements(document).entries()) {
+    if (element.type === 'checkbox' && checkboxGroup(document, element)[0] !== element) continue;
     if (element.type === 'radio' && element.name) {
       const group = radioGroup(document, element)[0];
       if (seenRadioGroups.has(group)) continue;
@@ -469,6 +479,8 @@ function uniqueFields(document) {
 }
 
 function fieldOptions(document, element) {
+  const checkboxes = checkboxGroup(document, element);
+  if (checkboxes.length > 1) return checkboxes.map(optionText).filter(Boolean);
   if (customWidgetElements(document).includes(element)) {
     return customWidgetOptions(document, element)
       .flatMap((option) => [customOptionText(option), customOptionValue(option)])
@@ -497,6 +509,8 @@ function optionText(element) {
 function fieldValue(document, element) {
   if (customWidgetElements(document).includes(element)) return customWidgetValue(element);
   if (element.type === 'checkbox') {
+    const group = checkboxGroup(document, element);
+    if (group.length > 1) return group.filter(candidate => candidate.checked).map(optionText).join(', ');
     return element.checked ? 'Yes' : (element.__jobApplicationUserEdited || element.__jobApplicationAutofillValue != null ? 'No' : '');
   }
   if (element.type === 'radio') {
@@ -524,11 +538,14 @@ function constraintsFor(element) {
 }
 
 function describeField(document, element, index) {
-  const type = element.tagName === 'SELECT' ? 'select' : element.tagName === 'TEXTAREA' ? 'textarea' : (element.type || 'text');
+  const checkboxes = checkboxGroup(document, element);
+  const grouped = checkboxes.length > 1;
+  const type = grouped || element.tagName === 'SELECT' ? 'select' : element.tagName === 'TEXTAREA' ? 'textarea' : (element.type || 'text');
   const descriptor = {
     id: fieldIdentity(element, index, [...formElements(document), ...customWidgetElements(document)]),
     handle: controlHandle(element),
-    multiple: Boolean(element.multiple),
+    multiple: grouped || Boolean(element.multiple),
+    ...(grouped ? {widget: 'checkbox-group'} : {}),
     selectedValues: element.tagName === 'SELECT' ? [...element.selectedOptions].filter((option) => option.value).map((option) => option.value) : [],
     structuredOptions: element.tagName === 'SELECT' ? [...element.options].map((option) => ({ label: option.textContent.trim(), value: option.value, selected: option.selected, disabled: option.disabled })) : [],
     ...questionMetadata(document, element),
@@ -537,7 +554,7 @@ function describeField(document, element, index) {
     type,
     autocomplete: element.autocomplete || '',
     placeholder: element.getAttribute('placeholder') || '',
-    required: Boolean(element.required) || element.getAttribute('aria-required') === 'true',
+    required: (grouped ? checkboxes : [element]).some(candidate => candidate.required || candidate.getAttribute('aria-required') === 'true'),
     currentValue: fieldValue(document, element),
     options: fieldOptions(document, element),
     constraints: constraintsFor(element),
@@ -598,7 +615,7 @@ function collectFieldDescriptorsImpl(document) {
 
 export function descriptorForElement(document, element) {
   if (!element || element.ownerDocument !== document || !element.isConnected) return null;
-  const handle = controlHandle(element);
+  const handle = controlHandle(checkboxGroup(document, element)[0] || element);
   const described = collectFieldDescriptors(document).find((field) => field.handle === handle);
   if (described) return described;
   // Inline focus can scope one field without granting bulk-fill authority.
@@ -647,6 +664,9 @@ function checkValidityWithoutPattern(element) {
 
 function checkValiditySafely(element) {
   if (element?.getAttribute('aria-invalid') === 'true') return false;
+  const checkboxes = element && checkboxGroup(element.ownerDocument, element);
+  if (checkboxes?.length > 1) return !checkboxes.some(candidate => candidate.getAttribute('aria-invalid') === 'true' || candidate.validity?.customError)
+    && (!checkboxes.some(candidate => candidate.required || candidate.getAttribute('aria-required') === 'true') || checkboxes.some(candidate => candidate.checked));
   if (typeof element?.checkValidity !== 'function') return true;
   const pattern = element.getAttribute('pattern');
   if (pattern !== null) {
@@ -691,6 +711,41 @@ function setSelectValue(element, answer) {
 
 function radioGroup(document, element) {
   return formElements(document).filter((candidate) => candidate.type === 'radio' && (element.name ? candidate.name === element.name && candidate.form === element.form && candidate.getRootNode() === element.getRootNode() : candidate === element));
+}
+
+function checkboxContainer(element) {
+  return composedClosest(element, '.application-question,fieldset,[role="group"]');
+}
+
+function checkboxGroup(document, element) {
+  if (element?.type !== 'checkbox') return [];
+  const container = checkboxContainer(element);
+  if (!container && !element.name) return [element];
+  const peers = formElements(document).filter(candidate => candidate.type === 'checkbox'
+    && candidate.form === element.form && candidate.getRootNode() === element.getRootNode()
+    && checkboxContainer(candidate) === container);
+  const names = new Set(peers.map(candidate => candidate.name).filter(Boolean));
+  // Lever includes a nameless Custom option alongside its named pronoun choices.
+  // Generic fieldsets may instead contain unrelated consent checkboxes.
+  return container?.matches('.application-question') && names.size <= 1 ? peers
+    : peers.filter(candidate => element.name ? candidate.name === element.name : candidate === element);
+}
+
+function setCheckboxGroup(document, element, answer) {
+  const group = checkboxGroup(document, element);
+  const exact = group.find(candidate => normalizeText(optionText(candidate)) === normalizeText(answer));
+  const requested = exact ? [exact] : String(answer).split(/\s*[,;]\s*/).map(value =>
+    group.find(candidate => normalizeText(optionText(candidate)) === normalizeText(value)));
+  if (!requested.length || requested.some(candidate => !candidate)) return false;
+  for (const candidate of group) {
+    candidate.__jobApplicationAutofillValue = String(answer);
+    delete candidate.__jobApplicationUserEdited;
+    if (candidate.checked !== requested.includes(candidate)) {
+      candidate.checked = requested.includes(candidate);
+      dispatchFormEvents(candidate);
+    }
+  }
+  return true;
 }
 
 function setRadioGroup(document, element, answer) {
@@ -805,7 +860,8 @@ async function fillElement(document, element, answer, deadline = Infinity) {
   if (customWidgetElements(document).includes(element)) return setCustomChoiceValue(document, element, answer, deadline);
   if (element.tagName === 'SELECT') return { ok: setSelectValue(element, answer) };
   if (element.type === 'radio') return { ok: setRadioGroup(document, element, answer) };
-  if (element.type === 'checkbox') return { ok: setCheckbox(element, answer) };
+  if (element.type === 'checkbox') return { ok: checkboxGroup(document, element).length > 1
+    ? setCheckboxGroup(document, element, answer) : setCheckbox(element, answer) };
   return { ok: setTextValue(element, answer) };
 }
 
@@ -1302,7 +1358,9 @@ function collectAnswerRecordsImpl(document, finalize) {
       occurrenceByKey.set(baseKey, occurrence);
       const repeated = occurrence > 1 || /__\d+$/.test(field.id);
       const element = elementForField(document, field.id);
-      const provenance = (element?.type === 'radio' ? radioGroup(document, element).some((item) => item.__jobApplicationUserEdited) : element?.__jobApplicationUserEdited)
+      const userEdited = (element?.type === 'radio' ? radioGroup(document, element)
+        : element?.type === 'checkbox' ? checkboxGroup(document, element) : [element]).some(item => item?.__jobApplicationUserEdited);
+      const provenance = userEdited
         || element?.__jobApplicationAutofillValue == null
         ? 'user'
         : 'autofill';
@@ -1316,7 +1374,7 @@ function collectAnswerRecordsImpl(document, finalize) {
         sensitivity: inferSensitivity(field.label, field.id),
         concept: concept === 'generic_name' ? 'full_name' : concept,
         provenance,
-        userEdited: Boolean(element?.type === 'radio' ? radioGroup(document, element).some((item) => item.__jobApplicationUserEdited) : element?.__jobApplicationUserEdited),
+        userEdited,
         completed: field.labelConfidence !== 'low' && (finalize || element?.__jobApplicationUserCompleted !== false),
         ...(field.entityId ? { entityId: field.entityId } : {}),
         ...(field.entityType ? { entityType: field.entityType } : {}),

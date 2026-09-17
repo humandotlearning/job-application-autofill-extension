@@ -182,6 +182,11 @@ export async function callAnswerSuggestions(
   { apiKey, field, page = {}, records = [] },
   { sessionId = '', fetchImpl = createPhoenixFetch(sessionId), timeoutMs = 30000, provider = 'openai', model = '' } = {},
 ) {
+  const label = normalizeText(field?.label || '');
+  if (!label || isOpaqueIdentifier(field?.label) || field?.labelConfidence === 'low'
+    || (Array.isArray(field?.options) && field.options.some(option => normalizeText(option) === label))) {
+    return {suggestions: [], missingContext: 'The full question is missing. Check the application page again to capture the question and its options together.'};
+  }
   const normalizedApiKey = normalizeApiKey(apiKey);
   const evidence = rankSuggestionRecords(field, records).slice(0, 40).map(sanitizeRewriteRecord);
   const controller = new AbortController();

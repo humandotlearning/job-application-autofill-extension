@@ -1,7 +1,49 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { JSDOM } from 'jsdom';
+import { collectFieldDescriptors } from '../src/form-engine.js';
 
 import { callAnswerPlanner, callAnswerRewriter, callAnswerSuggestions, callFormInterpreter, DEFAULT_FIREWORKS_MODEL, DEFAULT_PROVIDER } from '../src/llm.js';
+
+test('grouped question and options reach planner and suggestion requests for both providers', async () => {
+  const dom = new JSDOM(`<form><div class="application-question"><div class="application-label">Are you willing to relocate?</div>
+    <label><input type="checkbox" name="relocate" value="Yes">Yes</label>
+    <label><input type="checkbox" name="relocate" value="No">No</label></div></form>`);
+  try {
+    const fields = collectFieldDescriptors(dom.window.document);
+    const field = fields[0];
+    for (const provider of ['openai', 'fireworks']) {
+      for (const kind of ['planner', 'suggestions']) {
+        const fetchImpl = async (_url, options) => {
+          const body = JSON.parse(options.body);
+          const input = JSON.parse(provider === 'openai' ? body.input[1].content[0].text : body.messages[1].content);
+          const target = kind === 'planner' ? input.fields[0] : input.field;
+          if (kind === 'planner') assert.equal(input.fields.length, 1);
+          assert.equal(target.label, 'Are you willing to relocate?');
+          assert.deepEqual(target.options, ['Yes', 'No']);
+          assert.equal(target.multiple, true);
+          const payload = kind === 'planner' ? {decisions: [{fieldId: field.id, action: 'ask_user', value: null,
+            evidenceKeys: [], confidence: 'low', sensitivity: 'review', reason: 'No evidence', transformation: null}]}
+            : {suggestions: [], missingContext: 'No evidence'};
+          return createResponse(provider === 'openai'
+            ? {output: [{type: 'message', content: [{type: 'output_text', text: JSON.stringify(payload)}]}]}
+            : {choices: [{message: {content: JSON.stringify(payload)}}]});
+        };
+        if (kind === 'planner') await callAnswerPlanner({apiKey: 'test', fields, records: []}, {provider, fetchImpl});
+        else await callAnswerSuggestions({apiKey: 'test', field}, {provider, fetchImpl});
+      }
+    }
+  } finally { dom.window.close(); }
+});
+
+test('suggestions do not call the model for missing questions or orphaned option labels', async () => {
+  for (const label of ['', 'Yes', 'No', 'She/her']) {
+    const result = await callAnswerSuggestions({apiKey: 'test', field: {label, type: 'checkbox', options: ['Yes', 'No', 'She/her']}},
+      {fetchImpl: async () => { assert.fail('Missing question must be resolved before requesting an answer'); }});
+    assert.deepEqual(result.suggestions, []);
+    assert.match(result.missingContext, /full question is missing/i);
+  }
+});
 
 function createInput() {
   return {
