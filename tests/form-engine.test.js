@@ -19,6 +19,94 @@ function makeDocument(html) {
   return new JSDOM(html, { url: 'https://jobs.example.com/apply' }).window.document;
 }
 
+test('Lever checkbox options share their question through reading, filling, focus and learning', async () => {
+  const document = makeDocument(`<form><ul>
+    <li class="application-question"><div class="application-label">Pronouns</div>
+      <div class="application-field"><ul><div class="column-wrapper"><div class="table-row">
+      <li><label><input type="checkbox" name="pronouns" value="She/her">She/her</label></li>
+      <li><label><input type="checkbox" name="pronouns" value="They/them">They/them</label></li>
+      </div></div><li><label><input type="checkbox" id="custom" value="Custom">Custom</label>
+      <input type="text" name="pronouns" style="display:none"></li></ul></div></li>
+    <li class="application-question"><div><div class="application-label"><div class="text">Are you willing to relocate?<span>✱</span></div></div>
+      <div class="application-field"><ul>
+      <li><label><input type="checkbox" name="cards[field0]" value="Yes" required>Yes</label></li>
+      <li><label><input type="checkbox" name="cards[field0]" value="No" required>No</label></li>
+      </ul></div></div></li>
+    <li><label><input type="checkbox" id="consent">I agree</label></li>
+  </ul></form>`);
+  try {
+    const fields = collectFieldDescriptors(document);
+    assert.equal(fields.length, 3);
+    assert.deepEqual(fields.map(f => f.label), ['Pronouns', 'Are you willing to relocate?', 'I agree']);
+    assert.deepEqual(fields[0].options, ['She/her', 'They/them', 'Custom']);
+    assert.deepEqual(fields[1].options, ['Yes', 'No']);
+    assert.equal(fields[0].multiple, true);
+    assert.equal(fields[2].type, 'checkbox');
+    const no = document.querySelector('input[value="No"]');
+    assert.equal(descriptorForElement(document, no).handle, fields[1].handle);
+    const result = await applyDecisions(document, [
+      {fieldId: fields[0].id, action: 'fill', value: 'She/her, They/them', approved: true, sensitivity: 'review'},
+      {fieldId: fields[1].id, action: 'fill', value: 'No', approved: true, sensitivity: 'review'},
+    ]);
+    assert.equal(result.applied.length, 2, JSON.stringify(result));
+    assert.equal(no.checked, true);
+    assert.equal(document.querySelector('input[value="Yes"]').checked, false);
+    assert.equal(validateDocument(document).ok, true);
+    no.dispatchEvent(new document.defaultView.Event('input', {bubbles: true}));
+    const records = collectAnswerRecords(document, {finalize: true});
+    assert.deepEqual(records.map(r => [r.question, r.answer]), [
+      ['Pronouns', 'She/her, They/them'], ['Are you willing to relocate?', 'No'],
+    ]);
+    assert.equal(records[1].userEdited, true);
+  } finally { document.defaultView.close(); }
+});
+
+test('checkbox grouping respects question containers and separate form owners', () => {
+  const document = makeDocument(`<form>
+    <fieldset><legend>Locations</legend><label><input type="checkbox" name="choice" value="Japan">Japan</label><label><input type="checkbox" name="choice" value="Asia">Asia</label></fieldset>
+    <fieldset><legend>Teams</legend><label><input type="checkbox" name="choice" value="A">A</label><label><input type="checkbox" name="choice" value="B">B</label></fieldset>
+    </form><form><label><input type="checkbox" name="choice">Consent</label></form>`);
+  try {
+    selectApplicationRegion(document, document.querySelector('form input'));
+    const fields = collectFieldDescriptors(document);
+    assert.deepEqual(fields.map(f => f.label), ['Locations', 'Teams']);
+    assert.deepEqual(fields[0].options, ['Japan', 'Asia']);
+    assert.deepEqual(fields[1].options, ['A', 'B']);
+    selectApplicationRegion(document, document.querySelectorAll('form')[1].querySelector('input'));
+    assert.equal(collectFieldDescriptors(document)[0].type, 'checkbox');
+  } finally { document.defaultView.close(); }
+});
+
+test('checkbox groups accept an exact option containing a comma', async () => {
+  const document = makeDocument(`<fieldset><legend>Regions</legend>
+    <label><input type="checkbox" name="regions">Central America, South America</label>
+    <label><input type="checkbox" name="regions">Asia</label></fieldset>`);
+  try {
+    const [field] = collectFieldDescriptors(document);
+    const result = await applyDecisions(document, [{fieldId: field.id, action: 'fill', value: 'Central America, South America', approved: true}]);
+    assert.equal(result.applied.length, 1, JSON.stringify(result));
+    assert.equal(collectFieldDescriptors(document)[0].currentValue, 'Central America, South America');
+  } finally { document.defaultView.close(); }
+});
+
+test('unnamed consent checkboxes remain independent and grouped choices preserve custom errors', () => {
+  const document = makeDocument(`<form><fieldset><legend>Agreements</legend>
+    <label><input type="checkbox" required checked>I agree to privacy</label>
+    <label><input type="checkbox" required>I agree to terms</label></fieldset>
+    <fieldset><legend>Locations</legend><label><input type="checkbox" name="location" value="Japan" checked>Japan</label>
+    <label><input type="checkbox" name="location" value="Asia">Asia</label></fieldset></form>`);
+  try {
+    const fields = collectFieldDescriptors(document);
+    assert.deepEqual(fields.map(f => f.label), ['I agree to privacy', 'I agree to terms', 'Locations']);
+    assert.equal(validateDocument(document).ok, false);
+    document.querySelectorAll('input')[1].checked = true;
+    assert.equal(validateDocument(document).ok, true);
+    document.querySelector('input[value="Japan"]').setCustomValidity('Unavailable');
+    assert.equal(validateDocument(document).ok, false);
+    assert.equal(validateDocument(document).invalid[0].label, 'Locations');
+  } finally { document.defaultView.close(); }
+});
+
 test('application discovery reads only the selected form and its visible dialog heading', () => {
   const document = makeDocument(`
     <h1>Apply for other jobs</h1>
