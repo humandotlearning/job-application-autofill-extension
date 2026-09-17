@@ -6,6 +6,7 @@ const elements = {
   apiKey: byId('openai-api-key'),
   apiModel: byId('ai-model'),
   includeFormScreenshot: byId('include-form-screenshot'),
+  phoenixTracing: byId('phoenix-tracing'),
   autoAdvance: byId('auto-advance-pages'),
   employerName: byId('employer-name'),
   relatedDefault: byId('related-default'),
@@ -908,7 +909,6 @@ function itemRow(item, { focus = false, detail = '', responseHandler = response 
         workspace.state.editing = true;
         workspace.workspace.querySelector('[data-answer-draft]').value = workspace.state.answer;
         workspace.updateControls();
-        void workspace.applyAnswer();
       });
       const editDraft = document.createElement('button');
       editDraft.type = 'button';
@@ -1397,7 +1397,7 @@ async function refresh() {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
   activeTabId = tab?.id || null;
   await refreshSiteState();
-  const stored = await chrome.storage.local.get({ answerRecords: [], openaiApiKey: '', fireworksApiKey: '', aiProvider: '', aiModel: '', openaiModel: 'gpt-5.6-terra', includeFormScreenshot: true, autoAdvancePages: false });
+  const stored = await chrome.storage.local.get({ answerRecords: [], openaiApiKey: '', fireworksApiKey: '', aiProvider: '', aiModel: '', openaiModel: 'gpt-5.6-terra', includeFormScreenshot: true, autoAdvancePages: false, phoenixTracing: true });
   const provider = stored.aiProvider === 'openai' || stored.aiProvider === 'fireworks'
     ? stored.aiProvider
     : (stored.openaiApiKey ? 'openai' : 'fireworks');
@@ -1408,6 +1408,7 @@ async function refresh() {
   elements.openaiApiKey.value = stored.openaiApiKey || '';
   elements.apiModel.value = stored.aiModel || (provider === 'openai' ? stored.openaiModel : '') || defaultModel;
   elements.includeFormScreenshot.checked = stored.includeFormScreenshot !== false;
+  elements.phoenixTracing.checked = stored.phoenixTracing !== false;
   elements.autoAdvance.checked = Boolean(stored.autoAdvancePages);
   updateDatasourceSummary({ answerCount: stored.answerRecords.length });
   const datasourceResponse = await chrome.runtime.sendMessage({ type: 'JOB_DATASOURCE_STATE' });
@@ -1523,6 +1524,10 @@ elements.apiModel.addEventListener('change', saveModel);
 elements.apiModel.addEventListener('blur', saveModel);
 elements.autoAdvance.addEventListener('change', saveSettings);
 elements.includeFormScreenshot.addEventListener('change', saveScreenshotSetting);
+elements.phoenixTracing.addEventListener('change', async () => {
+  await chrome.storage.local.set({ phoenixTracing: elements.phoenixTracing.checked });
+  setStatus(elements.phoenixTracing.checked ? 'Local Phoenix tracing enabled.' : 'AI tracing disabled.');
+});
 for (const [field, key] of [[elements.employerName, 'employerName'], [elements.relatedDefault, 'relatedToHiringCompany'], [elements.knownDefault, 'knownAtHiringCompany'], [elements.phoneDeviceDefault, 'phoneDeviceType']]) field.addEventListener('change', () => saveProfile(key));
 elements.exportDatasource.addEventListener('click', exportDatasource);
 elements.importDatasourceButton.addEventListener('click', () => elements.importDatasource.click());
@@ -1570,6 +1575,7 @@ chrome.storage.onChanged.addListener((changes, area) => {
     elements.autoAdvance.checked = Boolean(changes.autoAdvancePages.newValue);
     if (currentRun?.status === 'running') renderRun(currentRun);
   }
+  if (area === 'local' && changes.phoenixTracing) elements.phoenixTracing.checked = changes.phoenixTracing.newValue !== false;
   if (area === 'local' && changes.includeFormScreenshot) elements.includeFormScreenshot.checked = changes.includeFormScreenshot.newValue !== false;
   if (area === 'local' && changes.disabledHostnames) refreshSiteState().catch(error => setStatus(error.message, 'error'));
   if (area === 'session' && changes.applicationRun && activeTabId) renderRun(changes.applicationRun.newValue?.[String(activeTabId)] || null);

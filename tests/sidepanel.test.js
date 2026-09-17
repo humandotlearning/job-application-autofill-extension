@@ -811,7 +811,7 @@ test('answer workspace stays blank until a readable candidate is chosen', async 
   } finally { harness.cleanup(); }
 });
 
-test('AI Use answer applies the selected draft in one click', async () => {
+test('AI Use answer loads the selected draft for review before sending', async () => {
   const generatedSuggestion = {
     tabId: 7, frameId: 3, applicationId: 'run-ai', pageSignature: 'page-one',
     field: { id: 'summary', handle: 'handle-summary' },
@@ -824,6 +824,10 @@ test('AI Use answer applies the selected draft in one click', async () => {
     const row = harness.dom.window.document.querySelector('#action-required-list .result-item');
     assert.equal(row.querySelector('.result-label').textContent, 'Why are you a good fit?');
     row.querySelector('[data-choose-generated-answer]').click();
+    await new Promise(resolve => setTimeout(resolve, 0));
+    assert.equal(row.querySelector('[data-answer-draft]').value, 'I built event processing systems that match this role.');
+    assert.equal(pageMutationMessages(harness.sentMessages).length, 0);
+    row.querySelector('[data-send-answer]').click();
     await new Promise(resolve => setTimeout(resolve, 0));
     const sent = harness.sentMessages.find(message => message.type === 'JOB_RUN_APPLY_DRAFT');
     assert.equal(sent.answer, 'I built event processing systems that match this role.');
@@ -1343,5 +1347,19 @@ test('empty drafts can generate directly, retry failure, and rewrite the generat
     assert.equal(doc.querySelector('[data-rewrite-answer]').disabled, false);
     assert.equal(doc.querySelector('[data-answer-draft]').readOnly, false);
     assert.equal(pageMutationMessages(harness.sentMessages).length, 0);
+  } finally { harness.cleanup(); }
+});
+
+test('Phoenix setting loads, persists and follows changes from another panel', async () => {
+  const harness = await setupPanel({localData: {phoenixTracing: false}});
+  try {
+    const checkbox = harness.dom.window.document.getElementById('phoenix-tracing');
+    assert.equal(checkbox.checked, false);
+    checkbox.checked = true;
+    checkbox.dispatchEvent(new harness.dom.window.Event('change'));
+    await panelTick();
+    assert.equal(harness.localData.phoenixTracing, true);
+    for (const listener of harness.storageListeners) listener({phoenixTracing: {newValue: false}}, 'local');
+    assert.equal(checkbox.checked, false);
   } finally { harness.cleanup(); }
 });
