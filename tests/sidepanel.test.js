@@ -289,11 +289,11 @@ test('editing a saved recommendation opens a writable draft without applying it'
   try {
     const row = harness.dom.window.document.querySelector('#action-required-list .result-item');
     const card = row.querySelector('.saved-evidence');
-    assert.equal(card.open, false);
-    assert.equal(card.querySelector('summary').textContent, 'Saved answer from Model deployment project');
+    assert.equal(card.querySelector('.saved-evidence-source').textContent, 'Saved answer from Model deployment project');
+    assert.equal(card.querySelector('.saved-provenance').open, false);
     assert.equal(card.querySelector('[data-saved-answer-text]').textContent, answer);
     assert.equal(row.querySelectorAll('.answer-details').length, 0);
-    card.open = true;
+    card.querySelector('.saved-provenance').open = true;
     row.querySelector('[data-edit-candidate]').click();
     assert.equal(row.querySelector('[data-answer-draft]').value, answer);
     assert.equal(row.querySelector('[data-answer-draft]').readOnly, false);
@@ -373,6 +373,10 @@ test('panel orders named fields before generic notices and emphasizes each quest
   const harness = await setupPanel({ run });
   try {
     const doc = harness.dom.window.document;
+    doc.querySelector('#optional-details').open = true;
+    doc.querySelector('#optional-details').dispatchEvent(new harness.dom.window.Event('toggle'));
+    doc.querySelector('#audit-details').open = true;
+    doc.querySelector('#audit-details').dispatchEvent(new harness.dom.window.Event('toggle'));
     const actionItems = [...doc.querySelectorAll('#action-required-list .result-item')];
     assert.deepEqual(actionItems.map((item) => item.querySelector('.result-label').textContent), ['First question', 'Later question', 'Second question', 'Field']);
     assert.equal(actionItems[0].querySelector('.result-label').tagName, 'H3');
@@ -422,6 +426,8 @@ test('panel keeps opaque field labels and audit values out of the visible panel'
   const harness = await setupPanel({ run });
   try {
     const doc = harness.dom.window.document;
+    doc.querySelector('#audit-details').open = true;
+    doc.querySelector('#audit-details').dispatchEvent(new harness.dom.window.Event('toggle'));
     const actionRow = doc.querySelector('#action-required-list .result-item');
     assert.equal(actionRow.querySelector('.result-label').firstChild.textContent, 'Form question');
     assert.equal(actionRow.querySelector('[data-internal-id-popover]'), null);
@@ -811,7 +817,7 @@ test('answer workspace stays blank until a readable candidate is chosen', async 
   } finally { harness.cleanup(); }
 });
 
-test('AI Use answer applies the selected draft in one click', async () => {
+test('AI answer selection opens a review draft without filling', async () => {
   const generatedSuggestion = {
     tabId: 7, frameId: 3, applicationId: 'run-ai', pageSignature: 'page-one',
     field: { id: 'summary', handle: 'handle-summary' },
@@ -826,7 +832,8 @@ test('AI Use answer applies the selected draft in one click', async () => {
     row.querySelector('[data-choose-generated-answer]').click();
     await new Promise(resolve => setTimeout(resolve, 0));
     const sent = harness.sentMessages.find(message => message.type === 'JOB_RUN_APPLY_DRAFT');
-    assert.equal(sent.answer, 'I built event processing systems that match this role.');
+    assert.equal(sent, undefined);
+    assert.equal(row.querySelector('[data-answer-draft]').value, 'I built event processing systems that match this role.');
   } finally { harness.cleanup(); }
 });
 
@@ -873,7 +880,7 @@ test('missing job context exposes a compact description editor and regenerates d
     await new Promise((resolve) => setTimeout(resolve, 0));
     const message = harness.sentMessages.find((entry) => entry.type === 'JOB_RUN_GENERATE_SUGGESTIONS');
     assert.equal(message.jobDescription, 'Build distributed systems.');
-    assert.equal(harness.dom.window.document.querySelector('[data-choose-generated-answer]').textContent, 'Use this answer');
+    assert.equal(harness.dom.window.document.querySelector('[data-choose-generated-answer]').textContent, 'Review this answer');
   } finally { harness.cleanup(); }
 });
 
@@ -927,6 +934,100 @@ test('rewrite prompt sends the question context and replaces only the draft', as
     await new Promise((resolve) => setTimeout(resolve, 0));
     assert.equal(row.querySelector('[data-answer-draft]').value, 'Rewritten by the configured model.');
     assert.match(harness.dom.window.document.querySelector('#status').textContent, /Rewrite unavailable/i);
+  } finally { harness.cleanup(); }
+});
+
+test('saved answers tailor to job context with immediate feedback and can restore the previous draft', async () => {
+  let resolveRewrite;
+  const rewriteResponse = () => new Promise((resolve) => { resolveRewrite = resolve; });
+  const suggestion = {
+    tabId: 7, frameId: 3, applicationId: 'run-tailor', pageSignature: 'page-one',
+    field: { id: 'summary', handle: 'handle-summary' },
+    candidates: [{ sourceKey: 'story', sourceQuestion: 'Saved story', answer: 'I delivered a reliable platform.', kind: 'related' }],
+  };
+  const run = { status: 'waiting_user', applicationId: 'run-tailor', pageSignature: 'page-one', revision: 1,
+    jobContext: { role: 'Platform Engineer', company: 'Example Co' },
+    actionRequired: [{ fieldId: 'summary', label: 'Why this role?', suggestion }], optionalUnresolved: [], reviewRequired: [], audit: [] };
+  const harness = await setupPanel({ run, rewriteResponse });
+  try {
+    const row = harness.dom.window.document.querySelector('#action-required-list .result-item');
+    row.querySelector('[data-tailor-answer]').click();
+    assert.equal(row.querySelector('[data-answer-status]').textContent, 'Tailoring…');
+    const message = harness.sentMessages.find(entry => entry.type === 'JOB_RUN_REWRITE_ANSWER');
+    assert.equal(message.tailorToJob, true);
+    assert.equal(message.draft, 'I delivered a reliable platform.');
+    assert.equal(message.sourceKey, 'story');
+    resolveRewrite({ok: true, answer: 'I delivered a reliable platform suited to this role.'});
+    await panelTick();
+    assert.equal(row.querySelector('[data-answer-draft]').value, 'I delivered a reliable platform suited to this role.');
+    assert.equal(row.querySelector('[data-restore-draft]').hidden, false);
+    row.querySelector('[data-restore-draft]').click();
+    assert.equal(row.querySelector('[data-answer-draft]').value, 'I delivered a reliable platform.');
+  } finally { harness.cleanup(); }
+});
+
+test('rapid saved-answer clicks send only one fill request', async () => {
+  let resolveApproval;
+  const approveSuggestionResponse = () => new Promise((resolve) => { resolveApproval = resolve; });
+  const suggestion = {
+    tabId: 7, frameId: 3, applicationId: 'run-double-click', pageSignature: 'page-one',
+    field: { id: 'summary', handle: 'handle-summary' },
+    candidates: [{ sourceKey: 'story', sourceQuestion: 'Saved story', answer: 'Use this once.', kind: 'related' }],
+  };
+  const run = { status: 'waiting_user', applicationId: 'run-double-click', pageSignature: 'page-one', revision: 1,
+    actionRequired: [{ fieldId: 'summary', label: 'Why this role?', suggestion }], optionalUnresolved: [], reviewRequired: [], audit: [] };
+  const harness = await setupPanel({ run, approveSuggestionResponse });
+  try {
+    const choose = harness.dom.window.document.querySelector('[data-choose-answer]');
+    choose.click();
+    choose.click();
+    assert.equal(harness.sentMessages.filter((message) => message.type === 'JOB_RUN_APPROVE_SUGGESTION').length, 1);
+    resolveApproval({ok: true, run});
+    await panelTick();
+  } finally { harness.cleanup(); }
+});
+
+test('a filled answer stays in its original section and sends guarded replacement data', async () => {
+  const candidate = {sourceKey: 'story', sourceQuestion: 'Saved story', answer: 'Original answer.', kind: 'related'};
+  const suggestion = {tabId: 7, frameId: 3, applicationId: 'run-filled', pageSignature: 'page-one',
+    field: {id: 'summary', handle: 'handle-summary'}, candidates: [candidate]};
+  const receipt = {fieldId: 'summary', handle: 'handle-summary', label: 'Why this role?', fieldType: 'textarea',
+    value: 'Original answer.', filled: true, list: 'required', pageSignature: 'page-one', formOrder: 0,
+    replacement: {rawValue: 'Original answer.', editRevision: 0}, suggestion};
+  const run = {status: 'waiting_user', applicationId: 'run-filled', pageSignature: 'page-one', revision: 2,
+    jobContext: {role: 'Platform Engineer'}, actionRequired: [], optionalUnresolved: [], reviewRequired: [], audit: [],
+    appliedAnswers: {summary: receipt}};
+  const harness = await setupPanel({run, rewriteResponse: {ok: true, answer: 'Tailored answer.'}});
+  try {
+    const row = harness.dom.window.document.querySelector('#action-required-list .result-item');
+    assert.equal(harness.dom.window.document.querySelector('#action-required-count').textContent, '0');
+    assert.match(row.textContent, /Filled/);
+    assert.equal(row.querySelector('.answer-workspace').hidden, true);
+    row.querySelector('[data-tailor-filled-answer]').click();
+    await panelTick();
+    assert.equal(row.querySelector('[data-answer-draft]').value, 'Tailored answer.');
+    assert.equal(row.querySelector('[data-send-answer]').textContent, 'Replace answer in form');
+    row.querySelector('[data-send-answer]').click();
+    await panelTick();
+    const message = harness.sentMessages.find(entry => entry.type === 'JOB_RUN_APPROVE_SUGGESTION');
+    assert.deepEqual(message.replacement, {rawValue: 'Original answer.', editRevision: 0});
+    assert.equal(message.answer, 'Tailored answer.');
+  } finally { harness.cleanup(); }
+});
+
+test('duplicate and older run notifications keep the existing question row', async () => {
+  const run = {status: 'waiting_user', applicationId: 'run-revision', pageSignature: 'page-one', revision: 4,
+    actionRequired: [{fieldId: 'summary', label: 'Current question'}], optionalUnresolved: [], reviewRequired: [], audit: []};
+  const harness = await setupPanel({run});
+  try {
+    const list = harness.dom.window.document.querySelector('#action-required-list');
+    const original = list.firstElementChild;
+    harness.storageListeners.forEach(listener => listener({applicationRun: {newValue: {7: structuredClone(run)}}}, 'session'));
+    assert.equal(list.firstElementChild, original);
+    const older = {...run, revision: 3, actionRequired: [{fieldId: 'summary', label: 'Stale question'}]};
+    harness.storageListeners.forEach(listener => listener({applicationRun: {newValue: {7: older}}}, 'session'));
+    assert.equal(list.firstElementChild, original);
+    assert.match(list.textContent, /Current question/);
   } finally { harness.cleanup(); }
 });
 
