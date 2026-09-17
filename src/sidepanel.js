@@ -388,8 +388,12 @@ function renderLearnedChanges(records) {
     const button = document.createElement('button');
     button.type = 'button';
     button.textContent = 'Confirm value';
+    const close = document.createElement('button');
+    close.type = 'button';
+    close.textContent = 'Close';
+    close.setAttribute('aria-label', `Close ${readableQuestion} notification without confirming`);
     button.addEventListener('click', async () => {
-      button.disabled = true;
+      button.disabled = close.disabled = true;
       try {
         const submitted = input.value;
         const response = await chrome.runtime.sendMessage({ type: 'JOB_DATASOURCE_CORRECT', key: record.key, answer: submitted });
@@ -398,9 +402,20 @@ function renderLearnedChanges(records) {
         if (response.datasource) updateDatasourceSummary(response.datasource);
         setStatus('Correction saved. Previous values remain in history.');
       } catch (error) { setStatus(error.message, 'error'); }
-      finally { button.disabled = false; }
+      finally { button.disabled = close.disabled = false; }
     });
-    correction.append(input, button);
+    close.addEventListener('click', async () => {
+      button.disabled = close.disabled = true;
+      try {
+        const response = await chrome.runtime.sendMessage({ type: 'JOB_DATASOURCE_DISMISS_CHANGE', key: record.key });
+        if (!response?.ok) throw new Error(response?.error || 'Could not close the notification.');
+        correctionDrafts.delete(record.key);
+        if (response.datasource) updateDatasourceSummary(response.datasource);
+        setStatus('Notification closed. The saved answer was not changed.');
+      } catch (error) { setStatus(error.message, 'error'); }
+      finally { button.disabled = close.disabled = false; }
+    });
+    correction.append(input, button, close);
     row.append(previous, correction);
     elements.learnedChangeList.append(row);
   }
