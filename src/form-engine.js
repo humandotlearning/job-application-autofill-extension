@@ -1285,11 +1285,11 @@ function validateDocumentImpl(document) {
   return { ok: requiredEmpty.length === 0 && invalid.length === 0, requiredEmpty, invalid };
 }
 
-export function collectAnswerRecords(document) {
-  return withDomSnapshot(document, () => collectAnswerRecordsImpl(document));
+export function collectAnswerRecords(document, { finalize = false } = {}) {
+  return withDomSnapshot(document, () => collectAnswerRecordsImpl(document, finalize));
 }
 
-function collectAnswerRecordsImpl(document) {
+function collectAnswerRecordsImpl(document, finalize) {
   ensureEditTracking(document);
   const fields = collectFieldDescriptors(document);
   const invalidIds = new Set(validateDocument(document).invalid.map((field) => field.fieldId));
@@ -1317,7 +1317,7 @@ function collectAnswerRecordsImpl(document) {
         concept: concept === 'generic_name' ? 'full_name' : concept,
         provenance,
         userEdited: Boolean(element?.type === 'radio' ? radioGroup(document, element).some((item) => item.__jobApplicationUserEdited) : element?.__jobApplicationUserEdited),
-        completed: field.labelConfidence !== 'low' && element?.__jobApplicationUserCompleted !== false,
+        completed: field.labelConfidence !== 'low' && (finalize || element?.__jobApplicationUserCompleted !== false),
         ...(field.entityId ? { entityId: field.entityId } : {}),
         ...(field.entityType ? { entityType: field.entityType } : {}),
         ...(field.section ? { context: field.section } : {}),

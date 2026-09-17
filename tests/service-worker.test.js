@@ -2049,7 +2049,9 @@ test('final site submission saves the supplied snapshot without recapturing or s
   assert.equal(saved.run.status, 'answers_saved');
   assert.equal(duplicate.ok, true);
   assert.equal(harness.localData.applicationDrafts[`${7}:${started.run.startedAt}`].records.some((record) => record.key === 'portfolio_url'), true);
-  assert.equal(harness.localData.learningInbox.filter((item) => item.candidate.id === 'portfolio_url').length, 1);
+  assert.equal(harness.localData.answerRecords.find((record) => record.key === 'portfolio_url')?.answer, 'https://example.com/nithin');
+  assert.equal(saved.persisted, 1);
+  assert.equal(duplicate.persisted, 0);
   assert.equal(harness.tabs.get(7).messages.slice(beforeMessages).some((message) => message.type === 'JOB_APP_CAPTURE'), false);
   assert.equal(harness.tabs.get(7).submitCalls, 0);
   assert.equal(harness.tabs.get(7).messages.some((message) => message.type === 'JOB_APP_SUBMIT'), false);
@@ -3024,5 +3026,23 @@ test('explicit Save updates a correction already captured in the draft and keeps
   const repeated = await harness.dispatch({ type: 'JOB_RUN_SAVE_ANSWERS', tabId: 7 });
   assert.equal(repeated.updated, 0);
   assert.ok(repeated.unchanged >= 1);
+  assert.equal(harness.tabs.get(7).submitCalls, 0);
+});
+
+test('submission saves reusable answers even when panel still waits for a manual step', async () => {
+  const harness = createHarness({ pagesByTab: { 7: { pages: [{
+    fields: [{ id: 'required_detail', label: 'Required detail', type: 'text', required: true }],
+    actions: [{ id: 'submit', label: 'Submit application', kind: 'submit', type: 'submit' }],
+  }] } } });
+  await import(`../src/service-worker.js?submit-waiting=${Date.now()}`);
+  const { run } = await harness.dispatch({ type: 'JOB_RUN_START', tabId: 7 });
+  assert.equal(run.status, 'waiting_user');
+  const message = { type: 'JOB_APP_FINAL_SUBMISSION', applicationId: run.startedAt,
+    records: [{ key: 'portfolio_url', question: 'Portfolio URL', answer: 'https://example.com/work', type: 'url', sensitivity: 'safe', provenance: 'user' }] };
+  const sender = { tab: { id: 7 }, frameId: 0, url: 'https://jobs.example.com/apply' };
+  assert.equal((await harness.dispatch({ ...message, applicationId: 'stale' }, sender)).ok, false);
+  const saved = await harness.dispatch(message, sender);
+  assert.equal(saved.ok, true, saved.error);
+  assert.equal(harness.localData.answerRecords.find(record => record.key === 'portfolio_url')?.answer, 'https://example.com/work');
   assert.equal(harness.tabs.get(7).submitCalls, 0);
 });

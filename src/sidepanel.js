@@ -26,6 +26,7 @@ const elements = {
   checkPage: byId('check-page'),
   advancePage: byId('advance-page'),
   saveAnswers: byId('save-answers'),
+  saveHint: byId('save-hint'),
   saveFeedback: byId('save-feedback'),
   employmentChoices: byId('employment-choices'),
   retryAi: byId('retry-ai'),
@@ -1075,6 +1076,8 @@ function setActionVisibility(run) {
   if (!currentSite.supported || currentSite.disabled) {
     elements.primaryAction.hidden = true;
     elements.secondaryActions.hidden = true;
+    elements.saveAnswers.hidden = true;
+    elements.saveHint.hidden = true;
     elements.retryAi.hidden = true;
     elements.employmentChoices.replaceChildren();
     return;
@@ -1089,15 +1092,18 @@ function setActionVisibility(run) {
   }
   elements.primaryAction.hidden = false;
   elements.checkPage.hidden = !['waiting_user', 'page_ready'].includes(status);
-  // The primary action carries the state-specific Continue/Save copy. Keep the
-  // secondary row focused on the safe, repeatable “Check again” action.
+  // Saving stays visible independently of the application’s next step.
   elements.advancePage.hidden = true;
   elements.saveAnswers.hidden = !['waiting_user', 'page_ready', 'ready_for_user_submit', 'answers_saved'].includes(status);
-  elements.saveAnswers.textContent = saving ? 'Saving…' : (['ready_for_user_submit', 'answers_saved'].includes(status) ? 'Save draft checkpoint' : 'Save filled values');
+  elements.saveAnswers.textContent = saving ? 'Saving…' : 'Save answers for future forms';
+  elements.saveHint.hidden = elements.saveAnswers.hidden;
+  elements.saveHint.textContent = missingDestination
+    ? 'Find or select your application form before saving its answers.'
+    : 'Save current answers without submitting the application.';
   elements.saveAnswers.setAttribute('aria-busy', String(saving));
   elements.saveAnswers.disabled ||= missingDestination;
   elements.checkPage.textContent = missingDestination ? 'Retry scan' : 'Check again';
-  elements.secondaryActions.hidden = !hasRun || (elements.checkPage.hidden && elements.advancePage.hidden && elements.saveAnswers.hidden);
+  elements.secondaryActions.hidden = !hasRun || (elements.checkPage.hidden && elements.advancePage.hidden);
   if (!hasRun) {
     elements.retryAi.hidden = true;
     elements.primaryAction.textContent = 'Fill this page';
@@ -1239,7 +1245,7 @@ function renderRun(run) {
     elements.runHint.textContent = 'This page is filled and validated. Review it, then continue when you are ready.';
     setStatus(`Page ${run.pageNumber || 1} is ready for your approval.`);
   } else if (run.status === 'ready_for_user_submit') {
-    elements.runHint.textContent = 'Review on the site, then submit there. Save a draft checkpoint if needed.';
+    elements.runHint.textContent = 'Review on the site, then submit there. You can save your answers for future forms at any time.';
     setStatus('Final page is ready. Submission stays manual; final values are captured automatically.');
   } else if (run.status === 'answers_saved') {
     elements.runHint.textContent = 'Saved locally. Final values are captured automatically when you submit on the site.';

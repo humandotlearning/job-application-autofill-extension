@@ -642,7 +642,7 @@ test('panel offers local saving while a page is ready to continue', async () => 
     const { document } = harness.dom.window;
     assert.equal(document.querySelector('#primary-action').textContent.trim(), 'Continue to next page');
     assert.equal(document.querySelector('#save-answers').hidden, false);
-    assert.equal(document.querySelector('#save-answers').textContent.trim(), 'Save filled values');
+    assert.equal(document.querySelector('#save-answers').textContent.trim(), 'Save answers for future forms');
 
     document.querySelector('#save-answers').click();
     await new Promise((resolve) => setTimeout(resolve, 0));
@@ -1265,5 +1265,35 @@ test('Sage Focus keeps planner diagnostics in a disclosure and clears them on a 
     assert.equal(doc.querySelector('#status-details').hidden, true);
     assert.equal(doc.querySelector('#retry-ai').hidden, true);
     assert.equal(doc.querySelector('#run-title').textContent, 'Ready to fill this page');
+  } finally { panel.cleanup(); }
+});
+
+for (const status of ['waiting_user', 'page_ready', 'ready_for_user_submit', 'answers_saved']) {
+  test(`reopened panel exposes saving outside collapsed actions while ${status}`, async () => {
+    const panel = await setupPanel({ run: { status, frame: { frameId: 0 }, startedAt: 'restored-application' } });
+    try {
+      const doc = panel.dom.window.document;
+      const save = doc.querySelector('#save-answers');
+      assert.equal(doc.querySelector('#secondary-actions').open, false);
+      assert.equal(save.closest('details'), null);
+      assert.equal(save.hidden, false);
+      assert.equal(save.disabled, false);
+      save.click();
+      await panelTick();
+      assert.equal(panel.sentMessages.filter(message => message.type === 'JOB_RUN_SAVE_ANSWERS').length, 1);
+      assert.equal(doc.querySelector('#save-feedback').hidden, false);
+      assert.equal(panel.sentMessages.some(message => message.type === 'JOB_RUN_START'), false);
+    } finally { panel.cleanup(); }
+  });
+}
+
+test('standalone save controls stay hidden on paused sites', async () => {
+  const panel = await setupPanel({ run: { status: 'waiting_user', frame: { frameId: 0 } } });
+  try {
+    const doc = panel.dom.window.document;
+    doc.querySelector('#site-toggle').click();
+    await panelTick();
+    assert.equal(doc.querySelector('#save-answers').hidden, true);
+    assert.equal(doc.querySelector('#save-hint').hidden, true);
   } finally { panel.cleanup(); }
 });

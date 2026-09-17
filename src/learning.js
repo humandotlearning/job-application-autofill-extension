@@ -35,7 +35,7 @@ export function createLearningSession(document, { capture, send, onFinalSubmit, 
     flush().catch(() => {});
     if (event?.type !== 'submit' || !applicationId || document.__jobApplicationFilling || typeof onFinalSubmit !== 'function') return;
     try {
-      Promise.resolve(onFinalSubmit({ applicationId, records: capture(), event })).catch(() => {});
+      Promise.resolve(onFinalSubmit({ applicationId, records: capture({ finalize: true }), event })).catch(() => {});
     } catch (_) {}
   };
   for (const name of ['input', 'change', 'blur', 'click']) document.addEventListener(name, schedule, true);

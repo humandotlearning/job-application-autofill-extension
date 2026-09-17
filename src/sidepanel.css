@@ -354,6 +354,8 @@ footer {
 
 @media (max-width: 320px) { .app-main { padding-inline: 16px; } .app-header, footer { padding-inline: 16px; } .eyebrow { letter-spacing: 0; } }
 
+.save-answers { margin-top: 12px; }
+#save-hint { margin-top: 8px; font-size: 12px; }
 .secondary-actions { margin-top: 12px; }
 .secondary-actions > summary { cursor: pointer; width: fit-content; color: var(--color-text-muted); font-size: 12px; }
 .secondary-actions .button-row { display: flex; flex-wrap: wrap; }

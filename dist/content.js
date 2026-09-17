@@ -1877,11 +1877,11 @@ function validateDocumentImpl(document) {
   return { ok: requiredEmpty.length === 0 && invalid.length === 0, requiredEmpty, invalid };
 }
 
-function collectAnswerRecords(document) {
-  return withDomSnapshot(document, () => collectAnswerRecordsImpl(document));
+function collectAnswerRecords(document, { finalize = false } = {}) {
+  return withDomSnapshot(document, () => collectAnswerRecordsImpl(document, finalize));
 }
 
-function collectAnswerRecordsImpl(document) {
+function collectAnswerRecordsImpl(document, finalize) {
   ensureEditTracking(document);
   const fields = collectFieldDescriptors(document);
   const invalidIds = new Set(validateDocument(document).invalid.map((field) => field.fieldId));
@@ -1909,7 +1909,7 @@ function collectAnswerRecordsImpl(document) {
         concept: concept === 'generic_name' ? 'full_name' : concept,
         provenance,
         userEdited: Boolean(element?.type === 'radio' ? radioGroup(document, element).some((item) => item.__jobApplicationUserEdited) : element?.__jobApplicationUserEdited),
-        completed: field.labelConfidence !== 'low' && element?.__jobApplicationUserCompleted !== false,
+        completed: field.labelConfidence !== 'low' && (finalize || element?.__jobApplicationUserCompleted !== false),
         ...(field.entityId ? { entityId: field.entityId } : {}),
         ...(field.entityType ? { entityType: field.entityType } : {}),
         ...(field.section ? { context: field.section } : {}),
@@ -2043,7 +2043,7 @@ function createLearningSession(document, { capture, send, onFinalSubmit, onReval
     flush().catch(() => {});
     if (event?.type !== 'submit' || !applicationId || document.__jobApplicationFilling || typeof onFinalSubmit !== 'function') return;
     try {
-      Promise.resolve(onFinalSubmit({ applicationId, records: capture(), event })).catch(() => {});
+      Promise.resolve(onFinalSubmit({ applicationId, records: capture({ finalize: true }), event })).catch(() => {});
     } catch (_) {}
   };
   for (const name of ['input', 'change', 'blur', 'click']) document.addEventListener(name, schedule, true);
@@ -2607,7 +2607,7 @@ if (!globalThis.__jobApplicationAutofillInstalled) {
     active = true;
     inline = createInlineAutofill(document, {send: message => sendRuntimeMessage(message), describe: descriptorForElement});
     learning = createLearningSession(document, {
-      capture: () => collectAnswerRecords(document),
+      capture: (options) => collectAnswerRecords(document, options),
       send: (message) => sendRuntimeMessage(message),
       onRevalidate: ({applicationId}) => sendRuntimeMessage({type:'JOB_APP_REVALIDATE',applicationId}),
       onFinalSubmit: ({ applicationId, records, event }) => {
@@ -2688,7 +2688,7 @@ if (!globalThis.__jobApplicationAutofillInstalled) {
         }
         case 'JOB_APP_CAPTURE':
           if (!active) { sendResponse({ok: false, disabled: true, records: []}); break; }
-          sendResponse({ ok: true, records: collectAnswerRecords(document) });
+          sendResponse({ ok: true, records: collectAnswerRecords(document, { finalize: message.finalize === true }) });
           break;
         case 'JOB_APP_VALIDATE':
           if (!active) { sendResponse({ok: false, disabled: true, validation: {ok: false, requiredEmpty: [], invalid: []}}); break; }

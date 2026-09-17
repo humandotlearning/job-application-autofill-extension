@@ -101,7 +101,7 @@ if (!globalThis.__jobApplicationAutofillInstalled) {
     active = true;
     inline = createInlineAutofill(document, {send: message => sendRuntimeMessage(message), describe: descriptorForElement});
     learning = createLearningSession(document, {
-      capture: () => collectAnswerRecords(document),
+      capture: (options) => collectAnswerRecords(document, options),
       send: (message) => sendRuntimeMessage(message),
       onRevalidate: ({applicationId}) => sendRuntimeMessage({type:'JOB_APP_REVALIDATE',applicationId}),
       onFinalSubmit: ({ applicationId, records, event }) => {
@@ -182,7 +182,7 @@ if (!globalThis.__jobApplicationAutofillInstalled) {
         }
         case 'JOB_APP_CAPTURE':
           if (!active) { sendResponse({ok: false, disabled: true, records: []}); break; }
-          sendResponse({ ok: true, records: collectAnswerRecords(document) });
+          sendResponse({ ok: true, records: collectAnswerRecords(document, { finalize: message.finalize === true }) });
           break;
         case 'JOB_APP_VALIDATE':
           if (!active) { sendResponse({ok: false, disabled: true, validation: {ok: false, requiredEmpty: [], invalid: []}}); break; }

@@ -2178,7 +2178,7 @@ async function saveAnswers(tabId) {
     if (discovery.errorCode) return { ok: false, error: discovery.reason, run: await saveRun(pauseForFrame(run, discovery)) };
     updateSelectedFrame(tabId, run, discovery);
     const inspection = discovery.inspection;
-    const captured = await sendToApplicationFrame(tabId, run, { type: 'JOB_APP_CAPTURE' });
+    const captured = await sendToApplicationFrame(tabId, run, { type: 'JOB_APP_CAPTURE', finalize: true });
     if (!captured?.ok) throw new Error(captured?.error || 'Could not read the current form values.');
     return await saveCapturedAnswers(run, inspection, captured.records || [], () => assertRunSiteAuthority(tabId, run), { promote: true });
   } catch (error) {
@@ -2227,14 +2227,14 @@ async function saveFinalSubmission(message, sender, assertAuthority = null) {
     assertAuthority?.();
     const previousPage = finalRun.pages?.find((page) => page.pageNumber === finalRun.pageNumber);
     const page = message.page && typeof message.page === 'object' ? message.page : (previousPage?.page || finalRun.jobContext || {});
-    return await saveCapturedAnswers(finalRun, { page }, message.records, assertAuthority);
+    return await saveCapturedAnswers(finalRun, { page }, message.records, assertAuthority, { promote: true });
   } finally {
     finishSave();
   }
 }
 
 function matchesFinalSubmission(run, message, sender, frameId) {
-  if (!run || !['ready_for_user_submit', 'answers_saved'].includes(run.status)
+  if (!run || !SAVABLE_RUN_STATUSES.has(run.status)
     || run.frame?.frameId !== frameId || message.applicationId !== run.startedAt) return false;
   if (!sender.url) return true;
   try {
