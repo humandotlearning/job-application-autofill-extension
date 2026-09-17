@@ -93,7 +93,7 @@ function draftFor(origin, fieldId) {
   if (!drafts.has(key)) {
     drafts.set(key, {
       answer: '', sourceKey: null, sourceKeys: [], candidateKind: null, editing: false, revision: 0, pending: null,
-      rewriteInstruction: '', searchQuery: '', jobDescription: '',
+      rewriteInstruction: '', searchQuery: '', jobDescription: '', previousDraft: null, lastRewrite: null, replacement: null,
     });
   }
   const draft = drafts.get(key);
@@ -103,6 +103,9 @@ function draftFor(origin, fieldId) {
   draft.rewriteInstruction = String(draft.rewriteInstruction || '');
   draft.searchQuery = String(draft.searchQuery || '');
   draft.jobDescription = String(draft.jobDescription || '');
+  draft.previousDraft = draft.previousDraft || null;
+  draft.lastRewrite = draft.lastRewrite || null;
+  draft.replacement = draft.replacement || null;
   return draft;
 }
 
@@ -129,7 +132,7 @@ function discardStaleDrafts(run) {
 
 function fieldOrigin(item) {
   const suggestion = item.suggestion || item.generatedSuggestion || {};
-  const field = suggestion.field || {};
+  const field = suggestion.field || item.field || {};
   return {
     ...((item.inlineSessionId || suggestion.inlineSessionId) ? {inlineSessionId: item.inlineSessionId || suggestion.inlineSessionId} : {}),
     tabId: suggestion.tabId ?? activeTabId,
@@ -557,6 +560,16 @@ function panelDetailKey(origin, kind, suffix = '') {
 function answerWorkspace(item, displayLabel, responseHandler = response => renderRun(response.run)) {
   const origin = fieldOrigin(item);
   const state = draftFor(origin, origin.fieldId);
+  const selectedCandidate = item.suggestion?.candidates?.[0];
+  if (item.filled && !state.initialized) {
+    state.initialized = true;
+    state.answer = String(item.value || '');
+    state.editing = true;
+    state.replacement = item.replacement || null;
+    state.sourceKey = selectedCandidate?.sourceKey || null;
+    state.sourceKeys = selectedCandidate ? sourceKeysForPanelCandidate(selectedCandidate) : [];
+    state.candidateKind = selectedCandidate?.kind || null;
+  }
   const workspace = document.createElement('section');
   workspace.className = 'answer-workspace';
   const workspaceLabel = document.createElement('label');
@@ -584,8 +597,34 @@ function answerWorkspace(item, displayLabel, responseHandler = response => rende
   const send = document.createElement('button');
   send.type = 'button';
   send.dataset.sendAnswer = 'true';
-  send.textContent = 'Send to form';
+  send.textContent = state.replacement ? 'Replace answer in form' : 'Send to form';
   send.className = 'answer-send';
+
+  const fieldStatus = document.createElement('p');
+  fieldStatus.className = 'answer-field-status';
+  fieldStatus.dataset.answerStatus = 'true';
+  fieldStatus.setAttribute('role', 'status');
+  fieldStatus.setAttribute('aria-live', 'polite');
+
+  const jobContext = currentRun?.jobContext || currentInlineSession?.jobContext || {};
+  const contextSummary = [jobContext.role, jobContext.company].filter(Boolean).join(' at ');
+  const context = document.createElement('p');
+  context.className = 'answer-job-context';
+  context.textContent = contextSummary ? `Tailoring context: ${contextSummary}`
+    : jobContext.jobDescription ? 'Tailoring context: job description detected' : 'Add the job description to tailor this answer.';
+  const contextEditor = document.createElement('details');
+  contextEditor.className = 'job-description-editor';
+  contextEditor.hidden = Boolean(jobContext.role || jobContext.jobDescription);
+  const contextEditorSummary = document.createElement('summary');
+  contextEditorSummary.textContent = 'Add job description';
+  const jobDescription = document.createElement('textarea');
+  jobDescription.dataset.jobDescription = 'true';
+  jobDescription.value = state.jobDescription;
+  jobDescription.maxLength = 16000;
+  jobDescription.placeholder = 'Paste the job description to tailor this answer.';
+  jobDescription.setAttribute('aria-label', `Job description for ${displayLabel}`);
+  jobDescription.addEventListener('input', () => { state.jobDescription = jobDescription.value; });
+  contextEditor.append(contextEditorSummary, jobDescription);
 
   const promptRow = document.createElement('div');
   promptRow.className = 'rewrite-prompt-row';
@@ -600,7 +639,17 @@ function answerWorkspace(item, displayLabel, responseHandler = response => rende
   submitRewrite.type = 'button';
   submitRewrite.dataset.submitRewrite = 'true';
   submitRewrite.textContent = 'Rewrite draft';
-  promptRow.append(prompt, submitRewrite);
+  const retryRewrite = document.createElement('button');
+  retryRewrite.type = 'button';
+  retryRewrite.dataset.retryRewrite = 'true';
+  retryRewrite.textContent = 'Try again';
+  retryRewrite.hidden = !state.lastRewrite;
+  const restoreDraft = document.createElement('button');
+  restoreDraft.type = 'button';
+  restoreDraft.dataset.restoreDraft = 'true';
+  restoreDraft.textContent = 'Restore previous draft';
+  restoreDraft.hidden = !state.previousDraft;
+  promptRow.append(prompt, submitRewrite, retryRewrite, restoreDraft);
 
   const updateControls = () => {
     const hasAnswer = Boolean(state.answer.trim()) && !isOpaqueIdentifier(state.answer);
@@ -611,7 +660,16 @@ function answerWorkspace(item, displayLabel, responseHandler = response => rende
     edit.disabled = pending || !state.answer.trim();
     rewrite.disabled = pending || !state.answer.trim();
     submitRewrite.disabled = pending || !state.answer.trim() || !prompt.value.trim();
+    retryRewrite.disabled = pending || !state.lastRewrite;
+    restoreDraft.disabled = pending || !state.previousDraft;
     send.disabled = pending || !hasAnswer;
+    fieldStatus.textContent = state.pending === 'apply' ? 'Filling…'
+      : state.pending === 'tailor' ? 'Tailoring…'
+      : state.pending === 'rewrite' ? 'Rewriting…'
+      : state.pending === 'generate' ? 'Generating…' : '';
+    fieldStatus.hidden = !fieldStatus.textContent;
+    retryRewrite.hidden = !state.lastRewrite;
+    restoreDraft.hidden = !state.previousDraft;
   };
   textarea.addEventListener('input', () => {
     updateDraftAnswer(state, textarea.value);
@@ -632,35 +690,66 @@ function answerWorkspace(item, displayLabel, responseHandler = response => rende
     state.rewriteInstruction = prompt.value;
     updateControls();
   });
-  submitRewrite.addEventListener('click', async () => {
-    const instruction = prompt.value.trim();
+  const performRewrite = async ({instruction, tailorToJob = false, draft = state.answer} = {}) => {
+    if (state.pending) return;
+    instruction = String(instruction || '').trim();
     if (!instruction || !state.answer.trim()) return;
+    if (tailorToJob) promptRow.hidden = false;
+    if (tailorToJob && !jobContext.role && !jobContext.jobDescription && !state.jobDescription.trim()) {
+      contextEditor.hidden = false;
+      contextEditor.open = true;
+      jobDescription.focus();
+      setStatus('Add the job description before tailoring this answer.', 'error');
+      return;
+    }
     const requestRevision = state.revision;
-    const requestDraft = state.answer;
-    state.pending = 'rewrite';
+    const requestDraft = String(draft);
+    state.lastRewrite = {instruction, tailorToJob, draft: requestDraft};
+    state.pending = tailorToJob ? 'tailor' : 'rewrite';
     updateControls();
     try {
       const response = await sendFieldAction('JOB_RUN_REWRITE_ANSWER', origin, {
         fieldId: origin.fieldId, draft: requestDraft, sourceKey: state.sourceKey, sourceKeys: state.sourceKeys,
-        question: displayLabel, instruction });
+        question: displayLabel, instruction, tailorToJob, jobDescription: state.jobDescription.trim(),
+        ...(state.replacement ? {replacement: state.replacement} : {}) });
       if (!response?.ok || typeof response.answer !== 'string') throw new Error(response?.error || 'Could not rewrite the answer.');
       if (state.revision !== requestRevision) {
         setStatus('Draft changed while the rewrite was running. Your latest edit was kept.');
         return;
       }
+      state.previousDraft = {
+        answer: requestDraft, sourceKey: state.sourceKey, sourceKeys: [...state.sourceKeys], candidateKind: state.candidateKind,
+      };
       updateDraftAnswer(state, response.answer);
-      state.editing = Boolean(origin.inlineSessionId);
+      state.editing = true;
       textarea.value = state.answer;
       state.pending = null;
       if (origin.inlineSessionId) responseHandler(response);
       setStatus('Draft rewritten. Review or edit it before sending it to the form.');
     } catch (error) { setStatus(error.message, 'error'); }
     finally {
-      if (state.pending === 'rewrite') state.pending = null;
+      if (['rewrite', 'tailor'].includes(state.pending)) state.pending = null;
       updateControls();
     }
+  };
+  submitRewrite.addEventListener('click', () => performRewrite({instruction: prompt.value}));
+  retryRewrite.addEventListener('click', () => performRewrite(state.lastRewrite));
+  restoreDraft.addEventListener('click', () => {
+    if (!state.previousDraft) return;
+    const previous = state.previousDraft;
+    state.previousDraft = null;
+    state.answer = previous.answer;
+    state.sourceKey = previous.sourceKey;
+    state.sourceKeys = previous.sourceKeys;
+    state.candidateKind = previous.candidateKind;
+    state.revision += 1;
+    textarea.value = state.answer;
+    state.editing = true;
+    updateControls();
+    textarea.focus();
   });
   const applyAnswer = async () => {
+    if (state.pending) return;
     const answer = state.answer;
     if (!answer.trim() || isOpaqueIdentifier(answer)) return;
     const requestRevision = state.revision;
@@ -670,16 +759,21 @@ function answerWorkspace(item, displayLabel, responseHandler = response => rende
     try {
       const type = candidateBacked ? 'JOB_RUN_APPROVE_SUGGESTION' : 'JOB_RUN_APPLY_DRAFT';
       const response = await sendFieldAction(type, origin, { fieldId: origin.fieldId, answer,
+        ...(state.replacement ? { replacement: state.replacement } : {}),
         ...(candidateBacked ? {
           ...(state.sourceKey ? { sourceKey: state.sourceKey } : {}),
           ...(state.sourceKeys.length ? { sourceKeys: state.sourceKeys } : {}),
           ...(state.candidateKind ? { candidateKind: state.candidateKind } : {}),
         } : {}) });
-      if (!response?.ok) throw new Error(response?.error || 'Could not send the answer to the form.');
+      if (!response?.ok && !(response?.applied && response.run)) throw new Error(response?.error || 'Could not send the answer to the form.');
       if (origin.inlineSessionId ? response.inlineSession?.sessionId !== origin.inlineSessionId : !response.run) throw new Error('Could not confirm the updated application state. Your draft was kept.');
       if (state.revision === requestRevision) clearDraft(origin, origin.fieldId);
       state.pending = null;
       responseHandler(response);
+      if (!response.ok) {
+        setStatus(response.error || 'Answer applied, but it could not be saved for reuse.', 'error');
+        return;
+      }
       if (state.revision !== requestRevision) {
         setStatus('The form received the earlier draft. Your newer edit was kept.');
       } else {
@@ -693,9 +787,9 @@ function answerWorkspace(item, displayLabel, responseHandler = response => rende
   };
   send.addEventListener('click', applyAnswer);
   controls.append(edit, rewrite, send);
-  workspace.append(workspaceLabel, textarea, controls, promptRow);
+  workspace.append(workspaceLabel, context, contextEditor, textarea, controls, promptRow, fieldStatus);
   updateControls();
-  return { workspace, state, origin, updateControls, applyAnswer };
+  return { workspace, state, origin, updateControls, applyAnswer, performRewrite };
 }
 
 function itemRow(item, { focus = false, detail = '', responseHandler = response => renderRun(response.run) } = {}) {
@@ -706,7 +800,7 @@ function itemRow(item, { focus = false, detail = '', responseHandler = response 
   const candidates = Array.isArray(item.suggestion?.candidates) ? item.suggestion.candidates : [];
   const readableCandidates = candidates.filter((candidate) => !isOpaqueIdentifier(candidate.answer));
   const onlyOpaqueSuggestions = candidates.length > 0 && readableCandidates.length === 0;
-  const generated = item.generatedSuggestion;
+  const generated = item.generatedSuggestion || (item.suggestion && readableCandidates.length && !item.filled ? {suggestions: []} : null);
   const hasReadableGeneratedDraft = Array.isArray(generated?.suggestions)
     && generated.suggestions.some((suggestion) => !isOpaqueIdentifier(suggestion.answer));
   const labelCandidates = [item.label, item.question, item.fieldId].filter(Boolean).map((value) => String(value));
@@ -715,7 +809,7 @@ function itemRow(item, { focus = false, detail = '', responseHandler = response 
   const itemValue = item.value ?? item.answer;
   const hasOpaqueValue = isOpaqueIdentifier(itemValue);
   const unclearQuestion = item.labelConfidence === 'low';
-  const fieldAction = focus && item.fieldId
+  const fieldAction = focus && item.fieldId && !item.filled
     ? onlyOpaqueSuggestions
       ? `Choose a value for ${displayLabel} on the application page, then click Check again.`
       : hasOpaqueValue
@@ -740,6 +834,12 @@ function itemRow(item, { focus = false, detail = '', responseHandler = response 
   else if (unclearQuestion) value.textContent = `${item.nearbyContext ? `Nearby text: ${item.nearbyContext}. ` : ''}Use Show on page to identify this question, then write your answer.`;
   else value.textContent = fieldAction || item.reason || 'Review this field';
   content.append(label, value);
+  if (item.filled) {
+    const filled = document.createElement('span');
+    filled.className = 'pill answer-filled';
+    filled.textContent = 'Filled';
+    label.append(document.createTextNode(' '), filled);
+  }
   if (displayLabel.length > 80) {
     label.classList.add('collapsed');
     const expand = document.createElement('button');
@@ -784,8 +884,37 @@ function itemRow(item, { focus = false, detail = '', responseHandler = response 
   const workspace = focus && item.fieldId && (!onlyOpaqueSuggestions || hasReadableGeneratedDraft)
     ? answerWorkspace(item, displayLabel, responseHandler)
     : null;
-  if (workspace) content.append(workspace.workspace);
   if (workspace) {
+    if (item.filled) {
+      workspace.workspace.hidden = true;
+      const filledControls = document.createElement('div');
+      filledControls.className = 'filled-answer-controls';
+      const tailor = document.createElement('button');
+      tailor.type = 'button';
+      tailor.dataset.tailorFilledAnswer = 'true';
+      tailor.textContent = 'Tailor to this job';
+      tailor.addEventListener('click', () => {
+        workspace.workspace.hidden = false;
+        void workspace.performRewrite({
+          instruction: 'Tailor this answer to the role and job description while preserving every factual claim.',
+          tailorToJob: true,
+        });
+      });
+      const editFilled = document.createElement('button');
+      editFilled.type = 'button';
+      editFilled.dataset.editFilledAnswer = 'true';
+      editFilled.textContent = 'Edit filled answer';
+      editFilled.addEventListener('click', () => {
+        workspace.workspace.hidden = false;
+        const input = workspace.workspace.querySelector('[data-answer-draft]');
+        input.focus();
+      });
+      filledControls.append(tailor, editFilled);
+      content.append(filledControls);
+    }
+    content.append(workspace.workspace);
+  }
+  if (workspace && !item.filled) {
     const search = document.createElement('div');
     search.className = 'answer-search';
     const query = document.createElement('input');
@@ -838,7 +967,7 @@ function itemRow(item, { focus = false, detail = '', responseHandler = response 
     draftList.className = 'generated-drafts';
     const heading = document.createElement('p');
     heading.className = 'generated-drafts-heading';
-    heading.textContent = drafts.length ? 'Suggested answers' : 'More context needed';
+    heading.textContent = drafts.length ? 'Suggested answers' : generated.missingContext ? 'More context needed' : 'Generate a new answer';
     draftList.append(heading);
     for (const suggestion of drafts) {
       if (isOpaqueIdentifier(suggestion.answer)) continue;
@@ -847,7 +976,7 @@ function itemRow(item, { focus = false, detail = '', responseHandler = response 
       const choose = document.createElement('button');
       choose.type = 'button';
       choose.dataset.chooseGeneratedAnswer = 'true';
-      choose.textContent = 'Use this answer';
+      choose.textContent = 'Review this answer';
       choose.addEventListener('click', () => {
         if (!workspace) return;
         updateDraftAnswer(workspace.state, suggestion.answer);
@@ -857,7 +986,6 @@ function itemRow(item, { focus = false, detail = '', responseHandler = response 
         workspace.state.editing = true;
         workspace.workspace.querySelector('[data-answer-draft]').value = workspace.state.answer;
         workspace.updateControls();
-        void workspace.applyAnswer();
       });
       const editDraft = document.createElement('button');
       editDraft.type = 'button';
@@ -888,15 +1016,16 @@ function itemRow(item, { focus = false, detail = '', responseHandler = response 
     regenerate.type = 'button';
     regenerate.className = 'inline-action';
     regenerate.dataset.generateSuggestions = 'true';
-    regenerate.textContent = drafts.length ? 'Generate again' : 'Generate suggestions';
+    regenerate.textContent = drafts.length ? 'Generate new answer' : 'Generate answer';
     regenerate.addEventListener('click', async () => {
-      if (!workspace) return;
-      const jobDescription = String(draftList.querySelector('[data-job-description]')?.value ?? workspace.state.jobDescription).trim();
+      if (!workspace || workspace.state.pending) return;
+      const jobDescription = String(workspace.workspace.querySelector('[data-job-description]')?.value ?? workspace.state.jobDescription).trim();
       workspace.state.jobDescription = jobDescription;
       const actionRevision = runRevision;
       workspace.state.pending = 'generate';
       workspace.updateControls();
       regenerate.disabled = true;
+      regenerate.textContent = 'Generating…';
       try {
         const response = await sendFieldAction('JOB_RUN_GENERATE_SUGGESTIONS', workspace.origin, { jobDescription });
         if (!response?.ok || (origin.inlineSessionId ? !response.inlineSession : !response.run)) throw new Error(response?.error || 'Could not generate answer suggestions.');
@@ -908,45 +1037,32 @@ function itemRow(item, { focus = false, detail = '', responseHandler = response 
       } catch (error) { setStatus(error.message, 'error'); }
       finally {
         workspace.state.pending = null;
+        regenerate.disabled = false;
+        regenerate.textContent = drafts.length ? 'Generate new answer' : 'Generate answer';
         workspace.updateControls();
       }
     });
-    if (generated.missingContext && !currentRun?.jobContext?.jobDescription) {
-      const details = document.createElement('details');
-      details.className = 'job-description-editor';
-      details.dataset.panelDetail = panelDetailKey(origin, 'job-description');
-      const summary = document.createElement('summary');
-      summary.textContent = 'Add job description';
-      const input = document.createElement('textarea');
-      input.dataset.jobDescription = 'true';
-      input.value = workspace.state.jobDescription;
-      input.maxLength = 16000;
-      input.placeholder = 'Paste the job description to tailor suggestions.';
-      input.setAttribute('aria-label', `Job description for ${displayLabel}`);
-      input.addEventListener('input', () => { workspace.state.jobDescription = input.value; });
-      details.append(summary, input);
-      draftList.append(details);
-    }
     draftList.append(regenerate);
     content.insertBefore(draftList, workspace?.workspace || null);
   }
-  if (item.suggestion) {
+  if (item.suggestion && !item.filled) {
     for (const candidate of candidates) {
-      const evidence = document.createElement('details');
+      const evidence = document.createElement('section');
       evidence.className = 'saved-evidence';
       evidence.dataset.panelDetail = panelDetailKey(origin, 'evidence', candidate.sourceKey || String(candidates.indexOf(candidate)));
-      const summary = document.createElement('summary');
+      const source = document.createElement('p');
+      source.className = 'saved-evidence-source';
       const sourceQuestion = String(candidate.sourceQuestion || 'Saved answer');
       if (isOpaqueIdentifier(sourceQuestion)) {
-        summary.textContent = 'Saved answer from a previous form';
+        source.textContent = 'Saved answer from a previous form';
         logOpaqueIdentifier('saved answer source', sourceQuestion);
-      } else summary.textContent = `Saved answer from ${sourceQuestion}`;
+      } else source.textContent = `Saved answer from ${sourceQuestion}`;
       if (isOpaqueIdentifier(candidate.answer)) {
         const unavailable = document.createElement('p');
         unavailable.className = 'result-detail';
         unavailable.textContent = 'This saved value cannot be used automatically.';
         logOpaqueIdentifier('saved answer', candidate.answer);
-        evidence.append(summary, unavailable);
+        evidence.append(source, unavailable);
         content.append(evidence);
         continue;
       }
@@ -957,41 +1073,55 @@ function itemRow(item, { focus = false, detail = '', responseHandler = response 
       const reason = document.createElement('p');
       reason.className = 'saved-evidence-reason';
       reason.textContent = candidate.reason || '';
+      const selectCandidate = (editing) => {
+        if (!workspace || workspace.state.pending) return;
+        updateDraftAnswer(workspace.state, candidate.answer);
+        workspace.state.sourceKey = candidate.sourceKey || null;
+        workspace.state.sourceKeys = Array.isArray(candidate.sourceKeys) ? candidate.sourceKeys : (candidate.sourceKey ? [candidate.sourceKey] : []);
+        workspace.state.candidateKind = candidate.kind || null;
+        workspace.state.editing = editing;
+        const draft = workspace.workspace.querySelector('[data-answer-draft]');
+        draft.value = workspace.state.answer;
+        workspace.updateControls();
+        return draft;
+      };
+      const actions = document.createElement('div');
+      actions.className = 'saved-answer-actions';
       const choose = document.createElement('button');
       choose.type = 'button';
       choose.dataset.chooseAnswer = 'true';
       choose.textContent = 'Use answer';
       choose.addEventListener('click', () => {
-        if (!workspace) return;
-        updateDraftAnswer(workspace.state, candidate.answer);
-        workspace.state.sourceKey = candidate.sourceKey || null;
-        workspace.state.sourceKeys = Array.isArray(candidate.sourceKeys) ? candidate.sourceKeys : (candidate.sourceKey ? [candidate.sourceKey] : []);
-        workspace.state.candidateKind = candidate.kind || null;
-        workspace.state.editing = false;
-        const draft = workspace.workspace.querySelector('[data-answer-draft]');
-        draft.value = workspace.state.answer;
-        workspace.updateControls();
+        if (!selectCandidate(false)) return;
         void workspace.applyAnswer();
+      });
+      const tailor = document.createElement('button');
+      tailor.type = 'button';
+      tailor.dataset.tailorAnswer = 'true';
+      tailor.textContent = 'Tailor to this job';
+      tailor.addEventListener('click', () => {
+        if (!selectCandidate(true)) return;
+        void workspace.performRewrite({
+          instruction: 'Tailor this answer to the role and job description while preserving every factual claim.',
+          tailorToJob: true,
+        });
       });
       const editCandidate = document.createElement('button');
       editCandidate.type = 'button';
       editCandidate.dataset.editCandidate = 'true';
       editCandidate.textContent = 'Edit';
       editCandidate.addEventListener('click', () => {
-        if (!workspace) return;
-        updateDraftAnswer(workspace.state, candidate.answer);
-        workspace.state.sourceKey = candidate.sourceKey || null;
-        workspace.state.sourceKeys = Array.isArray(candidate.sourceKeys) ? candidate.sourceKeys : (candidate.sourceKey ? [candidate.sourceKey] : []);
-        workspace.state.candidateKind = candidate.kind || null;
-        workspace.state.editing = true;
-        const draft = workspace.workspace.querySelector('[data-answer-draft]');
-        draft.value = workspace.state.answer;
-        workspace.updateControls();
-        draft.focus();
+        selectCandidate(true)?.focus();
       });
-      evidence.append(summary, answer);
-      if (reason.textContent) evidence.append(reason);
-      evidence.append(choose, editCandidate);
+      actions.append(choose, tailor, editCandidate);
+      const provenance = document.createElement('details');
+      provenance.className = 'saved-provenance';
+      provenance.dataset.panelDetail = `${evidence.dataset.panelDetail}:provenance`;
+      const provenanceSummary = document.createElement('summary');
+      provenanceSummary.textContent = 'Why this answer?';
+      provenance.append(provenanceSummary);
+      if (reason.textContent) provenance.append(reason);
+      evidence.append(source, answer, actions, provenance);
       const sourceKeys = Array.isArray(candidate.sourceKeys) ? candidate.sourceKeys : [candidate.sourceKey].filter(Boolean);
       if (!origin.inlineSessionId && candidate.kind !== 'draft' && candidate.kind !== 'planner' && sourceKeys.length === 1) {
         const dismiss = document.createElement('button');
@@ -1035,7 +1165,7 @@ function itemRow(item, { focus = false, detail = '', responseHandler = response 
           finally { confirm.disabled = false; }
         });
         confirmation.append(confirm, cancel);
-        evidence.append(dismiss, remove, confirmation);
+        provenance.append(dismiss, remove, confirmation);
       }
       content.append(evidence);
     }
@@ -1045,9 +1175,13 @@ function itemRow(item, { focus = false, detail = '', responseHandler = response 
 }
 
 function renderList(container, items, options = {}) {
-  container.replaceChildren();
   if (!items.length) {
-    container.append(itemRow({ label: options.emptyLabel || 'None' }, { detail: options.emptyDetail || 'Nothing to review.' }));
+    const signature = JSON.stringify([options.emptyLabel || 'None', options.emptyDetail || 'Nothing to review.']);
+    if (container.children.length === 1 && container.firstElementChild?.dataset.renderSignature === signature) return;
+    const empty = itemRow({ label: options.emptyLabel || 'None' }, { detail: options.emptyDetail || 'Nothing to review.' });
+    empty.dataset.renderKey = 'empty';
+    empty.dataset.renderSignature = signature;
+    container.replaceChildren(empty);
     return;
   }
   const ordered = items.map((item, index) => ({ item, index })).sort((left, right) => {
@@ -1068,7 +1202,27 @@ function renderList(container, items, options = {}) {
     if (leftOrder == null && rightOrder != null) return 1;
     return left.index - right.index;
   });
-  for (const { item } of ordered) container.append(itemRow(item, options));
+  const existing = new Map([...container.children].map(node => [node.dataset.renderKey, node]));
+  const nodes = ordered.map(({item}, index) => {
+    const key = [item.fieldId || item.key || item.question || item.label || 'item', item.pageNumber ?? '', item.formOrder ?? index].join(':');
+    const signature = JSON.stringify([item, Boolean(options.focus), options.detail || '']);
+    const current = existing.get(key);
+    if (current?.dataset.renderSignature === signature) return current;
+    const node = itemRow(item, options);
+    node.dataset.renderKey = key;
+    node.dataset.renderSignature = signature;
+    return node;
+  });
+  container.replaceChildren(...nodes);
+}
+
+function renderLazyList(details, container, items, options) {
+  details.__renderList = () => renderList(container, items, options);
+  if (!details.__lazyBound) {
+    details.__lazyBound = true;
+    details.addEventListener('toggle', () => { if (details.open) details.__renderList?.(); });
+  }
+  if (details.open) details.__renderList();
 }
 
 function setActionVisibility(run) {
@@ -1145,8 +1299,14 @@ function restorePanelState(state) {
   }
 }
 
-function renderRun(run) {
+function renderRun(run, {force = false} = {}) {
   if (!currentSite.supported || currentSite.disabled) run = null;
+  const currentIdentity = `${currentRun?.applicationId || currentRun?.startedAt || ''}:${currentRun?.pageSignature || ''}`;
+  const nextIdentity = `${run?.applicationId || run?.startedAt || ''}:${run?.pageSignature || ''}`;
+  const currentRevision = Number(currentRun?.revision);
+  const nextRevision = Number(run?.revision);
+  if (!force && run && currentRun && currentIdentity === nextIdentity
+    && Number.isFinite(currentRevision) && Number.isFinite(nextRevision) && nextRevision <= currentRevision) return;
   const panelState = capturePanelState();
   runRevision += 1;
   const previousOrigin = `${currentRun?.applicationId || ''}:${currentRun?.pageSignature || ''}`;
@@ -1181,6 +1341,9 @@ function renderRun(run) {
   const optionalUnresolved = run.optionalUnresolved || [];
   const reviewRequired = run.reviewRequired || [];
   const audit = run.audit || [];
+  const appliedAnswers = Object.values(run.appliedAnswers || {});
+  const requiredDisplay = [...actionRequired, ...appliedAnswers.filter(item => item.list === 'required')];
+  const optionalDisplay = [...optionalUnresolved, ...appliedAnswers.filter(item => item.list !== 'required')];
   elements.runHint.hidden = false;
   elements.runTitle.textContent = run.status === 'running' ? 'Filling this page…'
     : run.frame === null ? 'Let’s find your form'
@@ -1212,8 +1375,8 @@ function renderRun(run) {
   setActionVisibility(run);
 
   elements.actionRequiredCount.textContent = String(actionRequired.length);
-  elements.actionRequiredCard.hidden = actionRequired.length === 0;
-  renderList(elements.actionRequiredList, actionRequired, { focus: run.frame !== null, emptyDetail: 'No blockers on this page.' });
+  elements.actionRequiredCard.hidden = requiredDisplay.length === 0;
+  renderList(elements.actionRequiredList, requiredDisplay, { focus: run.frame !== null, emptyDetail: 'No blockers on this page.' });
 
   elements.reviewCount.textContent = String(reviewRequired.length);
   elements.reviewCard.hidden = reviewRequired.length === 0 && !['ready_for_user_submit', 'answers_saved'].includes(run.status);
@@ -1221,12 +1384,12 @@ function renderRun(run) {
   elements.submitInstructions.hidden = !['ready_for_user_submit', 'answers_saved'].includes(run.status);
 
   elements.optionalCount.textContent = String(optionalUnresolved.length);
-  elements.optionalDetails.hidden = optionalUnresolved.length === 0;
-  renderList(elements.optionalList, optionalUnresolved, { focus: run.frame !== null, emptyLabel: 'No optional unanswered fields', emptyDetail: 'Optional questions are complete or not present on this page.' });
+  elements.optionalDetails.hidden = optionalDisplay.length === 0;
+  renderLazyList(elements.optionalDetails, elements.optionalList, optionalDisplay, { focus: run.frame !== null, emptyLabel: 'No optional unanswered fields', emptyDetail: 'Optional questions are complete or not present on this page.' });
 
   elements.auditCount.textContent = String(audit.length);
   elements.auditDetails.hidden = audit.length === 0;
-  renderList(elements.auditList, audit, { detail: '' });
+  renderLazyList(elements.auditDetails, elements.auditList, audit, { detail: '' });
 
   if (run.status === 'waiting_user') {
     const waitingLabel = String(run.waitingLabel || '').trim();
@@ -1540,7 +1703,7 @@ chrome.storage.onChanged.addListener((changes, area) => {
   if (area === 'local' && changes.coverMessages) elements.coverMessageCount.textContent = `${(changes.coverMessages.newValue || []).length} cover messages`;
   if (area === 'local' && changes.autoAdvancePages) {
     elements.autoAdvance.checked = Boolean(changes.autoAdvancePages.newValue);
-    if (currentRun?.status === 'running') renderRun(currentRun);
+    if (currentRun?.status === 'running') renderRun(currentRun, {force: true});
   }
   if (area === 'local' && changes.includeFormScreenshot) elements.includeFormScreenshot.checked = changes.includeFormScreenshot.newValue !== false;
   if (area === 'local' && changes.disabledHostnames) refreshSiteState().catch(error => setStatus(error.message, 'error'));
