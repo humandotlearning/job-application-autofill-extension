@@ -738,9 +738,16 @@ test('panel exports datasource backups through a generated download link', async
 });
 
 test('panel shows learned changes and sends a user correction to the worker', async () => {
-  const harness = await setupPanel({ datasource: { answerCount: 1, coverMessageCount: 0, learnedChanges: [
+  const datasource = { answerCount: 1, coverMessageCount: 0, learnedChanges: [
     { key: 'email', question: 'Email', answer: 'new@example.com', history: [{ answer: 'old@example.com' }], alternatives: [] },
-  ] } });
+  ] };
+  const harness = await setupPanel({ datasource });
+  const original = chrome.runtime.sendMessage;
+  chrome.runtime.sendMessage = async (message) => {
+    if (message.type !== 'JOB_DATASOURCE_CORRECT') return original(message);
+    harness.sentMessages.push(message);
+    return { ok: true, datasource: { ...datasource, learnedChanges: [] } };
+  };
   try {
     const document = harness.dom.window.document;
     assert.match(document.querySelector('#learned-change-list').textContent, /old@example.com/);
@@ -749,6 +756,27 @@ test('panel shows learned changes and sends a user correction to the worker', as
     document.querySelector('#learned-change-list button').click();
     await new Promise((resolve) => setTimeout(resolve, 0));
     assert.ok(harness.sentMessages.some((message) => message.type === 'JOB_DATASOURCE_CORRECT' && message.answer === 'correct@example.com'));
+    assert.equal(document.querySelectorAll('#learned-change-list input').length, 0);
+  } finally { harness.cleanup(); }
+});
+
+test('panel closes a learned-change notification without confirming its value', async () => {
+  const datasource = { answerCount: 1, coverMessageCount: 0, learnedChanges: [
+    { key: 'email', question: 'Email', answer: 'new@example.com', confirmationState: 'pending' },
+  ] };
+  const harness = await setupPanel({ datasource });
+  const original = chrome.runtime.sendMessage;
+  chrome.runtime.sendMessage = async (message) => {
+    if (message.type !== 'JOB_DATASOURCE_DISMISS_CHANGE') return original(message);
+    harness.sentMessages.push(message);
+    return { ok: true, datasource: { ...datasource, learnedChanges: [] } };
+  };
+  try {
+    const document = harness.dom.window.document;
+    [...document.querySelectorAll('#learned-change-list button')].find((button) => button.textContent === 'Close').click();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assert.ok(harness.sentMessages.some((message) => message.type === 'JOB_DATASOURCE_DISMISS_CHANGE' && message.key === 'email'));
+    assert.equal(document.querySelectorAll('#learned-change-list input').length, 0);
   } finally { harness.cleanup(); }
 });
 

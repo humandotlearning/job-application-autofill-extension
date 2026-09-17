@@ -5,6 +5,7 @@ import {
   chooseRecord,
   canonicalConcept,
   inferSensitivity,
+  mergeLearnedAnswers,
   normalizeAnswerRecord,
   normalizeText,
   shouldReviewDecision,
@@ -267,6 +268,15 @@ test('retains user correction history when a confirmed answer changes', () => {
     key: 'email', question: 'Email address', answer: 'new@example.com', provenance: 'user',
   }], '2026-01-01T00:00:00.000Z');
   assert.deepEqual(merged[0].history.map((item) => item.answer), ['old@example.com']);
+});
+
+test('new learned values reopen a previously dismissed notification', () => {
+  const [record] = mergeLearnedAnswers([
+    { key: 'city', question: 'City', answer: 'Bengaluru', provenance: 'user', changeReviewedAt: '2026-01-01T00:00:00.000Z' },
+  ], [{ key: 'city', question: 'City', answer: 'Chennai', provenance: 'user', completed: true }], '2026-01-02T00:00:00.000Z');
+  assert.equal(record.confirmationState, 'pending');
+  assert.equal(record.changeReviewedAt, undefined);
+  assert.equal(record.pendingAnswer, 'Chennai');
 });
 
 test('keeps existing records with a safe migration shape', () => {

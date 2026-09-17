@@ -432,7 +432,7 @@ async function getSettings() {
 async function datasourceSummary() {
   const state = await getDatasource();
   const learnedChanges = state.answerRecords
-    .filter((record) => (record.history?.length || record.alternatives?.length || record.provenance === 'user' || record.confirmationState === 'pending'))
+    .filter((record) => !record.changeReviewedAt && (record.history?.length || record.alternatives?.length || record.provenance === 'user' || record.confirmationState === 'pending'))
     .map((record) => ({
       key: record.key,
       question: record.question,
@@ -484,6 +484,7 @@ async function correctDatasourceRecord(key, answer) {
       provenance: 'user',
       confirmationState: 'confirmed',
       pendingAnswer: '',
+      changeReviewedAt: now,
       confirmedAt: now,
       updatedAt: now,
     }], now);
@@ -499,7 +500,7 @@ async function correctDatasourceRecord(key, answer) {
     answerCount: state.answerRecords.length,
     coverMessageCount: state.coverMessages.length,
     learnedChanges: state.answerRecords
-      .filter((record) => (record.history?.length || record.alternatives?.length || record.provenance === 'user' || record.confirmationState === 'pending'))
+      .filter((record) => !record.changeReviewedAt && (record.history?.length || record.alternatives?.length || record.provenance === 'user' || record.confirmationState === 'pending'))
       .map((record) => ({
         key: record.key,
         question: record.question,
@@ -513,6 +514,22 @@ async function correctDatasourceRecord(key, answer) {
         confirmationState: record.confirmationState || 'legacy',
       })),
   };
+}
+
+async function dismissDatasourceChange(key) {
+  if (!key) throw new Error('A learned change key is required.');
+  datasourceWriteChain = datasourceWriteChain.catch(() => {}).then(async () => {
+    const current = await getDatasource();
+    if (!current.answerRecords.some((record) => record.key === key)) throw new Error('The learned answer no longer exists.');
+    const now = new Date().toISOString();
+    return saveDatasource({
+      ...current,
+      answerRecords: current.answerRecords.map((record) => record.key === key ? { ...record, changeReviewedAt: now } : record),
+      datasourceMeta: { ...(current.datasourceMeta || {}), schemaVersion: current.schemaVersion, updatedAt: now },
+    });
+  });
+  await datasourceWriteChain;
+  return datasourceSummary();
 }
 
 async function updateDatasourceProfile(profile) {
@@ -2401,6 +2418,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     'JOB_DATASOURCE_EXPORT',
     'JOB_DATASOURCE_IMPORT',
     'JOB_DATASOURCE_CORRECT',
+    'JOB_DATASOURCE_DISMISS_CHANGE',
     'JOB_DATASOURCE_SUPPRESS_ANSWER',
     'JOB_DATASOURCE_DELETE_ANSWER',
     'JOB_DATASOURCE_PROFILE_UPDATE',
@@ -2448,30 +2466,14 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (message.type === 'JOB_DATASOURCE_STATE') return { ok: true, datasource: await datasourceSummary() };
     if (message.type === 'JOB_DATASOURCE_EXPORT') return { ok: true, backup: serializeDatasourceBackup(await getDatasource()) };
     if (message.type === 'JOB_DATASOURCE_IMPORT') {
-      const state = await importDatasourceBackup(message.backup);
-      return {
-        ok: true,
-        datasource: {
-          schemaVersion: state.schemaVersion,
-          answerCount: state.answerRecords.length,
-          coverMessageCount: state.coverMessages.length,
-          learnedChanges: state.answerRecords
-            .filter((record) => (record.history?.length || record.alternatives?.length))
-            .map((record) => ({
-              key: record.key,
-              question: record.question,
-              answer: record.answer,
-              history: record.history || [],
-              alternatives: record.alternatives || [],
-              entityId: record.entityId || '',
-              context: record.context || '',
-              confirmedAt: record.confirmedAt || null,
-            })),
-        },
-      };
+      await importDatasourceBackup(message.backup);
+      return { ok: true, datasource: await datasourceSummary() };
     }
     if (message.type === 'JOB_DATASOURCE_CORRECT') {
       return { ok: true, datasource: await correctDatasourceRecord(message.key, message.answer) };
+    }
+    if (message.type === 'JOB_DATASOURCE_DISMISS_CHANGE') {
+      return { ok: true, datasource: await dismissDatasourceChange(message.key) };
     }
     if (message.type === 'JOB_DATASOURCE_PROFILE_UPDATE') {
       return { ok: true, datasource: await updateDatasourceProfile(message.profile || {}) };

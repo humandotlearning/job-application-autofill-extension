@@ -979,7 +979,7 @@ test('inline sessions isolate identical field IDs in two frames and preserve unr
 
 test('all existing management and run endpoints require a trusted extension panel sender', async () => {
   const harness = await inlineHarness();
-  const routes = ['JOB_RUN_APPROVE_SUGGESTION', 'JOB_RUN_APPLY_DRAFT', 'JOB_RUN_REWRITE_ANSWER', 'JOB_RUN_GENERATE_SUGGESTIONS', 'JOB_RUN_START', 'JOB_RUN_CHECK_PAGE', 'JOB_RUN_ADVANCE_PAGE', 'JOB_RUN_FOCUS_FIELD', 'JOB_RUN_SAVE_ANSWERS', 'JOB_RUN_VALIDATE_PAGE', 'JOB_RUN_RETRY_AI', 'JOB_RUN_SELECT_EMPLOYMENT', 'JOB_RUN_SEARCH_ANSWERS', 'JOB_RUN_STATE', 'JOB_DATASOURCE_STATE', 'JOB_DATASOURCE_EXPORT', 'JOB_DATASOURCE_IMPORT', 'JOB_DATASOURCE_CORRECT', 'JOB_DATASOURCE_SUPPRESS_ANSWER', 'JOB_DATASOURCE_DELETE_ANSWER', 'JOB_DATASOURCE_PROFILE_UPDATE', 'JOB_LEARNING_INBOX_RESOLVE'];
+  const routes = ['JOB_RUN_APPROVE_SUGGESTION', 'JOB_RUN_APPLY_DRAFT', 'JOB_RUN_REWRITE_ANSWER', 'JOB_RUN_GENERATE_SUGGESTIONS', 'JOB_RUN_START', 'JOB_RUN_CHECK_PAGE', 'JOB_RUN_ADVANCE_PAGE', 'JOB_RUN_FOCUS_FIELD', 'JOB_RUN_SAVE_ANSWERS', 'JOB_RUN_VALIDATE_PAGE', 'JOB_RUN_RETRY_AI', 'JOB_RUN_SELECT_EMPLOYMENT', 'JOB_RUN_SEARCH_ANSWERS', 'JOB_RUN_STATE', 'JOB_DATASOURCE_STATE', 'JOB_DATASOURCE_EXPORT', 'JOB_DATASOURCE_IMPORT', 'JOB_DATASOURCE_CORRECT', 'JOB_DATASOURCE_DISMISS_CHANGE', 'JOB_DATASOURCE_SUPPRESS_ANSWER', 'JOB_DATASOURCE_DELETE_ANSWER', 'JOB_DATASOURCE_PROFILE_UPDATE', 'JOB_LEARNING_INBOX_RESOLVE'];
   for (const type of routes) {
     const result = await harness.dispatch({type, tabId: 7}, inlineSender());
     assert.equal(result.ok, false, type);
@@ -990,6 +990,25 @@ test('all existing management and run endpoints require a trusted extension pane
   }
   assert.equal((await harness.dispatch({type: 'JOB_DATASOURCE_STATE'})).ok, true);
   assert.equal((await harness.dispatch({type: 'JOB_RUN_STATE', tabId: 7})).ok, true);
+});
+
+test('confirming or closing a learned change removes its notification without deleting the answer', async () => {
+  const harness = createHarness({ answerRecords: [
+    { key: 'email', question: 'Email', answer: 'new@example.com', history: [{ answer: 'old@example.com' }], provenance: 'user' },
+    { key: 'city', question: 'City', answer: 'Bengaluru', pendingAnswer: 'Chennai', confirmationState: 'pending' },
+  ] });
+  await import(`../src/service-worker.js?learned-change-review=${Date.now()}`);
+
+  assert.equal((await harness.dispatch({ type: 'JOB_DATASOURCE_STATE' })).datasource.learnedChanges.length, 2);
+  const confirmed = await harness.dispatch({ type: 'JOB_DATASOURCE_CORRECT', key: 'email', answer: 'new@example.com' });
+  assert.equal(confirmed.ok, true, confirmed.error);
+  assert.deepEqual(confirmed.datasource.learnedChanges.map((record) => record.key), ['city']);
+
+  const closed = await harness.dispatch({ type: 'JOB_DATASOURCE_DISMISS_CHANGE', key: 'city' });
+  assert.equal(closed.ok, true, closed.error);
+  assert.deepEqual(closed.datasource.learnedChanges, []);
+  assert.equal(harness.localData.answerRecords.find((record) => record.key === 'city').answer, 'Bengaluru');
+  assert.equal(harness.localData.answerRecords.length, 2);
 });
 
 test('inline acceptance rejects optional forged destination fields and unsupported numeric controls', async () => {
