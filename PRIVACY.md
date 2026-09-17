@@ -17,7 +17,7 @@ This personal unpacked extension fills job-application forms from an answer prof
 - Only a unique exact/concept match to a confirmed, compatible, safe short answer can be filled automatically after live validation. Sensitive, narrative, fuzzy, `review_only`, and AI-proposed answers require explicit review. Legal declarations and consent remain manual.
 - Passwords and file inputs are never filled. Resume upload, CAPTCHA, login, inaccessible shadow roots, and ambiguous custom widgets remain manual.
 - The extension never clicks or blocks a site Submit control. When you submit the detected final application form yourself, it captures the current values locally without delaying the site submission.
-- There is no backend, telemetry, analytics, Google integration, or runtime workbook importer. Edit monitoring is limited to activated application frames.
+- Optional local Phoenix tracing (enabled by default for this setup) sends full AI request/response bodies, including supplied personal evidence and screenshots, to 127.0.0.1:6006. HTTP authorization headers are excluded. Data persists separately in the project `.phoenix/` directory and is not removed when the extension is uninstalled. Disable it in Settings. There is no cloud analytics, Google integration, or runtime workbook importer. Edit monitoring is limited to activated application frames.
 
 Removing the extension removes its local Chrome storage. Review the provider account and API-key policies that apply to your use before entering a key.
 
