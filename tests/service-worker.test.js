@@ -476,6 +476,34 @@ test('inline TypeSafe search is explicit and rejects a source changed before app
   assert.equal(harness.tabs.get(7).messages.some(message => message.type === 'JOB_APP_APPLY'), false);
 });
 
+test('inline panel can search saved answers after focus leaves the page without applying them', async () => {
+  const harness = await inlineHarness({field: {label: 'How have you made systems safer?', type: 'textarea'}, answerRecords: [
+    {key: 'reliability', question: 'Engineering achievement',
+      answer: 'Reduced production outages with health checks and automated rollback.', sensitivity: 'safe'},
+  ]});
+  harness.localData.typesafeEnabled = true;
+  harness.localData.typesafeApiKey = 'ts_test';
+  let calls = 0;
+  globalThis.fetch = async () => {
+    calls++;
+    return {ok: true, status: 200, json: async () => ({answers: {
+      f0: {type: 'choice', choice: 'r0', confidence: 0.9, probabilities: {none: 0.1, r0: 0.9}},
+    }})};
+  };
+  const query = await harness.dispatch(inlineQuery(), inlineSender());
+  await handoffInline(harness, query);
+  const {inlineSession} = await harness.dispatch({type: 'JOB_INLINE_PANEL_STATE', tabId: 7});
+  harness.tabs.get(7).frames[0].pages[0].focusedFieldId = null;
+  const response = await harness.dispatch({type: 'JOB_RUN_SEMANTIC_SEARCH', ...panelOrigin(inlineSession)});
+  assert.equal(response.ok, true, response.error);
+  assert.equal(response.semanticStatus, 'matched');
+  assert.equal(response.candidates.length, 1);
+  assert.equal(response.candidates[0].kind, 'semantic');
+  assert.equal(response.inlineSession.sessionId, inlineSession.sessionId);
+  assert.equal(calls, 1);
+  assert.equal(harness.tabs.get(7).messages.some(message => message.type === 'JOB_APP_APPLY'), false);
+});
+
 test('inline TypeSafe search preserves an existing candidate ID for a duplicate answer', async () => {
   const harness = await inlineHarness({field: {label: 'Describe your ML deployment experience', type: 'textarea'}, answerRecords: [
     {key: 'ml_delivery', question: 'Machine learning delivery project',

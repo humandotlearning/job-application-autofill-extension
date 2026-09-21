@@ -1188,8 +1188,13 @@ test('unanswered fields explicitly find one complete saved answer without changi
     sourceQuestion: 'Describe your reliability impact', answer, kind: 'semantic'}], run};
   const harness = await setupPanel({run, semanticSearchResponse});
   try {
+    const card = harness.dom.window.document.querySelector('#action-required-card');
+    assert.equal(card.open, true, 'field actions are visible without opening a disclosure');
     const row = harness.dom.window.document.querySelector('#action-required-list .result-item');
     const draft = row.querySelector('[data-answer-draft]');
+    assert.ok(row.querySelector('[data-find-saved-answer]').compareDocumentPosition(draft) & 4,
+      'saved-answer search comes before the draft editor');
+    assert.equal(harness.sentMessages.some(({type}) => type === 'JOB_RUN_SEMANTIC_SEARCH'), false);
     row.querySelector('[data-find-saved-answer]').click();
     await panelTick();
     assert.equal(draft.value, '');
@@ -1199,6 +1204,49 @@ test('unanswered fields explicitly find one complete saved answer without changi
     assert.equal(harness.sentMessages.find(({type}) => type === 'JOB_RUN_SEMANTIC_SEARCH').fieldId, 'impact');
     result.click();
     assert.equal(draft.value, answer);
+    card.open = false;
+    harness.storageListeners.forEach(listener => listener({applicationRun: {newValue: {7: run}}}, 'session'));
+    await panelTick();
+    assert.equal(card.open, false, 'background updates preserve deliberate collapsing');
+  } finally { harness.cleanup(); }
+});
+
+test('saved-answer search shows the actionable settings error instead of a no-match result', async () => {
+  const run = {status: 'waiting_user', applicationId: 'settings-search', pageSignature: 'page',
+    actionRequired: [{fieldId: 'impact', label: 'Describe your impact'}]};
+  const harness = await setupPanel({run, semanticSearchResponse: {ok: false,
+    error: 'Enable TypeSafe saved-answer search and add its API key in Settings.'}});
+  try {
+    const row = harness.dom.window.document.querySelector('#action-required-list .result-item');
+    row.querySelector('[data-find-saved-answer]').click();
+    await panelTick();
+    assert.match(row.querySelector('.answer-search [role="status"]').textContent, /Enable TypeSafe.*Settings/);
+    assert.doesNotMatch(row.querySelector('.answer-search').textContent, /No clear match/);
+    assert.equal(pageMutationMessages(harness.sentMessages).length, 0);
+  } finally { harness.cleanup(); }
+});
+
+test('inline semantic search preserves its editor during storage refresh and returns a selectable answer', async () => {
+  const session = panelInlineSession('saved');
+  let resolveSearch;
+  const harness = await setupPanel({inlineSession: session,
+    semanticSearchResponse: () => new Promise(resolve => { resolveSearch = resolve; })});
+  try {
+    const row = harness.dom.window.document.querySelector('#inline-field-list .result-item');
+    const draft = row.querySelector('[data-answer-draft]');
+    row.querySelector('[data-find-saved-answer]').click();
+    await panelTick();
+    const candidate = {sourceKey: 'new-source', sourceQuestion: 'Original question', answer: 'New saved answer', kind: 'semantic'};
+    const updated = {...session, suggestions: {name: {field: session.field, candidates: [candidate]}}};
+    harness.handoff(updated);
+    await panelTick();
+    assert.equal(draft.isConnected, true);
+    resolveSearch({ok: true, semanticStatus: 'matched', candidates: [candidate], inlineSession: updated});
+    await panelTick();
+    assert.equal(draft.isConnected, true);
+    row.querySelector('[data-search-result]').click();
+    assert.equal(draft.value, candidate.answer);
+    assert.equal(pageMutationMessages(harness.sentMessages).length, 0);
   } finally { harness.cleanup(); }
 });
 
@@ -1297,7 +1345,8 @@ test('Sage Focus opens needed answers and settings without applying a value', as
     const doc = panel.dom.window.document;
     assert.equal(doc.querySelector('#run-title').textContent, '1 item needs your attention');
     assert.equal(doc.querySelector('#run-summary').textContent, '1 filled value');
-    assert.equal(doc.querySelector('#action-required-card').open, false);
+    assert.equal(doc.querySelector('#action-required-card').open, true);
+    doc.querySelector('#action-required-card').open = false;
     assert.equal(doc.querySelector('#optional-details').hidden, true);
     assert.equal(doc.querySelector('#secondary-actions').open, false);
     for (const id of ['run-hint', 'save-feedback', 'employment-choices', 'retry-ai']) assert.equal(doc.getElementById(id).closest('#secondary-actions'), null);

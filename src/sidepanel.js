@@ -868,6 +868,7 @@ function itemRow(item, { focus = false, detail = '', responseHandler = response 
     const semanticButton = document.createElement('button');
     semanticButton.type = 'button'; semanticButton.dataset.findSavedAnswer = 'true'; semanticButton.textContent = 'Find saved answer';
     const results = document.createElement('div');
+    results.setAttribute('role', 'status');
     const showCandidates = (candidates, emptyText, complete = false) => {
       results.replaceChildren();
       for (const candidate of candidates || []) {
@@ -906,10 +907,12 @@ function itemRow(item, { focus = false, detail = '', responseHandler = response 
     semanticButton.addEventListener('click', async () => {
       if (semanticButton.disabled) return;
       semanticButton.disabled = true; results.textContent = 'Searching saved answers…';
+      if (origin.inlineSessionId) workspace.state.pending = 'search';
       try {
         const response = await sendFieldAction('JOB_RUN_SEMANTIC_SEARCH', origin, {fieldId:origin.fieldId,retry:semanticButton.dataset.retry==='true'});
         if (!search.isConnected) return;
         if (!response?.ok) throw new Error(response?.error || 'Couldn’t search saved answers—try again.');
+        if (origin.inlineSessionId) responseHandler(response, {preserveContent: true});
         if (response.semanticStatus === 'matched') {
           semanticButton.dataset.retry = 'false'; semanticButton.textContent = 'Find saved answer';
           showCandidates(response.candidates, 'No clear match.', true);
@@ -920,11 +923,16 @@ function itemRow(item, { focus = false, detail = '', responseHandler = response 
         }
       } catch (error) {
         semanticButton.dataset.retry = 'true'; semanticButton.textContent = 'Try saved-answer search again';
-        if (search.isConnected) results.textContent = 'Couldn’t search saved answers—try again.';
-      } finally { semanticButton.disabled = false; }
+        if (search.isConnected) results.textContent = error.message;
+      } finally {
+        if (workspace.state.pending === 'search') workspace.state.pending = null;
+        semanticButton.disabled = false;
+        workspace.updateControls();
+      }
     });
     query.addEventListener('input', () => { workspace.state.searchQuery = query.value; results.replaceChildren(); });
-    search.append(query, button, semanticButton, results); content.append(search);
+    search.append(semanticButton, query, button, results);
+    content.insertBefore(search, workspace.workspace);
   }
   if (generated) {
     const drafts = Array.isArray(generated.suggestions) ? generated.suggestions : [];
@@ -1282,6 +1290,11 @@ function renderRun(run) {
   setActionVisibility(run);
 
   elements.actionRequiredCount.textContent = String(actionRequired.length);
+  // Reveal field actions on the first result/new page, but respect a user's
+  // collapse choice during subsequent background updates of the same page.
+  if (actionRequired.length && (elements.actionRequiredCard.hidden || previousOrigin !== nextOrigin)) {
+    panelState.openDetails[elements.actionRequiredCard.id] = true;
+  }
   elements.actionRequiredCard.hidden = actionRequired.length === 0;
   renderList(elements.actionRequiredList, actionRequired, { focus: run.frame !== null, emptyDetail: 'No blockers on this page.' });
 

@@ -1516,6 +1516,11 @@ async function inlinePanelAction(message) {
     });
     return {ok: true, candidates, inlineSession: saved};
   }
+  if (message.type === 'JOB_RUN_SEMANTIC_SEARCH') {
+    const response = await semanticSearchInlineField(request, sender, {requireFocus: false});
+    const current = await guardedPanelInline(message);
+    return {...response, candidates: response.semanticCandidate ? [response.semanticCandidate] : [], inlineSession: current.session};
+  }
   if (!['JOB_RUN_APPLY_DRAFT', 'JOB_RUN_APPROVE_SUGGESTION'].includes(message.type)) throw new Error('Unsupported inline panel action');
   const answer = message.type === 'JOB_RUN_APPLY_DRAFT' ? requiredBoundedText(message.answer, 'Answer', MAX_DRAFT_CHARS) : message.answer;
   if (answer != null && isOpaqueIdentifier(answer)) throw new Error('Internal IDs must be entered manually on the application page');
@@ -2707,8 +2712,8 @@ async function searchInlineField(message, sender) {
   return inlineReply(updated, message.requestId, {candidates: updated.suggestions[field.id].candidates});
 }
 
-async function semanticSearchInlineField(message, sender) {
-  const {session,field}=await guardInlineField(message,sender,{requireFocus:true});
+async function semanticSearchInlineField(message, sender, {requireFocus = true} = {}) {
+  const {session,field}=await guardInlineField(message,sender,{requireFocus});
   if(processingTabs.has(session.tabId)||saveLocks.has(session.tabId)) throw new Error('Application is busy. Try again.');
   const settings=await getSettings(); const apiKey=await getTypeSafeApiKey();
   if(!settings.typesafeEnabled||!apiKey) throw new Error('Enable TypeSafe saved-answer search and add its API key in Settings.');
@@ -2720,7 +2725,7 @@ async function semanticSearchInlineField(message, sender) {
   if(!liveSettings.typesafeEnabled||semanticFingerprint(field,liveRecords)!==result.fingerprint) {
     throw new Error('Saved answers changed. Try again.');
   }
-  const {session:latest,authority}=await guardInlineField(message,sender,{requireFocus:true});
+  const {session:latest,authority}=await guardInlineField(message,sender,{requireFocus});
   if(latest.revision!==session.revision) throw new Error('Inline session changed. Try again.');
   if(result.status!=='matched') return inlineReply(latest,message.requestId,{semanticStatus:result.status});
   const updated=await mutateInlineSession(session.tabId,session.frameId,session.sessionId,current=>{

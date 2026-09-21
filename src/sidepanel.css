@@ -282,6 +282,7 @@ button:disabled { cursor: default; opacity: .55; }
 .generated-drafts { display: grid; gap: var(--space-sm); margin-top: var(--space-md); }
 .answer-search, .employment-choice { display: grid; gap: var(--space-xs); margin-top: var(--space-md); }
 .answer-search { grid-template-columns: 1fr auto; }
+.answer-search > [data-find-saved-answer] { grid-column: 1 / -1; }
 .answer-search > div { grid-column: 1 / -1; display: grid; gap: var(--space-xs); }
 .generated-drafts-heading { color: var(--color-text); font-size: var(--font-xs); font-weight: 500; }
 .generated-draft { padding: var(--space-sm); border: var(--border-width) solid var(--color-border); color: var(--color-text); font-size: var(--font-sm); line-height: var(--line-body); overflow-wrap: anywhere; }
