@@ -22,6 +22,41 @@ The extension sends one batched request with independent Choice questions to pin
 
 Hard checks for employer/person scope, compensation meaning, qualifications, suppression, destination state, source revision, constraints, and page readback run locally before and after matching. Hierarchical classification is intentionally not used for this bounded flat shortlist because it would add dependent request rounds without improving the final action space.
 
+#### Current Jev flow
+
+Jev is a bounded selector in the service worker, not a text generator or browser operator. The extension owns retrieval, permissions, thresholds, approval, and every page mutation.
+
+```mermaid
+flowchart TD
+    A[Field is focused or Fill this page starts] --> B{Usable local answer?}
+    B -->|Yes| C[Keep local result; no Jev request]
+    B -->|No| D{Explicit search or unresolved Fill field?}
+    D -->|No| E[Stay local; wait for user action]
+    D -->|Yes| F[Hard compatibility filters]
+    F --> G{Eligible saved answers?}
+    G -->|None| H[No clear match; no request]
+    G -->|Yes| I[Rank locally; include up to 20 compatible records]
+    I --> J{Cached or concurrent request?}
+    J -->|Cached| K[Reuse match or no-match outcome]
+    J -->|New| L[Batch independent field Choice questions]
+    L --> M[POST to TypeSafe Jev 1.13.0]
+    M --> N{Response within 5 seconds?}
+    N -->|No / invalid| O[Could not search; preserve local state; Retry]
+    N -->|Yes| P{Selected record and confidence >= 0.8?}
+    P -->|No / none| H
+    P -->|Yes| Q[Show original question + complete saved answer]
+    K --> Q
+    Q --> R{User approves}
+    R -->|Edit and use| S[Edit proposal; keep approval required]
+    R -->|Use answer| T[Recheck source, destination, constraints, page]
+    S --> T
+    T -->|Changed or invalid| U[Discard stale result; keep user text]
+    T -->|Still valid| V[Copy exact stored answer and read back]
+    V --> W[Skip planner/draft generation for this field]
+```
+
+The cache is scoped to the current session and invalidates when the field, source record, policy, model, or page destination changes. A matched proposal never overwrites typing or an existing selection. A failed request is distinct from **No clear match**.
+
 ## Inline suggestions
 
 Inline suggestions work in eligible native text inputs and textareas: `text`, `email`, `tel`, and `url` controls. Focus an empty field to look up local saved answers with no API key, no panel startup, and no whole-page Fill action. Search, password, file, disabled, read-only, select, and custom controls remain outside this inline scope.
