@@ -324,7 +324,7 @@ function updateDatasourceSummary(datasource = {}) {
   elements.recordCount.textContent = `${answerCount} answer${answerCount === 1 ? '' : 's'}`;
   elements.coverMessageCount.textContent = `${coverMessageCount} cover message${coverMessageCount === 1 ? '' : 's'}`;
   if (datasource.learnedChanges) renderLearnedChanges(datasource.learnedChanges);
-  renderLearningInbox(datasource.learningInbox || []);
+  renderLearningInbox(datasource.learningInbox || [], datasource.undoAvailable === true);
   if (datasource.profile) {
     currentProfile = structuredClone(datasource.profile);
     elements.employerName.value = datasource.profile.employment?.[0]?.company || 'DeepSight AI Labs';
@@ -334,7 +334,7 @@ function updateDatasourceSummary(datasource = {}) {
   }
 }
 
-function renderLearningInbox(items) {
+function renderLearningInbox(items, undoAvailable = false) {
   elements.learningInboxCount.textContent = String(items.length);
   elements.learningInboxList.replaceChildren();
   for (const item of items) {
@@ -354,6 +354,16 @@ function renderLearningInbox(items) {
     elements.learningInboxList.append(row);
   }
   if (!items.length) elements.learningInboxList.textContent = 'No learning proposals waiting for review.';
+  if (undoAvailable) {
+    const undo = document.createElement('button');
+    undo.type = 'button'; undo.textContent = 'Undo latest automatic save';
+    undo.addEventListener('click', async () => {
+      const response = await chrome.runtime.sendMessage({ type: 'JOB_DATASOURCE_UNDO_LAST_AUTOSAVE' });
+      if (!response?.ok) { setStatus(response?.error || 'Could not undo the automatic save.', 'error'); return; }
+      updateDatasourceSummary(response.datasource); setStatus('Latest automatic save undone.');
+    });
+    elements.learningInboxList.append(undo);
+  }
 }
 
 function renderLearnedChanges(records) {
@@ -1267,7 +1277,7 @@ function renderRun(run) {
     : ['page_ready', 'ready_for_user_submit'].includes(run.status) ? 'This page is filled'
     : 'Current application';
   elements.runSummary.textContent = run.frame === null ? 'Choose or rescan the application form.'
-    : `${audit.length} filled value${audit.length === 1 ? '' : 's'}${reviewRequired.length ? ` · ${reviewRequired.length} to review` : ''}${run.frame?.interpretationMode ? ` · AI ${run.frame.interpretationMode} context` : ''}`;
+    : `${audit.length} filled value${audit.length === 1 ? '' : 's'}${reviewRequired.length ? ` · ${reviewRequired.length} to review` : ''}${actionRequired.length ? ` · ${actionRequired.length} need answers` : ''}${run.frame?.interpretationMode ? ` · AI ${run.frame.interpretationMode} context` : ''}`;
   const failedAi = Object.values(run.aiOperations || {}).some((operation) => ['failed', 'interrupted'].includes(operation?.status || operation));
   elements.retryAi.hidden = !failedAi && !run.llmError;
   elements.employmentChoices.replaceChildren();

@@ -3,7 +3,9 @@ import { canonicalConcept, chooseRecord, inferSensitivity, isOpaqueIdentifier, m
 // Shared by semantic discovery and approval: relevance is a model judgment,
 // but eligibility and compatibility remain local policy.
 export function semanticEligible(field, record) {
-  return ['text', 'textarea', 'email', 'tel', 'url'].includes(field.type)
+  const choice = ['select', 'select-one', 'radio', 'checkbox'].includes(field.type)
+    && Array.isArray(field.options) && field.options.some(option => String(option || '').trim());
+  return (['text', 'textarea', 'email', 'tel', 'url'].includes(field.type) || choice)
     && !field.widget && !field.multiple && !field.entityUnresolved
     && !String(field.currentValue || field.rawValue || '').trim()
     && field.labelConfidence !== 'low' && !isOpaqueIdentifier(field.label)
@@ -14,8 +16,8 @@ export function semanticEligible(field, record) {
     && Boolean(String(record.answer || '').trim()) && String(record.answer).length <= 8000
     && ![record.key, record.question, record.answer].some(isOpaqueIdentifier)
     && !record.suppressedFor?.includes(suggestionTargetKey(field))
-    && recordScopeCompatible(field, record) && meaningCompatible(field, record)
-    && validateFillValue(field, record.answer).ok;
+    && recordScopeCompatible(field, record)
+    && (choice || (meaningCompatible(field, record) && validateFillValue(field, record.answer).ok));
 }
 
 export function semanticRecordRevision(record) {

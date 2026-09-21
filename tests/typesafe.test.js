@@ -118,3 +118,18 @@ test('low-confidence and unknown choices cannot become recommendations', async (
     assert.notEqual(result[0].status,'matched');
   }
 });
+
+test('maps a confirmed fact to an exact visible option for one-time review', async () => {
+  let request;
+  const matcher=createSemanticMatcher({traceImpl:()=>{},fetchImpl:async(_url,options)=>{
+    request=JSON.parse(options.body);
+    return jsonResponse({answers:{f0:{type:'choice',choice:'o1',confidence:0.93,probabilities:{none:0.02,o0:0.05,o1:0.93}}}});
+  }});
+  const choice={id:'authorization',handle:'h-auth',label:'Are you authorized to work?',labelConfidence:'high',type:'radio',currentValue:'',rawValue:'',options:['No, sponsorship required','Yes, authorized to work'],constraints:{}};
+  const records=[record('authorization','Work authorization','Authorized to work')];
+  const [result]=await matcher.match({fields:[choice],records,apiKey:'ts_test'});
+  assert.equal(request.questions.f0.criteria.o1,'Select the exact enabled visible option label: Yes, authorized to work');
+  assert.equal(result.status,'matched');
+  assert.equal(result.candidate.kind,'semantic_option');
+  assert.equal(result.candidate.answer,'Yes, authorized to work');
+});
