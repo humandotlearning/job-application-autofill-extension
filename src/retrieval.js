@@ -1,4 +1,37 @@
-import { canonicalConcept, chooseRecord, inferSensitivity, isOpaqueIdentifier, meaningCompatible, normalizeText, recordScopeCompatible, suggestionTargetKey } from './core.js';
+import { canonicalConcept, chooseRecord, inferSensitivity, isOpaqueIdentifier, meaningCompatible, normalizeText, recordScopeCompatible, suggestionTargetKey, validateFillValue } from './core.js';
+
+// Shared by semantic discovery and approval: relevance is a model judgment,
+// but eligibility and compatibility remain local policy.
+export function semanticEligible(field, record) {
+  return ['text', 'textarea', 'email', 'tel', 'url'].includes(field.type)
+    && !field.widget && !field.multiple && !field.entityUnresolved
+    && !String(field.currentValue || field.rawValue || '').trim()
+    && field.labelConfidence !== 'low' && !isOpaqueIdentifier(field.label)
+    && Boolean(String(field.label || '').trim()) && inferSensitivity(field.label, field.id) !== 'legal'
+    && record.confirmationState === 'confirmed' && record.sensitivity !== 'legal'
+    && record.semantic?.reusePolicy !== 'never' && record.reusePolicy !== 'never'
+    && inferSensitivity(record.question) !== 'legal'
+    && Boolean(String(record.answer || '').trim()) && String(record.answer).length <= 8000
+    && ![record.key, record.question, record.answer].some(isOpaqueIdentifier)
+    && !record.suppressedFor?.includes(suggestionTargetKey(field))
+    && recordScopeCompatible(field, record) && meaningCompatible(field, record)
+    && validateFillValue(field, record.answer).ok;
+}
+
+export function semanticRecordRevision(record) {
+  return JSON.stringify([record.id || record.key, record.key, record.question, record.answer, record.aliases,
+    record.confirmationState, record.sensitivity, record.semantic, record.reusePolicy, record.suppressedFor,
+    record.entityId, record.entityType, record.employmentId, record.context, record.concept, record.updatedAt]);
+}
+
+export function selectSemanticEvidence(field, records, limit = 20) {
+  const eligible = records.filter(record => semanticEligible(field, record));
+  const ranked = rankEvidence(field, eligible, {limit});
+  const order = new Map(ranked.map((item, index) => [item.sourceKey, index]));
+  // Zero-overlap records remain available: re-ranking only lexical hits would
+  // reproduce the missed-paraphrase problem this path is meant to solve.
+  return eligible.sort((a, b) => (order.get(a.key) ?? limit) - (order.get(b.key) ?? limit)).slice(0, limit);
+}
 
 const EXPERIENCE_TAGS = {
   accomplishments: /\b(impressive|accomplishments?|proud|achievements?)\b/,

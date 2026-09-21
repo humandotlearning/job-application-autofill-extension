@@ -2131,10 +2131,10 @@ function createLearningSession(document, { capture, send, onFinalSubmit, onReval
 
 function createInlineAutofill(document, {send, describe}) {
   const view = document.defaultView;
-  let host, shadow, dialog, question, searchInput, list, preview, status, use, generate, edit, hint, retrySearch;
+  let host, shadow, dialog, question, searchInput, list, preview, status, use, generate, edit, findSaved, hint, retrySearch;
   let target = null, snapshot = null, sessionId = null, requestId = null;
   let answers = [], index = -1, epoch = 0, acceptance = null;
-  let loading = false, retry = false, composing = false, disposed = false, restoringFocus = false;
+  let loading = false, retry = false, semanticSearching = false, semanticRetry = false, composing = false, disposed = false, restoringFocus = false;
   let searchTimer = null;
   let searchVersion = 0, searchPending = null, searchReady = false, searching = false;
   let positionFrame = null, mutationObserver = null, resizeObserver = null;
@@ -2225,12 +2225,13 @@ function createInlineAutofill(document, {send, describe}) {
     use = button('Use and save reviewed answer', accept);
     use.setAttribute('data-primary', '');
     generate = button('Generate answer', generateAnswer);
-    edit = button('Edit in panel', editInPanel);
+    edit = button('Edit and use', editInPanel);
+    findSaved = button('Find saved answer', findSavedAnswer);
     retrySearch = button('Retry search', scheduleSearch);
     status = node('div', '', {role: 'status', 'aria-live': 'polite', 'aria-atomic': 'true'});
     hint = node('small', 'Arrow keys choose an answer; Tab uses the selection. Alt+ArrowDown enters controls. Escape closes.');
     const secondary = node('div', null, {'data-secondary': ''});
-    secondary.append(generate, edit);
+    secondary.append(findSaved, generate, edit);
     const results = node('div', null, {'data-results': ''});
     results.append(list, preview, secondary, hint);
     dialog.append(question, searchInput, status, retrySearch, results, use);
@@ -2252,11 +2253,11 @@ function createInlineAutofill(document, {send, describe}) {
   }
   function provenance(answer) {
     return answer.kind === 'generated' ? `Draft · Evidence: ${(answer.evidenceKeys || []).join(', ') || 'No candidate facts cited'}`
-      : `Source: ${answer.sourceQuestion || 'Reviewed answer'} · ${answer.kind || 'saved'}`;
+      : `Source: ${answer.sourceQuestion || 'Reviewed answer'} · Saved answer`;
   }
   function render() {
     const kept = snapshot?.rawValue !== '';
-    question.hidden = searchInput.hidden = list.hidden = preview.hidden = generate.hidden = edit.hidden = hint.hidden = kept;
+    question.hidden = searchInput.hidden = list.hidden = preview.hidden = findSaved.hidden = generate.hidden = edit.hidden = hint.hidden = kept;
     question.textContent = snapshot?.label || 'Application question';
     searchInput.disabled = loading && Boolean(sessionId) && !searching;
     retrySearch.hidden = !retry || !sessionId || kept;
@@ -2265,7 +2266,8 @@ function createInlineAutofill(document, {send, describe}) {
     answers.forEach((answer, answerIndex) => {
       const option = node('div', null, {role: 'option', id: `inline-answer-${answerIndex}`, 'aria-selected': String(index === answerIndex)});
       const text = String(answer.answer ?? '');
-      option.append(node('p', answer.sourceQuestion || 'Generated answer'), node('p', text.length > 160 ? `${text.slice(0, 160)}…` : text));
+      option.append(node('p', answer.sourceQuestion || 'Generated answer'),
+        node('p', answer.kind === 'semantic' || text.length <= 160 ? text : `${text.slice(0, 160)}…`));
       if (answer.kind === 'generated') option.append(node('small', provenance(answer)));
       option.addEventListener('click', () => select(answerIndex));
       list.append(option);
@@ -2273,6 +2275,8 @@ function createInlineAutofill(document, {send, describe}) {
     updateSelection();
     generate.disabled = loading || !sessionId || snapshot?.rawValue !== '';
     edit.disabled = loading || !sessionId;
+    findSaved.disabled = loading || semanticSearching || !sessionId || snapshot?.rawValue !== '';
+    findSaved.textContent = semanticSearching ? 'Searching saved answers…' : semanticRetry ? 'Try saved-answer search again' : 'Find saved answer';
     schedulePosition();
   }
   function updateSelection() {
@@ -2282,7 +2286,7 @@ function createInlineAutofill(document, {send, describe}) {
     preview.textContent = answer ? `${answer.answer}\n${provenance(answer)}\n${answer.requiresApproval === false ? 'Review this draft before use.' : 'Using this answer also saves it as a reviewed answer.'}` : '';
     if (answer) list.setAttribute('aria-activedescendant', `inline-answer-${index}`);
     else list.removeAttribute('aria-activedescendant');
-    use.textContent = answer?.requiresApproval === false ? 'Use draft' : 'Use and save reviewed answer';
+    use.textContent = answer?.requiresApproval === false ? 'Use draft' : answer?.kind === 'semantic' ? 'Use answer' : 'Use and save reviewed answer';
     use.disabled = loading || !answer;
     use.hidden = !answer;
     schedulePosition();
@@ -2311,7 +2315,7 @@ function createInlineAutofill(document, {send, describe}) {
     if (searchTimer !== null) { view.clearTimeout(searchTimer); searchTimer = null; }
     if (searchInput) searchInput.value = '';
     searchVersion++; searchPending = null; searchReady = searching = false;
-    target = snapshot = null; answers = []; index = -1; loading = false; retry = false;
+    target = snapshot = null; answers = []; index = -1; loading = false; retry = false; semanticSearching = semanticRetry = false;
     stopObserving();
     if (host) { host.hidden = true; controlsMode(false); }
     if ((returnFocus || popupFocused) && previous?.isConnected) {
@@ -2354,6 +2358,29 @@ function createInlineAutofill(document, {send, describe}) {
       if (searchPending !== pending) return;
       searchPending = null; runSearch();
     });
+  }
+  function findSavedAnswer() {
+    if(loading||semanticSearching||!sessionId||!isCurrent(epoch,target,fingerprint(snapshot))||snapshot.rawValue!=='')return;
+    semanticSearching=true; render(); setStatus('Searching saved answers…');
+    const version=epoch,element=target,expected=fingerprint(snapshot),session=sessionId;
+    requestId=uniqueId(); const request=requestId;
+    const selectedId=answers[index]?.candidateId;
+    message({type:'JOB_INLINE_SEMANTIC_SEARCH',sessionId:session,fieldId:snapshot.id,handle:snapshot.handle,
+      requestId:request,retry:semanticRetry}).then(response=>{
+      if(!isCurrent(version,element,expected))return;
+      if(!response?.ok)throw new Error(response?.error||'Couldn’t search saved answers—try again.');
+      if(response.sessionId!==session||response.requestId!==request)throw new Error('Saved-answer search changed. Try again.');
+      if(response.semanticStatus==='matched') {
+        answers=(response.candidates||[]).slice(0,20);
+        index=selectedId?answers.findIndex(answer=>answer.candidateId===selectedId):-1;
+        semanticRetry=false; setStatus('Saved answer found. Review the original question and full answer.');
+      } else if(response.semanticStatus==='none'||response.semanticStatus==='skipped') {
+        semanticRetry=false; setStatus('No clear match. You can search by keyword or generate an answer.');
+      } else {
+        semanticRetry=true; setStatus('Couldn’t search saved answers—try again.','error');
+      }
+    }).catch(()=>{if(isCurrent(version,element,expected)){semanticRetry=true;setStatus('Couldn’t search saved answers—try again.','error');}})
+      .finally(()=>{if(isCurrent(version,element,expected)){semanticSearching=false;render();}});
   }
   function observe() {
     stopObserving();

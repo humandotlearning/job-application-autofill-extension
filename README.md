@@ -1,12 +1,12 @@
 # Job Application Autofill
 
-A personal Manifest V3 Chrome extension that reads rendered application forms, fills uniquely confirmed safe short answers from a local profile, and offers optional AI assistance through Fireworks or OpenAI. Sensitive, narrative, fuzzy, and AI-proposed answers require review; final submission stays on the application site.
+A personal Manifest V3 Chrome extension that reads rendered application forms, fills uniquely confirmed safe short answers from a local profile, and offers optional AI assistance through Fireworks or OpenAI. TypeSafe can optionally find reusable saved answers. Sensitive, narrative, fuzzy, and AI-proposed answers require review; final submission stays on the application site.
 
 ## Saved-answer reuse
 
 Questions are extracted from native labels/ARIA or a bounded local wrapper, including Lever sibling headings and radio groups. Descriptors include label origin and confidence. Question wording is canonicalized at lookup; persisted source keys are not bulk-renamed.
 
-Related narrative evidence and review-sensitive equivalents appear beside unresolved fields with the source question, provenance, full saved answer, **Use this saved answer**, and **Edit and use**. No API key is needed. Approval is bound to the originating tab, frame, application, page signature and live control handle. Changed sources, replaced controls, changed options, nonempty destinations and invalid constraints reject approval. The page value and reusable save are read back before success is reported. Submission remains manual.
+Related narrative evidence and review-sensitive equivalents appear beside unresolved fields with the source question, provenance, full saved answer, **Use answer**, and **Edit and use**. No API key is needed. Approval is bound to the originating tab, frame, application, page signature and live control handle. Changed sources, replaced controls, changed options, nonempty destinations and invalid constraints reject approval. The page value and reusable save are read back before success is reported. Submission remains manual.
 
 Confirmed semantic-equivalent reuse adds an alias to its stable source. Edited or recomposed answers create a separate record with evidence links. Prior completed user drafts appear as **Previously entered, not yet saved for reuse**; scanning never promotes them. Legacy unmarked narratives are explicitly shown as unconfirmed evidence. Unsupported experience thresholds and qualifications remain manual; general ML evidence never establishes pharma experience.
 
@@ -14,13 +14,21 @@ Compensation current/expected, component, currency, period and scale are protect
 
 The AI planner receives at most 20 locally selected records. Fields already waiting on saved-evidence approval are excluded from planning. A separate suggestion generator can compose drafts; the planner itself supports only evidence-backed copying and constrained transformations.
 
+### Optional Jev saved-answer matching
+
+Enable TypeSafe and add its separate API key in **Settings & data** to find paraphrased saved questions that local matching misses. During **Fill this page**, only unresolved fields without usable suggestions are checked. Beside an individual field, **Find saved answer** starts the same check explicitly; ordinary field focus remains local and makes no TypeSafe request.
+
+The extension sends one batched request with independent Choice questions to pinned model `jev-1.13.0`. Each field can choose one of at most 20 locally compatible, confirmed saved answers or `none`; shared records are sent once. Jev selects—it never writes the answer. Code copies the exact stored answer only at confidence 0.8 or higher and still requires review. A five-second deadline has no automatic retry. Unchanged matches and no-match results are cached for the session, and duplicate concurrent searches share one request. A successful match skips planning and draft generation for that field.
+
+Hard checks for employer/person scope, compensation meaning, qualifications, suppression, destination state, source revision, constraints, and page readback run locally before and after matching. Hierarchical classification is intentionally not used for this bounded flat shortlist because it would add dependent request rounds without improving the final action space.
+
 ## Inline suggestions
 
 Inline suggestions work in eligible native text inputs and textareas: `text`, `email`, `tel`, and `url` controls. Focus an empty field to look up local saved answers with no API key, no panel startup, and no whole-page Fill action. Search, password, file, disabled, read-only, select, and custom controls remain outside this inline scope.
 
-Choose a displayed answer deliberately with ArrowDown or by clicking it. Tab then accepts that selected answer through the normal reviewed fill path; ordinary Tab with no selection keeps the page's native navigation. A second Tab continues native navigation after an accepted answer. Alt+ArrowDown moves into popup controls for **Generate answer**, **Edit in panel**, or **Close**; Escape returns focus to the page field.
+Choose a displayed answer deliberately with ArrowDown or by clicking it. Tab then accepts that selected answer through the normal reviewed fill path; ordinary Tab with no selection keeps the page's native navigation. A second Tab continues native navigation after an accepted answer. Alt+ArrowDown moves into popup controls for **Find saved answer**, **Generate answer**, or **Edit and use**; Escape returns focus to the page field.
 
-**Generate answer** is explicit and uses the configured provider only when requested. **Edit in panel** hands the same selected field and draft to the existing side panel; its toolbar fallback remains available when a browser cannot open the side panel directly. Standalone inline use does not activate whole-page learning. Saved-candidate approval retains existing reviewed save behavior. Applying a generated draft does not automatically create reusable facts.
+**Generate answer** is explicit and uses the configured provider only when requested. **Edit and use** hands the same selected field and draft to the existing side panel; its toolbar fallback remains available when a browser cannot open the side panel directly. Standalone inline use does not activate whole-page learning. Saved-candidate approval retains existing reviewed save behavior. Applying a generated draft does not automatically create reusable facts.
 
 ## Runtime flow
 
@@ -115,10 +123,11 @@ The supplied bundled LinkedIn and GitHub links are reusable short profile facts.
 
 ## Data sent to the model
 
-AI has four separate roles; a page can cause multiple requests:
+AI has five separate roles; a page can cause multiple requests:
 
 | Role | Input | Result |
 | --- | --- | --- |
+| TypeSafe saved-answer match | Unresolved questions plus up to 20 compatible saved questions and complete answers per field | One exact stored answer or `none`; review always required |
 | Planner | Unresolved descriptors, title/domain, up to 20 selected records | Evidence-backed proposal requiring approval |
 | Suggestions | One question, job context, up to 40 readable records | Up to three composed drafts for review |
 | Rewrite | Draft, user instruction, job context, up to 20 records | Revised draft, never a direct page mutation |
@@ -133,7 +142,7 @@ Depending on the operation, requests contain:
 
 Raw HTML, hidden/password inputs, cookies, and file contents are not collected for AI. Page context uses hostname rather than the application URL; answer text can contain user-supplied URLs. The key is sent only as authentication to the chosen provider, not in the prompt or to the page. Evidence-reference validation does not prove every generated narrative claim is true; review drafts before using them.
 
-The extension uses the configured AI provider and answer-planner model. Fireworks is the default provider with model `accounts/fireworks/models/glm-5p3-flash`; OpenAI remains available as an alternative. Fireworks requests use the OpenAI-compatible Chat Completions endpoint and JSON output mode. The provider, model ID, and provider-specific API keys are held in trusted `chrome.storage.local` and read only by the extension side panel/service worker.
+The extension uses the configured generation provider and answer-planner model. Fireworks is the default provider with model `accounts/fireworks/models/glm-5p3-flash`; OpenAI remains available as an alternative. Fireworks requests use the OpenAI-compatible Chat Completions endpoint and JSON output mode. Optional saved-answer matching uses TypeSafe separately with pinned model `jev-1.13.0`. Provider selection, model IDs, the generation key, and the separate TypeSafe key are held in trusted `chrome.storage.local` and read only by the extension side panel/service worker.
 
 ## Install and use
 
@@ -141,7 +150,7 @@ The extension uses the configured AI provider and answer-planner model. Firework
 2. Open `chrome://extensions`, enable Developer mode, and choose **Load unpacked**.
 3. Select `C:\Users\nithi\job-application-autofill-extension`.
 4. Open a job application and open the extension side panel.
-5. Open **Settings & data**, choose Fireworks or OpenAI, enter that provider’s API key, and select or type a compatible model ID. Local deterministic filling works without a key.
+5. Open **Settings & data**, choose Fireworks or OpenAI, enter that provider’s API key, and select or type a compatible model ID. Local deterministic filling works without a key. To enable semantic saved-answer reuse, separately enable TypeSafe and enter a TypeSafe key.
 6. Click **Fill this page**. Complete any highlighted required fields or manual steps, then click **Check again**.
 7. To leave a site untouched, open the side panel on that hostname and click **Disable on this site**. The rule matches that exact hostname (paths and ports are ignored; subdomains are separate). This immediately pauses scans, inline suggestions, filling, learning, and capture; use **Re-enable on this site** or remove the hostname under **Settings & data → Disabled sites** to restore it.
 8. When a page is ready, review it and click **Continue to next page**. On the final page, review the form and submit through the application site; the extension captures the final values automatically. **Save answers** remains available as an optional local checkpoint.

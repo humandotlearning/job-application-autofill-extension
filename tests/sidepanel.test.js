@@ -31,7 +31,8 @@ async function setupPanel({
   approveSuggestionResponse = { ok: true, run },
   rewriteResponse = { ok: true, answer: 'Rewritten answer.' },
   generateResponse = { ok: true, run },
-  validateResponse = { ok: true, run }, retryAiResponse = { ok: true, run }, searchResponse = { ok: true, candidates: [], run }, selectEmploymentResponse = { ok: true, run },
+  validateResponse = { ok: true, run }, retryAiResponse = { ok: true, run }, searchResponse = { ok: true, candidates: [], run },
+  semanticSearchResponse = {ok: true, semanticStatus: 'none', candidates: [], run}, selectEmploymentResponse = { ok: true, run },
 } = {}) {
   const dom = new JSDOM(await loadPanelHtml(), {
     url: 'https://extension.local/sidepanel.html',
@@ -114,6 +115,7 @@ async function setupPanel({
         if (message.type === 'JOB_RUN_VALIDATE_PAGE') return validateResponse;
         if (message.type === 'JOB_RUN_RETRY_AI') return retryAiResponse;
         if (message.type === 'JOB_RUN_SEARCH_ANSWERS') return typeof searchResponse === 'function' ? searchResponse(message) : searchResponse;
+        if (message.type === 'JOB_RUN_SEMANTIC_SEARCH') return typeof semanticSearchResponse === 'function' ? semanticSearchResponse(message) : semanticSearchResponse;
         if (message.type === 'JOB_RUN_SELECT_EMPLOYMENT') return selectEmploymentResponse;
         if (message.type === 'JOB_DATASOURCE_EXPORT') return { ok: true, backup: '{"schemaVersion":1}' };
         if (message.type === 'JOB_DATASOURCE_IMPORT') return { ok: true, datasource };
@@ -404,8 +406,8 @@ test('panel hides an opaque source question without an info button while keeping
     assert.equal(row.querySelector('[data-internal-id]'), null);
     assert.equal(row.querySelector('[data-internal-id-popover]'), null);
     assert.doesNotMatch(row.textContent, new RegExp(internalQuestion, 'i'));
-    assert.equal([...row.querySelectorAll('button')].some((button) => /Use this saved answer|Edit and use/.test(button.textContent)), false);
-    assert.ok(row.querySelector('[data-choose-answer]'));
+    assert.equal(row.querySelector('[data-choose-answer]').textContent, 'Use answer');
+    assert.equal(row.querySelector('[data-edit-candidate]').textContent, 'Edit and use');
   } finally { harness.cleanup(); }
 });
 
@@ -609,6 +611,22 @@ test('panel defaults to Fireworks and persists its key and selected model', asyn
   } finally {
     harness.cleanup();
   }
+});
+
+test('panel keeps TypeSafe opt-in, key, and matching separate from answer generation', async () => {
+  const harness = await setupPanel({localData: {fireworksApiKey: '', openaiApiKey: '', typesafeApiKey: '',
+    typesafeEnabled: false, aiProvider: '', aiModel: '', autoAdvancePages: false}});
+  try {
+    const {document, Event} = harness.dom.window;
+    const enabled = document.querySelector('#typesafe-enabled');
+    const key = document.querySelector('#typesafe-api-key');
+    enabled.checked = true; enabled.dispatchEvent(new Event('change', {bubbles: true}));
+    key.value = 'ts_live'; key.dispatchEvent(new Event('input', {bubbles: true}));
+    await panelTick();
+    assert.equal(harness.localData.typesafeEnabled, true);
+    assert.equal(harness.localData.typesafeApiKey, 'ts_live');
+    assert.equal(harness.localData.aiProvider, '');
+  } finally { harness.cleanup(); }
 });
 
 test('panel exposes and saves the phone device profile default', async () => {
@@ -1159,6 +1177,28 @@ test('unanswered fields can search saved answers and use a returned candidate', 
     row.querySelector('[data-search-result]').click();
     assert.equal(row.querySelector('[data-answer-draft]').value, '₹25,00,000');
     assert.equal(harness.sentMessages.find(({ type }) => type === 'JOB_RUN_SEARCH_ANSWERS').fieldId, 'salary');
+  } finally { harness.cleanup(); }
+});
+
+test('unanswered fields explicitly find one complete saved answer without changing the draft', async () => {
+  const answer = 'A complete saved answer that remains unchanged until the user chooses it. '.repeat(4).trim();
+  const run = {status: 'waiting_user', applicationId: 'run-semantic', pageSignature: 'page-one',
+    actionRequired: [{fieldId: 'impact', label: 'How did you improve reliability?'}], optionalUnresolved: [], reviewRequired: [], audit: []};
+  const semanticSearchResponse = {ok: true, semanticStatus: 'matched', candidates: [{sourceKey: 'impact-story',
+    sourceQuestion: 'Describe your reliability impact', answer, kind: 'semantic'}], run};
+  const harness = await setupPanel({run, semanticSearchResponse});
+  try {
+    const row = harness.dom.window.document.querySelector('#action-required-list .result-item');
+    const draft = row.querySelector('[data-answer-draft]');
+    row.querySelector('[data-find-saved-answer]').click();
+    await panelTick();
+    assert.equal(draft.value, '');
+    const result = row.querySelector('[data-search-result]');
+    assert.match(result.textContent, /Describe your reliability impact/);
+    assert.match(result.textContent, new RegExp(answer));
+    assert.equal(harness.sentMessages.find(({type}) => type === 'JOB_RUN_SEMANTIC_SEARCH').fieldId, 'impact');
+    result.click();
+    assert.equal(draft.value, answer);
   } finally { harness.cleanup(); }
 });
 

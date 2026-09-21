@@ -15,7 +15,8 @@ export function createPhoenixFetch(sessionId = '', { fetchImpl = globalThis.fetc
     let capture = false;
     try { capture = await enabled(); } catch { /* tracing cannot block AI */ }
     if (!capture) return fetchImpl(url, options);
-    const started = new Date().toISOString();
+    const startedAt = Date.now();
+    const started = new Date(startedAt).toISOString();
     let response;
     let failure;
     try {
@@ -39,14 +40,16 @@ export function createPhoenixFetch(sessionId = '', { fetchImpl = globalThis.fetc
         }
         let parsed = {};
         try { parsed = JSON.parse(output); } catch { /* retain malformed raw output */ }
-        const step = input.text?.format?.name || input.response_format?.json_schema?.name || 'ai_request';
+        const isTypeSafe = new URL(url).hostname === 'api.typesafe.ai';
+        const step = isTypeSafe ? 'saved_answer_match' : input.text?.format?.name || input.response_format?.json_schema?.name || 'ai_request';
         const attributes = {
           'openinference.span.kind': 'LLM',
           'input.value': JSON.stringify(input), 'input.mime_type': 'application/json',
           'output.value': output, 'output.mime_type': 'application/json',
           'llm.model_name': input.model || '',
-          'llm.provider': new URL(url).hostname.includes('fireworks') ? 'fireworks' : 'openai',
+          'llm.provider': isTypeSafe ? 'typesafe' : new URL(url).hostname.includes('fireworks') ? 'fireworks' : 'openai',
           'http.response.status_code': response?.status || 0,
+          'http.request.duration_ms': Date.now() - startedAt,
         };
         if (sessionId) attributes['session.id'] = sessionId;
         for (const [key, value] of Object.entries({
@@ -74,4 +77,28 @@ export function createPhoenixFetch(sessionId = '', { fetchImpl = globalThis.fetc
     }
     return response;
   };
+}
+
+/** Record bounded decision metrics without copying answer text or provider credentials. */
+export async function tracePhoenixEvent(name, attributes = {}, sessionId = '', {
+  fetchImpl = globalThis.fetch, enabled = tracingEnabled,
+} = {}) {
+  try {
+    if (!(await enabled())) return;
+    const now = new Date().toISOString();
+    const spanAttributes = {'openinference.span.kind': 'CHAIN', ...attributes};
+    if (sessionId) spanAttributes['session.id'] = sessionId;
+    const span = {
+      name, span_kind: 'CHAIN',
+      context: {trace_id: crypto.randomUUID().replaceAll('-', ''), span_id: crypto.randomUUID().replaceAll('-', '').slice(0, 16)},
+      start_time: now, end_time: now, status_code: 'OK', status_message: '', attributes: spanAttributes,
+    };
+    const response = await fetchImpl(`${BASE_URL}/v1/projects/${PROJECT}/spans`, {
+      method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({data: [span]}),
+      signal: AbortSignal.timeout(750),
+    });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+  } catch (error) {
+    console.warn('Phoenix decision trace not saved. Start local Phoenix or disable tracing in Settings.', error.message);
+  }
 }

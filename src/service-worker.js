@@ -1,4 +1,4 @@
-import { retrieveEvidence, savedFieldCandidates, searchEvidence, selectPlannerEvidence, rankSuggestionEvidence } from './retrieval.js';
+import { retrieveEvidence, savedFieldCandidates, searchEvidence, selectPlannerEvidence, rankSuggestionEvidence, semanticEligible, semanticRecordRevision } from './retrieval.js';
 import { inferSensitivity, isOpaqueIdentifier, validateFillValue, meaningCompatible, suggestionTargetKey } from './core.js';
 import { callAnswerPlanner, callAnswerRewriter, callAnswerSuggestions, callFormInterpreter, DEFAULT_FIREWORKS_MODEL, DEFAULT_OPENAI_MODEL, DEFAULT_PROVIDER } from './llm.js';
 import { prepareFormScreenshot } from './form-screenshot.js';
@@ -17,6 +17,8 @@ import {
 import { exactVisibleChoice, planDeterministicFill, requiresVisibleChoiceMatch } from './form-engine.js';
 import { buildLearningCandidates, callLearningReviewer } from './learning-review.js';
 import { hostnameFromUrl, isHostnameDisabled, isSupportedSiteUrl, normalizeHostname, normalizeHostnames } from './site-control.js';
+import { createSemanticMatcher, semanticFingerprint } from './typesafe.js';
+import { tracePhoenixEvent } from './phoenix.js';
 
 const RUN_STORAGE_KEY = 'applicationRun';
 const MAX_PAGES = 20;
@@ -24,6 +26,7 @@ const ACTIVE_RUN_STATUSES = new Set(['running', 'waiting_user', 'page_ready', 'r
 const SAVABLE_RUN_STATUSES = new Set(['waiting_user', 'page_ready', 'ready_for_user_submit', 'answers_saved']);
 const processingTabs = new Set();
 const backgroundJobs = new Map();
+const semanticMatcher = createSemanticMatcher();
 const WORKER_ID = `${Date.now()}:${Math.random()}`;
 const saveLocks = new Set();
 const saveOperations = new Map();
@@ -414,7 +417,7 @@ async function getCoverMessages() {
 }
 
 async function getSettings() {
-  const stored = await chrome.storage.local.get({ autoAdvancePages: false, includeFormScreenshot: true, aiProvider: '', aiModel: '', openaiModel: '', openaiApiKey: '', fireworksApiKey: '' });
+  const stored = await chrome.storage.local.get({ autoAdvancePages: false, includeFormScreenshot: true, aiProvider: '', aiModel: '', openaiModel: '', openaiApiKey: '', fireworksApiKey: '', typesafeEnabled: false });
   const aiProvider = stored.aiProvider === 'openai' || stored.aiProvider === 'fireworks'
     ? stored.aiProvider
     : (String(stored.openaiApiKey || '').trim() ? 'openai' : DEFAULT_PROVIDER);
@@ -426,6 +429,7 @@ async function getSettings() {
     aiProvider,
     aiModel,
     openaiModel: aiModel,
+    typesafeEnabled: Boolean(stored.typesafeEnabled),
   };
 }
 
@@ -558,6 +562,10 @@ async function getApiKey(provider = null) {
   const selectedProvider = provider || (await getSettings()).aiProvider;
   const stored = await chrome.storage.local.get({ openaiApiKey: '', fireworksApiKey: '' });
   return String(stored[selectedProvider === 'fireworks' ? 'fireworksApiKey' : 'openaiApiKey'] || '').trim();
+}
+
+async function getTypeSafeApiKey() {
+  return String((await chrome.storage.local.get({ typesafeApiKey: '' })).typesafeApiKey || '').trim();
 }
 
 async function enumerateFrames(tabId) {
@@ -874,6 +882,7 @@ function pauseForFrame(run, discovery) {
   run.reviewRequired = [];
   run.suggestions = {};
   run.generatedSuggestions = {};
+  run.semanticSearch = {};
   return run;
 }
 
@@ -902,6 +911,7 @@ function nowRun(tabId) {
     employmentChoices: [],
     llmError: null,
     generatedSuggestions: {},
+    semanticSearch: {},
     jobContext: null,
     startedAt,
     // This mirrors startedAt so the panel can form a stable transient-draft
@@ -1094,8 +1104,14 @@ function categorizeRun(run, inspection, validation, unresolvedResults = []) {
     .filter((field) => !field.currentValue || invalidIds.has(field.id))
     .map((field) => ({
       ...fieldIssue(field, invalidIds, unresolvedById, run.pageNumber),
-      ...(run.suggestions?.[field.id] ? { suggestion: run.suggestions[field.id], reason: 'Relevant saved evidence available — approve an answer before use' } : {}),
+      ...(run.semanticSearch?.[field.id] ? { semanticStatus: run.semanticSearch[field.id].status } : {}),
+      ...(run.suggestions?.[field.id] ? { suggestion: run.suggestions[field.id], reason: run.suggestions[field.id].candidates?.some(candidate => candidate.kind === 'semantic')
+        ? 'Saved answer found — review it before use'
+        : 'Relevant saved evidence available — approve an answer before use' } : {}),
       ...(run.generatedSuggestions?.[field.id] ? { generatedSuggestion: run.generatedSuggestions[field.id], reason: 'AI drafts are ready for review before sending' } : {}),
+      ...(!run.suggestions?.[field.id] && run.semanticSearch?.[field.id]?.status === 'searching' ? { reason: 'Searching saved answers…' } : {}),
+      ...(!run.suggestions?.[field.id] && run.semanticSearch?.[field.id]?.status === 'none' ? { reason: 'No clear saved-answer match' } : {}),
+      ...(!run.suggestions?.[field.id] && run.semanticSearch?.[field.id]?.status === 'failed' ? { reason: 'Couldn’t search saved answers — try again' } : {}),
     }));
   run.actionRequired = [
     ...navigationIssues(inspection),
@@ -1137,7 +1153,7 @@ async function applyPageDecisions(tabId, run, inspection, records, coverMessages
   run.lastAction = null;
   const pageOrOriginChanged = run.pageSignature !== currentPageSignature;
   if (pageOrOriginChanged || (run.suggestionDatasourceRevision && run.suggestionDatasourceRevision !== datasourceRevision)) run.generatedSuggestions = {};
-  if (pageOrOriginChanged) run.suggestions = {};
+  if (pageOrOriginChanged) { run.suggestions = {}; run.semanticSearch = {}; }
   else run.suggestions = run.suggestions || {};
   run.pageSignature = currentPageSignature;
   run.suggestionDatasourceRevision = datasourceRevision;
@@ -1158,6 +1174,7 @@ async function applyPageDecisions(tabId, run, inspection, records, coverMessages
       run.pageSignature = currentSignature;
       run.suggestions = {};
       run.generatedSuggestions = {};
+      run.semanticSearch = {};
     }
     const scopedFields = resolveEmploymentFields(run, currentInspection.fields, profile);
     const validationResponse = await sendToApplicationFrame(tabId, run, { type: 'JOB_APP_VALIDATE' });
@@ -1763,7 +1780,10 @@ async function reviewedCandidate(suggestion, message) {
   const sources = sourceKeys.map((key) => records.find((record) => record.key === key));
   const compatibleEvidence = candidate?.kind === 'planner'
     ? rankSuggestionEvidence(suggestion.field, records, {limit: records.length})
-    : searchEvidence(suggestion.field, sources.filter(Boolean), {limit: sources.length, query: candidate?.searchQuery || ''});
+    : candidate?.kind === 'semantic'
+      ? sources.filter(source => semanticEligible(suggestion.field, source)
+        && semanticRecordRevision(source) === candidate.sourceRevision)
+      : searchEvidence(suggestion.field, sources.filter(Boolean), {limit: sources.length, query: candidate?.searchQuery || ''});
   if (!candidate || !sourceKeys.length || sources.some((source) => !source)
     || sources.some((source) => source.answer !== sourceAnswerSnapshot(candidate, source.key))
     || sources.some((source) => !compatibleEvidence.some((item) => (item.sourceKey || item.key) === source.key))) {
@@ -1786,7 +1806,10 @@ async function applyReviewedField({ tabId, frameId, applicationId, field, sugges
   const validation = validateFillValue(field, value);
   const sourceCompatible = !candidate || (candidate.kind === 'planner'
     ? sources.every((item) => compatibleEvidence.some((evidence) => (evidence.sourceKey || evidence.key) === item.key))
-    : meaningCompatible(field, sources[0], { numericReview: !(['textarea', 'text'].includes(field.type) && value === candidate.answer) }));
+    : candidate.kind === 'semantic'
+      ? sources.length === 1 && semanticEligible(field, sources[0])
+        && semanticRecordRevision(sources[0]) === candidate.sourceRevision
+      : meaningCompatible(field, sources[0], { numericReview: !(['textarea', 'text'].includes(field.type) && value === candidate.answer) }));
   if (!validation.ok || !sourceCompatible || inferSensitivity(field.label, field.id) === 'legal' || field.type === 'checkbox') {
     throw new Error(validation.ok ? 'This destination requires manual entry' : validation.reason);
   }
@@ -1837,6 +1860,10 @@ async function applyReviewedField({ tabId, frameId, applicationId, field, sugges
     await datasourceWriteChain.catch(error => { throw new Error(`Answer applied, but not saved: ${error.message}`); });
   }
   const validationResponse = await sendToFrame(tabId, frameId, { type: 'JOB_APP_VALIDATE' }, assertAuthority);
+  if(candidate?.kind==='semantic') void tracePhoenixEvent('saved_answer_match_feedback', {
+    'llm.provider':'typesafe','llm.model_name':candidate.semantic?.model || '',
+    'typesafe.accepted':1,'typesafe.corrected':Number(value!==candidate.answer),
+  },`${tabId}:${applicationId}`);
   return { inspection: verified.inspection, validation: validationResponse?.validation || {}, value };
 }
 
@@ -2310,11 +2337,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     } catch (error) { sendResponse({ok: false, error: error.message}); }
     return true;
   }
-  if (['JOB_INLINE_QUERY', 'JOB_INLINE_SEARCH', 'JOB_INLINE_GENERATE', 'JOB_INLINE_ACCEPT', 'JOB_INLINE_CANCEL'].includes(message?.type)) {
+  if (['JOB_INLINE_QUERY', 'JOB_INLINE_SEARCH', 'JOB_INLINE_SEMANTIC_SEARCH', 'JOB_INLINE_GENERATE', 'JOB_INLINE_ACCEPT', 'JOB_INLINE_CANCEL'].includes(message?.type)) {
     (async () => {
       await assertTabSiteEnabled(sender?.tab?.id, sender?.tab);
       if (message.type === 'JOB_INLINE_QUERY') return queryInlineField(message, sender);
       if (message.type === 'JOB_INLINE_SEARCH') return searchInlineField(message, sender);
+      if (message.type === 'JOB_INLINE_SEMANTIC_SEARCH') return semanticSearchInlineField(message, sender);
       if (message.type === 'JOB_INLINE_GENERATE') return generateInlineField(message, sender);
       if (message.type === 'JOB_INLINE_ACCEPT') return acceptInlineField(message, sender);
       const origin = inlineOrigin(message, sender);
@@ -2413,6 +2441,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     'JOB_RUN_RETRY_AI',
     'JOB_RUN_SELECT_EMPLOYMENT',
     'JOB_RUN_SEARCH_ANSWERS',
+    'JOB_RUN_SEMANTIC_SEARCH',
     'JOB_RUN_STATE',
     'JOB_DATASOURCE_STATE',
     'JOB_DATASOURCE_EXPORT',
@@ -2494,6 +2523,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (message.type === 'JOB_RUN_RETRY_AI') { await scheduleAi(tabId, { retry: true }); return { ok: true, run: await getRun(tabId) }; }
     if (message.type === 'JOB_RUN_SELECT_EMPLOYMENT') return selectEmployment(message);
     if (message.type === 'JOB_RUN_SEARCH_ANSWERS') return searchSavedAnswers(message);
+    if (message.type === 'JOB_RUN_SEMANTIC_SEARCH') return semanticSearchSavedAnswers(message);
     if (message.type === 'JOB_RUN_FOCUS_FIELD') return focusRunField(tabId, message.fieldId);
     if (message.type === 'JOB_RUN_ADVANCE_PAGE') return advancePage(tabId);
     if (message.type === 'JOB_RUN_SAVE_ANSWERS') return saveAnswers(tabId);
@@ -2609,7 +2639,7 @@ async function validatePageOnly(tabId) {
     if (current.startedAt !== run.startedAt || current.frame?.frameId !== run.frame?.frameId) return false;
     const signature = pageSignature(inspection,current.frame);
     if (signature !== current.pageSignature) {
-      current.pageSignature=signature; current.suggestions={}; current.generatedSuggestions={};
+      current.pageSignature=signature; current.suggestions={}; current.generatedSuggestions={}; current.semanticSearch={};
       for (const op of Object.values(current.aiOperations || {})) if(op.status==='pending') op.status='interrupted';
     }
     for (const [id,suggestion] of Object.entries(current.suggestions || {})) {
@@ -2621,6 +2651,10 @@ async function validatePageOnly(tabId) {
       const field=inspection.fields.find(field=>field.id===id);
       const hasText = String(field?.currentValue || '').trim().length > 0;
       if(!field || hasText || field.handle!==suggestion.field.handle) delete current.generatedSuggestions[id];
+    }
+    for (const id of Object.keys(current.semanticSearch || {})) {
+      const field=inspection.fields.find(item=>item.id===id);
+      if(!field || String(field.currentValue||'').trim()) delete current.semanticSearch[id];
     }
     categorizeRun(current,inspection,validated.validation);
     const next=inspection.actions.filter(action=>action.kind==='next');
@@ -2673,6 +2707,33 @@ async function searchInlineField(message, sender) {
   return inlineReply(updated, message.requestId, {candidates: updated.suggestions[field.id].candidates});
 }
 
+async function semanticSearchInlineField(message, sender) {
+  const {session,field}=await guardInlineField(message,sender,{requireFocus:true});
+  if(processingTabs.has(session.tabId)||saveLocks.has(session.tabId)) throw new Error('Application is busy. Try again.');
+  const settings=await getSettings(); const apiKey=await getTypeSafeApiKey();
+  if(!settings.typesafeEnabled||!apiKey) throw new Error('Enable TypeSafe saved-answer search and add its API key in Settings.');
+  const records=await getRecords();
+  const [result]=await semanticMatcher.match({fields:[field],records,apiKey,enabled:true,
+    scope:`inline:${session.sessionId}:${session.pageSignature}`,retry:Boolean(message.retry),
+    sessionId:`${session.tabId}:${session.sessionId}`});
+  const [liveSettings,liveRecords]=await Promise.all([getSettings(),getRecords()]);
+  if(!liveSettings.typesafeEnabled||semanticFingerprint(field,liveRecords)!==result.fingerprint) {
+    throw new Error('Saved answers changed. Try again.');
+  }
+  const {session:latest,authority}=await guardInlineField(message,sender,{requireFocus:true});
+  if(latest.revision!==session.revision) throw new Error('Inline session changed. Try again.');
+  if(result.status!=='matched') return inlineReply(latest,message.requestId,{semanticStatus:result.status});
+  const updated=await mutateInlineSession(session.tabId,session.frameId,session.sessionId,current=>{
+    authority();
+    if(current.revision!==session.revision) throw new Error('Inline session changed. Try again.');
+    const registered={...result.candidate,candidateId:`semantic:${current.revision+1}:${crypto.randomUUID()}`};
+    const prior=current.suggestions[field.id]?.candidates||[];
+    const candidates=prior.some(candidate=>candidate.answer===registered.answer)?prior:[registered,...prior];
+    return {...current,suggestions:{...current.suggestions,[field.id]:{...current.suggestions[field.id],field,candidates}}};
+  });
+  return inlineReply(updated,message.requestId,{semanticStatus:'matched',semanticCandidate:updated.suggestions[field.id].candidates[0]});
+}
+
 async function searchSavedAnswers(message) {
   const {run,field}=await guardedDraftField(message);
   const candidates=await savedSearchCandidates(field,message.query);
@@ -2684,6 +2745,39 @@ async function searchSavedAnswers(message) {
   });
   if(!updated) throw new Error('The application changed. Search again.');
   return {ok:true,candidates,run:updated};
+}
+
+async function semanticSearchSavedAnswers(message) {
+  const {run,field}=await guardedDraftField(message);
+  const settings=await getSettings(); const apiKey=await getTypeSafeApiKey();
+  if(!settings.typesafeEnabled||!apiKey) throw new Error('Enable TypeSafe saved-answer search and add its API key in Settings.');
+  const records=await getRecords();
+  const [result]=await semanticMatcher.match({fields:[field],records,apiKey,enabled:true,
+    scope:`${run.startedAt}:${run.pageSignature}`,retry:Boolean(message.retry),sessionId:`${message.tabId}:${run.startedAt}`});
+  const [liveSettings,liveRecords]=await Promise.all([getSettings(),getRecords()]);
+  if(!liveSettings.typesafeEnabled||semanticFingerprint(field,liveRecords)!==result.fingerprint) {
+    throw new Error('Saved answers changed. Try again.');
+  }
+  await guardedDraftField(message);
+  const updated=await mutateRun(message.tabId,current=>{
+    if(current.startedAt!==run.startedAt||current.pageSignature!==run.pageSignature)return false;
+    current.semanticSearch ||= {}; current.semanticSearch[field.id]={status:result.status};
+    if(result.status==='matched') {
+      const prior=current.suggestions?.[field.id]?.candidates||[];
+      current.suggestions ||= {};
+      current.suggestions[field.id]={tabId:message.tabId,frameId:message.frameId,applicationId:run.startedAt,
+        pageSignature:run.pageSignature,field,candidates:prior.some(candidate=>candidate.answer===result.candidate.answer)
+          ? prior : [result.candidate,...prior]};
+    }
+    for(const item of [...(current.actionRequired||[]),...(current.optionalUnresolved||[])]) if(item.fieldId===field.id) {
+      item.semanticStatus=result.status;
+      if(result.status==='matched') {item.suggestion=current.suggestions[field.id];item.reason='Saved answer found — review it before use';}
+      else if(result.status==='none') item.reason='No clear saved-answer match';
+      else if(result.status==='failed') item.reason='Couldn’t search saved answers — try again';
+    }
+  });
+  if(!updated) throw new Error('The application changed. Try again.');
+  return {ok:true,semanticStatus:result.status,candidates:result.status==='matched'?[result.candidate]:[],run:updated};
 }
 
 function aiFieldSnapshot(field = {}) {
@@ -2712,7 +2806,7 @@ function aiEvidenceRevision(run, inspection, datasource) {
 }
 
 function aiFingerprint(run, fields, settings, evidenceRevision) {
-  return JSON.stringify({applicationId:run.startedAt,frame:run.frame?.frameId,page:run.pageSignature,fields:fields.map(({id,handle,entityId,employmentId})=>({id,handle,entityId,employmentId})),evidenceRevision,provider:settings.aiProvider,model:settings.aiModel,promptVersion:'reliable-review-1'});
+  return JSON.stringify({applicationId:run.startedAt,frame:run.frame?.frameId,page:run.pageSignature,fields:fields.map(({id,handle,entityId,employmentId})=>({id,handle,entityId,employmentId})),evidenceRevision,provider:settings.aiProvider,model:settings.aiModel,typesafeEnabled:settings.typesafeEnabled,promptVersion:'reliable-review-2'});
 }
 
 function suggestionRequestSnapshot(run, field, inspection, datasource, settings, jobContext) {
@@ -2740,6 +2834,10 @@ function sameSuggestionRun(run, snapshot) {
     && JSON.stringify(run.jobContext || {}) === JSON.stringify(snapshot.sourceJobContext || {}));
 }
 
+function hasUsableSuggestion(suggestion) {
+  return Boolean(suggestion?.candidates?.some(candidate => String(candidate?.answer || '').trim()));
+}
+
 async function currentSuggestionDestination(tabId, snapshot) {
   const run = await getRun(tabId);
   if (!sameSuggestionRun(run, snapshot)) return null;
@@ -2763,26 +2861,32 @@ async function scheduleAi(tabId,{retry=false}={}) {
   if(backgroundJobs.has(tabId) || processingTabs.has(tabId) || saveLocks.has(tabId)) return;
   const run=await getRun(tabId);
   if(!run || !SAVABLE_RUN_STATUSES.has(run.status) || !Number.isInteger(run.frame?.frameId)) return;
-  const settings=await getSettings(); const apiKey=await getApiKey(settings.aiProvider);
-  if(!apiKey) return;
+  const settings=await getSettings();
+  const [apiKey,typesafeApiKey]=await Promise.all([getApiKey(settings.aiProvider),getTypeSafeApiKey()]);
+  if(!apiKey && !(settings.typesafeEnabled && typesafeApiKey)) return;
   const inspected=await sendToApplicationFrame(tabId,run,{type:'JOB_APP_INSPECT'});
   if(!inspected?.ok || pageSignature(inspected.inspection,run.frame)!==run.pageSignature) return;
   const validated=await sendToApplicationFrame(tabId,run,{type:'JOB_APP_VALIDATE'});
   const invalidIds=new Set((validated?.validation?.invalid || []).map(field=>field.fieldId));
   const datasource=await getDatasource();
   const fields=resolveEmploymentFields(run,inspected.inspection.fields,datasource.profile);
-  const unresolved=fields.filter(field=>field.required && !String(field.currentValue || '').trim() && (!run.suggestions?.[field.id] || invalidIds.has(field.id)) && readableQuestion(field) && inferSensitivity(field.label,field.id)!=='legal' && !field.entityUnresolved);
+  const unresolved=fields.filter(field=>field.required && !String(field.currentValue || '').trim()
+    && (!hasUsableSuggestion(run.suggestions?.[field.id]) || invalidIds.has(field.id)) && readableQuestion(field)
+    && inferSensitivity(field.label,field.id)!=='legal' && !field.entityUnresolved);
   if(!unresolved.length) return;
   const planner=run.aiOperations?.planner;
   const retryableStates=new Set(['failed','interrupted']);
+  const semanticRetry=retry && unresolved.some(field=>run.semanticSearch?.[field.id]?.status==='failed');
   const plannerFields=retry
-    ? (retryableStates.has(planner?.status) ? unresolved : [])
+    ? (retryableStates.has(planner?.status) || semanticRetry ? unresolved : [])
     : unresolved;
   const suggestionFields=retry
     ? unresolved.filter(field=>retryableStates.has(run.aiOperations?.[`suggestion:${field.id}`]?.status) && !run.generatedSuggestions?.[field.id])
     : unresolved.filter(field=>!run.generatedSuggestions?.[field.id]);
+  const semanticFields=plannerFields.filter(field=>!hasUsableSuggestion(run.suggestions?.[field.id]));
+  if(!apiKey && !semanticFields.length) return;
   if(!plannerFields.length && !suggestionFields.length) return;
-  const operationFields=plannerFields.length ? plannerFields : suggestionFields;
+  const operationFields=[...new Map([...plannerFields,...semanticFields,...suggestionFields].map(field=>[field.id,field])).values()];
   const evidenceRevision=aiEvidenceRevision(run,inspected.inspection,datasource);
   const fingerprint=aiFingerprint(run,operationFields,settings,evidenceRevision);
   const op=planner;
@@ -2794,10 +2898,12 @@ async function scheduleAi(tabId,{retry=false}={}) {
     if(current.startedAt!==snapshot.startedAt || current.pageSignature!==snapshot.pageSignature) return false;
     current.aiOperations ||= {};
     current.aiOperations[operationKey]={status:'pending',cacheKey:fingerprint,id,workerId:WORKER_ID};
+    current.semanticSearch ||= {};
+    if(settings.typesafeEnabled && typesafeApiKey) for(const field of semanticFields) current.semanticSearch[field.id]={status:'searching'};
     current.progress='preparing_suggestions'; current.llmError=null;
   });
   const ownedSuggestionFields=suggestionFields.filter(field=>claimDraftField(draftFieldKey(tabId,snapshot.frameId,field),id));
-  const job=prepareAi(tabId,snapshot,plannerFields,ownedSuggestionFields,fields,datasource,apiKey).catch(async error=>{
+  const job=prepareAi(tabId,snapshot,plannerFields,semanticFields,ownedSuggestionFields,fields,datasource,apiKey,typesafeApiKey,{retry}).catch(async error=>{
     await mutateRun(tabId,current=>{
       if(current.aiOperations?.[operationKey]?.id!==id) return false;
       current.aiOperations[operationKey].status='failed';current.aiOperations[operationKey].error=error.message;current.llmError=error.message;current.progress='ready';
@@ -2814,7 +2920,8 @@ async function currentAiDestination(tabId,snapshot,field=null) {
   if(!run || run.startedAt!==snapshot.startedAt || run.pageSignature!==snapshot.pageSignature || run.frame?.frameId!==snapshot.frameId || run.aiOperations?.[snapshot.operationKey]?.id!==snapshot.id || !SAVABLE_RUN_STATUSES.has(run.status)) return null;
   const authority = siteAuthority(tabId);
   const settings=await getSettings();
-  if(settings.aiProvider!==snapshot.settings.aiProvider || settings.aiModel!==snapshot.settings.aiModel) return null;
+  if(settings.aiProvider!==snapshot.settings.aiProvider || settings.aiModel!==snapshot.settings.aiModel
+    || settings.typesafeEnabled!==snapshot.settings.typesafeEnabled) return null;
   const [datasource, inspected]=await Promise.all([getDatasource(),sendToFrame(tabId,snapshot.frameId,{type:'JOB_APP_INSPECT'}, authority)]);
   if(!inspected?.ok || pageSignature(inspected.inspection,run.frame)!==snapshot.pageSignature) return null;
   if(aiEvidenceRevision(run,inspected.inspection,datasource)!==snapshot.evidenceRevision) return null;
@@ -2825,8 +2932,54 @@ async function currentAiDestination(tabId,snapshot,field=null) {
   return {run,inspection:inspected.inspection};
 }
 
-async function prepareAi(tabId,snapshot,plannerFields,suggestionFields,allFields,datasource,apiKey) {
+async function prepareAi(tabId,snapshot,plannerFields,semanticFields,suggestionFields,allFields,datasource,apiKey,typesafeApiKey,{retry=false}={}) {
   const {aiProvider:provider,aiModel:model}=snapshot.settings;
+  let semanticFailure=false;
+  if(snapshot.settings.typesafeEnabled && typesafeApiKey && semanticFields.length) {
+    const semanticResults=await semanticMatcher.match({fields:semanticFields,records:datasource.answerRecords,
+      apiKey:typesafeApiKey,enabled:true,scope:`${snapshot.startedAt}:${snapshot.pageSignature}`,retry,
+      sessionId:`${tabId}:${snapshot.startedAt}`});
+    const destination=await currentAiDestination(tabId,snapshot);
+    if(destination) {
+      const fieldsById=new Map(destination.inspection.fields.map(field=>[field.id,field]));
+      const validResults=semanticResults.filter(result=>{
+        const original=semanticFields.find(field=>field.id===result.fieldId);
+        const live=fieldsById.get(result.fieldId);
+        return original && live && !String(live.currentValue||'').trim() && sameFieldSnapshot(live,aiFieldSnapshot(original));
+      });
+      await mutateRun(tabId,current=>{
+        if(current.aiOperations?.[snapshot.operationKey]?.id!==snapshot.id || current.pageSignature!==snapshot.pageSignature)return false;
+        current.semanticSearch ||= {}; current.suggestions ||= {};
+        for(const result of validResults) {
+          current.semanticSearch[result.fieldId]={status:result.status};
+          if(result.status==='matched') {
+            const field=semanticFields.find(item=>item.id===result.fieldId);
+            current.suggestions[result.fieldId]={tabId,frameId:snapshot.frameId,applicationId:snapshot.startedAt,
+              pageSignature:snapshot.pageSignature,field,candidates:[result.candidate]};
+          }
+        }
+      });
+      const outcomes=new Map(validResults.map(result=>[result.fieldId,result.status]));
+      semanticFailure=[...outcomes.values()].includes('failed');
+      const continueWithGeneration=field=>outcomes.get(field.id)!=='matched';
+      for(const field of suggestionFields.filter(field=>!continueWithGeneration(field))) {
+        releaseDraftField(draftFieldKey(tabId,snapshot.frameId,field),snapshot.id);
+      }
+      plannerFields=plannerFields.filter(continueWithGeneration);
+      suggestionFields=suggestionFields.filter(continueWithGeneration);
+      await validatePageOnly(tabId);
+    }
+  }
+  if(!apiKey) {
+    await mutateRun(tabId,current=>{
+      if(current.aiOperations?.[snapshot.operationKey]?.id!==snapshot.id)return false;
+      current.aiOperations[snapshot.operationKey].status=semanticFailure?'failed':'completed';
+      if(semanticFailure){current.aiOperations[snapshot.operationKey].error='Couldn’t search saved answers — try again';current.llmError='Couldn’t search saved answers — try again';}
+      current.progress='ready';
+    });
+    await validatePageOnly(tabId);
+    return;
+  }
   const plannerRecords=selectPlannerEvidence(plannerFields,datasource.answerRecords,{limit:20});
   let decisions=[]; let plannerError='';
   if(plannerFields.length) {

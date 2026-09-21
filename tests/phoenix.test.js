@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createPhoenixFetch } from '../src/phoenix.js';
+import { createPhoenixFetch, tracePhoenixEvent } from '../src/phoenix.js';
 
 const url = 'https://api.fireworks.ai/inference/v1/chat/completions';
 const options = { method: 'POST', headers: { Authorization: 'Bearer secret-key' }, body: JSON.stringify({model: 'test-model', messages: [{role: 'user', content: 'Test input'}], response_format: {json_schema: {name: 'answer_planner'}}}) };
@@ -23,7 +23,22 @@ test('Phoenix captures exact input/output, model, usage and session without cons
   assert.deepEqual(JSON.parse(span.attributes['output.value']), output);
   assert.equal(span.attributes['session.id'], 'application-1');
   assert.equal(span.attributes['llm.token_count.total'], 15);
+  assert.equal(Number.isFinite(span.attributes['http.request.duration_ms']), true);
   assert.equal(span.status_code, 'OK');
+});
+
+test('TypeSafe and decision metrics carry provider attribution without credentials', async () => {
+  const calls = [];
+  await tracePhoenixEvent('saved_answer_match_result', {'llm.provider': 'typesafe', 'typesafe.cache_hits': 2}, 'run-1', {
+    enabled: async () => true,
+    fetchImpl: async (endpoint, init) => { calls.push({endpoint, init}); return Response.json({}, {status: 202}); },
+  });
+  const span = JSON.parse(calls[0].init.body).data[0];
+  assert.equal(span.name, 'saved_answer_match_result');
+  assert.equal(span.attributes['llm.provider'], 'typesafe');
+  assert.equal(span.attributes['typesafe.cache_hits'], 2);
+  assert.equal(span.attributes['session.id'], 'run-1');
+  assert.equal(JSON.stringify(span).includes('Authorization'), false);
 });
 
 test('disabled tracing makes only the original request', async () => {

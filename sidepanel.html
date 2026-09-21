@@ -111,6 +111,13 @@
         <input id="fireworks-api-key" type="password" autocomplete="off" spellcheck="false" placeholder="Paste your Fireworks key">
         <label for="openai-api-key">OpenAI API key <span class="muted">(optional alternative)</span></label>
         <input id="openai-api-key" type="password" autocomplete="off" spellcheck="false" placeholder="sk-…">
+        <label class="checkbox-row" for="typesafe-enabled">
+          <input id="typesafe-enabled" type="checkbox">
+          <span>Use TypeSafe to find matching saved answers</span>
+        </label>
+        <label for="typesafe-api-key">TypeSafe API key <span class="muted">(stored locally)</span></label>
+        <input id="typesafe-api-key" type="password" autocomplete="off" spellcheck="false" placeholder="ts_…">
+        <p class="muted">Uses Jev 1.13 only for unresolved questions and explicit saved-answer searches.</p>
         <label for="employer-name">Confirmed employer</label>
         <input id="employer-name" type="text" autocomplete="organization" value="DeepSight AI Labs">
         <p class="muted">Only saved employment for cross-site work-history fields.</p>

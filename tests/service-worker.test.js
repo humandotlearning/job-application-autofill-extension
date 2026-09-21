@@ -327,6 +327,92 @@ test('inline lookup works with no run and never fills on focus', async () => {
   assert.equal(harness.tabs.get(7).submitCalls, 0);
 });
 
+test('Fill this page batches unresolved saved-answer choices and skips drafting matched fields', async () => {
+  const harness = createHarness({answerRecords: [
+    {key: 'reliability', question: 'Engineering achievement', answer: 'Reduced production outages with health checks and automated rollback.', sensitivity: 'safe'},
+    {key: 'teamwork', question: 'Leadership example', answer: 'Led a team through a difficult migration.', sensitivity: 'safe'},
+  ], pagesByTab: {7: {pages: [{
+    page: {title: 'Job application', domain: 'jobs.example.com'},
+    fields: [
+      {id: 'impact', handle: 'doc-a:impact', label: 'How have you made systems safer?', type: 'textarea', required: true, rawValue: '', editRevision: 0},
+      {id: 'collaboration', handle: 'doc-a:collaboration', label: 'How do you help groups work well together?', type: 'textarea', required: true, rawValue: '', editRevision: 0},
+    ], actions: [],
+  }]}}});
+  harness.localData.typesafeEnabled = true;
+  harness.localData.typesafeApiKey = 'ts_test';
+  const calls = [];
+  globalThis.fetch = async (url, options) => {
+    const body = JSON.parse(options.body);
+    calls.push({url, body});
+    const probabilities = selected => Object.fromEntries(Object.keys(body.questions.f0.criteria)
+      .map(key => [key, key === selected ? 0.9 : 0.05]));
+    return {ok: true, status: 200, json: async () => ({answers: {
+      f0: {type: 'choice', choice: 'r0', confidence: 0.9, probabilities: probabilities('r0')},
+      f1: {type: 'choice', choice: 'r1', confidence: 0.9, probabilities: probabilities('r1')},
+    }})};
+  };
+  await import(`../src/service-worker.js?test=typesafe-batch-${Date.now()}`);
+  const started = await harness.dispatch({type: 'JOB_RUN_START', tabId: 7});
+  assert.equal(started.ok, true, started.error);
+  assert.equal(calls.length, 1);
+  assert.match(calls[0].url, /api\.typesafe\.ai/);
+  assert.deepEqual(Object.keys(calls[0].body.questions), ['f0', 'f1']);
+  assert.equal(calls[0].body.state.records.length, 2);
+  assert.equal(started.run.suggestions.impact.candidates[0].kind, 'semantic');
+  assert.equal(started.run.suggestions.collaboration.candidates[0].kind, 'semantic');
+  assert.deepEqual(started.run.generatedSuggestions, {});
+});
+
+test('Fill this page makes no TypeSafe request when a usable local suggestion exists', async () => {
+  const harness = createHarness({answerRecords: [{key: 'story', question: 'Model deployment project',
+    answer: 'I trained machine learning models and deployed them to production.', sensitivity: 'safe'}],
+  pagesByTab: {7: {pages: [{page: {title: 'Application', domain: 'jobs.example.com'}, fields: [
+    {id: 'ml', handle: 'handle-ml', label: 'Describe your ML experience', type: 'textarea', required: true},
+  ], actions: [{id: 'submit', label: 'Submit application', kind: 'submit'}]}]}}});
+  harness.localData.typesafeEnabled = true;
+  harness.localData.typesafeApiKey = 'ts_test';
+  let calls = 0;
+  globalThis.fetch = async () => { calls += 1; throw new Error('TypeSafe should not be called'); };
+  await import(`../src/service-worker.js?test=typesafe-local-skip-${Date.now()}`);
+  const started = await harness.dispatch({type: 'JOB_RUN_START', tabId: 7});
+  assert.equal(started.ok, true, started.error);
+  assert.ok(started.run.suggestions.ml?.candidates.length, JSON.stringify(started.run));
+  assert.equal(calls, 0);
+});
+
+test('Fill this page still uses TypeSafe after an explicit local search found no candidates', async () => {
+  const harness = createHarness({waitForAI: false, answerRecords: [{key: 'reliability', question: 'Engineering achievement',
+    answer: 'Reduced production outages with health checks and automated rollback.', sensitivity: 'safe'}],
+  pagesByTab: {7: {pages: [{page: {title: 'Application', domain: 'jobs.example.com'}, fields: [
+    {id: 'impact', handle: 'handle-impact', label: 'How have you made systems safer?', type: 'textarea', required: true},
+  ], actions: [{id: 'submit', label: 'Submit application', kind: 'submit'}]}]}}});
+  await import(`../src/service-worker.js?test=typesafe-empty-local-search-${Date.now()}`);
+  const started = await harness.dispatch({type: 'JOB_RUN_START', tabId: 7});
+  assert.equal(started.ok, true, started.error);
+  const listed = started.run.actionRequired.find(item => item.fieldId === 'impact');
+  const origin = {tabId: 7, frameId: started.run.frame.frameId, applicationId: started.run.startedAt,
+    pageSignature: started.run.pageSignature, fieldId: 'impact', handle: listed.handle};
+  const searched = await harness.dispatch({type: 'JOB_RUN_SEARCH_ANSWERS', ...origin, query: 'no-such-keyword'});
+  assert.equal(searched.ok, true, searched.error);
+  assert.deepEqual(searched.candidates, []);
+
+  harness.localData.typesafeEnabled = true;
+  harness.localData.typesafeApiKey = 'ts_test';
+  harness.sessionData.applicationRun['7'].aiOperations = {planner: {status: 'failed'}};
+  harness.sessionData.applicationRun['7'].semanticSearch = {impact: {status: 'failed'}};
+  let calls = 0;
+  globalThis.fetch = async () => {
+    calls += 1;
+    return {ok: true, status: 200, json: async () => ({answers: {
+      f0: {type: 'choice', choice: 'r0', confidence: 0.9, probabilities: {none: 0.1, r0: 0.9}},
+    }})};
+  };
+  await harness.dispatch({type: 'JOB_RUN_RETRY_AI', tabId: 7});
+  await waitUntil(() => harness.sessionData.applicationRun['7'].aiOperations.planner.status === 'completed');
+  assert.equal(calls, 1);
+  assert.equal(harness.sessionData.applicationRun['7'].suggestions.impact.candidates[0].kind, 'semantic');
+});
+
 const inlineSender = (overrides = {}) => ({ id: 'test-extension', tab: {id: 7}, frameId: 0, documentId: 'doc-a', url: 'https://jobs.example.com/apply', ...overrides });
 const inlineQuery = (overrides = {}) => ({ type: 'JOB_INLINE_QUERY', fieldId: 'name', handle: 'doc-a:name', requestId: 'query-1', ...overrides });
 const inlineGeneration = (query, requestId = 'generate-1') => ({type: 'JOB_INLINE_GENERATE', sessionId: query.sessionId, requestId});
@@ -357,6 +443,56 @@ test('inline search registers and approves evidence missed by automatic matching
   assert.equal(searched.candidates.length, 1);
   const applied = await harness.dispatch(inlineAcceptance(searched), inlineSender());
   assert.equal(applied.ok, true, applied.error);
+});
+
+test('inline TypeSafe search is explicit and rejects a source changed before approval', async () => {
+  const harness = await inlineHarness({field: {id: 'impact', handle: 'doc-a:impact',
+    label: 'How have you made systems safer?', type: 'textarea'}, answerRecords: [
+    {key: 'reliability', question: 'Engineering achievement',
+      answer: 'Reduced production outages with health checks and automated rollback.', sensitivity: 'safe'},
+  ]});
+  harness.localData.typesafeEnabled = true;
+  harness.localData.typesafeApiKey = 'ts_test';
+  let calls = 0;
+  globalThis.fetch = async (_url, options) => {
+    calls += 1;
+    const body = JSON.parse(options.body);
+    assert.deepEqual(Object.keys(body.questions), ['f0']);
+    return {ok: true, status: 200, json: async () => ({answers: {
+      f0: {type: 'choice', choice: 'r0', confidence: 0.9, probabilities: {none: 0.1, r0: 0.9}},
+    }})};
+  };
+  const query = await harness.dispatch(inlineQuery({fieldId: 'impact', handle: 'doc-a:impact'}), inlineSender());
+  assert.equal(calls, 0, 'ordinary focus/query remains local');
+  const matched = await harness.dispatch({type: 'JOB_INLINE_SEMANTIC_SEARCH', sessionId: query.sessionId,
+    fieldId: 'impact', handle: 'doc-a:impact', requestId: 'semantic-1'}, inlineSender());
+  assert.equal(matched.semanticStatus, 'matched');
+  assert.equal(calls, 1);
+  harness.localData.answerRecords[0].answer = 'The saved source was edited after matching.';
+  const applied = await harness.dispatch({type: 'JOB_INLINE_ACCEPT', sessionId: query.sessionId,
+    requestId: 'accept-semantic', candidateId: matched.candidates[0].candidateId, acceptanceToken: 'content-token'}, inlineSender());
+  assert.equal(applied.ok, false);
+  assert.match(applied.error, /source|changed|available/i);
+  assert.equal(harness.tabs.get(7).messages.some(message => message.type === 'JOB_APP_APPLY'), false);
+});
+
+test('inline TypeSafe search preserves an existing candidate ID for a duplicate answer', async () => {
+  const harness = await inlineHarness({field: {label: 'Describe your ML deployment experience', type: 'textarea'}, answerRecords: [
+    {key: 'ml_delivery', question: 'Machine learning delivery project',
+      answer: 'I built and deployed machine learning models to production.', sensitivity: 'safe'},
+  ]});
+  harness.localData.typesafeEnabled = true;
+  harness.localData.typesafeApiKey = 'ts_test';
+  globalThis.fetch = async () => ({ok: true, status: 200, json: async () => ({answers: {
+    f0: {type: 'choice', choice: 'r0', confidence: 0.9, probabilities: {none: 0.1, r0: 0.9}},
+  }})});
+  const query = await harness.dispatch(inlineQuery(), inlineSender());
+  assert.equal(query.candidates.length, 1);
+  const candidateId = query.candidates[0].candidateId;
+  const matched = await harness.dispatch({type: 'JOB_INLINE_SEMANTIC_SEARCH', sessionId: query.sessionId,
+    fieldId: 'name', handle: 'doc-a:name', requestId: 'semantic-duplicate'}, inlineSender());
+  assert.equal(matched.semanticStatus, 'matched');
+  assert.equal(matched.candidates[0].candidateId, candidateId);
 });
 
 test('clearing inline search registers fresh automatic candidates and rejects expired IDs', async () => {
@@ -517,7 +653,7 @@ async function inlinePanelIntegration(t) {
   await new Promise(resolve => setTimeout(resolve, 0));
   const popup = content.window.document.querySelector('[data-job-inline-autofill]').shadowRoot;
   popup.querySelector('[role="option"]').click();
-  [...popup.querySelectorAll('button')].find(button => button.textContent === 'Edit in panel').click();
+  [...popup.querySelectorAll('button')].find(button => button.textContent === 'Edit and use').click();
   await waitUntil(() => !panel.window.document.querySelector('#inline-field-card').hidden);
   const card = panel.window.document.querySelector('#inline-field-card');
   const draft = card.querySelector('[data-answer-draft]');

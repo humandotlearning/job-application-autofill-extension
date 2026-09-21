@@ -3,6 +3,8 @@ const elements = {
   provider: byId('ai-provider'),
   fireworksApiKey: byId('fireworks-api-key'),
   openaiApiKey: byId('openai-api-key'),
+  typesafeEnabled: byId('typesafe-enabled'),
+  typesafeApiKey: byId('typesafe-api-key'),
   apiKey: byId('openai-api-key'),
   apiModel: byId('ai-model'),
   includeFormScreenshot: byId('include-form-screenshot'),
@@ -863,7 +865,24 @@ function itemRow(item, { focus = false, detail = '', responseHandler = response 
     query.value = workspace.state.searchQuery;
     const button = document.createElement('button');
     button.type = 'button'; button.dataset.searchAnswers = 'true'; button.textContent = 'Search';
+    const semanticButton = document.createElement('button');
+    semanticButton.type = 'button'; semanticButton.dataset.findSavedAnswer = 'true'; semanticButton.textContent = 'Find saved answer';
     const results = document.createElement('div');
+    const showCandidates = (candidates, emptyText, complete = false) => {
+      results.replaceChildren();
+      for (const candidate of candidates || []) {
+        if (isOpaqueIdentifier(candidate.answer)) continue;
+        const choice = document.createElement('button'); choice.type = 'button'; choice.dataset.searchResult = 'true';
+        choice.textContent = `${candidate.sourceQuestion || 'Saved answer'} — ${complete || candidate.answer.length <= 160 ? candidate.answer : `${candidate.answer.slice(0, 160)}…`}`;
+        choice.addEventListener('click', () => {
+          updateDraftAnswer(workspace.state, candidate.answer); workspace.state.sourceKey = candidate.sourceKey || null;
+          workspace.state.sourceKeys = candidate.sourceKeys || (candidate.sourceKey ? [candidate.sourceKey] : []); workspace.state.candidateKind = candidate.kind || null;
+          workspace.state.editing = true; workspace.workspace.querySelector('[data-answer-draft]').value = candidate.answer; workspace.updateControls();
+        });
+        results.append(choice);
+      }
+      if (!results.children.length) results.textContent = emptyText;
+    };
     button.addEventListener('click', async () => {
       if (button.disabled) return;
       const submittedQuery = workspace.state.searchQuery.trim();
@@ -876,19 +895,7 @@ function itemRow(item, { focus = false, detail = '', responseHandler = response 
         if (!search.isConnected || workspace.state.searchQuery.trim() !== submittedQuery) return;
         if (!response?.ok) throw new Error(response?.error || 'Could not search saved answers.');
         if (origin.inlineSessionId) responseHandler(response, {preserveContent: true});
-        results.replaceChildren();
-        for (const candidate of response.candidates || []) {
-          if (isOpaqueIdentifier(candidate.answer)) continue;
-          const choice = document.createElement('button'); choice.type = 'button'; choice.dataset.searchResult = 'true';
-          choice.textContent = `${candidate.sourceQuestion || 'Saved answer'} — ${candidate.answer.length > 160 ? `${candidate.answer.slice(0, 160)}…` : candidate.answer}`;
-          choice.addEventListener('click', () => {
-            updateDraftAnswer(workspace.state, candidate.answer); workspace.state.sourceKey = candidate.sourceKey || null;
-            workspace.state.sourceKeys = candidate.sourceKeys || (candidate.sourceKey ? [candidate.sourceKey] : []); workspace.state.candidateKind = candidate.kind || null;
-            workspace.state.editing = true; workspace.workspace.querySelector('[data-answer-draft]').value = candidate.answer; workspace.updateControls();
-          });
-          results.append(choice);
-        }
-        if (!results.children.length) results.textContent = 'No saved answers found.';
+        showCandidates(response.candidates, 'No saved answers found.');
       } catch (error) { if (search.isConnected) setStatus(error.message, 'error'); } finally {
         if (workspace.state.pending === 'search') workspace.state.pending = null;
         button.disabled = false;
@@ -896,8 +903,28 @@ function itemRow(item, { focus = false, detail = '', responseHandler = response 
         workspace.updateControls();
       }
     });
+    semanticButton.addEventListener('click', async () => {
+      if (semanticButton.disabled) return;
+      semanticButton.disabled = true; results.textContent = 'Searching saved answers…';
+      try {
+        const response = await sendFieldAction('JOB_RUN_SEMANTIC_SEARCH', origin, {fieldId:origin.fieldId,retry:semanticButton.dataset.retry==='true'});
+        if (!search.isConnected) return;
+        if (!response?.ok) throw new Error(response?.error || 'Couldn’t search saved answers—try again.');
+        if (response.semanticStatus === 'matched') {
+          semanticButton.dataset.retry = 'false'; semanticButton.textContent = 'Find saved answer';
+          showCandidates(response.candidates, 'No clear match.', true);
+        } else if (response.semanticStatus === 'none' || response.semanticStatus === 'skipped') {
+          semanticButton.dataset.retry = 'false'; semanticButton.textContent = 'Find saved answer'; results.textContent = 'No clear match.';
+        } else {
+          semanticButton.dataset.retry = 'true'; semanticButton.textContent = 'Try saved-answer search again'; results.textContent = 'Couldn’t search saved answers—try again.';
+        }
+      } catch (error) {
+        semanticButton.dataset.retry = 'true'; semanticButton.textContent = 'Try saved-answer search again';
+        if (search.isConnected) results.textContent = 'Couldn’t search saved answers—try again.';
+      } finally { semanticButton.disabled = false; }
+    });
     query.addEventListener('input', () => { workspace.state.searchQuery = query.value; results.replaceChildren(); });
-    search.append(query, button, results); content.append(search);
+    search.append(query, button, semanticButton, results); content.append(search);
   }
   if (generated) {
     const drafts = Array.isArray(generated.suggestions) ? generated.suggestions : [];
@@ -1014,7 +1041,7 @@ function itemRow(item, { focus = false, detail = '', responseHandler = response 
       const editCandidate = document.createElement('button');
       editCandidate.type = 'button';
       editCandidate.dataset.editCandidate = 'true';
-      editCandidate.textContent = 'Edit';
+      editCandidate.textContent = 'Edit and use';
       editCandidate.addEventListener('click', () => {
         if (!workspace) return;
         updateDraftAnswer(workspace.state, candidate.answer);
@@ -1412,7 +1439,7 @@ async function refresh() {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
   activeTabId = tab?.id || null;
   await refreshSiteState();
-  const stored = await chrome.storage.local.get({ answerRecords: [], openaiApiKey: '', fireworksApiKey: '', aiProvider: '', aiModel: '', openaiModel: 'gpt-5.6-terra', includeFormScreenshot: true, autoAdvancePages: false, phoenixTracing: true });
+  const stored = await chrome.storage.local.get({ answerRecords: [], openaiApiKey: '', fireworksApiKey: '', typesafeApiKey: '', typesafeEnabled: false, aiProvider: '', aiModel: '', openaiModel: 'gpt-5.6-terra', includeFormScreenshot: true, autoAdvancePages: false, phoenixTracing: true });
   const provider = stored.aiProvider === 'openai' || stored.aiProvider === 'fireworks'
     ? stored.aiProvider
     : (stored.openaiApiKey ? 'openai' : 'fireworks');
@@ -1421,6 +1448,8 @@ async function refresh() {
   elements.provider.selectedIndex = provider === 'openai' ? 1 : 0;
   elements.fireworksApiKey.value = stored.fireworksApiKey || '';
   elements.openaiApiKey.value = stored.openaiApiKey || '';
+  elements.typesafeApiKey.value = stored.typesafeApiKey || '';
+  elements.typesafeEnabled.checked = Boolean(stored.typesafeEnabled);
   elements.apiModel.value = stored.aiModel || (provider === 'openai' ? stored.openaiModel : '') || defaultModel;
   elements.includeFormScreenshot.checked = stored.includeFormScreenshot !== false;
   elements.phoenixTracing.checked = stored.phoenixTracing !== false;
@@ -1506,6 +1535,11 @@ async function saveScreenshotSetting() {
   setStatus(elements.includeFormScreenshot.checked ? 'Visual form context enabled.' : 'Using text form context only.');
 }
 
+async function saveTypeSafeSetting() {
+  await chrome.storage.local.set({ typesafeEnabled: Boolean(elements.typesafeEnabled.checked) });
+  setStatus(elements.typesafeEnabled.checked ? 'TypeSafe saved-answer search enabled.' : 'TypeSafe saved-answer search disabled.');
+}
+
 async function saveProfile(changedField) {
   try {
     const company = elements.employerName.value.trim() || 'DeepSight AI Labs';
@@ -1529,7 +1563,7 @@ async function saveProfile(changedField) {
   } catch (error) { setStatus(error.message, 'error'); }
 }
 
-for (const [input, key, label] of [[elements.fireworksApiKey, 'fireworksApiKey', 'Fireworks'], [elements.openaiApiKey, 'openaiApiKey', 'OpenAI']]) {
+for (const [input, key, label] of [[elements.fireworksApiKey, 'fireworksApiKey', 'Fireworks'], [elements.openaiApiKey, 'openaiApiKey', 'OpenAI'], [elements.typesafeApiKey, 'typesafeApiKey', 'TypeSafe']]) {
   input.addEventListener('change', () => saveApiKey(input, key, label));
   input.addEventListener('blur', () => saveApiKey(input, key, label));
   input.addEventListener('input', () => saveApiKey(input, key, label));
@@ -1539,6 +1573,7 @@ elements.apiModel.addEventListener('change', saveModel);
 elements.apiModel.addEventListener('blur', saveModel);
 elements.autoAdvance.addEventListener('change', saveSettings);
 elements.includeFormScreenshot.addEventListener('change', saveScreenshotSetting);
+elements.typesafeEnabled.addEventListener('change', saveTypeSafeSetting);
 elements.phoenixTracing.addEventListener('change', async () => {
   await chrome.storage.local.set({ phoenixTracing: elements.phoenixTracing.checked });
   setStatus(elements.phoenixTracing.checked ? 'Local Phoenix tracing enabled.' : 'AI tracing disabled.');
