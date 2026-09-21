@@ -136,6 +136,9 @@ function formSessionMatchesTab(run, tab) {
   const expected = run.formOrigin;
   if (!expected?.domain) return run.status === 'running';
   if (parsed.hostname !== expected.domain) return false;
+  const expectedDocumentId = run.frame?.destination?.documentId;
+  if (tab?.documentId && expectedDocumentId && tab.documentId !== expectedDocumentId
+    && !(run.status === 'running' && run.lastAction === 'next')) return false;
   if (!expected.pathname || parsed.pathname === expected.pathname) return true;
   // A user-approved Next/Continue click may update the URL before the new
   // content script reports navigation. Keep that transition authorized for
@@ -795,7 +798,7 @@ async function acceptFormSelection(message, sender) {
   const request = formSelections.get(tabId);
   if (sender?.id !== chrome.runtime.id || !request || request.token !== message.token || Date.now() > request.expiresAt
     || !request.frames.some(frame => frame.frameId === sender.frameId && frame.documentId === message.destination?.documentId)) throw new Error('Form selection expired. Click Select form again.');
-  await assertTabFormActive(tabId, sender?.tab);
+  await assertTabFormActive(tabId, sender);
   const run = await getRun(tabId);
   if (!run || run.startedAt !== request.applicationId || processingTabs.has(tabId)) throw new Error('The application changed. Select the form again.');
   await cancelFormSelection(tabId);
@@ -2370,9 +2373,10 @@ function beginSaveOperation(tabId) {
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message?.type === 'JOB_APP_SITE_STATUS') {
     (async () => {
-      const state = await siteStateForTab(sender?.tab?.id, sender?.tab);
+      const tabHint = sender?.tab ? {...sender.tab, ...(sender.url ? {url: sender.url} : {}), ...(sender.documentId ? {documentId: sender.documentId} : {})} : sender;
+      const state = await siteStateForTab(sender?.tab?.id, tabHint);
       const run = Number.isInteger(sender?.tab?.id) ? await getRun(sender.tab.id) : null;
-      const tab = await tabForSite(sender?.tab?.id, sender?.tab);
+      const tab = await tabForSite(sender?.tab?.id, tabHint);
       return siteStateReply({...state, sessionActive: formSessionMatchesTab(run, tab)});
     })()
       .then((state) => sendResponse({ ok: true, ...state }))
@@ -2393,7 +2397,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             ? Promise.resolve(chrome.sidePanel.open({tabId: origin.tabId})).then(() => null, () => PANEL_OPEN_FALLBACK)
             : Promise.resolve(PANEL_OPEN_FALLBACK);
         } catch { opening = Promise.resolve(PANEL_OPEN_FALLBACK); }
-        await assertTabFormActive(origin.tabId, sender?.tab);
+        await assertTabFormActive(origin.tabId, sender);
         return handoffInlineField(request, sender, opening);
       })().then(sendResponse).catch(error => sendResponse({ok: false, error: error.message}));
     } catch (error) { sendResponse({ok: false, error: error.message}); }
@@ -2401,7 +2405,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
   if (['JOB_INLINE_QUERY', 'JOB_INLINE_SEARCH', 'JOB_INLINE_SEMANTIC_SEARCH', 'JOB_INLINE_GENERATE', 'JOB_INLINE_ACCEPT', 'JOB_INLINE_CANCEL'].includes(message?.type)) {
     (async () => {
-      await assertTabFormActive(sender?.tab?.id, sender?.tab);
+      await assertTabFormActive(sender?.tab?.id, sender);
       if (message.type === 'JOB_INLINE_QUERY') return queryInlineField(message, sender);
       if (message.type === 'JOB_INLINE_SEARCH') return searchInlineField(message, sender);
       if (message.type === 'JOB_INLINE_SEMANTIC_SEARCH') return semanticSearchInlineField(message, sender);
@@ -2421,7 +2425,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message?.type === 'JOB_APP_REVALIDATE') {
     (async()=>{
       const tabId=sender?.tab?.id;const run=Number.isInteger(tabId)?await getRun(tabId):null;
-      await assertTabFormActive(tabId, sender?.tab);
+      await assertTabFormActive(tabId, sender);
       if(!run || message.applicationId!==run.startedAt || (sender.frameId??0)!==run.frame?.frameId) return {ok:false};
       if(sender.url){const url=new URL(sender.url);if(url.hostname!==run.frame.domain || (run.frame.pathname && url.pathname!==run.frame.pathname))return {ok:false};}
       return {ok:true,run:await validatePageOnly(tabId)};
@@ -2438,7 +2442,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message?.type === 'JOB_APP_LEARN' || message?.type === 'JOB_APP_LEARNING_STATUS') {
     (async () => {
       const tabId = sender?.tab?.id;
-      await assertTabFormActive(tabId, sender?.tab);
+      await assertTabSiteEnabled(tabId, sender);
       const run = tabId ? await getRun(tabId) : null;
       if (!run || ![...ACTIVE_RUN_STATUSES, 'answers_saved'].includes(run.status) || run.frame?.frameId !== (sender.frameId ?? 0)) return { ok: false };
       if (sender.url) {
