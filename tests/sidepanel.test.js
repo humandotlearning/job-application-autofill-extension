@@ -1344,7 +1344,7 @@ test('Sage Focus opens needed answers and settings without applying a value', as
   try {
     const doc = panel.dom.window.document;
     assert.equal(doc.querySelector('#run-title').textContent, '1 item needs your attention');
-    assert.equal(doc.querySelector('#run-summary').textContent, '1 filled value');
+    assert.equal(doc.querySelector('#run-summary').textContent, '1 filled value · 1 need answers');
     assert.equal(doc.querySelector('#action-required-card').open, true);
     doc.querySelector('#action-required-card').open = false;
     assert.equal(doc.querySelector('#optional-details').hidden, true);

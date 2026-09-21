@@ -267,6 +267,7 @@ async function initializeDatasource() {
     datasourceMeta: null,
     profile: null,
     learningInbox: [],
+    learningUndo: null,
     pendingLearnedAnswers: [],
     answerSource: '',
     sheetUrl: '',
@@ -312,6 +313,7 @@ async function initializeDatasource() {
       coverMessages: current.coverMessages,
       datasourceMeta: current.datasourceMeta,
       profile: current.profile,
+      learningUndo: current.learningUndo,
     });
   }
   return current;
@@ -329,6 +331,7 @@ async function saveDatasource(state) {
     datasourceMeta: state.datasourceMeta,
     profile: state.profile,
     learningInbox: state.learningInbox || [],
+    learningUndo: state.learningUndo || null,
   });
   return state;
 }
@@ -369,6 +372,13 @@ function scopeEmploymentRecords(records = [], profile = {}) {
     : record);
 }
 
+function reuseScopeFor(record = {}) {
+  if (record.employmentId) return 'employment';
+  if (record.entityId || record.entityType) return 'entity';
+  const text = `${record.question || ''} ${record.type || ''}`.toLowerCase();
+  return /why|motivation|cover letter|additional information|textarea/.test(text) ? 'application' : 'global';
+}
+
 function saveStats(before = [], after = [], records = []) {
   let persisted = 0;
   let updated = 0;
@@ -387,7 +397,7 @@ function saveStats(before = [], after = [], records = []) {
   return { persisted, updated, unchanged, unresolved, savedCount: persisted + updated };
 }
 
-async function persistLearnedRecords(records = [], run = null, { promote = false, assertAuthority = null } = {}) {
+async function persistLearnedRecords(records = [], run = null, { promote = false, auto = false, assertAuthority = null } = {}) {
   assertAuthority?.();
   const now = new Date().toISOString();
   datasourceWriteChain = datasourceWriteChain.catch(() => {}).then(async () => {
@@ -416,19 +426,21 @@ async function persistLearnedRecords(records = [], run = null, { promote = false
       await chrome.storage.local.set({ applicationDrafts: drafts });
     }
     const scoped = scopeEmploymentRecords(promote ? learned : (changedRecords || learned), current.profile);
-    // Mutation events are drafts only.  A deliberate Save promotes the exact
-    // current values, which prevents delayed page events from overwriting a
-    // correction the user just saved.
+    // A blur/change checkpoint may promote only clear, user-entered facts.
+    // Sensitive facts still require an explicit Save/review action.
     const promotable = scoped
-      .filter((record) => record.provenance !== 'autofill')
-      .map((record) => ({ ...record, provenance: 'user', userEdited: true }));
+      .filter((record) => record.provenance !== 'autofill' && record.completed !== false)
+      .filter((record) => !auto || (inferSensitivity(record.question, record.key) === 'safe' && record.sensitivity === 'safe'))
+      .map((record) => ({ ...record, provenance: 'user', userEdited: true, reuseScope: record.reuseScope || reuseScopeFor(record) }));
     const answerRecords = promote
-      ? mergeLearnedAnswers(current.answerRecords, promotable, now, { confirm: true })
+      ? mergeLearnedAnswers(current.answerRecords, promotable, now, { confirm: !auto })
       : current.answerRecords;
     assertAuthority?.();
     const state = await saveDatasource({
       ...current,
       answerRecords,
+      learningUndo: auto && promotable.length && JSON.stringify(answerRecords) !== JSON.stringify(current.answerRecords)
+        ? { answerRecords: current.answerRecords, savedAt: now, applicationId: run?.startedAt || '' } : current.learningUndo,
       datasourceMeta: { ...(current.datasourceMeta || {}), schemaVersion: current.schemaVersion, updatedAt: now },
     });
     return { state, stats: saveStats(current.answerRecords, answerRecords, promote ? promotable : scoped) };
@@ -436,8 +448,25 @@ async function persistLearnedRecords(records = [], run = null, { promote = false
   return datasourceWriteChain;
 }
 
-async function getRecords() {
-  return (await getDatasource()).answerRecords.filter((record) => record.confirmationState !== 'pending' && (!record.alternatives?.length || record.confirmationState === 'confirmed'));
+async function undoLastAutoLearn() {
+  datasourceWriteChain = datasourceWriteChain.catch(() => {}).then(async () => {
+    const current = await getDatasource();
+    if (!Array.isArray(current.learningUndo?.answerRecords)) throw new Error('There is no recent automatic save to undo.');
+    const state = await saveDatasource({
+      ...current,
+      answerRecords: current.learningUndo.answerRecords,
+      learningUndo: null,
+      datasourceMeta: { ...(current.datasourceMeta || {}), schemaVersion: current.schemaVersion, updatedAt: new Date().toISOString() },
+    });
+    return { answerCount: state.answerRecords.length, learningUndo: null };
+  });
+  return datasourceWriteChain;
+}
+
+async function getRecords({ includeProfile = false } = {}) {
+  const state = await getDatasource();
+  return [...state.answerRecords, ...(includeProfile ? profileEvidenceRecords(state.profile) : [])]
+    .filter((record) => record.confirmationState !== 'pending' && (!record.alternatives?.length || record.confirmationState === 'confirmed'));
 }
 
 async function draftEvidenceRecords() {
@@ -489,6 +518,7 @@ async function datasourceSummary() {
     answerCount: state.answerRecords.length,
     coverMessageCount: state.coverMessages.length,
     learningInbox: state.learningInbox || [],
+    undoAvailable: Boolean(state.learningUndo),
     initializedAt: state.datasourceMeta?.initializedAt || null,
     seededAt: state.datasourceMeta?.seededAt || null,
     learnedChanges,
@@ -1057,15 +1087,24 @@ function readableQuestion(field) {
   return Boolean(label && !isOpaqueIdentifier(label) && field?.labelConfidence !== 'low' && label.length <= 1000);
 }
 
+function structuredField(field) {
+  return ['select', 'select-one', 'radio', 'checkbox'].includes(String(field?.type || '').toLowerCase());
+}
+
+function writingField(field) {
+  const text = `${field?.label || ''} ${field?.helpText || ''}`.toLowerCase();
+  return field?.type === 'textarea' || /\b(why|describe|explain|motivation|cover letter|additional information|tell us about)\b/.test(text);
+}
+
 function profileEvidenceRecords(profile = {}) {
   const employment = Array.isArray(profile.employment) ? profile.employment : [];
   return employment.flatMap((entry, index) => {
     const company = String(entry?.company || '').trim();
     const roles = Array.isArray(entry?.roles) ? entry.roles : [];
-    const companyRecord = company ? [{ key: `profile:employment:${entry.id || index}`, question: 'Confirmed employer', answer: company, provenance: 'profile', sensitivity: 'safe' }] : [];
+    const companyRecord = company ? [{ key: `profile:employment:${entry.id || index}`, question: 'Confirmed employer', answer: company, provenance: 'profile', sensitivity: 'safe', confirmationState: 'confirmed' }] : [];
     const roleRecords = roles.map((role, roleIndex) => {
       const title = String(role?.title || role?.role || '').trim();
-      return title ? { key: `profile:employment:${entry.id || index}:role:${roleIndex}`, question: 'Employment role', answer: `${title}${company ? ` at ${company}` : ''}`, provenance: 'profile', sensitivity: 'safe' } : null;
+      return title ? { key: `profile:employment:${entry.id || index}:role:${roleIndex}`, question: 'Employment role', answer: `${title}${company ? ` at ${company}` : ''}`, provenance: 'profile', sensitivity: 'safe', confirmationState: 'confirmed' } : null;
     }).filter(Boolean);
     return [...companyRecord, ...roleRecords];
   });
@@ -1822,13 +1861,16 @@ async function reviewedCandidate(suggestion, message) {
     return requestedKeys.length > 0 && sameKeys(candidateKeys, requestedKeys);
   });
   const sourceKeys = sourceKeysForCandidate(candidate);
-  const records = candidate?.kind === 'draft' ? await draftEvidenceRecords() : await getRecords();
+  const records = candidate?.kind === 'draft' ? await draftEvidenceRecords()
+    : await getRecords({ includeProfile: sourceKeysForCandidate(candidate).some(key => key.startsWith('profile:')) });
   const sources = sourceKeys.map((key) => records.find((record) => record.key === key));
   const compatibleEvidence = candidate?.kind === 'planner'
     ? rankSuggestionEvidence(suggestion.field, records, {limit: records.length})
     : candidate?.kind === 'semantic'
       ? sources.filter(source => semanticEligible(suggestion.field, source)
         && semanticRecordRevision(source) === candidate.sourceRevision)
+      : candidate?.kind === 'semantic_option'
+        ? sources.filter(source => candidate.sourceRevisions?.[source.key] === semanticRecordRevision(source))
       : searchEvidence(suggestion.field, sources.filter(Boolean), {limit: sources.length, query: candidate?.searchQuery || ''});
   if (!candidate || !sourceKeys.length || sources.some((source) => !source)
     || sources.some((source) => source.answer !== sourceAnswerSnapshot(candidate, source.key))
@@ -1855,8 +1897,10 @@ async function applyReviewedField({ tabId, frameId, applicationId, field, sugges
     : candidate.kind === 'semantic'
       ? sources.length === 1 && semanticEligible(field, sources[0])
         && semanticRecordRevision(sources[0]) === candidate.sourceRevision
+      : candidate.kind === 'semantic_option'
+        ? sources.every(source => candidate.sourceRevisions?.[source.key] === semanticRecordRevision(source))
       : meaningCompatible(field, sources[0], { numericReview: !(['textarea', 'text'].includes(field.type) && value === candidate.answer) }));
-  if (!validation.ok || !sourceCompatible || inferSensitivity(field.label, field.id) === 'legal' || field.type === 'checkbox') {
+  if (!validation.ok || !sourceCompatible || inferSensitivity(field.label, field.id) === 'legal') {
     throw new Error(validation.ok ? 'This destination requires manual entry' : validation.reason);
   }
   const result = await sendToFrame(tabId, frameId, {
@@ -1886,7 +1930,7 @@ async function applyReviewedField({ tabId, frameId, applicationId, field, sugges
     const source = sources[0];
     datasourceWriteChain = datasourceWriteChain.catch(() => {}).then(async () => {
       const state = await getDatasource();
-      const latestRecords = candidate.kind === 'draft' ? await draftEvidenceRecords() : state.answerRecords;
+      const latestRecords = candidate.kind === 'draft' ? await draftEvidenceRecords() : [...state.answerRecords, ...profileEvidenceRecords(state.profile)];
       const latestSources = sourceKeys.map((key) => latestRecords.find((record) => record.key === key));
       if (latestSources.some((latest) => !latest || latest.answer !== sourceAnswerSnapshot(candidate, latest.key))) {
         throw new Error('Evidence changed while applying; answer applied but not learned');
@@ -2463,8 +2507,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       }
       if (message.type === 'JOB_APP_LEARNING_STATUS') return { ok: true, applicationId: run.startedAt };
       if (message.applicationId !== run.startedAt || !Array.isArray(message.records)) return { ok: false };
-      await persistLearnedRecords(message.records, run, { assertAuthority: () => assertRunSiteAuthority(tabId, run) });
-      return { ok: true };
+      const saved = await persistLearnedRecords(message.records, run, { promote: true, auto: true, assertAuthority: () => assertRunSiteAuthority(tabId, run) });
+      void scheduleAi(tabId).catch(() => {});
+      return { ok: true, savedCount: saved.stats.savedCount, undoAvailable: Boolean(saved.state.learningUndo) };
     })().then(sendResponse).catch((error) => sendResponse({ ok: false, error: error.message }));
     return true;
   }
@@ -2510,6 +2555,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     'JOB_RUN_SEMANTIC_SEARCH',
     'JOB_RUN_STATE',
     'JOB_DATASOURCE_STATE',
+    'JOB_DATASOURCE_UNDO_LAST_AUTOSAVE',
     'JOB_DATASOURCE_EXPORT',
     'JOB_DATASOURCE_IMPORT',
     'JOB_DATASOURCE_CORRECT',
@@ -2559,6 +2605,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       return approveSuggestion(message);
     }
     if (message.type === 'JOB_DATASOURCE_STATE') return { ok: true, datasource: await datasourceSummary() };
+    if (message.type === 'JOB_DATASOURCE_UNDO_LAST_AUTOSAVE') { await undoLastAutoLearn(); return { ok: true, datasource: await datasourceSummary() }; }
     if (message.type === 'JOB_DATASOURCE_EXPORT') return { ok: true, backup: serializeDatasourceBackup(await getDatasource()) };
     if (message.type === 'JOB_DATASOURCE_IMPORT') {
       await importDatasourceBackup(message.backup);
@@ -2941,22 +2988,23 @@ async function scheduleAi(tabId,{retry=false}={}) {
   const invalidIds=new Set((validated?.validation?.invalid || []).map(field=>field.fieldId));
   const datasource=await getDatasource();
   const fields=resolveEmploymentFields(run,inspected.inspection.fields,datasource.profile);
-  const unresolved=fields.filter(field=>field.required && !String(field.currentValue || '').trim()
+  const candidateFields=fields.filter(field=>!String(field.currentValue || '').trim()
     && (!hasUsableSuggestion(run.suggestions?.[field.id]) || invalidIds.has(field.id)) && readableQuestion(field)
     && inferSensitivity(field.label,field.id)!=='legal' && !field.entityUnresolved);
-  if(!unresolved.length) return;
+  const unresolved=candidateFields.filter(field=>field.required);
+  if(!candidateFields.length) return;
   const planner=run.aiOperations?.planner;
   const retryableStates=new Set(['failed','interrupted']);
   const semanticRetry=retry && unresolved.some(field=>run.semanticSearch?.[field.id]?.status==='failed');
-  const plannerFields=retry
+  const plannerFields=(retry
     ? (retryableStates.has(planner?.status) || semanticRetry ? unresolved : [])
-    : unresolved;
+    : unresolved).filter(field => writingField(field) || ((!settings.typesafeEnabled || !typesafeApiKey) && structuredField(field)));
   const suggestionFields=retry
-    ? unresolved.filter(field=>retryableStates.has(run.aiOperations?.[`suggestion:${field.id}`]?.status) && !run.generatedSuggestions?.[field.id])
-    : unresolved.filter(field=>!run.generatedSuggestions?.[field.id]);
-  const semanticFields=plannerFields.filter(field=>!hasUsableSuggestion(run.suggestions?.[field.id]));
+    ? unresolved.filter(writingField).filter(field=>retryableStates.has(run.aiOperations?.[`suggestion:${field.id}`]?.status) && !run.generatedSuggestions?.[field.id])
+    : unresolved.filter(writingField).filter(field=>!run.generatedSuggestions?.[field.id]);
+  const semanticFields=unresolved.filter(field=>!hasUsableSuggestion(run.suggestions?.[field.id]));
   if(!apiKey && !semanticFields.length) return;
-  if(!plannerFields.length && !suggestionFields.length) return;
+  if(!plannerFields.length && !semanticFields.length && !suggestionFields.length) return;
   const operationFields=[...new Map([...plannerFields,...semanticFields,...suggestionFields].map(field=>[field.id,field])).values()];
   const evidenceRevision=aiEvidenceRevision(run,inspected.inspection,datasource);
   const fingerprint=aiFingerprint(run,operationFields,settings,evidenceRevision);

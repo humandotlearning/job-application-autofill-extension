@@ -104,7 +104,9 @@ function slugify(value = '') {
 
 function inferSensitivity(question, key = '') {
   const text = normalizeText(`${key} ${question}`);
-  if (/\b(consent|agree|agreement|certif(?:y|ication)|attest|attestation|privacy|terms|declaration|conflict of interest|criminal|gender|race|ethnicity|disability|veteran)\b/.test(text)) {
+  // A stored fact (including demographics) is not the same thing as a legal
+  // declaration.  Only declarations and explicit consent stay manual.
+  if (/\b(consent|agree|agreement|certif(?:y|ication)|attest|attestation|privacy|terms|declaration|conflict of interest|criminal)\b/.test(text)) {
     return 'legal';
   }
   if (/\b(ctc|salary|compensation|notice period|sponsorship|sponsor|visa|citizenship|work authorization|reference|reason for leaving|relocat)\b/.test(text)) {
@@ -145,7 +147,7 @@ function normalizeAnswerRecord(record = {}) {
     sensitivity,
     updatedAt,
   };
-  for (const key of ['id', 'concept', 'entityId', 'entityType', 'employmentId', 'context', 'provenance', 'confirmedAt', 'confirmationState', 'pendingAnswer', 'reusePolicy', 'changeReviewedAt']) {
+  for (const key of ['id', 'concept', 'entityId', 'entityType', 'employmentId', 'context', 'provenance', 'confirmedAt', 'confirmationState', 'pendingAnswer', 'reusePolicy', 'reuseScope', 'country', 'validUntil', 'changeReviewedAt']) {
     if (record[key] != null && String(record[key]).trim()) normalized[key] = String(record[key]).trim();
   }
   if (Array.isArray(record.evidenceKeys)) normalized.evidenceKeys = uniqueStrings(record.evidenceKeys);
@@ -217,6 +219,7 @@ function profileUrlCompatible(concept, value) {
 
 function recordScopeCompatible(field, record) {
   if (record.semantic?.reusePolicy === 'never' || record.reusePolicy === 'never') return false;
+  if (record.reuseScope === 'application') return false;
   if (record.suppressedFor?.includes(suggestionTargetKey(field))) return false;
   if (record.confirmationState === 'pending') return false;
   if (record.alternatives?.length && record.confirmationState !== 'confirmed') return false;
