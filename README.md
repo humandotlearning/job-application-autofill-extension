@@ -16,7 +16,7 @@ The AI planner receives at most 20 locally selected records. Fields already wait
 
 ### Optional Jev saved-answer matching
 
-Enable TypeSafe and add its separate API key in **Settings & data** to find paraphrased saved questions that local matching misses. During **Fill this page**, only unresolved fields without usable suggestions are checked. Beside an individual field, **Find saved answer** starts the same check explicitly; ordinary field focus remains local and makes no TypeSafe request.
+Enable TypeSafe and add its separate API key in **Settings & data** to find paraphrased saved questions that local matching misses. During **Fill this form**, only unresolved fields without usable suggestions are checked. Beside an individual field, **Find saved answer** starts the same check explicitly; ordinary field focus remains local and makes no TypeSafe request.
 
 The extension sends one batched request with independent Choice questions to pinned model `jev-1.13.0`. Each field can choose one of at most 20 locally compatible, confirmed saved answers or `none`; shared records are sent once. Jev selects—it never writes the answer. Code copies the exact stored answer only at confidence 0.8 or higher and still requires review. A five-second deadline has no automatic retry. Unchanged matches and no-match results are cached for the session, and duplicate concurrent searches share one request. A successful match skips planning and draft generation for that field.
 
@@ -28,7 +28,7 @@ Jev is a bounded selector in the service worker, not a text generator or browser
 
 ```mermaid
 flowchart TD
-    A[Field is focused or Fill this page starts] --> B{Usable local answer?}
+    A[Field is focused after Fill this form starts] --> B{Usable local answer?}
     B -->|Yes| C[Keep local result; no Jev request]
     B -->|No| D{Explicit search or unresolved Fill field?}
     D -->|No| E[Stay local; wait for user action]
@@ -108,7 +108,7 @@ sequenceDiagram
     participant Run as chrome.storage.session
     participant OpenAI as Selected AI provider
 
-    Panel->>Worker: Fill this page
+    Panel->>Worker: Fill this form
     Worker->>Run: status=running, keyed by tab
     Worker->>Page: inspect visible fields
     Page-->>Worker: descriptors, actions, pause reasons
@@ -148,7 +148,7 @@ flowchart LR
     C --> G[Generated or incomplete values remain drafts]
 ```
 
-Learning activates with **Fill this page**. Edits are debounced into local application drafts, not automatically promoted into the reusable profile. **Save answers** and observed final submission capture drafts and queue eligible new user answers in the learning inbox. Approving a learning proposal creates a reusable record. Approving saved evidence can separately save a reviewed equivalent alias or edited answer. Capturing a submit event does not prove the employer accepted the application. Scoped records and backups preserve separate entries and alternatives.
+Learning activates with **Fill this form**. Before that button is pressed, the content script stays inert and does not inspect the page or offer inline suggestions. Edits are debounced into local application drafts, not automatically promoted into the reusable profile. **Save answers** and observed final submission capture drafts and queue eligible new user answers in the learning inbox. Approving a learning proposal creates a reusable record. Approving saved evidence can separately save a reviewed equivalent alias or edited answer. Capturing a submit event does not prove the employer accepted the application. Scoped records and backups preserve separate entries and alternatives.
 
 The initial profile is bundled separately in `data/seed-data.json`, extracted from `resume.xlsx`, and imported only when the live datasource is empty. The live `answerRecords`, cover-message templates, datasource metadata, and exact-hostname site exclusions are stored in `chrome.storage.local`; extension updates never replace them. The side panel provides JSON export and non-destructive import for datasource backups.
 
@@ -186,7 +186,7 @@ The extension uses the configured generation provider and answer-planner model. 
 3. Select `C:\Users\nithi\job-application-autofill-extension`.
 4. Open a job application and open the extension side panel.
 5. Open **Settings & data**, choose Fireworks or OpenAI, enter that provider’s API key, and select or type a compatible model ID. Local deterministic filling works without a key. To enable semantic saved-answer reuse, separately enable TypeSafe and enter a TypeSafe key.
-6. Click **Fill this page**. Complete any highlighted required fields or manual steps, then click **Check again**.
+6. Click **Fill this form**. Complete any highlighted required fields or manual steps, then click **Check again**.
 7. To leave a site untouched, open the side panel on that hostname and click **Disable on this site**. The rule matches that exact hostname (paths and ports are ignored; subdomains are separate). This immediately pauses scans, inline suggestions, filling, learning, and capture; use **Re-enable on this site** or remove the hostname under **Settings & data → Disabled sites** to restore it.
 8. When a page is ready, review it and click **Continue to next page**. On the final page, review the form and submit through the application site; the extension captures the final values automatically. **Save answers** remains available as an optional local checkpoint.
 

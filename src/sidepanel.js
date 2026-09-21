@@ -266,7 +266,7 @@ function renderSiteState(site = {}) {
     ? 'Site controls are unavailable on this browser or extension page.'
     : currentSite.disabled
     ? `Autofill is paused on ${currentSite.hostname}. No page data is inspected, filled, learned, or captured.`
-    : `Autofill is active on ${currentSite.hostname}. Disable it here whenever this site should stay untouched.`;
+    : `Autofill starts only after you press Fill this form. Disable this site here if it should stay untouched.`;
   setActionVisibility(currentRun);
   if (!currentSite.supported || currentSite.disabled) {
     renderRun(null);
@@ -1178,14 +1178,14 @@ function setActionVisibility(run) {
   elements.secondaryActions.hidden = !hasRun || (elements.checkPage.hidden && elements.advancePage.hidden);
   if (!hasRun) {
     elements.retryAi.hidden = true;
-    elements.primaryAction.textContent = 'Fill this page';
+    elements.primaryAction.textContent = 'Fill this form';
     return;
   }
   if (status === 'running') elements.primaryAction.textContent = 'Filling this page…';
   else if (status === 'waiting_user') elements.primaryAction.textContent = selectForm ? 'Select form' : missingDestination ? 'Retry scan' : (run.actionRequired || run.unresolved || [])[0]?.fieldId ? 'Review needed answers' : 'Check again';
   else if (status === 'page_ready') elements.primaryAction.textContent = 'Continue to next page';
   else if (['ready_for_user_submit', 'answers_saved'].includes(status)) elements.primaryAction.textContent = 'Review on site';
-  else elements.primaryAction.textContent = 'Fill this page';
+  else elements.primaryAction.textContent = 'Fill this form';
 }
 
 function capturePanelState() {
@@ -1235,8 +1235,8 @@ function renderRun(run) {
   }
   currentRun = run || null;
   if (!run) {
-    elements.runTitle.textContent = !currentSite.supported ? 'Open an application' : currentSite.disabled ? 'Autofill is paused' : 'Ready to fill this page';
-    elements.runSummary.textContent = !currentSite.supported ? 'Switch to a job application to get started.' : currentSite.disabled ? 'Re-enable this site using the site access menu above.' : 'Use your saved answers to get started.';
+    elements.runTitle.textContent = !currentSite.supported ? 'Open an application' : currentSite.disabled ? 'Autofill is paused' : 'Ready to fill this form';
+    elements.runSummary.textContent = !currentSite.supported ? 'Switch to a job application to get started.' : currentSite.disabled ? 'Re-enable this site using the site access menu above.' : 'Press Fill this form to enable autofill for this application.';
     elements.runState.textContent = !currentSite.supported ? 'Unavailable' : currentSite.disabled ? 'Paused' : 'Ready';
     elements.runState.className = 'pill neutral';
     elements.runHint.textContent = 'Review each page before continuing.';

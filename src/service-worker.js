@@ -23,6 +23,7 @@ import { tracePhoenixEvent } from './phoenix.js';
 const RUN_STORAGE_KEY = 'applicationRun';
 const MAX_PAGES = 20;
 const ACTIVE_RUN_STATUSES = new Set(['running', 'waiting_user', 'page_ready', 'ready_for_user_submit']);
+const FORM_SESSION_STATUSES = new Set([...ACTIVE_RUN_STATUSES, 'answers_saved']);
 const SAVABLE_RUN_STATUSES = new Set(['waiting_user', 'page_ready', 'ready_for_user_submit', 'answers_saved']);
 const processingTabs = new Set();
 const backgroundJobs = new Map();
@@ -61,6 +62,7 @@ const DISCOVERY_REASONS = {
   destination_changed: 'The selected form changed. Retry the scan before filling more details.',
 };
 const DISABLED_SITE_REASON = 'The extension is disabled on this site. Re-enable it from the side panel to use autofill.';
+const INACTIVE_FORM_REASON = 'Press Fill this form to enable autofill for this form.';
 const SITE_SETTINGS_KEY = 'disabledHostnames';
 const siteRevisions = new Map();
 
@@ -106,7 +108,8 @@ function siteStateReply(state) {
     supported: state.supported,
     disabled: state.disabled,
     disabledHostnames: state.disabledHostnames,
-    enabled: state.supported && !state.disabled,
+    sessionActive: state.sessionActive === true,
+    enabled: state.supported && !state.disabled && state.sessionActive === true,
   };
 }
 
@@ -120,6 +123,26 @@ async function assertTabSiteEnabled(tabId, expectedRevision = null) {
   return state;
 }
 
+function formSessionMatchesTab(run, tab) {
+  if (!run || !FORM_SESSION_STATUSES.has(run.status)) return false;
+  const url = typeof tab?.url === 'string' ? tab.url : '';
+  if (!url) return !run.frame || run.status === 'running';
+  let parsed;
+  try { parsed = new URL(url); } catch { return false; }
+  if (!['http:', 'https:'].includes(parsed.protocol)) return false;
+  // The selected form may live in an iframe whose URL differs from the
+  // top-level tab URL. Authorization is therefore tied to the tab's form
+  // origin, not the selected frame pathname.
+  const expected = run.formOrigin;
+  if (!expected?.domain) return run.status === 'running';
+  if (parsed.hostname !== expected.domain) return false;
+  if (!expected.pathname || parsed.pathname === expected.pathname) return true;
+  // A user-approved Next/Continue click may update the URL before the new
+  // content script reports navigation. Keep that transition authorized for
+  // this session, then processPage replaces the frame identity.
+  return run.status === 'running' && run.lastAction === 'next';
+}
+
 function assertRunSiteAuthority(tabId, run) {
   if (run?.siteRevision != null && siteRevision(tabId) !== run.siteRevision) throw new Error(DISABLED_SITE_REASON);
 }
@@ -129,6 +152,14 @@ function siteAuthority(tabId) {
   return () => {
     if (siteRevision(tabId) !== revision) throw new Error(DISABLED_SITE_REASON);
   };
+}
+
+async function assertTabFormActive(tabId, tabHint = null) {
+  const state = await assertTabSiteEnabled(tabId, tabHint);
+  const run = Number.isInteger(tabId) ? await getRun(tabId) : null;
+  const tab = await tabForSite(tabId, tabHint && typeof tabHint === 'object' ? tabHint : null);
+  if (!formSessionMatchesTab(run, tab)) throw new Error(INACTIVE_FORM_REASON);
+  return state;
 }
 
 async function notifySiteState(tabId, enabled) {
@@ -153,7 +184,7 @@ async function updateSiteDisabled(tabId, disabled) {
   await chrome.storage.local.set({ [SITE_SETTINGS_KEY]: next });
   await invalidateInlineSessions(tabId);
   await removeRun(tabId);
-  await notifySiteState(tabId, !disabled);
+  await notifySiteState(tabId, false);
   return siteStateReply({ ...state, disabled, disabledHostnames: next });
 }
 
@@ -208,6 +239,7 @@ async function removeRun(tabId) {
   const runs = await getRuns();
   delete runs[String(tabId)];
   await chrome.storage.session.set({ [RUN_STORAGE_KEY]: runs });
+  await notifySiteState(tabId, false);
 }
 
 async function loadSeedData() {
@@ -763,7 +795,7 @@ async function acceptFormSelection(message, sender) {
   const request = formSelections.get(tabId);
   if (sender?.id !== chrome.runtime.id || !request || request.token !== message.token || Date.now() > request.expiresAt
     || !request.frames.some(frame => frame.frameId === sender.frameId && frame.documentId === message.destination?.documentId)) throw new Error('Form selection expired. Click Select form again.');
-  await assertTabSiteEnabled(tabId);
+  await assertTabFormActive(tabId, sender?.tab);
   const run = await getRun(tabId);
   if (!run || run.startedAt !== request.applicationId || processingTabs.has(tabId)) throw new Error('The application changed. Select the form again.');
   await cancelFormSelection(tabId);
@@ -886,8 +918,13 @@ function pauseForFrame(run, discovery) {
   return run;
 }
 
-function nowRun(tabId) {
+function nowRun(tabId, tab = null) {
   const startedAt = new Date().toISOString();
+  let formOrigin = null;
+  try {
+    const url = new URL(tab?.url || '');
+    formOrigin = {domain: url.hostname, pathname: url.pathname};
+  } catch { /* the site guard rejects unsupported tabs before this point */ }
   return {
     tabId,
     siteRevision: siteRevision(tabId),
@@ -900,6 +937,7 @@ function nowRun(tabId) {
     reviewRequired: [],
     audit: [],
     frame: null,
+    formOrigin,
     nextAction: null,
     waitingFor: null,
     waitingLabel: null,
@@ -1481,7 +1519,7 @@ async function guardedPanelInline(message) {
   if (!session?.panelRequested || session.sessionId !== message.inlineSessionId) throw new Error('Inline panel session expired or closed');
   const [tab] = await chrome.tabs.query({active: true, currentWindow: true});
   if (tab?.id !== session.tabId) throw new Error('The selected tab changed');
-  await assertTabSiteEnabled(session.tabId, tab);
+  await assertTabFormActive(session.tabId, tab);
   if (processingTabs.has(session.tabId) || saveLocks.has(session.tabId)) throw new Error('Fill is in progress');
   const sender = {id: chrome.runtime.id, tab: {id: session.tabId}, frameId: session.frameId, documentId: session.documentId, url: session.url};
   const request = {...message, sessionId: session.sessionId, requestId: crypto.randomUUID()};
@@ -1990,9 +2028,9 @@ async function processPage(tabId, { autoAdvance, selectedDestination = null } = 
     let run = await getRun(tabId);
     if (!run || run.status !== 'running') return run;
     if (run.siteRevision == null) run.siteRevision = siteRevision(tabId);
-    try { await assertTabSiteEnabled(tabId, run.siteRevision); }
+    try { await assertTabFormActive(tabId, run.siteRevision); }
     catch (error) {
-      if (error.message === DISABLED_SITE_REASON) { await removeRun(tabId); return null; }
+      if ([DISABLED_SITE_REASON, INACTIVE_FORM_REASON].includes(error.message)) { await removeRun(tabId); return null; }
       throw error;
     }
     if (run.pageNumber > MAX_PAGES) {
@@ -2011,7 +2049,12 @@ async function processPage(tabId, { autoAdvance, selectedDestination = null } = 
     const discovery = await discoverApplicationFrame(tabId, () => assertRunSiteAuthority(tabId, run), selectedDestination || run.selectedDestination);
     if (discovery.errorCode) return await saveRun(pauseForFrame(run, discovery));
     updateSelectedFrame(tabId, run, discovery);
-    await assertTabSiteEnabled(tabId, run.siteRevision);
+    const currentTab = await tabForSite(tabId);
+    try {
+      const url = new URL(currentTab?.url || '');
+      run.formOrigin = {domain: url.hostname, pathname: url.pathname};
+    } catch { /* site guard already validated the tab */ }
+    await assertTabFormActive(tabId, run.siteRevision);
     const processed = await applyPageDecisions(
       tabId,
       run,
@@ -2109,13 +2152,16 @@ async function processPage(tabId, { autoAdvance, selectedDestination = null } = 
 async function startRun(tabId) {
   await invalidateInlineSessions(tabId);
   await assertTabSiteEnabled(tabId);
+  const tab = await tabForSite(tabId);
   const current = await getRun(tabId);
   if (current && ACTIVE_RUN_STATUSES.has(current.status)) {
+    await notifySiteState(tabId, true);
     if (current.status !== 'running') return current;
     const settings = await getSettings();
     return processPage(tabId, { autoAdvance: settings.autoAdvancePages });
   }
-  const run = await saveRun(nowRun(tabId));
+  const run = await saveRun(nowRun(tabId, tab));
+  await notifySiteState(tabId, true);
   const settings = await getSettings();
   return processPage(tabId, { autoAdvance: settings.autoAdvancePages });
 }
@@ -2317,7 +2363,12 @@ function beginSaveOperation(tabId) {
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message?.type === 'JOB_APP_SITE_STATUS') {
-    (async () => siteStateReply(await siteStateForTab(sender?.tab?.id, sender?.tab)))()
+    (async () => {
+      const state = await siteStateForTab(sender?.tab?.id, sender?.tab);
+      const run = Number.isInteger(sender?.tab?.id) ? await getRun(sender.tab.id) : null;
+      const tab = await tabForSite(sender?.tab?.id, sender?.tab);
+      return siteStateReply({...state, sessionActive: formSessionMatchesTab(run, tab)});
+    })()
       .then((state) => sendResponse({ ok: true, ...state }))
       .catch((error) => sendResponse({ ok: false, enabled: false, supported: false, error: error.message }));
     return true;
@@ -2330,13 +2381,13 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       // content-script user gesture, before storage/inspection awaits consume it.
       // https://developer.chrome.com/docs/extensions/reference/api/sidePanel
       (async () => {
-        await assertTabSiteEnabled(origin.tabId);
         let opening;
         try {
           opening = typeof chrome.sidePanel?.open === 'function'
             ? Promise.resolve(chrome.sidePanel.open({tabId: origin.tabId})).then(() => null, () => PANEL_OPEN_FALLBACK)
             : Promise.resolve(PANEL_OPEN_FALLBACK);
         } catch { opening = Promise.resolve(PANEL_OPEN_FALLBACK); }
+        await assertTabFormActive(origin.tabId, sender?.tab);
         return handoffInlineField(request, sender, opening);
       })().then(sendResponse).catch(error => sendResponse({ok: false, error: error.message}));
     } catch (error) { sendResponse({ok: false, error: error.message}); }
@@ -2344,7 +2395,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
   if (['JOB_INLINE_QUERY', 'JOB_INLINE_SEARCH', 'JOB_INLINE_SEMANTIC_SEARCH', 'JOB_INLINE_GENERATE', 'JOB_INLINE_ACCEPT', 'JOB_INLINE_CANCEL'].includes(message?.type)) {
     (async () => {
-      await assertTabSiteEnabled(sender?.tab?.id, sender?.tab);
+      await assertTabFormActive(sender?.tab?.id, sender?.tab);
       if (message.type === 'JOB_INLINE_QUERY') return queryInlineField(message, sender);
       if (message.type === 'JOB_INLINE_SEARCH') return searchInlineField(message, sender);
       if (message.type === 'JOB_INLINE_SEMANTIC_SEARCH') return semanticSearchInlineField(message, sender);
@@ -2364,7 +2415,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message?.type === 'JOB_APP_REVALIDATE') {
     (async()=>{
       const tabId=sender?.tab?.id;const run=Number.isInteger(tabId)?await getRun(tabId):null;
-      await assertTabSiteEnabled(tabId, sender?.tab);
+      await assertTabFormActive(tabId, sender?.tab);
       if(!run || message.applicationId!==run.startedAt || (sender.frameId??0)!==run.frame?.frameId) return {ok:false};
       if(sender.url){const url=new URL(sender.url);if(url.hostname!==run.frame.domain || (run.frame.pathname && url.pathname!==run.frame.pathname))return {ok:false};}
       return {ok:true,run:await validatePageOnly(tabId)};
@@ -2381,7 +2432,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message?.type === 'JOB_APP_LEARN' || message?.type === 'JOB_APP_LEARNING_STATUS') {
     (async () => {
       const tabId = sender?.tab?.id;
-      await assertTabSiteEnabled(tabId, sender?.tab);
+      await assertTabFormActive(tabId, sender?.tab);
       const run = tabId ? await getRun(tabId) : null;
       if (!run || ![...ACTIVE_RUN_STATUSES, 'answers_saved'].includes(run.status) || run.frame?.frameId !== (sender.frameId ?? 0)) return { ok: false };
       if (sender.url) {
@@ -2548,9 +2599,14 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
   if (changeInfo.status !== 'complete') return;
   getRun(tabId)
     .then(async (run) => {
-      if (run?.status !== 'running' || run.waitingFor === 'operation_interrupted') return;
       const site = await siteStateForTab(tabId);
       if (!site.supported || site.disabled) { await removeRun(tabId); return; }
+      const tab = await tabForSite(tabId);
+      if (run && FORM_SESSION_STATUSES.has(run.status) && !formSessionMatchesTab(run, tab)) {
+        await removeRun(tabId);
+        return;
+      }
+      if (run?.status !== 'running' || run.waitingFor === 'operation_interrupted') return;
       run.frame = null;
       await saveRun(run);
       const settings = await getSettings();

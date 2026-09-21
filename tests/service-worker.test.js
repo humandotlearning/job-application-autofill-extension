@@ -285,6 +285,50 @@ test('site controls normalize, persist, and match only the active exact hostname
   assert.deepEqual(harness.localData.disabledHostnames, []);
 });
 
+test('supported tabs stay content-disabled until Fill this form starts a session', async () => {
+  const harness = createHarness({pagesByTab: {7: {pages: [{
+    page: {title: 'Job application', domain: 'jobs.example.com'},
+    fields: [{id: 'name', label: 'Full name', type: 'text'}], actions: [],
+  }]}}});
+  await import(`../src/service-worker.js?form-session-default=${Date.now()}`);
+  const sender = {id: 'test-extension', tab: {id: 7, url: 'https://jobs.example.com/apply'}, frameId: 0};
+  const initial = await harness.dispatch({type: 'JOB_APP_SITE_STATUS'}, sender);
+  assert.equal(initial.ok, true, initial.error);
+  assert.equal(initial.enabled, false);
+  assert.equal(initial.sessionActive, false);
+
+  const started = await harness.dispatch({type: 'JOB_RUN_START', tabId: 7});
+  assert.equal(started.ok, true, started.error);
+  assert.equal(harness.tabs.get(7).messages.some(message => message.type === 'JOB_APP_SITE_STATE_CHANGED' && message.enabled === true), true);
+  const active = await harness.dispatch({type: 'JOB_APP_SITE_STATUS'}, sender);
+  assert.equal(active.enabled, true);
+  assert.equal(active.sessionActive, true);
+  const unrelatedForm = await harness.dispatch({type: 'JOB_APP_SITE_STATUS'}, {
+    ...sender, tab: {id: 7, url: 'https://jobs.example.com/another-form'},
+  });
+  assert.equal(unrelatedForm.enabled, false);
+  assert.equal(unrelatedForm.sessionActive, false);
+
+  await harness.dispatch({type: 'JOB_SITE_SET_DISABLED', tabId: 7, disabled: true});
+  await harness.dispatch({type: 'JOB_SITE_SET_DISABLED', tabId: 7, disabled: false});
+  const stateChanges = harness.tabs.get(7).messages.filter(message => message.type === 'JOB_APP_SITE_STATE_CHANGED');
+  assert.equal(stateChanges.at(-1).enabled, false);
+});
+
+test('form-session authorization survives an explicit next-page advance', async () => {
+  const harness = createHarness({pagesByTab: {7: {pages: [
+    {page: {title: 'Job application', domain: 'jobs.example.com'}, fields: [{id: 'name', label: 'Full name', type: 'text'}], actions: [{id: 'next', label: 'Next', kind: 'next'}], advanceOnClick: true},
+    {page: {title: 'Job application', domain: 'jobs.example.com'}, fields: [{id: 'email', label: 'Email', type: 'email'}], actions: []},
+  ]}}});
+  await import(`../src/service-worker.js?form-session-next=${Date.now()}`);
+  await harness.dispatch({type: 'JOB_RUN_START', tabId: 7});
+  const advanced = await harness.dispatch({type: 'JOB_RUN_ADVANCE_PAGE', tabId: 7});
+  assert.equal(advanced.ok, true, advanced.error);
+  const active = await harness.dispatch({type: 'JOB_APP_SITE_STATUS'}, {id: 'test-extension', tab: {id: 7, url: 'https://jobs.example.com/apply?step=2'}, frameId: 0});
+  assert.equal(active.enabled, true);
+  assert.equal(active.sessionActive, true);
+});
+
 test('disabled site rejects inline requests and prevents a late run write after revocation', async () => {
   const harness = createHarness({
     disabledHostnames: [],
@@ -308,7 +352,7 @@ test('disabled site rejects inline requests and prevents a late run write after 
   assert.match(inline.error, /disabled on this site/i);
 });
 
-test('inline lookup works with no run and never fills on focus', async () => {
+test('inline lookup is blocked until a form session is active', async () => {
   const harness = createHarness({pagesByTab: {7: {pages: [{
     page: {title: 'Job application', domain: 'jobs.example.com'},
     fields: [{id: 'name', handle: 'doc-a:name', label: 'Full name',
@@ -319,8 +363,8 @@ test('inline lookup works with no run and never fills on focus', async () => {
     documentId: 'doc-a', url: 'https://jobs.example.com/apply'};
   const response = await harness.dispatch({type: 'JOB_INLINE_QUERY',
     fieldId: 'name', handle: 'doc-a:name', requestId: 'query-1'}, sender);
-  assert.equal(response.ok, true, response.error);
-  assert.equal(response.candidates[0].answer, 'Nithin');
+  assert.equal(response.ok, false);
+  assert.match(response.error, /Fill this form/i);
   assert.equal(harness.sessionData.applicationRun?.['7'], undefined);
   assert.equal(harness.tabs.get(7).messages.some(m => m.type === 'JOB_APP_APPLY'), false);
   assert.equal(harness.tabs.get(7).nextClicks, 0);
@@ -422,11 +466,22 @@ async function waitUntil(predicate) {
   assert.ok(predicate(), 'Expected deferred provider operation to start');
 }
 const inlineAcceptance = (query, overrides = {}) => ({ type: 'JOB_INLINE_ACCEPT', sessionId: query.sessionId, requestId: 'accept-1', candidateId: query.candidates[0].candidateId, acceptanceToken: 'content-token', ...overrides });
-async function inlineHarness({ field = {}, page = {}, ...options } = {}) {
+async function inlineHarness({ field = {}, page = {}, sessionActive = true, ...options } = {}) {
   const harness = createHarness({pagesByTab: {7: {pages: [{page: {title: 'Job application', domain: 'jobs.example.com'}, fields: [
     {id: 'name', handle: 'doc-a:name', label: 'Full name', type: 'text', rawValue: '', editRevision: 0, ...field},
   ], actions: [], ...page}]}}, ...options});
   await import(`../src/service-worker.js?test=inline-${Date.now()}-${Math.random()}`);
+  if (sessionActive) {
+    const tab = harness.tabs.get(7);
+    const url = new URL(tab.url);
+    harness.sessionData.applicationRun = {
+      ...(harness.sessionData.applicationRun || {}),
+      '7': {
+      tabId: 7, siteRevision: 0, status: 'answers_saved', startedAt: 'inline-test-session', applicationId: 'inline-test-session', formOrigin: {domain: url.hostname, pathname: url.pathname},
+      frame: {frameId: 0, domain: url.hostname, pathname: url.pathname},
+      },
+    };
+  }
   return harness;
 }
 
@@ -552,7 +607,7 @@ async function handoffInline(harness, query, sender = inlineSender()) {
   return harness.dispatch({type: 'JOB_INLINE_EDIT_IN_PANEL', sessionId: query.sessionId, candidateId: query.candidates[0]?.candidateId}, sender);
 }
 
-for (const support of ['available', 'missing', 'rejected']) test(`inline panel handoff opens before async storage with ${support} API and no run`, async () => {
+for (const support of ['available', 'missing', 'rejected']) test(`inline panel handoff opens before async storage with ${support} API in an active form session`, async () => {
   const harness = await inlineHarness();
   const query = await harness.dispatch(inlineQuery(), inlineSender());
   const calls = [];
@@ -566,7 +621,7 @@ for (const support of ['available', 'missing', 'rejected']) test(`inline panel h
   const state = await harness.dispatch({type: 'JOB_INLINE_PANEL_STATE', tabId: 7});
   assert.equal(state.inlineSession.sessionId, query.sessionId);
   assert.equal(state.inlineSession.panelCandidateId, query.candidates[0].candidateId);
-  assert.equal(harness.sessionData.applicationRun?.['7'], undefined);
+  assert.equal(harness.sessionData.applicationRun?.['7']?.status, 'answers_saved');
   assert.equal((await harness.dispatch({type: 'JOB_INLINE_PANEL_STATE', tabId: 8})).inlineSession, null);
   assert.equal((await harness.dispatch({type: 'JOB_INLINE_PANEL_STATE', tabId: 7}, inlineSender())).ok, false);
   const closed = await harness.dispatch({type: 'JOB_INLINE_PANEL_STATE', ...panelOrigin(state.inlineSession), close: true});
@@ -590,7 +645,7 @@ test('inline panel child-frame focus and edited saved approval use the live sess
   const applied = await harness.dispatch({type: 'JOB_RUN_APPROVE_SUGGESTION', ...origin, sourceKey: 'full_name', answer: 'Nithin edited'});
   assert.equal(applied.ok, true, applied.error); assert.ok(applied.inlineSession);
   assert.equal(harness.tabs.get(7).frames[0].pages[0].values.name, 'Nithin edited');
-  assert.equal(harness.sessionData.applicationRun?.['7'], undefined);
+  assert.equal(harness.sessionData.applicationRun?.['7']?.status, 'answers_saved');
 });
 
 test('inline panel rejects changed destinations and untrusted origins before applying', async () => {
@@ -653,6 +708,7 @@ test('closing the latest handoff cannot resurrect an earlier requested frame', a
 
 async function inlinePanelIntegration(t) {
   const harness = await inlineHarness();
+  await harness.dispatch({type: 'JOB_RUN_START', tabId: 7});
   const content = new JSDOM('<form><label>Full name<input id="name"></label></form><button id="outside">Outside</button>', {url: 'https://jobs.example.com/apply', pretendToBeVisual: true});
   const panel = new JSDOM(await readFile(new URL('../sidepanel.html', import.meta.url), 'utf8'), {url: 'https://extension.local/sidepanel.html', pretendToBeVisual: true});
   t.after(() => {content.window.close(); panel.window.close();});
@@ -733,30 +789,12 @@ test('panel Show on page rejects a same-ID replacement between worker inspection
   assert.equal(card.querySelector('[data-answer-draft]').value, 'Edited in the panel');
 });
 
-test('inline explicit generation without a run creates selectable drafts without learning or applying', async () => {
-  const harness = await inlineHarness({waitForAI: false});
+test('inline explicit generation is blocked without an active form session', async () => {
+  const harness = await inlineHarness({waitForAI: false, sessionActive: false});
   harness.localData.openaiApiKey = 'synthetic-test-key';
-  let calls = 0;
-  globalThis.fetch = async () => {calls++; return generatedResponse();};
-  const query = await harness.dispatch(inlineQuery(), inlineSender());
-  assert.equal(calls, 0, 'focus lookup cannot call AI');
-  const before = structuredClone(harness.localData.answerRecords);
-  const response = await harness.dispatch(inlineGeneration(query), inlineSender());
-  assert.equal(response.ok, true, response.error);
-  assert.equal(calls, 1);
-  assert.equal(response.generatedSuggestion.suggestions[0].answer, 'Nithin');
-  assert.ok(response.generatedSuggestion.snapshot.evidenceRevision);
-  assert.match(response.candidates[0].candidateId, /^saved:/);
-  const draft = response.candidates.find(candidate => candidate.kind === 'generated');
-  assert.match(draft.candidateId, /^generated:/);
-  assert.equal(draft.requiresApproval, false);
-  assert.deepEqual(draft.evidenceKeys, ['full_name']);
-  assert.equal(harness.tabs.get(7).messages.some(message => message.type === 'JOB_APP_APPLY'), false);
-  const accepted = await harness.dispatch(inlineAcceptance(response, {candidateId: draft.candidateId, answer: 'Forged'}), inlineSender());
-  assert.equal(accepted.ok, true, accepted.error);
-  assert.equal(harness.tabs.get(7).frames[0].pages[0].values.name, 'Nithin');
-  assert.deepEqual(harness.localData.answerRecords, before, 'generated provenance is not reusable evidence authority');
-  assert.equal(harness.sessionData.applicationRun?.['7'], undefined);
+  const response = await harness.dispatch(inlineQuery(), inlineSender());
+  assert.equal(response.ok, false);
+  assert.match(response.error, /Fill this form/i);
 });
 
 test('inline generation without a key or with provider failure preserves saved choices', async () => {
@@ -1033,24 +1071,12 @@ test('worker restart interrupts actual pending inline work and rejects the old r
   assert.equal(harness.sessionData.inlineFieldSessions['7:0'].generatedSuggestions.name, undefined);
 });
 
-test('inline saved acceptance resolves worker candidate authority, persists once, and does not create a run', async () => {
-  const harness = await inlineHarness();
+test('inline saved acceptance is blocked without an active form session', async () => {
+  const harness = await inlineHarness({sessionActive: false});
   const query = await harness.dispatch(inlineQuery(), inlineSender());
-  assert.equal(query.ok, true, query.error);
-  const message = inlineAcceptance(query, {answer: 'Forged answer', sourceKey: 'foreign'});
-  const [accepted, duplicate] = await Promise.all([harness.dispatch(message, inlineSender()), harness.dispatch(message, inlineSender())]);
-  assert.equal(accepted.ok, true, accepted.error);
-  assert.equal(duplicate.ok, false);
-  assert.equal(harness.tabs.get(7).frames[0].pages[0].values.name, 'Nithin');
-  const applies = harness.tabs.get(7).messages.filter(message => message.type === 'JOB_APP_APPLY');
-  assert.equal(applies.length, 1);
-  assert.equal(applies[0].applicationId, undefined);
-  assert.equal(applies[0].decisions[0].expectedRawValue, '');
-  assert.equal(applies[0].decisions[0].expectedEditRevision, 0);
-  assert.equal(applies[0].approvalGuard.acceptanceToken, 'content-token');
+  assert.equal(query.ok, false);
+  assert.match(query.error, /Fill this form/i);
   assert.equal(harness.sessionData.applicationRun?.['7'], undefined);
-  assert.deepEqual(harness.sessionData.inlineFieldSessions['7:0'].suggestions, {});
-  assert.equal((await harness.dispatch(message, inlineSender())).ok, false);
 });
 
 test('inline query rejects forged origins and malformed identity before inspection', async () => {
@@ -1126,7 +1152,7 @@ test('inline save failure reports applied but not saved and does not repeat the 
 test('inline sessions isolate identical field IDs in two frames and preserve unrelated live run', async () => {
   const pages = handle => [{page: {title: 'Job application', domain: 'jobs.example.com'}, fields: [{id: 'name', handle, label: 'Full name', type: 'text', rawValue: '', editRevision: 0}], actions: []}];
   const harness = await inlineHarness({pagesByTab: {7: {frames: [{frameId: 0, pages: pages('doc-a:name')}, {frameId: 2, pages: pages('doc-b:name')}]}}});
-  harness.sessionData.applicationRun = {'7': {tabId: 7, startedAt: 'other-run', status: 'waiting_user', frame: {frameId: 9}, revision: 23, suggestions: {foreign: {}}}};
+  harness.sessionData.applicationRun = {'7': {tabId: 7, startedAt: 'other-run', status: 'waiting_user', formOrigin: {domain: 'jobs.example.com', pathname: '/apply'}, frame: {frameId: 9}, revision: 23, suggestions: {foreign: {}}}};
   const runBefore = JSON.stringify(harness.sessionData.applicationRun);
   const [first, second] = await Promise.all([
     harness.dispatch(inlineQuery(), inlineSender()),
@@ -1359,7 +1385,7 @@ test('inline compatible run acceptance uses real learning identity and refreshes
 test('inline unresolved employment asks to choose employer instead of borrowing another frame mapping', async () => {
   const harness = await inlineHarness({field: {label: 'Job title', entityType: 'employment', entityId: 'work-1'}});
   harness.localData.profile = {employment: [{id: 'employer-a', company: 'Company A'}, {id: 'employer-b', company: 'Company B'}]};
-  harness.sessionData.applicationRun = {'7': {tabId: 7, startedAt: 'other', status: 'waiting_user', frame: {frameId: 9}, employmentMappings: {'work-1': 'employer-a'}}};
+  harness.sessionData.applicationRun = {'7': {tabId: 7, startedAt: 'other', status: 'waiting_user', formOrigin: {domain: 'jobs.example.com', pathname: '/apply'}, frame: {frameId: 9}, employmentMappings: {'work-1': 'employer-a'}}};
   const query = await harness.dispatch(inlineQuery(), inlineSender());
   assert.equal(query.ok, true, query.error);
   assert.deepEqual(query.candidates, []);

@@ -32,7 +32,7 @@ function notifyNavigation() {
   waitForDocumentSettled(document).then(() => sendRuntimeMessage({ type: 'JOB_APP_NAVIGATED' })).catch(() => {});
 }
 
-const CONTENT_VERSION = 'autofill-ux-5';
+const CONTENT_VERSION = 'autofill-ux-6';
 if (!globalThis.__jobApplicationAutofillInstalled) {
   globalThis.__jobApplicationAutofillInstalled = CONTENT_VERSION;
   let inline = null;
@@ -220,7 +220,7 @@ if (!globalThis.__jobApplicationAutofillInstalled) {
 
   sendRuntimeMessage({ type: 'JOB_APP_SITE_STATUS' }).then((response) => {
     const enabled = forcedState == null
-      ? response?.enabled !== false && response?.supported !== false
+      ? response?.enabled === true
       : forcedState;
     if (!enabled) disable();
     else enable();

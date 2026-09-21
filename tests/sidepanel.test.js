@@ -1385,7 +1385,7 @@ test('Sage Focus keeps planner diagnostics in a disclosure and clears them on a 
     panel.storageListeners.forEach(listener => listener({applicationRun: {newValue: {}}}, 'session'));
     assert.equal(doc.querySelector('#status-details').hidden, true);
     assert.equal(doc.querySelector('#retry-ai').hidden, true);
-    assert.equal(doc.querySelector('#run-title').textContent, 'Ready to fill this page');
+    assert.equal(doc.querySelector('#run-title').textContent, 'Ready to fill this form');
   } finally { panel.cleanup(); }
 });
 
