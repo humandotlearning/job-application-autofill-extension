@@ -155,8 +155,9 @@ export function sanitizeLearningProposals(payload = {}, candidates = [], { model
   });
 }
 
-export async function callLearningReviewer({ apiKey, candidates = [] }, { sessionId = '', fetchImpl = createPhoenixFetch(sessionId), provider = 'openai', model = '', timeoutMs = 30000 } = {}) {
+export async function callLearningReviewer({ apiKey, candidates = [] }, { sessionId = '', fetchImpl, traceContext = null, provider = 'openai', model = '', timeoutMs = 30000 } = {}) {
   if (!candidates.length) return [];
+  fetchImpl ||= createPhoenixFetch(sessionId, {traceContext});
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {

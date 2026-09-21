@@ -18,9 +18,10 @@ import { exactVisibleChoice, planDeterministicFill, requiresVisibleChoiceMatch }
 import { buildLearningCandidates, callLearningReviewer } from './learning-review.js';
 import { hostnameFromUrl, isHostnameDisabled, isSupportedSiteUrl, normalizeHostname, normalizeHostnames } from './site-control.js';
 import { createSemanticMatcher, semanticFingerprint } from './typesafe.js';
-import { tracePhoenixEvent } from './phoenix.js';
+import { createPhoenixTrace, flushPhoenixQueue, tracePhoenixEvent } from './phoenix.js';
 
 const RUN_STORAGE_KEY = 'applicationRun';
+const PHOENIX_ACTIVE_ACTIONS_KEY = 'phoenixActiveActions';
 const MAX_PAGES = 20;
 const ACTIVE_RUN_STATUSES = new Set(['running', 'waiting_user', 'page_ready', 'ready_for_user_submit']);
 const FORM_SESSION_STATUSES = new Set([...ACTIVE_RUN_STATUSES, 'answers_saved']);
@@ -65,6 +66,55 @@ const DISABLED_SITE_REASON = 'The extension is disabled on this site. Re-enable 
 const INACTIVE_FORM_REASON = 'Press Fill this form to enable autofill for this form.';
 const SITE_SETTINGS_KEY = 'disabledHostnames';
 const siteRevisions = new Map();
+let phoenixActionWriteChain = Promise.resolve();
+
+async function readPhoenixActions() {
+  const stored = await chrome.storage.local.get({[PHOENIX_ACTIVE_ACTIONS_KEY]: {}});
+  return stored[PHOENIX_ACTIVE_ACTIONS_KEY] && typeof stored[PHOENIX_ACTIVE_ACTIONS_KEY] === 'object'
+    ? stored[PHOENIX_ACTIVE_ACTIONS_KEY] : {};
+}
+
+function updatePhoenixActions(change) {
+  const operation = phoenixActionWriteChain.catch(() => {}).then(async () => {
+    const actions = await readPhoenixActions();
+    const next = change(actions) || actions;
+    await chrome.storage.local.set({[PHOENIX_ACTIVE_ACTIONS_KEY]: next});
+  });
+  phoenixActionWriteChain = operation.catch(error => {
+    console.warn('Phoenix active-action metadata was not persisted.', error?.message || error);
+  });
+  return operation.catch(() => false);
+}
+
+function persistPhoenixAction(traceContext, name, sessionId, attributes = {}) {
+  const key = `${traceContext.traceId}:${traceContext.spanId}`;
+  return updatePhoenixActions(actions => ({...actions, [key]: {
+    key, name, sessionId, traceContext: {...traceContext}, attributes: {...attributes}, startedAt: traceContext.startedAt || new Date().toISOString(),
+  }}));
+}
+
+function clearPhoenixAction(traceContext) {
+  if (!traceContext?.traceId || !traceContext?.spanId) return Promise.resolve();
+  const key = `${traceContext.traceId}:${traceContext.spanId}`;
+  return updatePhoenixActions(actions => {
+    const next = {...actions};
+    delete next[key];
+    return next;
+  });
+}
+
+async function recoverPhoenixActions() {
+  let actions;
+  try { actions = await readPhoenixActions(); } catch { return; }
+  await chrome.storage.local.set({[PHOENIX_ACTIVE_ACTIONS_KEY]: {}});
+  for (const action of Object.values(actions)) {
+    const traceContext = {...(action.traceContext || {}), startedAt: action.startedAt || action.traceContext?.startedAt};
+    await tracePhoenixEvent(action.name || 'fill_page', {...(action.attributes || {}), 'ai.interrupted': true}, action.sessionId || traceContext.sessionId || '', {
+      traceContext, root: true, statusCode: 'ERROR', statusMessage: 'worker_interrupted',
+      output: {retained: false, interrupted: true, reason: 'worker_interrupted'},
+    });
+  }
+}
 
 function siteRevision(tabId) {
   return siteRevisions.get(tabId) || 0;
@@ -336,7 +386,7 @@ async function saveDatasource(state) {
   return state;
 }
 
-async function queueLearningReview(records = []) {
+async function queueLearningReview(records = [], sessionId = '') {
   const current = await getDatasource();
   const inbox = Array.isArray(current.learningInbox) ? current.learningInbox : [];
   const candidates = buildLearningCandidates(records).filter(candidate => !current.answerRecords.some(record => record.key === candidate.id) && !inbox.some(item => item.candidate?.id === candidate.id));
@@ -345,16 +395,26 @@ async function queueLearningReview(records = []) {
   const apiKey = await getApiKey(settings.aiProvider);
   let proposals;
   let error = '';
+  let traceContext = null;
   try {
-    proposals = apiKey ? await callLearningReviewer({ apiKey, candidates }, { provider: settings.aiProvider, model: settings.aiModel }) : candidates.map(candidate => ({ candidateId: candidate.id, outcome: 'needs_user_label', canonicalKey: '', displayLabel: '', intent: 'other', valueKind: candidate.valueShape, aliases: [], topicTags: [], scope: candidate.scope, reusePolicy: 'never', confidence: 'low', classifier: { model: '', promptVersion: 'learning-review-v1', classifiedAt: new Date().toISOString() } }));
+    traceContext = createPhoenixTrace(sessionId, { 'phoenix.action': 'learning_review', 'learning.candidate_count': candidates.length });
+    await persistPhoenixAction(traceContext, 'learning_review', sessionId, {'learning.candidate_count': candidates.length});
+    void tracePhoenixEvent('learning_review', {'learning.candidate_count': candidates.length}, sessionId, {traceContext, root: true, defer: true, input: candidates});
+    proposals = apiKey ? await callLearningReviewer({ apiKey, candidates }, { provider: settings.aiProvider, model: settings.aiModel, sessionId, traceContext }) : candidates.map(candidate => ({ candidateId: candidate.id, outcome: 'needs_user_label', canonicalKey: '', displayLabel: '', intent: 'other', valueKind: candidate.valueShape, aliases: [], topicTags: [], scope: candidate.scope, reusePolicy: 'never', confidence: 'low', classifier: { model: '', promptVersion: 'learning-review-v1', classifiedAt: new Date().toISOString() } }));
+    void tracePhoenixEvent('learning_review_result', {'learning.candidate_count': candidates.length, 'learning.proposal_count': proposals.length}, sessionId, {traceContext, output: proposals});
   } catch (caught) {
     error = caught.message;
+    if (traceContext) void tracePhoenixEvent('learning_review_result', {'learning.validation_error': error}, sessionId, {traceContext, statusCode: 'ERROR', statusMessage: error, output: {retained: false}});
     proposals = candidates.map(candidate => ({ candidateId: candidate.id, outcome: 'needs_user_label', canonicalKey: '', displayLabel: '', intent: 'other', valueKind: candidate.valueShape, aliases: [], topicTags: [], scope: candidate.scope, reusePolicy: 'never', confidence: 'low', classifier: { model: settings.aiModel, promptVersion: 'learning-review-v1', classifiedAt: new Date().toISOString() } }));
   }
   const now = new Date().toISOString();
   const byKey = new Map(records.map(record => [record.key, record]));
   const learningInbox = [...inbox, ...proposals.map(proposal => ({ id: `learning:${proposal.candidateId}:${Date.now()}`, status: 'pending', candidate: candidates.find(candidate => candidate.id === proposal.candidateId), record: byKey.get(proposal.candidateId), proposal, error, createdAt: now }))];
   await saveDatasource({ ...current, learningInbox, datasourceMeta: { ...(current.datasourceMeta || {}), schemaVersion: current.schemaVersion, updatedAt: now } });
+  if (traceContext) {
+    void tracePhoenixEvent('learning_review', {'learning.candidate_count': candidates.length, 'learning.proposal_count': proposals.length}, sessionId, {traceContext, root: true, statusCode: error ? 'ERROR' : 'OK', statusMessage: error, output: {retained: true, queued: proposals.length, error}});
+    void clearPhoenixAction(traceContext);
+  }
   return { queued: proposals.length, error };
 }
 
@@ -764,32 +824,48 @@ function applyFormInterpretation(item, interpretation) {
   return {...item, inspection, ...scoreApplicationFrame(item, inspection)};
 }
 
-async function interpretApplicationFrames(tabId, inspected) {
+async function interpretApplicationFrames(tabId, inspected, sessionId = '') {
   const frames = inspected.filter(item => item.inspection?.fields?.length);
   if (!frames.length) return null;
+  const traceContext = createPhoenixTrace(sessionId, {'phoenix.action': 'form_interpretation', 'form.frame_count': frames.length});
+  await persistPhoenixAction(traceContext, 'form_interpretation', sessionId, {'form.frame_count': frames.length});
+  void tracePhoenixEvent('form_interpretation', {'form.frame_count': frames.length}, sessionId, {traceContext, root: true, defer: true, input: frames});
+  const finishTrace = (output, statusCode = 'OK', statusMessage = '') => {
+    void tracePhoenixEvent('form_interpretation', {'form.frame_count': frames.length, 'ai.retained': output?.retained !== false}, sessionId, {traceContext, root: true, statusCode, statusMessage, output});
+    void clearPhoenixAction(traceContext);
+  };
   const settings = await getSettings();
   const apiKey = await getApiKey(settings.aiProvider);
-  if (!apiKey) return null;
+  if (!apiKey) { finishTrace({retained: false, reason: 'missing_provider_key'}); return null; }
   const signature = interpretationSignature(tabId, frames, settings);
   let interpretation = formInterpretationCache.get(signature);
   if (!interpretation) {
     const screenshot = await formScreenshot(tabId, frames, settings.includeFormScreenshot);
-    interpretation = await callFormInterpreter({apiKey, snapshot: {frames}, screenshot}, {provider: settings.aiProvider, model: settings.aiModel});
+    try {
+      interpretation = await callFormInterpreter({apiKey, snapshot: {frames}, screenshot}, {provider: settings.aiProvider, model: settings.aiModel, sessionId, traceContext});
+    } catch (error) {
+      void tracePhoenixEvent('form_interpretation_result', {'form.validation_error': error.message}, sessionId, {traceContext, statusCode: 'ERROR', statusMessage: error.message, output: {retained: false}});
+      finishTrace({retained: false, reason: error.message}, 'ERROR', error.message);
+      throw error;
+    }
+    void tracePhoenixEvent('form_interpretation_result', {'form.status': interpretation.status}, sessionId, {traceContext, output: interpretation});
     if (interpretation.status === 'ready') formInterpretationCache.set(signature, interpretation);
   }
-  if (interpretation.status !== 'ready') return null;
+  if (interpretation.status !== 'ready') { finishTrace({retained: false, reason: 'not_ready', status: interpretation.status}); return null; }
   const currentSettings = await getSettings();
   if (currentSettings.aiProvider !== settings.aiProvider || currentSettings.aiModel !== settings.aiModel
-    || currentSettings.includeFormScreenshot !== settings.includeFormScreenshot) return null;
+    || currentSettings.includeFormScreenshot !== settings.includeFormScreenshot) { finishTrace({retained: false, reason: 'settings_changed'}); return null; }
   let selected = frames.find(item => item.frameId === interpretation.frameId);
-  if (!selected) return null;
+  if (!selected) { finishTrace({retained: false, reason: 'frame_changed'}); return null; }
   const refreshed = await sendToFrame(tabId, selected.frameId, {type: 'JOB_APP_INSPECT'});
-  if (!refreshed?.ok || !refreshed.inspection) return null;
+  if (!refreshed?.ok || !refreshed.inspection) { finishTrace({retained: false, reason: 'inspection_failed'}); return null; }
   const freshItem = {...selected, inspection: refreshed.inspection};
-  if (interpretationSignature(tabId, [selected], settings) !== interpretationSignature(tabId, [freshItem], settings)) return null;
+  if (interpretationSignature(tabId, [selected], settings) !== interpretationSignature(tabId, [freshItem], settings)) { finishTrace({retained: false, reason: 'page_changed'}); return null; }
   selected = freshItem;
   const interpreted = selected ? applyFormInterpretation(selected, interpretation) : null;
-  return interpreted?.eligible ? interpreted : null;
+  if (!interpreted?.eligible) { finishTrace({retained: false, reason: 'ineligible'}); return null; }
+  finishTrace({retained: true, status: interpretation.status});
+  return interpreted;
 }
 
 function discoveryFailure(errorCode, diagnostics = []) {
@@ -844,7 +920,7 @@ async function acceptFormSelection(message, sender) {
   return {ok: true, run: await processPage(tabId, {autoAdvance: false, selectedDestination: {...message.destination, frameId: sender.frameId}})};
 }
 
-async function discoverApplicationFrame(tabId, assertAuthority = null, selectedDestination = null) {
+async function discoverApplicationFrame(tabId, assertAuthority = null, selectedDestination = null, sessionId = '') {
   await assertTabSiteEnabled(tabId);
   assertAuthority?.();
   let contexts;
@@ -872,7 +948,7 @@ async function discoverApplicationFrame(tabId, assertAuthority = null, selectedD
   } else if (candidates.length !== 1 || inspected.some(item => item.inspection?.discovery?.code === 'ambiguous_form')) {
     let interpreted = null;
     try {
-      interpreted = await interpretApplicationFrames(tabId, inspected);
+      interpreted = await interpretApplicationFrames(tabId, inspected, sessionId);
       if (interpreted) candidates = [interpreted];
     } catch { /* deterministic discovery and manual selection remain available */ }
     if (!interpreted && (candidates.length > 1 || inspected.some(item => item.inspection?.discovery?.code === 'ambiguous_form'))) return discoveryFailure('ambiguous_form', diagnostics);
@@ -1727,11 +1803,20 @@ async function generateInlineField(message, sender, {requireFocus = true, jobDes
   if (!reusable && compatible?.aiOperations?.[`suggestion:${field.id}`]?.status === 'pending') {
     return inlineReply(session, message.requestId, {error: 'This answer is already being prepared'});
   }
+  const sessionId = String(origin.tabId) + ':' + (session.attachedRun?.applicationId || session.sessionId);
+  const traceContext = createPhoenixTrace(sessionId, {'phoenix.action': 'answer_suggestions', 'application.field_id': field.id, 'inline.reused': Boolean(reusable)});
+  await persistPhoenixAction(traceContext, 'answer_suggestions', sessionId, {'application.field_id': field.id, 'inline.reused': Boolean(reusable)});
+  void tracePhoenixEvent('answer_suggestions', {'application.field_id': field.id, 'inline.reused': Boolean(reusable)}, sessionId, {traceContext, root: true, defer: true, input: {field, jobContext, evidenceRevision: snapshot.evidenceRevision}});
   const apiKey = reusable ? null : await getApiKey(settings.aiProvider);
-  if (!reusable && !apiKey) throw new Error(`Add a ${settings.aiProvider === 'fireworks' ? 'Fireworks' : 'OpenAI'} API key before generating answer suggestions`);
+  if (!reusable && !apiKey) {
+    void tracePhoenixEvent('answer_suggestions', {'ai.skipped': true, 'ai.reason': 'missing_provider_key'}, sessionId, {traceContext, root: true, output: {retained: false, reason: 'missing_provider_key'}});
+    void clearPhoenixAction(traceContext);
+    throw new Error(`Add a ${settings.aiProvider === 'fireworks' ? 'Fireworks' : 'OpenAI'} API key before generating answer suggestions`);
+  }
   const draftKey = draftFieldKey(origin.tabId, origin.frameId, field), owner = crypto.randomUUID();
   if (!reusable && !claimDraftField(draftKey, owner)) return inlineReply(session, message.requestId, {error: 'This answer is already being prepared'});
   let pending;
+  let traceOutcome = {retained: false, reason: 'incomplete'};
   try {
     pending = await mutateInlineSession(origin.tabId, origin.frameId, session.sessionId, current => {
       if (processingTabs.has(origin.tabId) || saveLocks.has(origin.tabId)) throw new Error('Fill is in progress');
@@ -1740,7 +1825,7 @@ async function generateInlineField(message, sender, {requireFocus = true, jobDes
     });
     if (!pending) return inlineReply(session, message.requestId, {error: 'This answer is already being prepared'});
     if (!(await currentInlineDestination(pending, snapshot))) throw new Error('The page or supporting evidence changed. Generate again.');
-    const generated = reusable ? cached : await generateFieldDrafts({field, inspection, jobContext, datasource, records: datasource.answerRecords, settings, apiKey});
+    const generated = reusable ? cached : await generateFieldDrafts({field, inspection, jobContext, datasource, records: datasource.answerRecords, settings, apiKey, sessionId, traceContext});
     if (!(await currentInlineDestination(pending, snapshot))) throw new Error('The page or supporting evidence changed. Generate again.');
     const committed = await mutateInlineSession(origin.tabId, origin.frameId, pending.sessionId, current => {
       if (processingTabs.has(origin.tabId) || saveLocks.has(origin.tabId)) throw new Error('Fill is in progress');
@@ -1751,14 +1836,20 @@ async function generateInlineField(message, sender, {requireFocus = true, jobDes
         generatedSuggestions: {...current.generatedSuggestions, [field.id]: {suggestions, missingContext: generated.missingContext, snapshot}}};
     });
     if (!committed) throw new Error('Inline session changed. Generate again.');
+    traceOutcome = {retained: true, suggestionCount: generated.suggestions?.length || 0};
+    void tracePhoenixEvent('answer_suggestions_result', {'application.field_id': field.id, 'ai.suggestion_count': generated.suggestions?.length || 0, 'ai.retained': true}, sessionId, {traceContext, output: {...generated, retained: true}});
     return inlineReply(committed, message.requestId);
   } catch (error) {
+    traceOutcome = {retained: false, reason: error.message};
+    void tracePhoenixEvent('answer_suggestions_result', {'application.field_id': field.id, 'ai.validation_error': error.message, 'ai.retained': false}, sessionId, {traceContext, statusCode: 'ERROR', statusMessage: error.message, output: {retained: false, reason: error.message}});
     if (pending) await mutateInlineSession(origin.tabId, origin.frameId, pending.sessionId, current => {
       if (current.workerId !== WORKER_ID || current.generation.status !== 'pending' || current.revision !== pending.revision || current.generation.requestId !== message.requestId) return false;
       return {...current, generation: {status: 'failed', requestId: message.requestId, error: error.message}};
     }).catch(() => {});
     throw error;
   } finally {
+    void tracePhoenixEvent('answer_suggestions', {'application.field_id': field.id, 'ai.retained': Boolean(traceOutcome.retained)}, sessionId, {traceContext, root: true, statusCode: traceOutcome.retained ? 'OK' : 'ERROR', statusMessage: traceOutcome.reason || '', output: traceOutcome});
+    void clearPhoenixAction(traceContext);
     releaseDraftField(draftKey, owner);
   }
 }
@@ -1999,18 +2090,42 @@ async function rewriteAnswer(message, inlineContext = null) {
   const instruction = requiredBoundedText(message.instruction, 'Rewrite instruction', MAX_REWRITE_INSTRUCTION_CHARS);
   const { suggestion, field } = inlineContext || await guardedDraftField(message);
   const settings = await getSettings();
+  const sessionId = inlineContext?.session?.attachedRun?.applicationId
+    ? String(message.tabId) + ':' + inlineContext.session.attachedRun.applicationId
+    : String(message.tabId) + ':' + ((await getRun(message.tabId))?.startedAt || message.sessionId || 'standalone');
+  const traceContext = createPhoenixTrace(sessionId, {'phoenix.action': 'answer_rewrite', 'application.field_id': field.id});
+  await persistPhoenixAction(traceContext, 'answer_rewrite', sessionId, {'application.field_id': field.id});
+  void tracePhoenixEvent('answer_rewrite', {'application.field_id': field.id}, sessionId, {traceContext, root: true, defer: true, input: {question: field.label, draft, instruction}});
   const apiKey = await getApiKey(settings.aiProvider);
-  if (!apiKey) throw new Error(`Add a ${settings.aiProvider === 'fireworks' ? 'Fireworks' : 'OpenAI'} API key before requesting a rewrite`);
+  if (!apiKey) {
+    void tracePhoenixEvent('answer_rewrite', {'ai.skipped': true, 'ai.reason': 'missing_provider_key'}, sessionId, {traceContext, root: true, output: {retained: false, reason: 'missing_provider_key'}});
+    void clearPhoenixAction(traceContext);
+    throw new Error(`Add a ${settings.aiProvider === 'fireworks' ? 'Fireworks' : 'OpenAI'} API key before requesting a rewrite`);
+  }
   const records = await rewriteEvidence(suggestion, message);
-  const rewritten = await callAnswerRewriter({
-    apiKey,
-    question: field.label,
-    draft,
-    instruction,
-    records,
-    page: inlineContext ? inlineContext.session.jobContext || {} : (await getRun(message.tabId))?.jobContext || {},
-  }, { provider: settings.aiProvider, model: settings.aiModel });
-  return { ok: true, answer: requiredBoundedText(rewritten.answer, 'Rewritten answer', MAX_DRAFT_CHARS) };
+  let rewritten;
+  let traceOutcome = {retained: false, reason: 'incomplete'};
+  try {
+    rewritten = await callAnswerRewriter({
+      apiKey,
+      question: field.label,
+      draft,
+      instruction,
+      records,
+      page: inlineContext ? inlineContext.session.jobContext || {} : (await getRun(message.tabId))?.jobContext || {},
+    }, { provider: settings.aiProvider, model: settings.aiModel, sessionId, traceContext });
+    const answer = requiredBoundedText(rewritten.answer, 'Rewritten answer', MAX_DRAFT_CHARS);
+    traceOutcome = {retained: true};
+    void tracePhoenixEvent('answer_rewrite_result', {'application.field_id': field.id, 'ai.retained': true}, sessionId, {traceContext, output: {...rewritten, retained: true}});
+    return { ok: true, answer };
+  } catch (error) {
+    traceOutcome = {retained: false, reason: error.message};
+    void tracePhoenixEvent('answer_rewrite_result', {'application.field_id': field.id, 'ai.validation_error': error.message, 'ai.retained': false}, sessionId, {traceContext, statusCode: 'ERROR', statusMessage: error.message, output: {retained: false, reason: error.message}});
+    throw error;
+  } finally {
+    void tracePhoenixEvent('answer_rewrite', {'application.field_id': field.id, 'ai.retained': Boolean(traceOutcome.retained)}, sessionId, {traceContext, root: true, statusCode: traceOutcome.retained ? 'OK' : 'ERROR', statusMessage: traceOutcome.reason || '', output: traceOutcome});
+    void clearPhoenixAction(traceContext);
+  }
 }
 
 function savedClosingEvidence(field, datasource) {
@@ -2021,7 +2136,7 @@ function savedClosingEvidence(field, datasource) {
   }));
 }
 
-async function generateFieldDrafts({ field, inspection, jobContext, datasource, records, settings, apiKey }) {
+async function generateFieldDrafts({ field, inspection, jobContext, datasource, records, settings, apiKey, sessionId = '', traceContext = null }) {
   const pageRecords = (inspection?.fields || [])
     .filter((item) => item.currentValue && readableQuestion(item))
     .map((item) => ({ key: `page:${item.id}`, question: item.label, answer: item.currentValue, provenance: 'current application page', sensitivity: inferSensitivity(item.label, item.id) }));
@@ -2030,7 +2145,7 @@ async function generateFieldDrafts({ field, inspection, jobContext, datasource, 
     field,
     page: jobContext,
     records: [...savedClosingEvidence(field, datasource), ...rankSuggestionEvidence(field, [...records, ...profileEvidenceRecords(datasource.profile), ...pageRecords], {limit:40})],
-  }, { provider: settings.aiProvider, model: settings.aiModel });
+  }, { provider: settings.aiProvider, model: settings.aiModel, sessionId, traceContext });
 }
 
 async function generateSuggestions(message) {
@@ -2040,28 +2155,48 @@ async function generateSuggestions(message) {
   const { run, field, authority } = await guardedDraftField(message);
   if (!readableQuestion(field)) throw new Error('The form question is unclear. Use Show on page and enter the answer manually.');
   const settings = await getSettings();
+  const sessionId = String(message.tabId) + ':' + run.startedAt;
+  const traceContext = createPhoenixTrace(sessionId, {'phoenix.action': 'answer_suggestions', 'application.field_id': field.id});
+  await persistPhoenixAction(traceContext, 'answer_suggestions', sessionId, {'application.field_id': field.id});
+  void tracePhoenixEvent('answer_suggestions', {'application.field_id': field.id}, sessionId, {traceContext, root: true, defer: true, input: {field, jobDescription}});
   const apiKey = await getApiKey(settings.aiProvider);
-  if (!apiKey) throw new Error(`Add a ${settings.aiProvider === 'fireworks' ? 'Fireworks' : 'OpenAI'} API key before generating answer suggestions`);
+  if (!apiKey) {
+    void tracePhoenixEvent('answer_suggestions', {'ai.skipped': true, 'ai.reason': 'missing_provider_key'}, sessionId, {traceContext, root: true, output: {retained: false, reason: 'missing_provider_key'}});
+    void clearPhoenixAction(traceContext);
+    throw new Error(`Add a ${settings.aiProvider === 'fireworks' ? 'Fireworks' : 'OpenAI'} API key before generating answer suggestions`);
+  }
   const [records, datasource, inspected] = await Promise.all([getRecords(), getDatasource(), sendToFrame(message.tabId, message.frameId, { type: 'JOB_APP_INSPECT' }, authority)]);
   const jobContext = mergeJobContext(run.jobContext, inspected.inspection?.page);
   if (jobDescription) jobContext.jobDescription = jobDescription;
   const snapshot = suggestionRequestSnapshot(run, field, inspected.inspection, datasource, settings, jobContext);
-  const generated = await generateFieldDrafts({ field, inspection: inspected.inspection, jobContext, datasource, records, settings, apiKey });
-  const validation = await sendToFrame(message.tabId, message.frameId, { type: 'JOB_APP_VALIDATE' }, authority);
-  const current = await currentSuggestionDestination(message.tabId, snapshot);
-  if (!current) throw new Error('The page or supporting evidence changed. Generate again.');
-  const updated = await mutateRun(message.tabId, (run) => {
-    if (!sameSuggestionRun(run, snapshot)) return false;
-    run.jobContext = jobContext;
-    run.generatedSuggestions = run.generatedSuggestions || {};
-    run.generatedSuggestions[field.id] = {
-      tabId: message.tabId, frameId: message.frameId, applicationId: run.startedAt, pageSignature: run.pageSignature,
-      field, suggestions: generated.suggestions, missingContext: generated.missingContext, snapshot,
-    };
-    categorizeRun(run, current.inspection, validation?.validation || {});
-  });
-  if (!updated) throw new Error('The page or supporting evidence changed. Generate again.');
-  return { ok: true, run: updated };
+  let traceOutcome = {retained: false, reason: 'incomplete'};
+  try {
+    const generated = await generateFieldDrafts({ field, inspection: inspected.inspection, jobContext, datasource, records, settings, apiKey, sessionId, traceContext });
+    const validation = await sendToFrame(message.tabId, message.frameId, { type: 'JOB_APP_VALIDATE' }, authority);
+    const current = await currentSuggestionDestination(message.tabId, snapshot);
+    if (!current) throw new Error('The page or supporting evidence changed. Generate again.');
+    const updated = await mutateRun(message.tabId, (run) => {
+      if (!sameSuggestionRun(run, snapshot)) return false;
+      run.jobContext = jobContext;
+      run.generatedSuggestions = run.generatedSuggestions || {};
+      run.generatedSuggestions[field.id] = {
+        tabId: message.tabId, frameId: message.frameId, applicationId: run.startedAt, pageSignature: run.pageSignature,
+        field, suggestions: generated.suggestions, missingContext: generated.missingContext, snapshot,
+      };
+      categorizeRun(run, current.inspection, validation?.validation || {});
+    });
+    if (!updated) throw new Error('The page or supporting evidence changed. Generate again.');
+    traceOutcome = {retained: true, suggestionCount: generated.suggestions?.length || 0};
+    void tracePhoenixEvent('answer_suggestions_result', {'application.field_id': field.id, 'ai.suggestion_count': generated.suggestions?.length || 0, 'ai.retained': true}, sessionId, {traceContext, output: {...generated, retained: true}});
+    return { ok: true, run: updated };
+  } catch (error) {
+    traceOutcome = {retained: false, reason: error.message};
+    void tracePhoenixEvent('answer_suggestions_result', {'application.field_id': field.id, 'ai.validation_error': error.message, 'ai.retained': false}, sessionId, {traceContext, statusCode: 'ERROR', statusMessage: error.message, output: {retained: false, reason: error.message}});
+    throw error;
+  } finally {
+    void tracePhoenixEvent('answer_suggestions', {'application.field_id': field.id, 'ai.retained': Boolean(traceOutcome.retained)}, sessionId, {traceContext, root: true, statusCode: traceOutcome.retained ? 'OK' : 'ERROR', statusMessage: traceOutcome.reason || '', output: traceOutcome});
+    void clearPhoenixAction(traceContext);
+  }
 }
 
 function hasBlockingIssues(run, validation) {
@@ -2093,7 +2228,7 @@ async function processPage(tabId, { autoAdvance, selectedDestination = null } = 
       getCoverMessages(),
       getDatasource(),
     ]);
-    const discovery = await discoverApplicationFrame(tabId, () => assertRunSiteAuthority(tabId, run), selectedDestination || run.selectedDestination);
+    const discovery = await discoverApplicationFrame(tabId, () => assertRunSiteAuthority(tabId, run), selectedDestination || run.selectedDestination, String(tabId) + ':' + run.startedAt);
     if (discovery.errorCode) return await saveRun(pauseForFrame(run, discovery));
     updateSelectedFrame(tabId, run, discovery);
     const currentTab = await tabForSite(tabId);
@@ -2264,7 +2399,7 @@ async function focusRunField(tabId, fieldId) {
   const run = await getRun(tabId);
   if (!run) return { ok: false, run: null };
   if (!Number.isInteger(run.frame?.frameId)) return {ok: false, error: 'Select an application form before focusing a field.', run};
-  const discovery = await discoverApplicationFrame(tabId, () => assertRunSiteAuthority(tabId, run), run.frame?.destination ? {...run.frame.destination, frameId: run.frame.frameId} : run.selectedDestination);
+  const discovery = await discoverApplicationFrame(tabId, () => assertRunSiteAuthority(tabId, run), run.frame?.destination ? {...run.frame.destination, frameId: run.frame.frameId} : run.selectedDestination, String(tabId) + ':' + run.startedAt);
   if (discovery.errorCode) return { ok: false, run: await saveRun(pauseForFrame(run, discovery)) };
   updateSelectedFrame(tabId, run, discovery);
   try {
@@ -2330,7 +2465,7 @@ async function saveAnswers(tabId) {
     if (!run || !SAVABLE_RUN_STATUSES.has(run.status) || !Number.isInteger(run.frame?.frameId)) {
       return { ok: false, error: 'The current page is not ready to save answers' };
     }
-    const discovery = await discoverApplicationFrame(tabId, () => assertRunSiteAuthority(tabId, run), run.frame?.destination ? {...run.frame.destination, frameId: run.frame.frameId} : run.selectedDestination);
+    const discovery = await discoverApplicationFrame(tabId, () => assertRunSiteAuthority(tabId, run), run.frame?.destination ? {...run.frame.destination, frameId: run.frame.frameId} : run.selectedDestination, String(tabId) + ':' + run.startedAt);
     if (discovery.errorCode) return { ok: false, error: discovery.reason, run: await saveRun(pauseForFrame(run, discovery)) };
     updateSelectedFrame(tabId, run, discovery);
     const inspection = discovery.inspection;
@@ -2349,7 +2484,7 @@ async function saveCapturedAnswers(run, inspection, records, assertAuthority = n
   assertAuthority?.();
   const result = await recordPageCapture(run, inspection, records, { promote, assertAuthority });
   assertAuthority?.();
-  const learning = await queueLearningReview(records);
+  const learning = await queueLearningReview(records, String(run.tabId) + ':' + run.startedAt);
   run = result.run;
   if (run.status === 'ready_for_user_submit') {
     run.status = 'answers_saved';
@@ -2493,7 +2628,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         const url = new URL(sender.url);
         if (run.frame.domain && url.hostname !== run.frame.domain) return { ok: false };
         if (run.frame.pathname && url.pathname !== run.frame.pathname) {
-          const discovery = await discoverApplicationFrame(tabId, () => assertRunSiteAuthority(tabId, run), run.frame?.destination ? {...run.frame.destination, frameId: run.frame.frameId} : run.selectedDestination);
+          const discovery = await discoverApplicationFrame(tabId, () => assertRunSiteAuthority(tabId, run), run.frame?.destination ? {...run.frame.destination, frameId: run.frame.frameId} : run.selectedDestination, String(tabId) + ':' + run.startedAt);
           if (discovery.errorCode || discovery.frameId !== (sender.frameId ?? 0) || discovery.context.pathname !== url.pathname) return { ok: false };
           updateSelectedFrame(tabId, run, discovery);
           if (run.lastAction !== 'next') {
@@ -2717,6 +2852,25 @@ chrome.runtime.onInstalled.addListener(async () => {
   }
 });
 
+async function ensurePhoenixDelivery() {
+  try {
+    if (chrome.alarms?.create) chrome.alarms.create('phoenix-trace-retry', {periodInMinutes: 1});
+    await recoverPhoenixActions();
+    await flushPhoenixQueue();
+  } catch { /* tracing delivery is independent of form filling */ }
+}
+if (chrome.alarms?.onAlarm?.addListener) {
+  chrome.alarms.onAlarm.addListener((alarm) => {
+    if (alarm?.name === 'phoenix-trace-retry') flushPhoenixQueue().catch(() => {});
+  });
+}
+if (chrome.storage?.onChanged?.addListener) {
+  chrome.storage.onChanged.addListener((changes, area) => {
+    if (area === 'local' && changes.phoenixTracing && changes.phoenixTracing.newValue !== false) flushPhoenixQueue().catch(() => {});
+  });
+}
+void ensurePhoenixDelivery();
+
 function resolveEmploymentFields(run, fields, profile) {
   const employers = profile.employment || [];
   run.employmentMappings ||= {};
@@ -2762,7 +2916,7 @@ async function validatePageOnly(tabId, {refreshDestination = false} = {}) {
     inspected = await sendToApplicationFrame(tabId, run, {type:'JOB_APP_INSPECT'});
   } catch (error) {
     if (!refreshDestination || !error.frameDiscovery) throw error;
-    const discovery = await discoverApplicationFrame(tabId, () => assertRunSiteAuthority(tabId, run));
+    const discovery = await discoverApplicationFrame(tabId, () => assertRunSiteAuthority(tabId, run), null, String(tabId) + ':' + run.startedAt);
     if (discovery.errorCode) return saveRun(pauseForFrame(run, discovery));
     updateSelectedFrame(tabId, run, discovery);
     inspected = {ok: true, inspection: discovery.inspection};
@@ -2860,28 +3014,44 @@ async function searchInlineField(message, sender) {
 async function semanticSearchInlineField(message, sender, {requireFocus = true} = {}) {
   const {session,field}=await guardInlineField(message,sender,{requireFocus});
   if(processingTabs.has(session.tabId)||saveLocks.has(session.tabId)) throw new Error('Application is busy. Try again.');
+  const sessionId = String(session.tabId) + ':' + (session.attachedRun?.applicationId || session.sessionId);
+  const traceContext = createPhoenixTrace(sessionId, {'phoenix.action': 'semantic_search', 'application.field_id': field.id});
+  await persistPhoenixAction(traceContext, 'semantic_search', sessionId, {'application.field_id': field.id});
+  void tracePhoenixEvent('semantic_search', {'application.field_id': field.id}, sessionId, {traceContext, root: true, defer: true, input: {field}});
   const settings=await getSettings(); const apiKey=await getTypeSafeApiKey();
-  if(!settings.typesafeEnabled||!apiKey) throw new Error('Enable TypeSafe saved-answer search and add its API key in Settings.');
-  const records=await getRecords();
-  const [result]=await semanticMatcher.match({fields:[field],records,apiKey,enabled:true,
-    scope:`inline:${session.sessionId}:${session.pageSignature}`,retry:Boolean(message.retry),
-    sessionId:`${session.tabId}:${session.sessionId}`});
-  const [liveSettings,liveRecords]=await Promise.all([getSettings(),getRecords()]);
-  if(!liveSettings.typesafeEnabled||semanticFingerprint(field,liveRecords)!==result.fingerprint) {
-    throw new Error('Saved answers changed. Try again.');
+  if(!settings.typesafeEnabled||!apiKey) {
+    void tracePhoenixEvent('semantic_search', {'ai.skipped': true, 'ai.reason': !settings.typesafeEnabled ? 'provider_disabled' : 'missing_provider_key'}, sessionId, {traceContext, root: true, output: {retained: false, reason: !settings.typesafeEnabled ? 'provider_disabled' : 'missing_provider_key'}});
+    void clearPhoenixAction(traceContext);
+    throw new Error('Enable TypeSafe saved-answer search and add its API key in Settings.');
   }
-  const {session:latest,authority}=await guardInlineField(message,sender,{requireFocus});
-  if(latest.revision!==session.revision) throw new Error('Inline session changed. Try again.');
-  if(result.status!=='matched') return inlineReply(latest,message.requestId,{semanticStatus:result.status});
-  const updated=await mutateInlineSession(session.tabId,session.frameId,session.sessionId,current=>{
-    authority();
-    if(current.revision!==session.revision) throw new Error('Inline session changed. Try again.');
-    const registered={...result.candidate,candidateId:`semantic:${current.revision+1}:${crypto.randomUUID()}`};
-    const prior=current.suggestions[field.id]?.candidates||[];
-    const candidates=prior.some(candidate=>candidate.answer===registered.answer)?prior:[registered,...prior];
-    return {...current,suggestions:{...current.suggestions,[field.id]:{...current.suggestions[field.id],field,candidates}}};
-  });
-  return inlineReply(updated,message.requestId,{semanticStatus:'matched',semanticCandidate:updated.suggestions[field.id].candidates[0]});
+  const records=await getRecords();
+  let traceOutcome = {retained: false, reason: 'incomplete'};
+  try {
+    const [result]=await semanticMatcher.match({fields:[field],records,apiKey,enabled:true,
+      scope:`inline:${session.sessionId}:${session.pageSignature}`,retry:Boolean(message.retry),
+      sessionId, traceContext});
+    const [liveSettings,liveRecords]=await Promise.all([getSettings(),getRecords()]);
+    if(!liveSettings.typesafeEnabled||semanticFingerprint(field,liveRecords)!==result.fingerprint) throw new Error('Saved answers changed. Try again.');
+    const {session:latest,authority}=await guardInlineField(message,sender,{requireFocus});
+    if(latest.revision!==session.revision) throw new Error('Inline session changed. Try again.');
+    if(result.status!=='matched') { traceOutcome = {retained: true, status: result.status}; return inlineReply(latest,message.requestId,{semanticStatus:result.status}); }
+    const updated=await mutateInlineSession(session.tabId,session.frameId,session.sessionId,current=>{
+      authority();
+      if(current.revision!==session.revision) throw new Error('Inline session changed. Try again.');
+      const registered={...result.candidate,candidateId:`semantic:${current.revision+1}:${crypto.randomUUID()}`};
+      const prior=current.suggestions[field.id]?.candidates||[];
+      const candidates=prior.some(candidate=>candidate.answer===registered.answer)?prior:[registered,...prior];
+      return {...current,suggestions:{...current.suggestions,[field.id]:{...current.suggestions[field.id],field,candidates}}};
+    });
+    traceOutcome = {retained: true, status: 'matched'};
+    return inlineReply(updated,message.requestId,{semanticStatus:'matched',semanticCandidate:updated.suggestions[field.id].candidates[0]});
+  } catch (error) {
+    traceOutcome = {retained: false, reason: error.message};
+    throw error;
+  } finally {
+    void tracePhoenixEvent('semantic_search', {'application.field_id': field.id, 'ai.retained': Boolean(traceOutcome.retained)}, sessionId, {traceContext, root: true, statusCode: traceOutcome.retained ? 'OK' : 'ERROR', statusMessage: traceOutcome.reason || '', output: traceOutcome});
+    void clearPhoenixAction(traceContext);
+  }
 }
 
 async function searchSavedAnswers(message) {
@@ -2899,35 +3069,51 @@ async function searchSavedAnswers(message) {
 
 async function semanticSearchSavedAnswers(message) {
   const {run,field}=await guardedDraftField(message);
+  const sessionId = String(message.tabId) + ':' + run.startedAt;
+  const traceContext = createPhoenixTrace(sessionId, {'phoenix.action': 'semantic_search', 'application.field_id': field.id});
+  await persistPhoenixAction(traceContext, 'semantic_search', sessionId, {'application.field_id': field.id});
+  void tracePhoenixEvent('semantic_search', {'application.field_id': field.id}, sessionId, {traceContext, root: true, defer: true, input: {field}});
   const settings=await getSettings(); const apiKey=await getTypeSafeApiKey();
-  if(!settings.typesafeEnabled||!apiKey) throw new Error('Enable TypeSafe saved-answer search and add its API key in Settings.');
-  const records=await getRecords();
-  const [result]=await semanticMatcher.match({fields:[field],records,apiKey,enabled:true,
-    scope:`${run.startedAt}:${run.pageSignature}`,retry:Boolean(message.retry),sessionId:`${message.tabId}:${run.startedAt}`});
-  const [liveSettings,liveRecords]=await Promise.all([getSettings(),getRecords()]);
-  if(!liveSettings.typesafeEnabled||semanticFingerprint(field,liveRecords)!==result.fingerprint) {
-    throw new Error('Saved answers changed. Try again.');
+  if(!settings.typesafeEnabled||!apiKey) {
+    void tracePhoenixEvent('semantic_search', {'ai.skipped': true, 'ai.reason': !settings.typesafeEnabled ? 'provider_disabled' : 'missing_provider_key'}, sessionId, {traceContext, root: true, output: {retained: false, reason: !settings.typesafeEnabled ? 'provider_disabled' : 'missing_provider_key'}});
+    void clearPhoenixAction(traceContext);
+    throw new Error('Enable TypeSafe saved-answer search and add its API key in Settings.');
   }
-  await guardedDraftField(message);
-  const updated=await mutateRun(message.tabId,current=>{
-    if(current.startedAt!==run.startedAt||current.pageSignature!==run.pageSignature)return false;
-    current.semanticSearch ||= {}; current.semanticSearch[field.id]={status:result.status};
-    if(result.status==='matched') {
-      const prior=current.suggestions?.[field.id]?.candidates||[];
-      current.suggestions ||= {};
-      current.suggestions[field.id]={tabId:message.tabId,frameId:message.frameId,applicationId:run.startedAt,
-        pageSignature:run.pageSignature,field,candidates:prior.some(candidate=>candidate.answer===result.candidate.answer)
-          ? prior : [result.candidate,...prior]};
-    }
-    for(const item of [...(current.actionRequired||[]),...(current.optionalUnresolved||[])]) if(item.fieldId===field.id) {
-      item.semanticStatus=result.status;
-      if(result.status==='matched') {item.suggestion=current.suggestions[field.id];item.reason='Saved answer found — review it before use';}
-      else if(result.status==='none') item.reason='No clear saved-answer match';
-      else if(result.status==='failed') item.reason='Couldn’t search saved answers — try again';
-    }
-  });
-  if(!updated) throw new Error('The application changed. Try again.');
-  return {ok:true,semanticStatus:result.status,candidates:result.status==='matched'?[result.candidate]:[],run:updated};
+  const records=await getRecords();
+  let traceOutcome = {retained: false, reason: 'incomplete'};
+  try {
+    const [result]=await semanticMatcher.match({fields:[field],records,apiKey,enabled:true,
+      scope:`${run.startedAt}:${run.pageSignature}`,retry:Boolean(message.retry),sessionId, traceContext});
+    const [liveSettings,liveRecords]=await Promise.all([getSettings(),getRecords()]);
+    if(!liveSettings.typesafeEnabled||semanticFingerprint(field,liveRecords)!==result.fingerprint) throw new Error('Saved answers changed. Try again.');
+    await guardedDraftField(message);
+    const updated=await mutateRun(message.tabId,current=>{
+      if(current.startedAt!==run.startedAt||current.pageSignature!==run.pageSignature)return false;
+      current.semanticSearch ||= {}; current.semanticSearch[field.id]={status:result.status};
+      if(result.status==='matched') {
+        const prior=current.suggestions?.[field.id]?.candidates||[];
+        current.suggestions ||= {};
+        current.suggestions[field.id]={tabId:message.tabId,frameId:message.frameId,applicationId:run.startedAt,
+          pageSignature:run.pageSignature,field,candidates:prior.some(candidate=>candidate.answer===result.candidate.answer)
+            ? prior : [result.candidate,...prior]};
+      }
+      for(const item of [...(current.actionRequired||[]),...(current.optionalUnresolved||[])]) if(item.fieldId===field.id) {
+        item.semanticStatus=result.status;
+        if(result.status==='matched') {item.suggestion=current.suggestions[field.id];item.reason='Saved answer found — review it before use';}
+        else if(result.status==='none') item.reason='No clear saved-answer match';
+        else if(result.status==='failed') item.reason='Couldn’t search saved answers — try again';
+      }
+    });
+    if(!updated) throw new Error('The application changed. Try again.');
+    traceOutcome = {retained: true, status: result.status};
+    return {ok:true,semanticStatus:result.status,candidates:result.status==='matched'?[result.candidate]:[],run:updated};
+  } catch (error) {
+    traceOutcome = {retained: false, reason: error.message};
+    throw error;
+  } finally {
+    void tracePhoenixEvent('semantic_search', {'application.field_id': field.id, 'ai.retained': Boolean(traceOutcome.retained)}, sessionId, {traceContext, root: true, statusCode: traceOutcome.retained ? 'OK' : 'ERROR', statusMessage: traceOutcome.reason || '', output: traceOutcome});
+    void clearPhoenixAction(traceContext);
+  }
 }
 
 function aiFieldSnapshot(field = {}) {
@@ -3011,11 +3197,20 @@ async function scheduleAi(tabId,{retry=false}={}) {
   if(backgroundJobs.has(tabId) || processingTabs.has(tabId) || saveLocks.has(tabId)) return;
   const run=await getRun(tabId);
   if(!run || !SAVABLE_RUN_STATUSES.has(run.status) || !Number.isInteger(run.frame?.frameId)) return;
+  const sessionId = String(tabId) + ':' + run.startedAt;
+  const traceContext = createPhoenixTrace(sessionId, {'phoenix.action': 'fill_page', 'application.page': run.pageSignature, 'application.frame_id': run.frame.frameId});
+  await persistPhoenixAction(traceContext, 'fill_page', sessionId, {'application.page': run.pageSignature, 'application.frame_id': run.frame.frameId});
+  const traceSkip = reason => {
+    void tracePhoenixEvent('fill_page_result', {'ai.skipped': true, 'ai.reason': reason}, sessionId, {traceContext, output: {retained: false, reason}});
+    void tracePhoenixEvent('fill_page', {'ai.skipped': true, 'ai.reason': reason}, sessionId, {traceContext, root: true, output: {retained: false, reason}});
+    void clearPhoenixAction(traceContext);
+  };
+  void tracePhoenixEvent('fill_page', {'ai.retry': Boolean(retry)}, sessionId, {traceContext, root: true, defer: true, input: {pageSignature: run.pageSignature, frameId: run.frame.frameId}});
   const settings=await getSettings();
   const [apiKey,typesafeApiKey]=await Promise.all([getApiKey(settings.aiProvider),getTypeSafeApiKey()]);
-  if(!apiKey && !(settings.typesafeEnabled && typesafeApiKey)) return;
+  if(!apiKey && !(settings.typesafeEnabled && typesafeApiKey)) { traceSkip('missing_provider_key'); return; }
   const inspected=await sendToApplicationFrame(tabId,run,{type:'JOB_APP_INSPECT'});
-  if(!inspected?.ok || pageSignature(inspected.inspection,run.frame)!==run.pageSignature) return;
+  if(!inspected?.ok || pageSignature(inspected.inspection,run.frame)!==run.pageSignature) { traceSkip('page_changed_before_ai'); return; }
   const validated=await sendToApplicationFrame(tabId,run,{type:'JOB_APP_VALIDATE'});
   const invalidIds=new Set((validated?.validation?.invalid || []).map(field=>field.fieldId));
   const datasource=await getDatasource();
@@ -3024,7 +3219,7 @@ async function scheduleAi(tabId,{retry=false}={}) {
     && (!hasUsableSuggestion(run.suggestions?.[field.id]) || invalidIds.has(field.id)) && readableQuestion(field)
     && inferSensitivity(field.label,field.id)!=='legal' && !field.entityUnresolved);
   const unresolved=candidateFields.filter(field=>field.required);
-  if(!candidateFields.length) return;
+  if(!candidateFields.length) { traceSkip('no_eligible_fields'); return; }
   const planner=run.aiOperations?.planner;
   const retryableStates=new Set(['failed','interrupted']);
   const semanticRetry=retry && unresolved.some(field=>run.semanticSearch?.[field.id]?.status==='failed');
@@ -3035,13 +3230,13 @@ async function scheduleAi(tabId,{retry=false}={}) {
     ? unresolved.filter(writingField).filter(field=>retryableStates.has(run.aiOperations?.[`suggestion:${field.id}`]?.status) && !run.generatedSuggestions?.[field.id])
     : unresolved.filter(writingField).filter(field=>!run.generatedSuggestions?.[field.id]);
   const semanticFields=unresolved.filter(field=>!hasUsableSuggestion(run.suggestions?.[field.id]));
-  if(!apiKey && !semanticFields.length) return;
-  if(!plannerFields.length && !semanticFields.length && !suggestionFields.length) return;
+  if(!apiKey && !semanticFields.length) { traceSkip('missing_provider_key'); return; }
+  if(!plannerFields.length && !semanticFields.length && !suggestionFields.length) { traceSkip('cached_or_no_pending_ai'); return; }
   const operationFields=[...new Map([...plannerFields,...semanticFields,...suggestionFields].map(field=>[field.id,field])).values()];
   const evidenceRevision=aiEvidenceRevision(run,inspected.inspection,datasource);
   const fingerprint=aiFingerprint(run,operationFields,settings,evidenceRevision);
   const op=planner;
-  if(op?.cacheKey===fingerprint && ((!retry && ['completed','failed','interrupted'].includes(op.status)) || op.status==='pending')) return;
+  if(op?.cacheKey===fingerprint && ((!retry && ['completed','failed','interrupted'].includes(op.status)) || op.status==='pending')) { traceSkip('operation_already_recorded'); return; }
   const id=`${WORKER_ID}:${Date.now()}:${Math.random()}`;
   const operationKey=plannerFields.length ? 'planner' : 'suggestion_batch';
   const snapshot={startedAt:run.startedAt,pageSignature:run.pageSignature,frameId:run.frame.frameId,cacheKey:fingerprint,id,operationKey,evidenceRevision,jobContext:run.jobContext || {},settings};
@@ -3054,12 +3249,16 @@ async function scheduleAi(tabId,{retry=false}={}) {
     current.progress='preparing_suggestions'; current.llmError=null;
   });
   const ownedSuggestionFields=suggestionFields.filter(field=>claimDraftField(draftFieldKey(tabId,snapshot.frameId,field),id));
-  const job=prepareAi(tabId,snapshot,plannerFields,semanticFields,ownedSuggestionFields,fields,datasource,apiKey,typesafeApiKey,{retry}).catch(async error=>{
+  let aiError = null;
+  const job=prepareAi(tabId,snapshot,plannerFields,semanticFields,ownedSuggestionFields,fields,datasource,apiKey,typesafeApiKey,{retry, traceContext}).catch(async error=>{
+    aiError = error;
     await mutateRun(tabId,current=>{
       if(current.aiOperations?.[operationKey]?.id!==id) return false;
       current.aiOperations[operationKey].status='failed';current.aiOperations[operationKey].error=error.message;current.llmError=error.message;current.progress='ready';
     });
   }).finally(()=>{
+    void tracePhoenixEvent('fill_page', {'ai.retry': Boolean(retry), 'ai.retained': !aiError}, sessionId, {traceContext, root: true, statusCode: aiError ? 'ERROR' : 'OK', statusMessage: aiError?.message || '', output: {retained: !aiError, reason: aiError?.message || ''}});
+    void clearPhoenixAction(traceContext);
     for(const field of ownedSuggestionFields) releaseDraftField(draftFieldKey(tabId,snapshot.frameId,field),id);
     if(backgroundJobs.get(tabId)===job) backgroundJobs.delete(tabId);
   });
@@ -3083,13 +3282,17 @@ async function currentAiDestination(tabId,snapshot,field=null) {
   return {run,inspection:inspected.inspection};
 }
 
-async function prepareAi(tabId,snapshot,plannerFields,semanticFields,suggestionFields,allFields,datasource,apiKey,typesafeApiKey,{retry=false}={}) {
+async function prepareAi(tabId,snapshot,plannerFields,semanticFields,suggestionFields,allFields,datasource,apiKey,typesafeApiKey,{retry=false, traceContext: parentTraceContext = null}={}) {
   const {aiProvider:provider,aiModel:model}=snapshot.settings;
+  const sessionId = String(tabId) + ':' + snapshot.startedAt;
+  const traceContext = parentTraceContext || createPhoenixTrace(sessionId, {'phoenix.action': 'fill_page', 'application.page': snapshot.pageSignature, 'application.frame_id': snapshot.frameId, 'typesafe.field_ids': JSON.stringify(semanticFields.map(field => field.id)), 'typesafe.source_keys': JSON.stringify(datasource.answerRecords.map(record => record.key))});
+  traceContext.attributes = {...traceContext.attributes, 'typesafe.field_ids': JSON.stringify(semanticFields.map(field => field.id)), 'typesafe.source_keys': JSON.stringify(datasource.answerRecords.map(record => record.key))};
+  if (!parentTraceContext) void tracePhoenixEvent('fill_page', {'ai.planner_fields': plannerFields.length, 'ai.semantic_fields': semanticFields.length, 'ai.suggestion_fields': suggestionFields.length, 'ai.retry': Boolean(retry)}, sessionId, {traceContext, root: true, input: {plannerFields, semanticFields, suggestionFields}});
   let semanticFailure=false;
   if(snapshot.settings.typesafeEnabled && typesafeApiKey && semanticFields.length) {
     const semanticResults=await semanticMatcher.match({fields:semanticFields,records:datasource.answerRecords,
       apiKey:typesafeApiKey,enabled:true,scope:`${snapshot.startedAt}:${snapshot.pageSignature}`,retry,
-      sessionId:`${tabId}:${snapshot.startedAt}`});
+      sessionId, traceContext});
     const destination=await currentAiDestination(tabId,snapshot);
     if(destination) {
       const fieldsById=new Map(destination.inspection.fields.map(field=>[field.id,field]));
@@ -3098,6 +3301,10 @@ async function prepareAi(tabId,snapshot,plannerFields,semanticFields,suggestionF
         const live=fieldsById.get(result.fieldId);
         return original && live && !String(live.currentValue||'').trim() && sameFieldSnapshot(live,aiFieldSnapshot(original));
       });
+      const discardedResults = semanticResults.filter(result => !validResults.includes(result));
+      if (discardedResults.length) void tracePhoenixEvent('saved_answer_match_result', {
+        'llm.provider': 'typesafe', 'typesafe.discarded': discardedResults.length, 'ai.retained': false, 'ai.discard_reason': 'page_changed',
+      }, sessionId, {traceContext, statusCode: 'ERROR', statusMessage: 'page_changed', output: {retained: false, reason: 'page_changed', results: discardedResults}});
       await mutateRun(tabId,current=>{
         if(current.aiOperations?.[snapshot.operationKey]?.id!==snapshot.id || current.pageSignature!==snapshot.pageSignature)return false;
         current.semanticSearch ||= {}; current.suggestions ||= {};
@@ -3119,6 +3326,10 @@ async function prepareAi(tabId,snapshot,plannerFields,semanticFields,suggestionF
       plannerFields=plannerFields.filter(continueWithGeneration);
       suggestionFields=suggestionFields.filter(continueWithGeneration);
       await validatePageOnly(tabId);
+    } else if (semanticResults.length) {
+      void tracePhoenixEvent('saved_answer_match_result', {
+        'llm.provider': 'typesafe', 'typesafe.discarded': semanticResults.length, 'ai.retained': false, 'ai.discard_reason': 'page_changed',
+      }, sessionId, {traceContext, statusCode: 'ERROR', statusMessage: 'page_changed', output: {retained: false, reason: 'page_changed', results: semanticResults}});
     }
   }
   if(!apiKey) {
@@ -3129,28 +3340,40 @@ async function prepareAi(tabId,snapshot,plannerFields,semanticFields,suggestionF
       current.progress='ready';
     });
     await validatePageOnly(tabId);
+    void tracePhoenixEvent('fill_page_result', {'ai.skipped': true, 'ai.semantic_failure': semanticFailure, 'ai.reason': 'missing_provider_key'}, sessionId, {traceContext, output: {semanticFailure}});
     return;
   }
   const plannerRecords=selectPlannerEvidence(plannerFields,datasource.answerRecords,{limit:20});
   let decisions=[]; let plannerError='';
   if(plannerFields.length) {
-    try { decisions=(await callAnswerPlanner({apiKey,fields:plannerFields,records:plannerRecords,page:snapshot.jobContext},{provider,model,allowPartial:true,sessionId:`${tabId}:${snapshot.startedAt}`})).decisions; }
-    catch(error) {plannerError=error.message;}
+    try {
+      decisions=(await callAnswerPlanner({apiKey,fields:plannerFields,records:plannerRecords,page:snapshot.jobContext},{provider,model,allowPartial:true,sessionId,traceContext})).decisions;
+    }
+    catch(error) {plannerError=error.message; void tracePhoenixEvent('answer_planner_result', {'ai.validation_error': error.message}, sessionId, {traceContext, statusCode: 'ERROR', statusMessage: error.message, output: {retained: false}});}
   }
   const proposed=new Set();
+  const retainedDecisions=[];
+  const discardedDecisions=[];
   for(const decision of decisions) {
     const field=plannerFields.find(item=>item.id===decision.fieldId);
-    if(!field || decision.action!=='fill' || !(await currentAiDestination(tabId,snapshot,field))) continue;
+    if(!field) { discardedDecisions.push({decision, reason:'unknown_field'}); continue; }
+    if(decision.action!=='fill') { discardedDecisions.push({decision, reason:'action_not_fill'}); continue; }
+    if(!(await currentAiDestination(tabId,snapshot,field))) { discardedDecisions.push({decision, reason:'page_changed'}); continue; }
     const keys=[...new Set(decision.evidenceKeys)]; const sources=keys.map(key=>plannerRecords.find(record=>record.key===key));
-    if(sources.some(source=>!source)) continue;
+    if(sources.some(source=>!source)) { discardedDecisions.push({decision, reason:'missing_evidence'}); continue; }
     const candidate={sourceKey:keys[0],sourceKeys:keys,sourceAnswers:Object.fromEntries(sources.map(source=>[source.key,source.answer])),sourceQuestion:sources.map(source=>source.question).join(' + '),answer:decision.value,excerpt:String(decision.value).slice(0,400),provenance:'AI planner',kind:'planner',requiresApproval:true,reason:decision.reason,transformation:decision.transformation || null,confidence:decision.confidence,sensitivity:decision.sensitivity};
-    await mutateRun(tabId,current=>{
+    const retained = await mutateRun(tabId,current=>{
       if(current.aiOperations?.[snapshot.operationKey]?.id!==snapshot.id || current.pageSignature!==snapshot.pageSignature) return false;
       current.suggestions ||= {};
       current.suggestions[field.id]={tabId,frameId:snapshot.frameId,applicationId:snapshot.startedAt,pageSignature:snapshot.pageSignature,field,candidates:[candidate]};
     });
+    if (!retained) { discardedDecisions.push({decision, reason:'run_changed'}); continue; }
     proposed.add(field.id);
+    retainedDecisions.push(decision);
   }
+  if (decisions.length) void tracePhoenixEvent('answer_planner_result', {
+    'ai.decision_count': decisions.length, 'ai.retained_decision_count': retainedDecisions.length, 'ai.discarded_decision_count': discardedDecisions.length,
+  }, sessionId, {traceContext, output: {retained: discardedDecisions.length === 0, decisions: retainedDecisions, discarded: discardedDecisions}});
   const pageRecords=allFields.filter(field=>field.currentValue && readableQuestion(field)).map(field=>({key:`page:${field.id}`,question:field.label,answer:field.currentValue,provenance:'current application page',sensitivity:inferSensitivity(field.label,field.id),entityId:field.entityId,entityType:field.entityType}));
   const evidence=[...datasource.answerRecords,...profileEvidenceRecords(datasource.profile),...pageRecords];
   for(const field of suggestionFields) if(proposed.has(field.id)) releaseDraftField(draftFieldKey(tabId,snapshot.frameId,field),snapshot.id);
@@ -3161,19 +3384,25 @@ async function prepareAi(tabId,snapshot,plannerFields,semanticFields,suggestionF
     if(!(await currentAiDestination(tabId,snapshot,field))) {releaseDraftField(draftFieldKey(tabId,snapshot.frameId,field),snapshot.id);continue;}
     await mutateRun(tabId,current=>{if(current.aiOperations?.[snapshot.operationKey]?.id!==snapshot.id)return false;current.aiOperations[key]={status:'pending',workerId:WORKER_ID,id:snapshot.id,cacheKey:snapshot.cacheKey};});
     try {
-      const generated=await callAnswerSuggestions({apiKey,field,page:snapshot.jobContext,records:[...savedClosingEvidence(field,datasource),...rankSuggestionEvidence(field,evidence,{limit:40})]},{provider,model,sessionId:`${tabId}:${snapshot.startedAt}`});
+      const generated=await callAnswerSuggestions({apiKey,field,page:snapshot.jobContext,records:[...savedClosingEvidence(field,datasource),...rankSuggestionEvidence(field,evidence,{limit:40})]},{provider,model,sessionId,traceContext});
       if(!(await currentAiDestination(tabId,snapshot,field))) {
+        void tracePhoenixEvent('answer_suggestions_result', {'application.field_id': field.id, 'ai.suggestion_count': generated.suggestions?.length || 0, 'ai.retained': false, 'ai.discard_reason': 'page_changed'}, sessionId, {traceContext, output: {...generated, retained: false, discardReason: 'page_changed'}});
         await mutateRun(tabId,current=>{if(current.aiOperations?.[key]?.id!==snapshot.id)return false;current.aiOperations[key].status='interrupted';}); continue;
       }
-      await mutateRun(tabId,current=>{
+      const committed = await mutateRun(tabId,current=>{
         if(current.aiOperations?.[snapshot.operationKey]?.id!==snapshot.id || current.pageSignature!==snapshot.pageSignature)return false;
         current.generatedSuggestions ||= {};
         current.generatedSuggestions[field.id]={tabId,frameId:snapshot.frameId,applicationId:snapshot.startedAt,pageSignature:snapshot.pageSignature,field,...generated,
           snapshot: {...snapshot, field: aiFieldSnapshot(field)}};
         current.aiOperations[key].status='completed';
       });
+      if (!committed) {
+        void tracePhoenixEvent('answer_suggestions_result', {'application.field_id': field.id, 'ai.suggestion_count': generated.suggestions?.length || 0, 'ai.retained': false, 'ai.discard_reason': 'run_changed'}, sessionId, {traceContext, output: {...generated, retained: false, discardReason: 'run_changed'}});
+        continue;
+      }
+      void tracePhoenixEvent('answer_suggestions_result', {'application.field_id': field.id, 'ai.suggestion_count': generated.suggestions?.length || 0, 'ai.retained': true}, sessionId, {traceContext, output: {...generated, retained: true}});
       await validatePageOnly(tabId);
-    } catch(error) {await mutateRun(tabId,current=>{if(current.aiOperations?.[key]?.id!==snapshot.id)return false;current.aiOperations[key].status='failed';current.aiOperations[key].error=error.message;current.llmError=error.message;});}
+    } catch(error) {void tracePhoenixEvent('answer_suggestions_result', {'application.field_id': field.id, 'ai.validation_error': error.message}, sessionId, {traceContext, statusCode: 'ERROR', statusMessage: error.message, output: {retained: false}}); await mutateRun(tabId,current=>{if(current.aiOperations?.[key]?.id!==snapshot.id)return false;current.aiOperations[key].status='failed';current.aiOperations[key].error=error.message;current.llmError=error.message;});}
     finally {releaseDraftField(draftFieldKey(tabId,snapshot.frameId,field),snapshot.id);}
   }};
   await Promise.all([consume(),consume()]);
@@ -3184,4 +3413,5 @@ async function prepareAi(tabId,snapshot,plannerFields,semanticFields,suggestionF
     current.progress='ready';
   });
   await validatePageOnly(tabId);
+  void tracePhoenixEvent('fill_page_result', {'ai.planner_error': Boolean(plannerError), 'ai.semantic_failure': semanticFailure}, sessionId, {traceContext, output: {plannerError, semanticFailure}});
 }

@@ -264,4 +264,10 @@ Save filled values promotes the current captured user values to reusable answers
 
 ## Inspect AI inputs and outputs
 
-Run `powershell -ExecutionPolicy Bypass -File scripts/start-phoenix.ps1`, reload the extension, then open http://127.0.0.1:6006 and select **job-autofill**. The Settings checkbox **Save AI traces to local Phoenix** controls capture. See [Phoenix setup and storage details](docs/phoenix.md).
+Start Phoenix from the project folder:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/start-phoenix.ps1
+```
+
+Then reload the extension, open http://127.0.0.1:6006, and select **job-autofill**. The Settings checkbox **Save AI traces to local Phoenix** controls capture. See [Phoenix setup and storage details](docs/phoenix.md).

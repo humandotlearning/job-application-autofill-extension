@@ -1,11 +1,20 @@
 import assert from 'node:assert/strict';
-import {createPhoenixFetch} from '../src/phoenix.js';
+import {createPhoenixFetch, createPhoenixTrace, tracePhoenixEvent} from '../src/phoenix.js';
 
 const providerUrl = 'https://api.fireworks.ai/inference/v1/chat/completions';
 const session = `setup-${Date.now()}`;
+const traceContext = createPhoenixTrace(session, {'phoenix.action': 'phoenix_setup_check'});
+await tracePhoenixEvent('phoenix_setup_check', {'phoenix.synthetic': true}, session, {
+  enabled: async () => true,
+  fetchImpl: async (url, options) => fetch(url, {...options, headers: {...options.headers, Origin: 'chrome-extension://phoenix-setup-check'}}),
+  traceContext,
+  root: true,
+  input: {synthetic: true},
+});
 let exportedId;
 const traced = createPhoenixFetch(session, {
   enabled: async () => true,
+  traceContext,
   fetchImpl: async (url, options) => {
     if (url === providerUrl) return Response.json({choices: [{message: {role: 'assistant', content: 'Phoenix captured this synthetic response.'}}], usage: {prompt_tokens: 8, completion_tokens: 7, total_tokens: 15}});
     exportedId = JSON.parse(options.body).data[0].context.span_id;
@@ -30,4 +39,5 @@ const output = attrs['output.value'] ?? attrs.output?.value;
 assert.equal(JSON.parse(input).messages[0].content, 'Verify local tracing.');
 assert.equal(JSON.parse(output).choices[0].message.content, 'Phoenix captured this synthetic response.');
 assert.equal(JSON.stringify(found).includes('synthetic-never-export'), false);
-console.log(`Verified Phoenix input/output round-trip: ${found.context.trace_id}`);
+assert.equal(found.parent_id, traceContext.spanId);
+console.log('Verified Phoenix grouped input/output round-trip: ' + found.context.trace_id);
