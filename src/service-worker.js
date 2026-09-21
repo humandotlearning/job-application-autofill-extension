@@ -2180,30 +2180,36 @@ async function checkPage(tabId) {
 async function advancePage(tabId) {
   let run = await checkPage(tabId);
   if (!run || run.status !== 'page_ready' || !run.nextAction) return { ok: false, error: 'The current page is not ready to advance', run };
-  let clicked;
-  try {
-    clicked = await sendToApplicationFrame(tabId, run, {
-      type: 'JOB_APP_CLICK_NEXT',
-      actionId: run.nextAction.id,
-    });
-  } catch (error) {
-    if (!error.frameDiscovery) throw error;
-    return { ok: false, error: error.message, run: await saveRun(pauseForFrame(run, error.frameDiscovery)) };
-  }
-  if (!clicked?.ok) {
-    run.status = 'waiting_user';
-    run.waitingFor = 'ambiguous_navigation';
-    run.actionRequired = [{ reason: clicked?.error || 'The Next control could not be activated' }];
-    run.nextAction = null;
-    return { ok: false, error: run.actionRequired[0].reason, run: await saveRun(run) };
-  }
+  const previous = structuredClone(run);
+  const nextAction = run.nextAction;
   run.pageNumber += 1;
   run.status = 'running';
   run.lastAction = 'next';
   run.waitingFor = null;
   run.waitingLabel = null;
   run.nextAction = null;
-  return { ok: true, run: await saveRun(run) };
+  // Persist the transition before clicking. A full-document navigation can
+  // start the new content script before the click response reaches us.
+  run = await saveRun(run);
+  await notifySiteState(tabId, true);
+  let clicked;
+  try {
+    clicked = await sendToApplicationFrame(tabId, run, {
+      type: 'JOB_APP_CLICK_NEXT',
+      actionId: nextAction.id,
+    });
+  } catch (error) {
+    if (!error.frameDiscovery) throw error;
+    return { ok: false, error: error.message, run: await saveRun(pauseForFrame(previous, error.frameDiscovery)) };
+  }
+  if (!clicked?.ok) {
+    previous.status = 'waiting_user';
+    previous.waitingFor = 'ambiguous_navigation';
+    previous.actionRequired = [{ reason: clicked?.error || 'The Next control could not be activated' }];
+    previous.nextAction = null;
+    return { ok: false, error: previous.actionRequired[0].reason, run: await saveRun(previous) };
+  }
+  return { ok: true, run };
 }
 
 async function focusRunField(tabId, fieldId) {
