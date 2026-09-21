@@ -13,7 +13,7 @@ test('fresh classic bundle executes and same-version reinjection preserves value
   new Script(bundle).runInContext(context);
   assert.equal(listeners.size, 1);
   const ping = await new Promise(resolve => [...listeners][0]({ type: 'JOB_APP_PING' }, {}, resolve));
-  assert.equal(ping.version, 'autofill-ux-6');
+  assert.equal(ping.version, 'autofill-ux-7');
   const result = await new Promise(resolve => [...listeners][0]({ type: 'JOB_APP_INSPECT' }, {}, resolve));
   assert.equal(result.ok, true, result.error);
   assert.equal(result.inspection.fields[0].label, 'Current CTC');
@@ -237,4 +237,59 @@ test('synchronous invalidation during startup is caught without changing page va
   await new Promise(resolve => setTimeout(resolve, 0));
   assert.equal(dom.window.document.querySelector('input').value, 'Unsaved name');
   dom.window.close();
+});
+
+
+test('active content reports structural application changes but ignores ordinary value edits', async () => {
+  const bundle = await readFile(new URL('../dist/content.js', import.meta.url), 'utf8');
+  const dom = new JSDOM('<form aria-label="Job application"><label>Email<input id="email"></label><button type="button">Next</button></form>', {url:'https://jobs.example.com/apply'});
+  const sent = [];
+  const listeners = [];
+  const context = createContext({document:dom.window.document, setTimeout, clearTimeout, console, chrome:{runtime:{
+    onMessage:{addListener:listener=>listeners.push(listener)},
+    sendMessage:async message=>{sent.push(message);return message.type==='JOB_APP_SITE_STATUS' ? {ok:true,enabled:true} : {ok:true};},
+  }}});
+  new Script(bundle).runInContext(context);
+  await new Promise(resolve=>setTimeout(resolve, 30));
+  sent.length = 0;
+  const input = dom.window.document.querySelector('input');
+  input.value = 'kept@example.com';
+  input.dispatchEvent(new dom.window.Event('input', {bubbles:true}));
+  await new Promise(resolve=>setTimeout(resolve, 450));
+  assert.equal(sent.filter(m=>m.type==='JOB_APP_NAVIGATED').length, 0);
+  dom.window.document.querySelector('form').innerHTML = '<label>LinkedIn<input id="linkedin"></label><button type="button">Next</button>';
+  await new Promise(resolve=>setTimeout(resolve, 700));
+  assert.equal(sent.filter(m=>m.type==='JOB_APP_NAVIGATED').length, 1);
+  await new Promise(resolve=>listeners[0]({type:'JOB_APP_SITE_STATE_CHANGED', enabled:false}, {}, resolve));
+  dom.window.document.querySelector('form').innerHTML = '<label>City<input id="city"></label>';
+  await new Promise(resolve=>setTimeout(resolve, 450));
+  assert.equal(sent.filter(m=>m.type==='JOB_APP_NAVIGATED').length, 1);
+  dom.window.close();
+});
+
+
+test('content detects shadow-root steps and labels changed through existing text nodes', async () => {
+  const bundle = await readFile(new URL('../dist/content.js', import.meta.url), 'utf8');
+  const dom = new JSDOM('<div id="app"></div>', {url:'https://jobs.example.com/apply'});
+  const root = dom.window.document.querySelector('#app').attachShadow({mode:'open'});
+  root.innerHTML = '<form aria-label="Job application"><label>Email<input id="answer"></label><button type="button">Next</button></form>';
+  const sent = [], listeners = [];
+  const context = createContext({document:dom.window.document,setTimeout,clearTimeout,console,chrome:{runtime:{
+    onMessage:{addListener:listener=>listeners.push(listener)},
+    sendMessage:async message=>{sent.push(message);return message.type==='JOB_APP_SITE_STATUS' ? {ok:true,enabled:true} : {ok:true};},
+  }}});
+  try {
+    new Script(bundle).runInContext(context);
+    await new Promise(resolve=>setTimeout(resolve,30));
+    sent.length = 0;
+    root.querySelector('form').innerHTML = '<label>LinkedIn<input id="linkedin"></label><button type="button">Next</button>';
+    await new Promise(resolve=>setTimeout(resolve,700));
+    assert.equal(sent.filter(m=>m.type==='JOB_APP_NAVIGATED').length,1);
+    root.querySelector('label').firstChild.data = 'Portfolio';
+    await new Promise(resolve=>setTimeout(resolve,700));
+    assert.equal(sent.filter(m=>m.type==='JOB_APP_NAVIGATED').length,2);
+  } finally {
+    await new Promise(resolve=>listeners[0]({type:'JOB_APP_SITE_STATE_CHANGED',enabled:false},{},resolve));
+    dom.window.close();
+  }
 });

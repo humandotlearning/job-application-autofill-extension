@@ -27,6 +27,7 @@ const elements = {
   primaryAction: byId('primary-action'),
   secondaryActions: byId('secondary-actions'),
   checkPage: byId('check-page'),
+  fillPage: byId('fill-page'),
   advancePage: byId('advance-page'),
   saveAnswers: byId('save-answers'),
   saveHint: byId('save-hint'),
@@ -1157,6 +1158,7 @@ function renderList(container, items, options = {}) {
 function setActionVisibility(run) {
   if (!currentSite.supported || currentSite.disabled) {
     elements.primaryAction.hidden = true;
+    elements.fillPage.hidden = true;
     elements.secondaryActions.hidden = true;
     elements.saveAnswers.hidden = true;
     elements.saveHint.hidden = true;
@@ -1169,10 +1171,11 @@ function setActionVisibility(run) {
   const missingDestination = run?.frame === null;
   const selectForm = ['ambiguous_form', 'selecting_form'].includes(run?.waitingFor);
   elements.primaryAction.disabled = busy || status === 'running';
-  for (const button of [elements.checkPage, elements.advancePage, elements.saveAnswers]) {
+  for (const button of [elements.checkPage, elements.fillPage, elements.advancePage, elements.saveAnswers]) {
     button.disabled = busy || status === 'running';
   }
   elements.primaryAction.hidden = false;
+  elements.fillPage.hidden = !['waiting_user', 'page_ready', 'ready_for_user_submit', 'answers_saved'].includes(status) || run?.waitingFor === 'page_changed' || selectForm;
   elements.checkPage.hidden = !['waiting_user', 'page_ready'].includes(status);
   // Saving stays visible independently of the application’s next step.
   elements.advancePage.hidden = true;
@@ -1192,7 +1195,7 @@ function setActionVisibility(run) {
     return;
   }
   if (status === 'running') elements.primaryAction.textContent = 'Filling this page…';
-  else if (status === 'waiting_user') elements.primaryAction.textContent = selectForm ? 'Select form' : missingDestination ? 'Retry scan' : (run.actionRequired || run.unresolved || [])[0]?.fieldId ? 'Review needed answers' : 'Check again';
+  else if (status === 'waiting_user') elements.primaryAction.textContent = run.waitingFor === 'page_changed' ? 'Fill this page' : selectForm ? 'Select form' : missingDestination ? 'Retry scan' : (run.actionRequired || run.unresolved || [])[0]?.fieldId ? 'Review needed answers' : 'Check again';
   else if (status === 'page_ready') elements.primaryAction.textContent = 'Continue to next page';
   else if (['ready_for_user_submit', 'answers_saved'].includes(status)) elements.primaryAction.textContent = 'Review on site';
   else elements.primaryAction.textContent = 'Fill this form';
@@ -1324,7 +1327,7 @@ function renderRun(run) {
   if (run.status === 'waiting_user') {
     const waitingLabel = String(run.waitingLabel || '').trim();
     const visibleWaitingLabel = waitingLabel && !isOpaqueIdentifier(waitingLabel) ? waitingLabel : '';
-    elements.runHint.textContent = run.frame === null ? (run.actionRequired?.[0]?.reason || 'Retry the scan to find the application form.') : visibleWaitingLabel
+    elements.runHint.textContent = run.waitingFor === 'page_changed' ? 'The application page changed. Fill this page using your saved answers, then review it before continuing.' : run.frame === null ? (run.actionRequired?.[0]?.reason || 'Retry the scan to find the application form.') : visibleWaitingLabel
       ? `Complete “${visibleWaitingLabel}” on the application page, then click Check again.`
       : 'Complete the highlighted field or handle the manual step, then click Check again.';
     setStatus(run.llmError ? 'Couldn’t prepare AI answers. Try Retry AI.' : 'Action is required on the application page.', run.llmError ? 'error' : 'ok', run.llmError || '');
@@ -1415,6 +1418,7 @@ async function sendRunAction(type) {
 
 async function runPrimaryAction() {
   if (currentRun?.status === 'waiting_user') {
+    if (currentRun.waitingFor === 'page_changed') return sendRunAction('JOB_RUN_CHECK_PAGE');
     if (['ambiguous_form', 'selecting_form'].includes(currentRun.waitingFor)) return sendRunAction('JOB_RUN_SELECT_FORM');
     if (currentRun.frame === null) return sendRunAction('JOB_RUN_CHECK_PAGE');
     if (!elements.actionRequiredCard.hidden) {
@@ -1615,6 +1619,7 @@ byId('open-settings').addEventListener('click', () => {
   byId('settings-data').open = true;
   byId('settings-data').querySelector('summary').focus();
 });
+elements.fillPage.addEventListener('click', () => sendRunAction('JOB_RUN_CHECK_PAGE'));
 elements.checkPage.addEventListener('click', () => sendRunAction('JOB_RUN_VALIDATE_PAGE'));
 elements.closeInlineField.addEventListener('click', async () => {
   const session = currentInlineSession;

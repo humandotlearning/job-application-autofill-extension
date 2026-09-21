@@ -1480,3 +1480,26 @@ test('Phoenix setting loads, persists and follows changes from another panel', a
     assert.equal(checkbox.checked, false);
   } finally { harness.cleanup(); }
 });
+
+
+test('changed pages offer a primary fill action and every paused run has a visible refill action', async () => {
+  for (const waitingFor of ['page_changed', 'invalid_field']) {
+    const run = {status:'waiting_user', waitingFor, actionRequired:[{fieldId:'name', label:'Full name'}], optionalUnresolved:[], reviewRequired:[], audit:[]};
+    const h = await setupPanel({run});
+    try {
+      const d = h.dom.window.document;
+      const fill = d.querySelector('#fill-page');
+      assert.ok(fill);
+      if (waitingFor === 'page_changed') {
+        assert.equal(d.querySelector('#primary-action').textContent, 'Fill this page');
+        d.querySelector('#primary-action').click();
+      } else {
+        assert.equal(fill.hidden, false);
+        assert.equal(fill.closest('details'), null);
+        fill.click();
+      }
+      await new Promise(resolve=>setTimeout(resolve, 0));
+      assert.ok(h.sentMessages.some(m=>m.type==='JOB_RUN_CHECK_PAGE'));
+    } finally { h.cleanup(); }
+  }
+});

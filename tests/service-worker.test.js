@@ -3279,3 +3279,52 @@ test('direct AI generation uses saved cover answers and current company context'
   assert.match(JSON.stringify(input.page), /AiPrise/);
   assert.equal(response.run.generatedSuggestions.why.suggestions.length, 1);
 });
+
+
+test('manual same-document navigation exposes the new page without filling and can explicitly fill it', async () => {
+  const h = createHarness({pagesByTab: {7: {pages: [
+    {fields: [{id: 'email', label: 'Email address', type: 'email', required: true}], actions: [{id:'next', label:'Next', kind:'next'}]},
+    {fields: [{id: 'full_name', label: 'Full name', type: 'text', required: true}, {id:'city', label:'City', type:'text', currentValue:'User city'}], actions: [{id:'submit', label:'Submit application', kind:'submit'}]},
+  ]}}});
+  await import(`../src/service-worker.js?manual-page=${Date.now()}`);
+  const first = await h.dispatch({type:'JOB_RUN_START', tabId:7});
+  assert.equal(first.run.status, 'waiting_user');
+  h.tabs.get(7).currentPage = 1;
+  const changed = await h.dispatch({type:'JOB_APP_NAVIGATED'}, {tab:{id:7}, frameId:0});
+  assert.equal(changed.run.waitingFor, 'page_changed');
+  assert.equal(changed.run.pageNumber, 2);
+  assert.equal(changed.run.waitingLabel, null);
+  assert.deepEqual(changed.run.actionRequired.map(f=>f.fieldId), ['full_name']);
+  assert.equal(h.tabs.get(7).frames[0].pages[1].values?.full_name, undefined);
+  const repeated = await h.dispatch({type:'JOB_APP_NAVIGATED'}, {tab:{id:7}, frameId:0});
+  assert.equal(repeated.run.pageNumber, 2);
+  assert.equal(repeated.run.waitingFor, 'page_changed');
+  const filled = await h.dispatch({type:'JOB_RUN_CHECK_PAGE', tabId:7});
+  assert.equal(filled.ok, true, filled.error);
+  assert.equal(h.tabs.get(7).frames[0].pages[1].values.full_name, 'Nithin');
+  assert.equal(h.tabs.get(7).frames[0].pages[1].values.city, undefined);
+  assert.equal(h.tabs.get(7).frames[0].pages[1].fields[1].currentValue, 'User city');
+  assert.equal(h.tabs.get(7).submitCalls, 0);
+});
+
+
+test('manual replacement of an explicitly selected form refreshes the selection used by Fill this page', async () => {
+  const destination = regionId => ({documentId:'document', regionId});
+  const h = createHarness({pagesByTab:{7:{pages:[
+    {destination:destination('old'), fields:[{id:'email',label:'Email address',type:'email',required:true}], actions:[{id:'next',label:'Next',kind:'next'}]},
+    {destination:destination('new'), fields:[{id:'full_name',label:'Full name',type:'text',required:true}], actions:[{id:'submit',label:'Submit application',kind:'submit'}]},
+  ]}}});
+  await import(`../src/service-worker.js?selected-manual-page=${Date.now()}`);
+  await h.dispatch({type:'JOB_RUN_START',tabId:7});
+  h.sessionData.applicationRun['7'].selectedDestination = {...destination('old'),frameId:0};
+  h.tabs.get(7).currentPage = 1;
+  const send = chrome.tabs.sendMessage;
+  chrome.tabs.sendMessage = async (tabId, message, options) => message.destination?.regionId === 'old'
+    ? {ok:false,code:'destination_changed'} : send(tabId,message,options);
+  const changed = await h.dispatch({type:'JOB_APP_NAVIGATED'}, {tab:{id:7},frameId:0});
+  assert.equal(changed.run.waitingFor,'page_changed');
+  assert.equal(changed.run.selectedDestination.regionId,'new');
+  const filled = await h.dispatch({type:'JOB_RUN_CHECK_PAGE',tabId:7});
+  assert.equal(filled.ok,true,filled.error);
+  assert.equal(h.tabs.get(7).frames[0].pages[1].values.full_name,'Nithin');
+});

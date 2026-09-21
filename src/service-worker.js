@@ -2525,8 +2525,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       if (Number.isInteger(tabId)) await invalidateInlineSessions(tabId, Number.isInteger(sender.frameId) ? sender.frameId : 0);
       const run = tabId ? await getRun(tabId) : null;
       const senderFrameId = Number.isInteger(sender?.frameId) ? sender.frameId : 0;
-      if (run?.status !== 'running' || run.lastAction !== 'next') return { ok: true, run };
+      if (!run || !FORM_SESSION_STATUSES.has(run.status)) return { ok: true, run };
       if (!Number.isInteger(run.frame?.frameId) || run.frame.frameId !== senderFrameId) return { ok: true, run };
+      if (run.status !== 'running' || run.lastAction !== 'next') {
+        return { ok: true, run: await validatePageOnly(tabId, {refreshDestination: true}) };
+      }
       const settings = await getSettings();
       return { ok: true, run: await processPage(tabId, { autoAdvance: settings.autoAdvancePages }) };
     })().then(sendResponse).catch((error) => sendResponse({ ok: false, error: error.message }));
@@ -2663,6 +2666,10 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
         await removeRun(tabId);
         return;
       }
+      if (run && SAVABLE_RUN_STATUSES.has(run.status)) {
+        await validatePageOnly(tabId, {refreshDestination: true});
+        return;
+      }
       if (run?.status !== 'running' || run.waitingFor === 'operation_interrupted') return;
       run.frame = null;
       await saveRun(run);
@@ -2746,17 +2753,41 @@ async function mutateRun(tabId, change) {
   return result;
 }
 
-async function validatePageOnly(tabId) {
+async function validatePageOnly(tabId, {refreshDestination = false} = {}) {
   const run = await getRun(tabId);
   if (!run || processingTabs.has(tabId) || saveLocks.has(tabId)) return run;
-  const inspected = await sendToApplicationFrame(tabId, run, {type:'JOB_APP_INSPECT'});
+  const priorFrameId = run.frame?.frameId;
+  let inspected;
+  try {
+    inspected = await sendToApplicationFrame(tabId, run, {type:'JOB_APP_INSPECT'});
+  } catch (error) {
+    if (!refreshDestination || !error.frameDiscovery) throw error;
+    const discovery = await discoverApplicationFrame(tabId, () => assertRunSiteAuthority(tabId, run));
+    if (discovery.errorCode) return saveRun(pauseForFrame(run, discovery));
+    updateSelectedFrame(tabId, run, discovery);
+    inspected = {ok: true, inspection: discovery.inspection};
+  }
   const validated = await sendToApplicationFrame(tabId, run, {type:'JOB_APP_VALIDATE'});
   if (!inspected?.ok || !validated?.ok) throw new Error('The page could not be checked. Try Check again.');
   const inspection = inspected.inspection;
   return mutateRun(tabId, current => {
-    if (current.startedAt !== run.startedAt || current.frame?.frameId !== run.frame?.frameId) return false;
+    if (current.startedAt !== run.startedAt || current.frame?.frameId !== priorFrameId || current.pageSignature !== run.pageSignature) return false;
+    if (refreshDestination) {
+      current.frame = run.frame;
+      current.frameId = run.frameId;
+      if (current.selectedDestination && run.frame.destination) {
+        current.selectedDestination = {...run.frame.destination, frameId: run.frame.frameId};
+      }
+    }
     const signature = pageSignature(inspection,current.frame);
-    if (signature !== current.pageSignature) {
+    const pageChanged = signature !== current.pageSignature;
+    const needsFill = pageChanged || current.waitingFor === 'page_changed';
+    if (pageChanged) {
+      if (current.lastAction !== 'next') current.pageNumber = (current.pageNumber || 1) + 1;
+      current.lastAction = null;
+      current.waitingLabel = null;
+      current.reviewRequired = [];
+      current.jobContext = mergeJobContext(current.jobContext, inspection.page);
       current.pageSignature=signature; current.suggestions={}; current.generatedSuggestions={}; current.semanticSearch={};
       for (const op of Object.values(current.aiOperations || {})) if(op.status==='pending') op.status='interrupted';
     }
@@ -2778,7 +2809,8 @@ async function validatePageOnly(tabId) {
     const next=inspection.actions.filter(action=>action.kind==='next');
     const submit=inspection.actions.filter(action=>action.kind==='submit');
     current.nextAction=null;
-    if(hasBlockingIssues(current,validated.validation)) {current.status='waiting_user';current.waitingFor=current.actionRequired[0]?.reason || 'invalid_field';}
+    if(needsFill) {current.status='waiting_user';current.waitingFor='page_changed';}
+    else if(hasBlockingIssues(current,validated.validation)) {current.status='waiting_user';current.waitingFor=current.actionRequired[0]?.reason || 'invalid_field';}
     else if(next.length===1) {current.status='page_ready';current.nextAction=next[0];current.waitingFor=null;}
     else if(submit.length===1) {current.status='ready_for_user_submit';current.waitingFor=null;}
     else {current.status='waiting_user';current.waitingFor='ambiguous_navigation';}

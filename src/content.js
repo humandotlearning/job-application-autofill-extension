@@ -13,7 +13,7 @@ import {
   selectApplicationField,
   clearApplicationSelection,
 } from './form-engine.js';
-import { eventControl } from './dom.js';
+import { isExtensionElement, eventControl, withDomSnapshot } from './dom.js';
 import { createLearningSession } from './learning.js';
 import { createInlineAutofill } from './inline-autofill.js';
 
@@ -32,7 +32,7 @@ function notifyNavigation() {
   waitForDocumentSettled(document).then(() => sendRuntimeMessage({ type: 'JOB_APP_NAVIGATED' })).catch(() => {});
 }
 
-const CONTENT_VERSION = 'autofill-ux-6';
+const CONTENT_VERSION = 'autofill-ux-7';
 if (!globalThis.__jobApplicationAutofillInstalled) {
   globalThis.__jobApplicationAutofillInstalled = CONTENT_VERSION;
   let inline = null;
@@ -43,6 +43,39 @@ if (!globalThis.__jobApplicationAutofillInstalled) {
   let forcedState = null;
   let selectionRequest = null;
   let selectionTimer = null;
+  let pageObserver = null;
+  let pageChangeTimer = null;
+  let observedPage = null;
+
+  function formShape() {
+    return withDomSnapshot(document, index => {
+      // Mutation observers do not cross shadow boundaries. Refresh the roots
+      // after structural changes so newly inserted component forms are watched.
+      pageObserver?.disconnect();
+      for (const root of index.roots) pageObserver?.observe(root, {
+        subtree: true, childList: true, characterData: true, attributes: true,
+        attributeFilter: ['hidden', 'aria-hidden', 'class', 'style', 'disabled', 'required', 'aria-label'],
+      });
+      const inspection = inspectDocument(document);
+      return JSON.stringify([document.location.href, inspection.destination,
+        inspection.fields.map(field => [field.id, field.label, field.type, field.options]),
+        inspection.actions.map(action => [action.kind, action.label])]);
+    });
+  }
+
+  function schedulePageCheck() {
+    if (!active) return;
+    clearTimeout(pageChangeTimer);
+    pageChangeTimer = setTimeout(() => {
+      if (!active) return;
+      const current = formShape();
+      if (current === observedPage) return;
+      observedPage = current;
+      sendRuntimeMessage({type: 'JOB_APP_NAVIGATED'}).catch(() => {});
+    }, 350);
+  }
+  document.defaultView.addEventListener('popstate', schedulePageCheck);
+  document.defaultView.addEventListener('hashchange', schedulePageCheck);
   const readyPromise = new Promise(resolve => { resolveReady = resolve; });
 
   function cancelSelection() {
@@ -88,6 +121,10 @@ if (!globalThis.__jobApplicationAutofillInstalled) {
   }
 
   function disable() {
+    clearTimeout(pageChangeTimer);
+    pageObserver?.disconnect();
+    pageObserver = null;
+    observedPage = null;
     invalidateDestination();
     if (inline) inline.dispose();
     if (learning) learning.dispose();
@@ -99,6 +136,12 @@ if (!globalThis.__jobApplicationAutofillInstalled) {
   function enable() {
     if (active) return;
     active = true;
+    pageObserver = new document.defaultView.MutationObserver(changes => {
+      if (changes.some(change => !isExtensionElement(change.target)
+        && !(change.type === 'childList' && [...change.addedNodes, ...change.removedNodes]
+          .every(node => node.nodeType === 1 && node.matches('[data-job-inline-autofill]'))))) schedulePageCheck();
+    });
+    observedPage = formShape();
     inline = createInlineAutofill(document, {send: message => sendRuntimeMessage(message), describe: descriptorForElement});
     learning = createLearningSession(document, {
       capture: (options) => collectAnswerRecords(document, options),
@@ -153,9 +196,18 @@ if (!globalThis.__jobApplicationAutofillInstalled) {
           return true;
         case 'JOB_APP_INSPECT_INLINE': {
           if (!active) { sendResponse({ok: false, disabled: true}); break; }
-          const inspection = inspectDocument(document);
+          let focused, focusInspected = false;
+          const inspection = withDomSnapshot(document, () => {
+            const current = inspectDocument(document);
+            if (current.fields.some(field => field.id === message.fieldId && field.handle === message.handle)) {
+              focused = descriptorForElement(document, inline.activeField());
+              focusInspected = true;
+            }
+            return current;
+          });
           inspection.page.url = document.location.href;
-          const focused = descriptorForElement(document, inline.activeField());
+          // A field outside the selected region needs its own temporary selection and fresh snapshot.
+          if (!focusInspected) focused = descriptorForElement(document, inline.activeField());
           if (focused && !inspection.fields.some(field => field.handle === focused.handle)) inspection.fields.push(focused);
           sendResponse({ok: true, inspection, focusedFieldId: focused?.id ?? null, focusedHandle: focused?.handle ?? null,
             rawValue: focused?.rawValue ?? null, editRevision: focused?.editRevision ?? null});
