@@ -16,7 +16,7 @@ test('manifest has only the permissions needed for local autofill', async () => 
   assert.equal(manifest.minimum_chrome_version, '114');
   assert.equal(manifest.version, '0.1.7');
   assert.equal(manifest.side_panel.default_path, 'sidepanel.html');
-  assert.deepEqual(manifest.permissions.sort(), ['activeTab', 'scripting', 'sidePanel', 'storage'].sort());
+  assert.deepEqual(manifest.permissions.sort(), ['activeTab', 'alarms', 'scripting', 'sidePanel', 'storage'].sort());
   assert.equal(manifest.permissions.includes('identity'), false);
   assert.equal('oauth2' in manifest, false);
   assert.ok(manifest.host_permissions.includes('<all_urls>'));

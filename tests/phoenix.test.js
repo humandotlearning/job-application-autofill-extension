@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createPhoenixFetch, tracePhoenixEvent } from '../src/phoenix.js';
+import { createPhoenixFetch, createPhoenixTrace, flushPhoenixQueue, getPhoenixStatus, tracePhoenixEvent } from '../src/phoenix.js';
 
 const url = 'https://api.fireworks.ai/inference/v1/chat/completions';
 const options = { method: 'POST', headers: { Authorization: 'Bearer secret-key' }, body: JSON.stringify({model: 'test-model', messages: [{role: 'user', content: 'Test input'}], response_format: {json_schema: {name: 'answer_planner'}}}) };
@@ -117,4 +117,60 @@ test('collector delay cannot invalidate a completed provider body when its deadl
     server.closeAllConnections();
     await new Promise(resolve => server.close(resolve));
   }
+});
+
+test('child provider spans reuse the action trace and parent span', async () => {
+  const calls = [];
+  const traceContext = createPhoenixTrace('application-2', {'application.field_id': 'name'});
+  const traced = createPhoenixFetch('application-2', {
+    enabled: async () => true,
+    traceContext,
+    fetchImpl: async (endpoint, init) => {
+      calls.push({endpoint, init});
+      return endpoint === url ? Response.json({choices: [{message: {content: 'ok'}}]}) : Response.json({}, {status: 202});
+    },
+  });
+  await (await traced(url, options)).json();
+  const span = JSON.parse(calls[1].init.body).data[0];
+  assert.equal(span.context.trace_id, traceContext.traceId);
+  assert.equal(span.parent_id, traceContext.spanId);
+  assert.equal(span.attributes['session.id'], 'application-2');
+  assert.equal(span.attributes['application.field_id'], 'name');
+});
+
+test('Phoenix persists failed exports and retries them without changing span IDs', async () => {
+  const data = {};
+  globalThis.chrome = {
+    runtime: {id: 'phoenix-test'},
+    storage: {local: {
+      get: async defaults => ({...defaults, ...data}),
+      set: async values => Object.assign(data, values),
+    }},
+  };
+  let attempts = 0;
+  const traced = createPhoenixFetch('queued-session', {
+    enabled: async () => true,
+    fetchImpl: async (endpoint, init) => {
+      if (endpoint === url) return Response.json({choices: [{message: {content: 'queued'}}]});
+      attempts++;
+      return attempts <= 1 ? new Response('offline', {status: 503}) : Response.json({total_queued: 1}, {status: 202});
+    },
+  });
+  await (await traced(url, options)).json();
+  let status = await getPhoenixStatus();
+  assert.equal(status.pending, 1);
+  const queuedId = data.phoenixTraceQueue[0].span.context.span_id;
+  await flushPhoenixQueue({enabled: async () => true, fetchImpl: async (endpoint, init) => {
+    const body = JSON.parse(init.body);
+    assert.equal(body.data[0].context.span_id, queuedId);
+    return Response.json({total_queued: 1}, {status: 202});
+  }});
+  await flushPhoenixQueue({enabled: async () => true, fetchImpl: async (endpoint, init) => {
+    const body = JSON.parse(init.body);
+    assert.equal(body.data[0].context.span_id, queuedId);
+    return Response.json({total_queued: 1}, {status: 202});
+  }});
+  status = await getPhoenixStatus();
+  assert.equal(status.pending, 0);
+  delete globalThis.chrome;
 });

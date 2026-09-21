@@ -40,9 +40,12 @@ function createRequest(entries) {
   const state = { fields: {}, records: [] };
   const recordIds = new Map();
   const questions = {};
+  const fieldMappings = [];
+  const recordMappings = [];
 
   entries.forEach((entry, index) => {
     const fieldId = `f${index}`;
+    fieldMappings.push({transportId: fieldId, fieldId: entry.field.id, fieldHandle: entry.field.handle || ''});
     const choiceField = ['select', 'select-one', 'radio', 'checkbox'].includes(entry.field.type)
       && Array.isArray(entry.field.options) && entry.field.options.length > 0;
     const criteria = { none: choiceField
@@ -56,6 +59,7 @@ function createRequest(entries) {
       if (!recordIds.has(revision)) {
         const recordId = `r${state.records.length}`;
         recordIds.set(revision, recordId);
+        recordMappings.push({transportId: recordId, sourceKey: record.key, sourceId: record.id || record.key});
         state.records.push({
           id: recordId,
           question: record.question,
@@ -86,7 +90,7 @@ function createRequest(entries) {
     };
   });
 
-  return { model: TYPESAFE_MODEL, state, questions };
+  return { payload: { model: TYPESAFE_MODEL, state, questions }, mappings: {fields: fieldMappings, records: recordMappings} };
 }
 
 function validateChoice(answer, criteria) {
@@ -149,12 +153,17 @@ function semanticOptionCandidate(entry, answer, field) {
 export function createSemanticMatcher({fetchImpl, timeoutMs = 5000, traceImpl = tracePhoenixEvent} = {}) {
   const cache = new Map();
 
-  async function execute(entries, apiKey, sessionId) {
-    const request = createRequest(entries);
+  async function execute(entries, apiKey, sessionId, traceContext = null) {
+    const {payload: request, mappings} = createRequest(entries);
+    if (traceContext) traceContext.attributes = {
+      ...(traceContext.attributes || {}),
+      'typesafe.field_map': JSON.stringify(mappings.fields),
+      'typesafe.record_map': JSON.stringify(mappings.records),
+    };
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
     try {
-      const response = await (fetchImpl || createPhoenixFetch(sessionId))(TYPESAFE_URL, {
+      const response = await (fetchImpl || createPhoenixFetch(sessionId, {traceContext}))(TYPESAFE_URL, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
         body: JSON.stringify(request),
@@ -175,8 +184,8 @@ export function createSemanticMatcher({fetchImpl, timeoutMs = 5000, traceImpl = 
           ? { status: 'matched', candidate: record ? semanticCandidate(record, answer, entry.field) : semanticOptionCandidate(entry, answer, entry.field) }
           : { status: 'none' });
       });
-    } catch {
-      entries.forEach(entry => entry.resolve({ status: 'failed' }));
+    } catch (error) {
+      entries.forEach(entry => entry.resolve({ status: 'failed', error: String(error?.message || error) }));
     } finally {
       clearTimeout(timer);
     }
@@ -184,7 +193,7 @@ export function createSemanticMatcher({fetchImpl, timeoutMs = 5000, traceImpl = 
 
   return {
     clear() { cache.clear(); },
-    async match({ fields, records, apiKey, enabled = true, scope = '', retry = false, sessionId = '' }) {
+    async match({ fields, records, apiKey, enabled = true, scope = '', retry = false, sessionId = '', traceContext = null }) {
       if (!enabled || !String(apiKey || '').trim()) {
         return fields.map(field => ({ fieldId: field.id, status: 'skipped' }));
       }
@@ -218,7 +227,7 @@ export function createSemanticMatcher({fetchImpl, timeoutMs = 5000, traceImpl = 
       const batches = [];
       let batch = [];
       for (const entry of newEntries) {
-        const byteLength = entries => new TextEncoder().encode(JSON.stringify(createRequest(entries))).length;
+        const byteLength = entries => new TextEncoder().encode(JSON.stringify(createRequest(entries).payload)).length;
         if (batch.length && byteLength([...batch, entry]) > MAX_REQUEST_BYTES) {
           batches.push(batch);
           batch = [];
@@ -227,7 +236,7 @@ export function createSemanticMatcher({fetchImpl, timeoutMs = 5000, traceImpl = 
         else batch.push(entry);
       }
       if (batch.length) batches.push(batch);
-      await Promise.all(batches.map(entries => execute(entries, String(apiKey).trim(), sessionId)));
+      await Promise.all(batches.map(entries => execute(entries, String(apiKey).trim(), sessionId, traceContext)));
       const results = await Promise.all(waiting);
       const counts = status => results.filter(result => result.status === status).length;
       void Promise.resolve(traceImpl('saved_answer_match_result', {
@@ -237,7 +246,7 @@ export function createSemanticMatcher({fetchImpl, timeoutMs = 5000, traceImpl = 
         'typesafe.shortlist_omitted': newEntries.reduce((sum, entry) => sum + entry.shortlistOmitted, 0),
         'typesafe.no_match': counts('none'), 'typesafe.failed': counts('failed'),
         'typesafe.skipped': counts('skipped'),
-      }, sessionId)).catch(() => {});
+      }, sessionId, {traceContext, output: results})).catch(() => {});
       return results;
     },
   };

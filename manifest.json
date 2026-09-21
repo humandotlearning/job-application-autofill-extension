@@ -4,7 +4,7 @@
   "description": "Fast, accurate local-first job application autofill with optional LLM assistance.",
   "version": "0.1.7",
   "minimum_chrome_version": "114",
-  "permissions": ["activeTab", "scripting", "storage", "sidePanel"],
+  "permissions": ["activeTab", "scripting", "storage", "sidePanel", "alarms"],
   "host_permissions": ["<all_urls>"],
   "content_scripts": [
     {

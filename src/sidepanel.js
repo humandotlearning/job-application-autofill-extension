@@ -9,6 +9,7 @@ const elements = {
   apiModel: byId('ai-model'),
   includeFormScreenshot: byId('include-form-screenshot'),
   phoenixTracing: byId('phoenix-tracing'),
+  phoenixStatus: byId('phoenix-status'),
   autoAdvance: byId('auto-advance-pages'),
   employerName: byId('employer-name'),
   relatedDefault: byId('related-default'),
@@ -333,6 +334,16 @@ function updateDatasourceSummary(datasource = {}) {
     elements.knownDefault.value = datasource.profile.defaults?.knownAtHiringCompany || 'Unknown';
     elements.phoneDeviceDefault.value = datasource.profile.defaults?.phoneDeviceType || 'Unknown';
   }
+}
+
+async function refreshPhoenixStatus() {
+  if (!elements.phoenixStatus) return;
+  const stored = await chrome.storage.local.get({phoenixTraceQueue: [], phoenixTraceStatus: {}});
+  const status = stored.phoenixTraceStatus || {};
+  status.pending = Array.isArray(stored.phoenixTraceQueue) ? stored.phoenixTraceQueue.length : 0;
+  const last = status.lastSuccessAt ? ` Last sent ${new Date(status.lastSuccessAt).toLocaleTimeString()}.` : '';
+  const error = status.lastError ? ` Last error: ${status.lastError}.` : '';
+  elements.phoenixStatus.textContent = `Phoenix delivery: ${status.pending} pending, ${status.dropped} dropped.${last}${error}`;
 }
 
 function renderLearningInbox(items, undoAvailable = false) {
@@ -1480,6 +1491,7 @@ async function refresh() {
   elements.apiModel.value = stored.aiModel || (provider === 'openai' ? stored.openaiModel : '') || defaultModel;
   elements.includeFormScreenshot.checked = stored.includeFormScreenshot !== false;
   elements.phoenixTracing.checked = stored.phoenixTracing !== false;
+  await refreshPhoenixStatus();
   elements.autoAdvance.checked = Boolean(stored.autoAdvancePages);
   updateDatasourceSummary({ answerCount: stored.answerRecords.length });
   const datasourceResponse = await chrome.runtime.sendMessage({ type: 'JOB_DATASOURCE_STATE' });
@@ -1604,6 +1616,7 @@ elements.typesafeEnabled.addEventListener('change', saveTypeSafeSetting);
 elements.phoenixTracing.addEventListener('change', async () => {
   await chrome.storage.local.set({ phoenixTracing: elements.phoenixTracing.checked });
   setStatus(elements.phoenixTracing.checked ? 'Local Phoenix tracing enabled.' : 'AI tracing disabled.');
+  await refreshPhoenixStatus();
 });
 for (const [field, key] of [[elements.employerName, 'employerName'], [elements.relatedDefault, 'relatedToHiringCompany'], [elements.knownDefault, 'knownAtHiringCompany'], [elements.phoneDeviceDefault, 'phoneDeviceType']]) field.addEventListener('change', () => saveProfile(key));
 elements.exportDatasource.addEventListener('click', exportDatasource);
@@ -1654,6 +1667,7 @@ chrome.storage.onChanged.addListener((changes, area) => {
     if (currentRun?.status === 'running') renderRun(currentRun);
   }
   if (area === 'local' && changes.phoenixTracing) elements.phoenixTracing.checked = changes.phoenixTracing.newValue !== false;
+  if (area === 'local' && (changes.phoenixTraceQueue || changes.phoenixTraceStatus || changes.phoenixTracing)) refreshPhoenixStatus().catch(() => {});
   if (area === 'local' && changes.includeFormScreenshot) elements.includeFormScreenshot.checked = changes.includeFormScreenshot.newValue !== false;
   if (area === 'local' && changes.disabledHostnames) refreshSiteState().catch(error => setStatus(error.message, 'error'));
   if (area === 'session' && changes.applicationRun && activeTabId) renderRun(changes.applicationRun.newValue?.[String(activeTabId)] || null);

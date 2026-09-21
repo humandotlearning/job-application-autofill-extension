@@ -6,7 +6,7 @@
 2. Reload this unpacked extension at `chrome://extensions` to load the tracing code.
 3. In Settings, leave **Save AI traces to local Phoenix** enabled (the default).
 4. Use an AI action such as Generate answer, Rewrite, or Fill this page when AI assistance is needed.
-5. Open http://127.0.0.1:6006 and select **job-autofill**. Select a trace to inspect Input, Output and attributes.
+5. Open http://127.0.0.1:6006 and select **job-autofill**. Open the application session whose ID is `tabId:startedAt`; each fill, retry, rewrite, and search action is a root trace with provider calls nested below it.
 
 Local matching and cached answers make no AI request and create no trace. Historical calls cannot be recovered; collection starts after reloading the extension. The synthetic setup check is named `phoenix_setup_check`.
 
@@ -16,9 +16,9 @@ Local matching and cached answers make no AI request and create no trace. Histor
 - Raw response body, including provider errors and malformed JSON.
 - Model, provider, HTTP status, start/end time, and usage tokens when returned by the provider.
 - The operation name: form_interpretation, answer_planner, answer_suggestions, answer_rewriter, or learning_review.
-- Background planner and suggestion calls from the same application are grouped in Phoenix Sessions by tab ID and application start time. Each HTTP call is a separate trace, including screenshot fallback attempts.
+- Every application action uses the same Phoenix Session (`tabId:startedAt`) across pages. Each action is a root trace, with provider HTTP calls and parsed-result spans beneath it. TypeSafe/Jev requests include the complete request and response body; result spans include field outcomes, cache hits, and validation status.
 
-This records the provider HTTP boundary. Subsequent local validation/rejection and form interactions are not captured as spans. A successful HTTP response may still be rejected by the extension's validation.
+Provider HTTP boundaries and subsequent local validation/rejection results are both captured. A successful HTTP response can therefore be compared directly with the parsed result that the extension retained or rejected.
 
 ## Storage and stopping
 
@@ -26,7 +26,7 @@ Phoenix listens at 127.0.0.1:6006 and persists data in this project's `.phoenix/
 
 Turn off **Save AI traces to local Phoenix** to stop capture. Stop a foreground server with Ctrl+C. Use Phoenix's UI to delete traces you no longer need.
 
-Delivery is best-effort: Phoenix must be running when a request finishes; missed traces are not queued for later. Exports time out after 750 ms and cannot replace the AI result with a tracing error. Missing exports generate a warning in the extension service worker console.
+Exports are persisted in a bounded local queue (100 spans, 4 MiB, seven days) before delivery. The queue retries on worker startup and once per minute while Phoenix is unavailable. The Settings panel shows pending, dropped, and last-error counts. Exports time out after 750 ms and never replace the AI result with a tracing error.
 
 ## Reinstall
 
