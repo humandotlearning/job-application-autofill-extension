@@ -17,6 +17,12 @@ function isNarrativeField(field = {}) {
       .test(`${field.label || ''} ${field.helpText || ''}`);
 }
 
+function semanticSkipReason(field, records) {
+  const choice = ['select', 'select-one', 'radio', 'checkbox'].includes(field.type);
+  if (choice && !(field.options || []).some(option => String(option || '').trim())) return 'options_unavailable';
+  return records.some(record => semanticEligible(field, record)) ? '' : 'no_eligible_evidence';
+}
+
 function compactField(field) {
   return Object.fromEntries(Object.entries({
     question: field.label,
@@ -28,6 +34,7 @@ function compactField(field) {
     entityId: field.entityId,
     entityType: field.entityType,
     employmentId: field.employmentId,
+    optionsStatus: field.optionsStatus,
     options: Array.isArray(field.options) ? field.options.slice(0, 255) : undefined,
   }).filter(([, value]) => value != null && value !== ''));
 }
@@ -355,7 +362,7 @@ export function createSemanticMatcher({fetchImpl, timeoutMs = 5000, traceImpl = 
             optionsOmitted: Math.max(0, new Set(field.options || []).size - 254),
             contextTruncated: String(field.helpText || '').length > 1000 || String(field.nearbyContext || '').length > 500});
           else finish({ status: 'none', route: isNarrativeField(field) ? 'narrative' : 'factual',
-            disposition: isNarrativeField(field) ? 'draft' : 'manual',
+            disposition: isNarrativeField(field) ? 'draft' : 'manual', skipReason: semanticSkipReason(field, records),
             coverage: {complete: true, omittedRecords: 0, omittedOptions: 0}, judgments: {}, evidenceRevisions: [] });
           for (const [oldKey, oldValue] of cache) {
             if (cache.size <= MAX_CACHE_ENTRIES) break;
@@ -392,6 +399,7 @@ export function createSemanticMatcher({fetchImpl, timeoutMs = 5000, traceImpl = 
         'typesafe.shortlist_omitted': newEntries.reduce((sum, entry) => sum + entry.shortlistOmitted, 0),
         'typesafe.no_match': counts('none'), 'typesafe.failed': counts('failed'),
         'typesafe.skipped': counts('skipped'),
+        'typesafe.no_request': results.filter(result => result.status === 'none' && result.skipReason).length,
       }, sessionId, {traceContext, output: results})).catch(() => {});
       return results;
     },

@@ -1299,6 +1299,12 @@ async function focusFirstProblem(tabId, run, inspection, validation) {
   return first?.label || '';
 }
 
+function applicationRecordsForLocalReuse(run = {}) {
+  return (run.answers || []).filter(record => ['user', 'autofill'].includes(record?.provenance) && String(record?.answer || '').trim())
+    .map((record, index) => ({...record, key: `application_${Number(record.pageNumber) || 0}_${record.key || index}`,
+      provenance: 'this application', confirmationState: 'confirmed'}));
+}
+
 async function applyPageDecisions(tabId, run, inspection, records, coverMessages, profile = {}, datasourceRevision = '', cycle = {pass: 0, deadline: Date.now() + 8000}) {
   const currentPageSignature = pageSignature(inspection, run.frame);
   if (run.lastAction === 'next' && run.pageSignature === currentPageSignature) {
@@ -1339,7 +1345,7 @@ async function applyPageDecisions(tabId, run, inspection, records, coverMessages
     const validationResponse = await sendToApplicationFrame(tabId, run, { type: 'JOB_APP_VALIDATE' });
     currentValidation = validationResponse?.validation || { ok: false, requiredEmpty: [], invalid: [] };
     const invalidFieldIds = new Set((currentValidation.invalid || []).map((field) => field.fieldId));
-    const localDecisions = planDeterministicFill(scopedFields, records, coverMessages, profile, currentInspection.page).map(decision => {
+    const localDecisions = planDeterministicFill(scopedFields, [...applicationRecordsForLocalReuse(run), ...records], coverMessages, profile, currentInspection.page).map(decision => {
       const field = scopedFields.find(field => field.id === decision.fieldId);
       if (!field) return decision;
       if (field.entityUnresolved) return {...decision, action:'ask_user',value:null,disposition:'manual',reason:'Choose the employer for this work-history section'};
@@ -1415,7 +1421,8 @@ async function approveSuggestion(message) {
     const authority = () => assertRunSiteAuthority(tabId, run);
     const inspected = await sendToFrame(tabId, message.frameId, { type: 'JOB_APP_INSPECT' }, authority);
     const field = resolveEmploymentFields(run, inspected.inspection?.fields || [], (await getDatasource()).profile).find(item => item.id === fieldId);
-    if (!field || field.handle !== message.handle || field.currentValue || JSON.stringify(field.options) !== JSON.stringify(suggestion.field.options)
+    if (!field || field.handle !== message.handle || field.currentValue
+      || (field.widget !== 'custom' && JSON.stringify(field.options) !== JSON.stringify(suggestion.field.options))
       || field.label !== suggestion.field.label || field.type !== suggestion.field.type
       || pageSignature(inspected.inspection, run.frame) !== message.pageSignature) throw new Error('Destination changed; check the page again');
     const applied = await applyReviewedField({
@@ -1872,7 +1879,9 @@ function sameFieldSnapshot(field, snapshot = {}) {
   if (snapshot.editRevision !== undefined && field.editRevision !== snapshot.editRevision) return false;
   if (snapshot.label && field.label !== snapshot.label) return false;
   if (snapshot.fieldType && field.type !== snapshot.fieldType) return false;
-  if (snapshot.fieldOptions && JSON.stringify(field.options || []) !== JSON.stringify(snapshot.fieldOptions)) return false;
+  // Custom menus render their options only while open. Their observed choices
+  // belong to the AI request, while the closed live widget correctly reports none.
+  if (snapshot.fieldOptions && snapshot.fieldWidget !== 'custom' && JSON.stringify(field.options || []) !== JSON.stringify(snapshot.fieldOptions)) return false;
   if (snapshot.fieldConstraints && JSON.stringify(field.constraints || {}) !== JSON.stringify(snapshot.fieldConstraints)) return false;
   if (snapshot.fieldMultiple != null && Boolean(field.multiple) !== Boolean(snapshot.fieldMultiple)) return false;
   for (const key of ['helpText','nearbyContext','section','labelConfidence','entityId','entityType']) {
@@ -1988,7 +1997,7 @@ async function applyReviewedField({ tabId, frameId, applicationId, field, sugges
     ({ candidate, sourceKeys, sources, compatibleEvidence } = await reviewedCandidate(suggestion, message));
   }
   const value = candidate ? String(message.answer ?? candidate.answer).trim() : String(message.answer);
-  const validation = validateFillValue(field, value);
+  const validation = validateFillValue(field.widget === 'custom' ? {...field, options: [], optionsStatus: ''} : field, value);
   const sourceCompatible = !candidate || (candidate.kind === 'planner'
     ? sources.every((item) => compatibleEvidence.some((evidence) => (evidence.sourceKey || evidence.key) === item.key))
     : candidate.kind === 'semantic'
@@ -3132,6 +3141,7 @@ function aiFieldSnapshot(field = {}) {
     rawValue: field.rawValue,
     editRevision: field.editRevision,
     fieldOptions: field.options || [],
+    fieldWidget: field.widget || '',
     fieldConstraints: field.constraints || {},
     fieldMultiple: Boolean(field.multiple),
     helpText: String(field.helpText || ''),
@@ -3150,6 +3160,7 @@ function aiEvidenceRevision(run, inspection, datasource) {
     profile: datasource?.profile || {},
     records: datasource?.answerRecords || [],
     coverMessages: datasource?.coverMessages || [],
+    applicationAnswers: run.answers || [],
     pageFacts: (inspection?.fields || []).map((field) => aiFieldSnapshot(field)),
   });
 }
@@ -3206,6 +3217,30 @@ async function currentSuggestionDestination(tabId, snapshot) {
   return { run, inspection: inspected.inspection };
 }
 
+async function discoverContextOptions(tabId, run, fields) {
+  const deadline = Date.now() + 5000;
+  const ordered = [...fields].filter(field => field.widget === 'custom' && structuredField(field)
+    && !String(field.currentValue || '').trim() && !(field.options || []).length)
+    .sort((left, right) => Number(Boolean(right.required)) - Number(Boolean(left.required)));
+  const discovered = new Map();
+  for (const field of ordered) {
+    if (Date.now() >= deadline) break;
+    try {
+      const response = await sendToApplicationFrame(tabId, run, {
+        type: 'JOB_APP_DISCOVER_OPTIONS', fieldId: field.id, handle: field.handle,
+        timeoutMs: Math.min(1500, deadline - Date.now()),
+      });
+      if (response?.ok && response.fieldId === field.id && response.handle === field.handle) {
+        discovered.set(field.id, {...field, options: response.options || [], structuredOptions: response.structuredOptions || [],
+          optionsStatus: response.optionsStatus || ((response.options || []).length ? 'partial' : 'unavailable')});
+      } else discovered.set(field.id, {...field, optionsStatus: 'unavailable'});
+    } catch {
+      discovered.set(field.id, {...field, optionsStatus: 'unavailable'});
+    }
+  }
+  return fields.map(field => discovered.get(field.id) || field);
+}
+
 async function scheduleAi(tabId,{retry=false}={}) {
   if(backgroundJobs.has(tabId) || processingTabs.has(tabId) || saveLocks.has(tabId)) return;
   const run=await getRun(tabId);
@@ -3227,23 +3262,25 @@ async function scheduleAi(tabId,{retry=false}={}) {
   const validated=await sendToApplicationFrame(tabId,run,{type:'JOB_APP_VALIDATE'});
   const invalidIds=new Set((validated?.validation?.invalid || []).map(field=>field.fieldId));
   const datasource=await getDatasource();
-  const fields=resolveEmploymentFields(run,inspected.inspection.fields,datasource.profile);
+  let fields=resolveEmploymentFields(run,inspected.inspection.fields,datasource.profile);
+  fields=await discoverContextOptions(tabId,run,fields);
   const candidateFields=fields.filter(field=>!String(field.currentValue || '').trim()
     && (!hasUsableSuggestion(run.suggestions?.[field.id]) || invalidIds.has(field.id)) && readableQuestion(field)
-    && inferSensitivity(field.label,field.id)!=='legal' && !field.entityUnresolved);
+    && inferSensitivity(field.label,field.id)!=='legal' && !field.entityUnresolved)
+    .sort((left,right)=>Number(Boolean(right.required))-Number(Boolean(left.required)));
   const unresolved=candidateFields.filter(field=>field.required);
   if(!candidateFields.length) { traceSkip('no_eligible_fields'); return; }
   const planner=run.aiOperations?.planner;
   const retryableStates=new Set(['failed','interrupted']);
   const semanticRetry=retry && unresolved.some(field=>run.semanticSearch?.[field.id]?.status==='failed');
   const plannerFields=(retry
-    ? (retryableStates.has(planner?.status) || semanticRetry ? unresolved : [])
-    : unresolved).filter(field => writingField(field) || structuredField(field)
+    ? (retryableStates.has(planner?.status) || semanticRetry ? candidateFields : [])
+    : candidateFields).filter(field => writingField(field) || structuredField(field)
       || ((settings.typesafeEnabled && typesafeApiKey) && !writingField(field)));
   const suggestionFields=retry
-    ? unresolved.filter(writingField).filter(field=>retryableStates.has(run.aiOperations?.[`suggestion:${field.id}`]?.status) && !run.generatedSuggestions?.[field.id])
-    : unresolved.filter(writingField).filter(field=>!run.generatedSuggestions?.[field.id]);
-  const semanticFields=unresolved.filter(field=>!hasUsableSuggestion(run.suggestions?.[field.id]));
+    ? candidateFields.filter(writingField).filter(field=>retryableStates.has(run.aiOperations?.[`suggestion:${field.id}`]?.status) && !run.generatedSuggestions?.[field.id])
+    : candidateFields.filter(writingField).filter(field=>!run.generatedSuggestions?.[field.id]);
+  const semanticFields=candidateFields.filter(field=>!hasUsableSuggestion(run.suggestions?.[field.id]));
   if(!apiKey && !semanticFields.length) { traceSkip('missing_provider_key'); return; }
   if(!plannerFields.length && !semanticFields.length && !suggestionFields.length) { traceSkip('cached_or_no_pending_ai'); return; }
   const operationFields=[...new Map([...plannerFields,...semanticFields,...suggestionFields].map(field=>[field.id,field])).values()];
@@ -3464,10 +3501,12 @@ async function prepareAi(tabId,snapshot,plannerFields,semanticFields,suggestionF
   plannerFields=plannerFields.filter(field=>!(snapshot.settings.typesafeEnabled&&typesafeApiKey&&writingField(field))
     && selectPlannerEvidence([field],datasource.answerRecords,{limit:1}).length);
   const plannerRecords=selectPlannerEvidence(plannerFields,datasource.answerRecords,{limit:20});
-  let decisions=[]; let plannerError='';
+  let decisions=[]; let plannerRejected=[]; let plannerError='';
   if(plannerFields.length) {
     try {
-      decisions=(await callAnswerPlanner({apiKey,fields:plannerFields,records:plannerRecords,page:snapshot.jobContext},{provider,model,allowPartial:true,sessionId,traceContext})).decisions;
+      const planned=await callAnswerPlanner({apiKey,fields:plannerFields,records:plannerRecords,page:snapshot.jobContext},{provider,model,allowPartial:true,sessionId,traceContext});
+      decisions=planned.decisions;
+      plannerRejected=planned.rejectedDecisions || [];
     }
     catch(error) {plannerError=error.message; void tracePhoenixEvent('answer_planner_result', {'ai.validation_error': error.message}, sessionId, {traceContext, statusCode: 'ERROR', statusMessage: error.message, output: {retained: false}});}
   }
@@ -3491,9 +3530,11 @@ async function prepareAi(tabId,snapshot,plannerFields,semanticFields,suggestionF
     proposed.add(field.id);
     retainedDecisions.push(decision);
   }
-  if (decisions.length) void tracePhoenixEvent('answer_planner_result', {
-    'ai.decision_count': decisions.length, 'ai.retained_decision_count': retainedDecisions.length, 'ai.discarded_decision_count': discardedDecisions.length,
-  }, sessionId, {traceContext, output: {retained: discardedDecisions.length === 0, decisions: retainedDecisions, discarded: discardedDecisions}});
+  if (plannerFields.length) void tracePhoenixEvent('answer_planner_result', {
+    'ai.decision_count': decisions.length + plannerRejected.length, 'ai.retained_decision_count': retainedDecisions.length,
+    'ai.rejected_decision_count': plannerRejected.length, 'ai.discarded_decision_count': discardedDecisions.length,
+  }, sessionId, {traceContext, output: {retained: plannerRejected.length === 0 && discardedDecisions.length === 0,
+    decisions: retainedDecisions, rejected: plannerRejected, discarded: discardedDecisions}});
   for(const field of suggestionFields) if(proposed.has(field.id)) releaseDraftField(draftFieldKey(tabId,snapshot.frameId,field),snapshot.id);
   const immediateIds=new Set(immediateDraftFields.map(field=>field.id));
   const remainingDraftFields=suggestionFields.filter(field=>!proposed.has(field.id)&&!immediateIds.has(field.id))
@@ -3506,5 +3547,6 @@ async function prepareAi(tabId,snapshot,plannerFields,semanticFields,suggestionF
     current.progress='ready';
   });
   await validatePageOnly(tabId);
-  void tracePhoenixEvent('fill_page_result', {'ai.planner_error': Boolean(plannerError), 'ai.semantic_failure': semanticFailure}, sessionId, {traceContext, output: {plannerError, semanticFailure}});
+  void tracePhoenixEvent('fill_page_result', {'ai.planner_error': Boolean(plannerError), 'ai.semantic_failure': semanticFailure,
+    'ai.rejected_decision_count': plannerRejected.length}, sessionId, {traceContext, output: {plannerError, plannerRejected, semanticFailure}});
 }

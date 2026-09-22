@@ -323,6 +323,11 @@ export function validateFillValue(field = {}, value) {
   const text = String(value).trim();
   if (isOpaqueIdentifier(text)) return { ok: false, reason: 'value is an opaque internal identifier' };
   const constraints = field.constraints || {};
+  const type = normalizeText(field.type);
+  if (['select', 'select-one', 'radio'].includes(type) && field.optionsStatus
+    && !(field.options || []).some(option => String(option || '').trim())) {
+    return { ok: false, reason: 'field options are unavailable' };
+  }
   if (Array.isArray(field.options) && field.options.length) {
     const exactOption = field.options.some(option => normalizeText(option) === normalizeText(text));
     const values = field.multiple && !exactOption ? text.split(/\s*[,;]\s*/) : [text];
@@ -339,7 +344,6 @@ export function validateFillValue(field = {}, value) {
       return { ok: false, reason: 'field pattern is invalid' };
     }
   }
-  const type = normalizeText(field.type);
   if (type === 'email' && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(text)) return { ok: false, reason: 'value is not a valid email' };
   if (type === 'url') {
     try {
@@ -354,7 +358,12 @@ export function validateFillValue(field = {}, value) {
     if (!Number.isFinite(numeric)) return { ok: false, reason: 'value is not numeric' };
     if (constraints.min != null && numeric < numberConstraint(constraints.min, -Infinity)) return { ok: false, reason: 'value is below the minimum' };
     if (constraints.max != null && numeric > numberConstraint(constraints.max, Infinity)) return { ok: false, reason: 'value is above the maximum' };
+    if (constraints.step && constraints.step !== 'any') {
+      const step = Number(constraints.step), min = constraints.min != null ? Number(constraints.min) : 0;
+      if (Number.isFinite(step) && step > 0 && Number.isFinite(min) && Math.abs((numeric - min) / step - Math.round((numeric - min) / step)) > 1e-9) return { ok: false, reason: 'value does not match the field step' };
+    }
   }
+  if (type === 'date' && !/^\d{4}-\d{2}-\d{2}$/.test(text)) return { ok: false, reason: 'date must use YYYY-MM-DD' };
   if (type === 'checkbox' && !['yes', 'no', 'true', 'false', 'checked', 'unchecked'].includes(normalizeText(text))) {
     return { ok: false, reason: 'checkbox value must be yes or no' };
   }
