@@ -1875,6 +1875,9 @@ function sameFieldSnapshot(field, snapshot = {}) {
   if (snapshot.fieldOptions && JSON.stringify(field.options || []) !== JSON.stringify(snapshot.fieldOptions)) return false;
   if (snapshot.fieldConstraints && JSON.stringify(field.constraints || {}) !== JSON.stringify(snapshot.fieldConstraints)) return false;
   if (snapshot.fieldMultiple != null && Boolean(field.multiple) !== Boolean(snapshot.fieldMultiple)) return false;
+  for (const key of ['helpText','nearbyContext','section','labelConfidence','entityId','entityType']) {
+    if (Object.hasOwn(snapshot,key) && String(field[key] || '') !== snapshot[key]) return false;
+  }
   return true;
 }
 
@@ -3131,12 +3134,19 @@ function aiFieldSnapshot(field = {}) {
     fieldOptions: field.options || [],
     fieldConstraints: field.constraints || {},
     fieldMultiple: Boolean(field.multiple),
+    helpText: String(field.helpText || ''),
+    nearbyContext: String(field.nearbyContext || ''),
+    section: String(field.section || ''),
+    labelConfidence: String(field.labelConfidence || ''),
+    entityId: String(field.entityId || ''),
+    entityType: String(field.entityType || ''),
   };
 }
 
 function aiEvidenceRevision(run, inspection, datasource) {
   return JSON.stringify({
     context: run.jobContext || {},
+    employmentMappings: run.employmentMappings || {},
     profile: datasource?.profile || {},
     records: datasource?.answerRecords || [],
     coverMessages: datasource?.coverMessages || [],
@@ -3145,7 +3155,7 @@ function aiEvidenceRevision(run, inspection, datasource) {
 }
 
 function aiFingerprint(run, fields, settings, evidenceRevision) {
-  return JSON.stringify({applicationId:run.startedAt,frame:run.frame?.frameId,page:run.pageSignature,fields:fields.map(({id,handle,entityId,employmentId})=>({id,handle,entityId,employmentId})),evidenceRevision,provider:settings.aiProvider,model:settings.aiModel,typesafeEnabled:settings.typesafeEnabled,typesafeAutofillEnabled:settings.typesafeAutofillEnabled,promptVersion:'jev-fast-path-3'});
+  return JSON.stringify({applicationId:run.startedAt,frame:run.frame?.frameId,page:run.pageSignature,fields:fields.map(({id,handle,entityId,employmentId})=>({id,handle,entityId,employmentId})),evidenceRevision,provider:settings.aiProvider,model:settings.aiModel,typesafeEnabled:settings.typesafeEnabled,typesafeAutofillEnabled:settings.typesafeAutofillEnabled,promptVersion:'jev-fast-path-4'});
 }
 
 function suggestionRequestSnapshot(run, field, inspection, datasource, settings, jobContext) {
@@ -3364,7 +3374,10 @@ async function prepareAi(tabId,snapshot,plannerFields,semanticFields,suggestionF
         let ranked=rankSuggestionEvidence(field,evidence,{limit:40});
         const eligibleNarrative=narrativeEvidence(field,evidence);
         if(snapshot.settings.typesafeEnabled&&typesafeApiKey&&eligibleNarrative.length>20){
-          try{ranked=await semanticMatcher.rankNarrative({field,records:eligibleNarrative,apiKey:typesafeApiKey,enabled:true,scope:`${snapshot.startedAt}:${snapshot.pageSignature}`,sessionId,traceContext});}
+          try{
+            const shortlist=rankSuggestionEvidence(field,eligibleNarrative,{limit:eligibleNarrative.length});
+            ranked=await semanticMatcher.rankNarrative({field,records:shortlist,apiKey:typesafeApiKey,enabled:true,scope:`${snapshot.startedAt}:${snapshot.pageSignature}`,sessionId,traceContext});
+          }
           catch(error){void tracePhoenixEvent('jev_narrative_ranking',{'llm.provider':'typesafe','ai.validation_error':error.message},sessionId,{traceContext,statusCode:'ERROR',statusMessage:error.message});}
         }
         const generated=await callAnswerSuggestions({apiKey,field,page:snapshot.jobContext,records:[...savedClosingEvidence(field,datasource),...ranked]},{provider,model,sessionId,traceContext});

@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createSemanticMatcher, TYPESAFE_MODEL } from '../src/typesafe.js';
-import { selectSemanticEvidence, semanticEligible } from '../src/retrieval.js';
+import { rankSuggestionEvidence, selectSemanticEvidence, semanticEligible } from '../src/retrieval.js';
 
 const field = (id, label) => ({id,handle:`h-${id}`,label,labelConfidence:'high',type:'textarea',currentValue:'',rawValue:'',constraints:{}});
 const record = (key, question, answer, extra = {}) => ({key,question,answer,confirmationState:'confirmed',sensitivity:'safe',...extra});
@@ -12,7 +12,7 @@ const answersFor = (body, selections = {}) => Object.fromEntries(Object.entries(
     probabilities:{0:0,1:0,2:0,3:1},legend:{0:question.criteria[0],1:question.criteria[1],2:question.criteria[2],3:question.criteria[3]}}];
   const supplied=selections[id];
   if (supplied && typeof supplied === 'object') return [id,supplied];
-  const choice=supplied || (id.endsWith('_route') ? 'factual' : 'none');
+  const choice=supplied || 'none';
   return [id,{type:'choice',choice,confidence:1,probabilities:Object.fromEntries(Object.keys(question.criteria).map(key=>[key,key===choice?1:0]))}];
 }));
 
@@ -146,11 +146,13 @@ test('maps a confirmed fact to an exact visible option for one-time review', asy
 test('recommends autofill only for complete, high-confidence, low-risk factual matches', async () => {
   const email={...field('email','Email address'),type:'email'};
   const saved=record('email','Email address','person@example.com');
+  let request;
   const matcher=createSemanticMatcher({traceImpl:()=>{},fetchImpl:async(_url,options)=>{
-    const body=JSON.parse(options.body);
-    return jsonResponse({answers:answersFor(body,{f0:'r0'})});
+    request=JSON.parse(options.body);
+    return jsonResponse({answers:answersFor(request,{f0:'r0'})});
   }});
   const [result]=await matcher.match({fields:[email],records:[saved],apiKey:'ts_test'});
+  assert.deepEqual(Object.keys(request.questions),['f0','f0_sufficiency','f0_conflict']);
   assert.equal(result.status,'matched');
   assert.equal(result.route,'factual');
   assert.equal(result.coverage.complete,true);
@@ -182,4 +184,77 @@ test('ranks large narrative evidence pools with Score and returns eight source r
   assert.equal(Object.keys(request.questions).length,21);
   assert.equal(ranked.length,8);
   assert.deepEqual(ranked.map(item=>item.key),records.slice(0,8).map(item=>item.key));
+});
+
+test('narrative ranking keeps only evidence scoring at least useful', async () => {
+  const records=Array.from({length:21},(_,index)=>record(`story-${index}`,'Project example',`Built production system ${index}.`));
+  const matcher=createSemanticMatcher({traceImpl:()=>{},fetchImpl:async(_url,options)=>{
+    const body=JSON.parse(options.body);
+    const scores=[0,1,2,3,...Array(17).fill(0)];
+    const answers=Object.fromEntries(Object.entries(body.questions).map(([id,question],index)=>[id,{
+      type:'score',score:scores[index],confidence:index===2?0.8:1,
+      probabilities:{0:Number(scores[index]===0),1:Number(scores[index]===1),2:Number(scores[index]===2),3:Number(scores[index]===3)},
+      legend:{0:question.criteria[0],1:question.criteria[1],2:question.criteria[2],3:question.criteria[3]},
+    }]));
+    return jsonResponse({answers});
+  }});
+  const ranked=await matcher.rankNarrative({field:field('story','Describe a production project'),records,apiKey:'ts_test'});
+  assert.deepEqual(ranked.map(item=>item.key),['story-3','story-2']);
+});
+
+test('narrative ranking returns no evidence when every score is below useful', async () => {
+  const records=Array.from({length:21},(_,index)=>record(`story-${index}`,'Project example',`Archived project ${index}.`));
+  const matcher=createSemanticMatcher({traceImpl:()=>{},fetchImpl:async(_url,options)=>{
+    const body=JSON.parse(options.body);
+    const answers=Object.fromEntries(Object.entries(body.questions).map(([id,question])=>[id,{
+      type:'score',score:1,confidence:1,probabilities:{0:0,1:1,2:0,3:0},
+      legend:{0:question.criteria[0],1:question.criteria[1],2:question.criteria[2],3:question.criteria[3]},
+    }]));
+    return jsonResponse({answers});
+  }});
+  assert.deepEqual(await matcher.rankNarrative({field:field('story','Describe a production project'),records,apiKey:'ts_test'}),[]);
+});
+
+test('local narrative ordering retains the full eligible pool after lexical matches', () => {
+  const target=field('response','Describe a production project');
+  const records=Array.from({length:21},(_,index)=>record(`archive-${index}`,
+    index===0?'Describe a production project':`Archived example ${index}`,
+    `Built and shipped a production system ${index}.`));
+  const ranked=rankSuggestionEvidence(target,records,{limit:records.length});
+  assert.equal(ranked.length,records.length);
+  assert.equal(ranked[0].key,'archive-0');
+});
+
+test('narrative ranking never sends a request above the local byte limit', async () => {
+  const records=[record('oversized','Project example','x'.repeat(30_000)),
+    ...Array.from({length:20},(_,index)=>record(`story-${index}`,'Project example',`Built production system ${index}.`))];
+  let calls=0;
+  const traces=[];
+  const matcher=createSemanticMatcher({traceImpl:(name,attributes)=>traces.push({name,attributes}),fetchImpl:async()=>{
+    calls+=1;
+    throw new Error('Oversized request should not be sent');
+  }});
+  assert.deepEqual(await matcher.rankNarrative({field:field('story','Describe a production project'),records,apiKey:'ts_test'}),[]);
+  assert.equal(calls,0);
+  assert.equal(traces[0].attributes['typesafe.question_count'],0);
+  assert.equal(traces[0].attributes['typesafe.omitted'],records.length);
+});
+
+test('local narrative ordering preserves a relevant late record through request trimming', async () => {
+  const records=Array.from({length:21},(_,index)=>record(`archive-${index}`,
+    `Archived project ${index}`,
+    `${index===20?'RELEVANT_LATE_RECORD':`Archived evidence ${index}`} ${'detail '.repeat(300)}`,
+    index===20?{aliases:['quuxmarker']}:{}));
+  const target={...field('response','Explain your approach'),helpText:'quuxmarker'};
+  const shortlist=rankSuggestionEvidence(target,records,{limit:records.length});
+  assert.equal(shortlist[0].key,'archive-20');
+  let request;
+  const matcher=createSemanticMatcher({traceImpl:()=>{},fetchImpl:async(_url,options)=>{
+    request=JSON.parse(options.body);
+    return jsonResponse({answers:answersFor(request)});
+  }});
+  await matcher.rankNarrative({field:target,records:shortlist,apiKey:'ts_test'});
+  assert.ok(request.state.records.length<records.length);
+  assert.ok(new TextEncoder().encode(JSON.stringify(request)).length<=24_000);
+  assert.match(request.state.records[0].answer,/RELEVANT_LATE_RECORD/);
 });

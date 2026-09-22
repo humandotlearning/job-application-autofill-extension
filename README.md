@@ -18,7 +18,11 @@ The AI planner receives at most 20 locally selected records. Fields already wait
 
 Enable TypeSafe and add its separate API key in **Settings & data** to find paraphrased saved questions that local matching misses. During **Fill this form**, only unresolved fields without usable suggestions are checked. Beside an individual field, **Find saved answer** starts the same check explicitly; ordinary field focus remains local and makes no TypeSafe request.
 
-The extension sends one batched request with independent Choice questions to pinned model `jev-1.13.0`. Each field can choose one of at most 20 locally compatible, confirmed saved answers or `none`; shared records are sent once. Jev selects—it never writes the answer. Code copies the exact stored answer only at confidence 0.8 or higher and still requires review. A five-second deadline has no automatic retry. Unchanged matches and no-match results are cached for the session, and duplicate concurrent searches share one request. A successful match skips planning and draft generation for that field.
+The extension sends one batched request to pinned model `jev-1.13.0`. Each field has three independent judgments: a Choice selects a locally compatible confirmed answer or visible option, one Noul judges whether the evidence is sufficient, and one Noul judges whether eligible records conflict. The Choice protocol allows 254 candidates plus `none`; a 24 KB local request limit can reduce that count. Shared records are sent once. Jev selects and judges evidence—it never writes the answer.
+
+Code accepts a match only when Choice confidence is at least 0.8, sufficiency is at least 0.8, and conflict is at most 0.2. Matches normally require review. Optional guarded autofill is limited to complete-coverage, low-risk factual fields with selected probability at least 0.98, confidence at least 0.90, sufficiency at least 0.98, and conflict at most 0.02; all existing local safety checks still apply. A five-second deadline has no automatic retry. Unchanged matches and no-match results are cached for the session, duplicate concurrent searches share one request, and a successful match skips planning and draft generation for that field.
+
+For narrative fields with more than 20 eligible records, local evidence ranking orders the entire pool before the 24 KB limit removes records from the tail. Jev then scores the submitted records for drafting usefulness. Only records scoring at least 2 (useful for part of the answer) are retained, ordered by score and confidence, with at most eight returned. If every submitted record scores below 2, no evidence is returned. Lexical ranking is used as a fallback only when the Jev ranking request fails.
 
 Hard checks for employer/person scope, compensation meaning, qualifications, suppression, destination state, source revision, constraints, and page readback run locally before and after matching. Hierarchical classification is intentionally not used for this bounded flat shortlist because it would add dependent request rounds without improving the final action space.
 
@@ -35,16 +39,18 @@ flowchart TD
     D -->|Yes| F[Hard compatibility filters]
     F --> G{Eligible saved answers?}
     G -->|None| H[No clear match; no request]
-    G -->|Yes| I[Rank locally; include up to 20 compatible records]
+    G -->|Yes| I[Rank locally; include up to 254 compatible records within 24 KB]
     I --> J{Cached or concurrent request?}
     J -->|Cached| K[Reuse match or no-match outcome]
-    J -->|New| L[Batch independent field Choice questions]
+    J -->|New| L[Batch selection, sufficiency, and conflict judgments]
     L --> M[POST to TypeSafe Jev 1.13.0]
     M --> N{Response within 5 seconds?}
     N -->|No / invalid| O[Could not search; preserve local state; Retry]
-    N -->|Yes| P{Selected record and confidence >= 0.8?}
+    N -->|Yes| P{Selection >= 0.8, sufficiency >= 0.8, conflict <= 0.2?}
     P -->|No / none| H
-    P -->|Yes| Q[Show original question + complete saved answer]
+    P -->|Yes| X{Opt-in guarded autofill gates pass?}
+    X -->|No| Q[Show original question + complete saved answer]
+    X -->|Yes| T
     K --> Q
     Q --> R{User approves}
     R -->|Edit and use| S[Edit proposal; keep approval required]
@@ -162,7 +168,7 @@ AI has five separate roles; a page can cause multiple requests:
 
 | Role | Input | Result |
 | --- | --- | --- |
-| TypeSafe saved-answer match | Unresolved questions plus up to 20 compatible saved questions and complete answers per field | One exact stored answer or `none`; review always required |
+| TypeSafe saved-answer match | Unresolved questions plus up to 254 compatible saved questions and complete answers per field, subject to a 24 KB request limit | One exact stored answer or visible option, or `none`; review by default with optional guarded factual autofill |
 | Planner | Unresolved descriptors, title/domain, up to 20 selected records | Evidence-backed proposal requiring approval |
 | Suggestions | One question, job context, up to 40 readable records | Up to three composed drafts for review |
 | Rewrite | Draft, user instruction, job context, up to 20 records | Revised draft, never a direct page mutation |

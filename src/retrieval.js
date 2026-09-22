@@ -95,20 +95,22 @@ function rankEvidence(field, records = [], { limit = 40 } = {}) {
 export function rankSuggestionEvidence(field, records = [], { limit = 40 } = {}) {
   const evidence = rankEvidence(field, records, { limit });
   const matched = evidence.map(item => records.find(record => (record.id || record.key) === item.sourceId && record.key === item.sourceKey)).filter(Boolean);
-  if (matched.length || !isNarrativeDraftField(field)) return matched;
+  if (!isNarrativeDraftField(field) || matched.length >= limit) return matched;
 
   const targetKey = suggestionTargetKey(field);
+  const matchedRecords = new Set(matched);
   const queryTokens = new Set(normalizeText([field.label, field.helpText, field.id].filter(Boolean).join(' ')).split(' ').filter(token => token.length > 2));
-  return records
-    .filter(record => isSafeNarrativeEvidence(field, record, targetKey))
+  const remaining = records
+    .filter(record => !matchedRecords.has(record) && isSafeNarrativeEvidence(field, record, targetKey))
     .map((record, index) => {
       const text = normalizeText([record.question, record.answer, ...(record.aliases || [])].filter(Boolean).join(' '));
       const overlap = text.split(' ').reduce((score, token) => score + Number(queryTokens.has(token)), 0);
       return { record, index, score: overlap };
     })
     .sort((a, b) => b.score - a.score || a.index - b.index)
-    .slice(0, limit)
+    .slice(0, limit - matched.length)
     .map(item => item.record);
+  return [...matched, ...remaining];
 }
 
 function isNarrativeDraftField(field = {}) {

@@ -6,7 +6,9 @@ import { JSDOM } from 'jsdom';
 
 const jevAnswers = (body, selected = {}) => Object.fromEntries(Object.entries(body.questions).map(([id, question]) => {
   if (question.type === 'noul') return [id, {type:'noul',noul:id.endsWith('_conflict')?0:1}];
-  const choice=selected[id] || (id.endsWith('_route')?'factual':'none');
+  if (question.type === 'score') return [id,{type:'score',score:3,confidence:1,
+    probabilities:{0:0,1:0,2:0,3:1},legend:Object.fromEntries(question.criteria.map((criterion,index)=>[index,criterion]))}];
+  const choice=selected[id] || 'none';
   return [id,{type:'choice',choice,confidence:0.99,
     probabilities:Object.fromEntries(Object.keys(question.criteria).map(key=>[key,key===choice?0.99:0.01/(Object.keys(question.criteria).length-1)]))}];
 }));
@@ -504,6 +506,70 @@ async function waitUntil(predicate) {
   for (let i = 0; i < 100 && !predicate(); i++) await new Promise(resolve => setTimeout(resolve, 5));
   assert.ok(predicate(), 'Expected deferred provider operation to start');
 }
+
+test('pending JEV results are discarded when semantic field context changes', async () => {
+  for (const property of ['helpText','nearbyContext','section','labelConfidence','entityId','entityType']) {
+    const harness=createHarness({answerRecords:[
+      {key:'reliability',question:'Engineering achievement',answer:'Reduced production outages with health checks and automated rollback.',sensitivity:'safe'},
+      {key:'teamwork',question:'Leadership example',answer:'Led a team through a difficult migration.',sensitivity:'safe'},
+    ],
+    pagesByTab:{7:{pages:[{page:{title:'Application',domain:'jobs.example.com'},fields:[
+      {id:'impact',handle:'impact-h',label:'How have you made systems safer?',type:'textarea',required:true,
+        rawValue:'',editRevision:0,helpText:'Original help',nearbyContext:'Original context'},
+      {id:'collaboration',handle:'collaboration-h',label:'How do you help groups work well together?',type:'textarea',required:true,
+        rawValue:'',editRevision:0},
+    ],actions:[]}]}}});
+    harness.localData.typesafeEnabled=true;
+    harness.localData.typesafeApiKey='ts_test';
+    let release;
+    globalThis.fetch=async(_url,options)=>{
+      const body=JSON.parse(options.body);
+      await new Promise(resolve=>{release=resolve;});
+      return {ok:true,status:200,json:async()=>({answers:jevAnswers(body,{f0:'r0',f1:'r1'})})};
+    };
+    await import(`../src/service-worker.js?test=typesafe-stale-${property}-${Date.now()}`);
+    const starting=harness.dispatch({type:'JOB_RUN_START',tabId:7});
+    await waitUntil(()=>Boolean(release));
+    harness.tabs.get(7).frames[0].pages[0].fields[0][property]=`Changed ${property}`;
+    release();
+    const started=await starting;
+    assert.equal(started.ok,true,started.error);
+    assert.equal(started.run.suggestions?.impact,undefined,property);
+    assert.equal(harness.tabs.get(7).messages.some(message=>message.type==='JOB_APP_APPLY'),false,property);
+  }
+});
+
+test('pending JEV results are discarded when the employment mapping changes', async () => {
+  const harness=createHarness({answerRecords:[
+    {key:'reliability',question:'Engineering achievement',answer:'Reduced production outages with health checks and automated rollback.',sensitivity:'safe'},
+    {key:'teamwork',question:'Leadership example',answer:'Led a team through a difficult migration.',sensitivity:'safe'},
+  ],
+  pagesByTab:{7:{pages:[{page:{title:'Application',domain:'jobs.example.com'},fields:[
+    {id:'impact',handle:'impact-h',label:'How have you made systems safer?',type:'textarea',required:true,
+      rawValue:'',editRevision:0},
+    {id:'collaboration',handle:'collaboration-h',label:'How do you help groups work well together?',type:'textarea',required:true,
+      rawValue:'',editRevision:0},
+  ],actions:[]}]}}});
+  harness.localData.typesafeEnabled=true;
+  harness.localData.typesafeApiKey='ts_test';
+  let release;
+  globalThis.fetch=async(_url,options)=>{
+    const body=JSON.parse(options.body);
+    await new Promise(resolve=>{release=resolve;});
+    return {ok:true,status:200,json:async()=>({answers:jevAnswers(body,{f0:'r0',f1:'r1'})})};
+  };
+  await import(`../src/service-worker.js?test=typesafe-stale-employment-${Date.now()}`);
+  const starting=harness.dispatch({type:'JOB_RUN_START',tabId:7});
+  await waitUntil(()=>Boolean(release));
+  const run=harness.sessionData.applicationRun['7'];
+  run.employmentMappings={[`${run.pageSignature}:work-1`]:'emp-b'};
+  release();
+  const started=await starting;
+  assert.equal(started.ok,true,started.error);
+  assert.equal(started.run.suggestions?.impact,undefined);
+  assert.equal(harness.tabs.get(7).messages.some(message=>message.type==='JOB_APP_APPLY'),false);
+});
+
 const inlineAcceptance = (query, overrides = {}) => ({ type: 'JOB_INLINE_ACCEPT', sessionId: query.sessionId, requestId: 'accept-1', candidateId: query.candidates[0].candidateId, acceptanceToken: 'content-token', ...overrides });
 async function inlineHarness({ field = {}, page = {}, sessionActive = true, ...options } = {}) {
   const harness = createHarness({pagesByTab: {7: {pages: [{page: {title: 'Job application', domain: 'jobs.example.com'}, fields: [
