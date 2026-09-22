@@ -4,6 +4,7 @@ const elements = {
   fireworksApiKey: byId('fireworks-api-key'),
   openaiApiKey: byId('openai-api-key'),
   typesafeEnabled: byId('typesafe-enabled'),
+  typesafeAutofillEnabled: byId('typesafe-autofill-enabled'),
   typesafeApiKey: byId('typesafe-api-key'),
   apiKey: byId('openai-api-key'),
   apiModel: byId('ai-model'),
@@ -1283,6 +1284,9 @@ function renderRun(run) {
   const optionalUnresolved = run.optionalUnresolved || [];
   const reviewRequired = run.reviewRequired || [];
   const audit = run.audit || [];
+  const semanticAutofills = run.semanticAutofills || [];
+  const filledCount = audit.length + semanticAutofills.filter(fill => !audit.some(item =>
+    item.question === fill.label && String(item.answer) === String(fill.value))).length;
   elements.runHint.hidden = false;
   elements.runTitle.textContent = run.status === 'running' ? 'Filling this page…'
     : run.frame === null ? 'Let’s find your form'
@@ -1291,7 +1295,7 @@ function renderRun(run) {
     : ['page_ready', 'ready_for_user_submit'].includes(run.status) ? 'This page is filled'
     : 'Current application';
   elements.runSummary.textContent = run.frame === null ? 'Choose or rescan the application form.'
-    : `${audit.length} filled value${audit.length === 1 ? '' : 's'}${reviewRequired.length ? ` · ${reviewRequired.length} to review` : ''}${actionRequired.length ? ` · ${actionRequired.length} need answers` : ''}${run.frame?.interpretationMode ? ` · AI ${run.frame.interpretationMode} context` : ''}`;
+    : `${filledCount} filled value${filledCount === 1 ? '' : 's'}${semanticAutofills.length ? ` · ${semanticAutofills.length} filled by JEV` : ''}${reviewRequired.length ? ` · ${reviewRequired.length} to review` : ''}${actionRequired.length ? ` · ${actionRequired.length} need answers` : ''}${run.frame?.interpretationMode ? ` · AI ${run.frame.interpretationMode} context` : ''}`;
   const failedAi = Object.values(run.aiOperations || {}).some((operation) => ['failed', 'interrupted'].includes(operation?.status || operation));
   elements.retryAi.hidden = !failedAi && !run.llmError;
   elements.employmentChoices.replaceChildren();
@@ -1477,7 +1481,7 @@ async function refresh() {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
   activeTabId = tab?.id || null;
   await refreshSiteState();
-  const stored = await chrome.storage.local.get({ answerRecords: [], openaiApiKey: '', fireworksApiKey: '', typesafeApiKey: '', typesafeEnabled: false, aiProvider: '', aiModel: '', openaiModel: 'gpt-5.6-terra', includeFormScreenshot: true, autoAdvancePages: false, phoenixTracing: true });
+  const stored = await chrome.storage.local.get({ answerRecords: [], openaiApiKey: '', fireworksApiKey: '', typesafeApiKey: '', typesafeEnabled: false, typesafeAutofillEnabled: false, aiProvider: '', aiModel: '', openaiModel: 'gpt-5.6-terra', includeFormScreenshot: true, autoAdvancePages: false, phoenixTracing: true });
   const provider = stored.aiProvider === 'openai' || stored.aiProvider === 'fireworks'
     ? stored.aiProvider
     : (stored.openaiApiKey ? 'openai' : 'fireworks');
@@ -1488,6 +1492,8 @@ async function refresh() {
   elements.openaiApiKey.value = stored.openaiApiKey || '';
   elements.typesafeApiKey.value = stored.typesafeApiKey || '';
   elements.typesafeEnabled.checked = Boolean(stored.typesafeEnabled);
+  elements.typesafeAutofillEnabled.checked = Boolean(stored.typesafeAutofillEnabled);
+  elements.typesafeAutofillEnabled.disabled = !elements.typesafeEnabled.checked;
   elements.apiModel.value = stored.aiModel || (provider === 'openai' ? stored.openaiModel : '') || defaultModel;
   elements.includeFormScreenshot.checked = stored.includeFormScreenshot !== false;
   elements.phoenixTracing.checked = stored.phoenixTracing !== false;
@@ -1575,8 +1581,16 @@ async function saveScreenshotSetting() {
 }
 
 async function saveTypeSafeSetting() {
-  await chrome.storage.local.set({ typesafeEnabled: Boolean(elements.typesafeEnabled.checked) });
-  setStatus(elements.typesafeEnabled.checked ? 'TypeSafe saved-answer search enabled.' : 'TypeSafe saved-answer search disabled.');
+  const typesafeEnabled = Boolean(elements.typesafeEnabled.checked);
+  const typesafeAutofillEnabled = typesafeEnabled && Boolean(elements.typesafeAutofillEnabled.checked);
+  elements.typesafeAutofillEnabled.disabled = !typesafeEnabled;
+  await chrome.storage.local.set({ typesafeEnabled, typesafeAutofillEnabled });
+  setStatus(typesafeEnabled ? 'JEV-assisted filling enabled.' : 'JEV-assisted filling disabled.');
+}
+
+async function saveTypeSafeAutofillSetting() {
+  await chrome.storage.local.set({ typesafeAutofillEnabled: Boolean(elements.typesafeEnabled.checked && elements.typesafeAutofillEnabled.checked) });
+  setStatus(elements.typesafeAutofillEnabled.checked ? 'Low-risk JEV autofill enabled.' : 'Low-risk JEV matches require review.');
 }
 
 async function saveProfile(changedField) {
@@ -1613,6 +1627,7 @@ elements.apiModel.addEventListener('blur', saveModel);
 elements.autoAdvance.addEventListener('change', saveSettings);
 elements.includeFormScreenshot.addEventListener('change', saveScreenshotSetting);
 elements.typesafeEnabled.addEventListener('change', saveTypeSafeSetting);
+elements.typesafeAutofillEnabled.addEventListener('change', saveTypeSafeAutofillSetting);
 elements.phoenixTracing.addEventListener('change', async () => {
   await chrome.storage.local.set({ phoenixTracing: elements.phoenixTracing.checked });
   setStatus(elements.phoenixTracing.checked ? 'Local Phoenix tracing enabled.' : 'AI tracing disabled.');

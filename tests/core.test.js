@@ -228,6 +228,13 @@ test('validates options, patterns, lengths, and numeric bounds', () => {
 test('only high-confidence safe short answers are unreviewed', () => {
   const field = { type: 'text', label: 'Full name' };
   assert.equal(shouldReviewDecision({ confidence: 'high', sensitivity: 'safe', value: 'Nithin', confirmationState: 'confirmed', matchKind: 'exact' }, field), false);
+  const semantic = { sensitivity: 'safe', value: 'person@example.com', confirmationState: 'confirmed', matchKind: 'semantic', compatible: true,
+    semantic: { coverageComplete: true, selectedProbability: 0.99, confidence: 0.96, sufficiency: 0.99, conflict: 0.01 } };
+  assert.equal(shouldReviewDecision(semantic, { type: 'email', label: 'Email address', labelConfidence: 'high' }), false);
+  assert.equal(shouldReviewDecision({ ...semantic, semantic: { ...semantic.semantic, coverageComplete: false } },
+    { type: 'email', label: 'Email address', labelConfidence: 'high' }), true);
+  assert.equal(shouldReviewDecision({ ...semantic, value: '100000' },
+    { type: 'text', label: 'Salary expectation', labelConfidence: 'high' }), true);
   assert.equal(shouldReviewDecision({ confidence: 'medium', sensitivity: 'safe', value: 'Nithin' }, field), true);
   assert.equal(shouldReviewDecision({ confidence: 'high', sensitivity: 'review', value: '14 days' }, field), true);
   assert.equal(shouldReviewDecision({ confidence: 'high', sensitivity: 'safe', value: 'long answer' }, { type: 'textarea' }), true);

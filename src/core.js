@@ -361,6 +361,23 @@ export function validateFillValue(field = {}, value) {
   return { ok: true, reason: 'valid' };
 }
 
+export function lowRiskSemanticField(field = {}) {
+  if (field.widget || field.multiple || field.entityUnresolved || field.labelConfidence !== 'high'
+    || !['text', 'email', 'tel', 'url', 'select', 'select-one', 'radio'].includes(field.type)
+    || inferSensitivity(field.label, field.id) !== 'safe') return false;
+  const concept = canonicalConcept(field.label);
+  return ['generic_name', 'first_name', 'last_name', 'full_name', 'preferred_name', 'email',
+    'phone_number', 'phone_country_code', 'phone_device_type', 'address_line_1', 'address_line_2',
+    'city', 'postal_code', 'state', 'github_url', 'linkedin_url', 'portfolio_url', 'current_employer',
+    'current_city', 'current_location', 'employer', 'company', 'job_title', 'role', 'school',
+    'university', 'degree', 'highest_degree', 'field_of_study'].includes(concept);
+}
+
+export function semanticAutofillQualified(semantic = {}) {
+  return semantic.coverageComplete === true && semantic.selectedProbability >= 0.98
+    && semantic.confidence >= 0.90 && semantic.sufficiency >= 0.98 && semantic.conflict <= 0.02;
+}
+
 export function decideDisposition(decision = {}, field = {}) {
   const manual = reason => ({ disposition: 'manual', reason });
   const review = reason => ({ disposition: 'review', reason });
@@ -376,6 +393,8 @@ export function decideDisposition(decision = {}, field = {}) {
   if (sensitivity !== 'safe' || decision.sensitivity !== 'safe') return review('Sensitive answer requires approval');
   if (normalizeText(field.type) === 'textarea' || String(decision.value).length > 240 || /describe|tell us|why.*(?:join|company|work)|motivat/.test(normalizeText(field.label))) return review('Narrative answer requires approval');
   if (decision.confirmationState !== 'confirmed') return review('Saved answer is not confirmed');
+  if (decision.matchKind === 'semantic' && decision.compatible === true && lowRiskSemanticField(field)
+    && semanticAutofillQualified(decision.semantic)) return { disposition: 'autofill', reason: 'Validated low-risk JEV match' };
   if (!['exact', 'concept'].includes(decision.matchKind) || decision.confidence !== 'high') return review('Match requires explicit approval');
   return { disposition: 'autofill', reason: 'Unique confirmed compatible short fact' };
 }
