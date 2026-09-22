@@ -25,30 +25,31 @@ test('browser controller detaches after an observation and a trusted click', asy
   const controller = createBrowserController(browser);
   assert.deepEqual(await controller.observe(5), {ok: true, controls: []});
   assert.deepEqual(await controller.click(5, {x: 10, y: 20, width: 30, height: 40}), {ok: true});
+  assert.deepEqual(await controller.click(5, {x: 10, y: 20, width: 30, height: 40}, 3), {ok: false, code: 'frame_control_unavailable'});
   assert.equal(calls.filter(call => call[0] === 'attach').length, 2);
   assert.equal(calls.filter(call => call[0] === 'detach').length, 2);
   assert.equal(calls.filter(call => call[2] === 'Input.dispatchMouseEvent').length, 2);
 });
 
-test('browser controller includes accessibility controls from flat child-frame sessions', async () => {
+test('browser controller waits for delayed nested child-frame sessions', async () => {
   const listeners = [];
   const browser = {debugger: {
     onEvent: {addListener: listener => listeners.push(listener)},
     onDetach: {addListener: () => {}},
     attach: async () => {}, detach: async () => {},
     sendCommand: async (session, method) => {
-      if (method === 'Target.setAutoAttach' && !session.sessionId) {
-        queueMicrotask(() => listeners.forEach(listener => listener({tabId: 5}, 'Target.attachedToTarget', {sessionId: 'child-frame'})));
-      }
+      if (method === 'Target.setAutoAttach' && !session.sessionId) setTimeout(() => listeners.forEach(listener => listener({tabId: 5}, 'Target.attachedToTarget', {sessionId: 'child-frame'})), 5);
+      if (method === 'Target.setAutoAttach' && session.sessionId === 'child-frame') setTimeout(() => listeners.forEach(listener => listener({tabId: 5, sessionId: 'child-frame'}, 'Target.attachedToTarget', {sessionId: 'grandchild-frame'})), 5);
       if (method === 'Accessibility.getFullAXTree') {
-        return {nodes: [{nodeId: session.sessionId ? 'child' : 'root', role: {value: 'textbox'}, name: {value: session.sessionId ? 'Experience' : 'Name'}}]};
+        const name = session.sessionId === 'grandchild-frame' ? 'Education' : session.sessionId ? 'Experience' : 'Name';
+        return {nodes: [{nodeId: session.sessionId || 'root', role: {value: 'textbox'}, name: {value: name}}]};
       }
       return {};
     },
   }};
   const observed = await createBrowserController(browser).observe(5);
   assert.equal(observed.ok, true);
-  assert.deepEqual(observed.controls.map(control => control.name).sort(), ['Experience', 'Name']);
+  assert.deepEqual(observed.controls.map(control => control.name).sort(), ['Education', 'Experience', 'Name']);
   assert.equal(observed.controls.find(control => control.name === 'Experience').sessionId, 'child-frame');
 });
 

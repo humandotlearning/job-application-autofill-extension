@@ -814,7 +814,7 @@ async function formScreenshot(tabId, inspected, enabled) {
 
 async function enrichAccessibilityInspection(tabId, inspection) {
   const accessibility = await browserController.observe(tabId);
-  return accessibility.ok ? mergeAccessibilityInspection(inspection, accessibility.controls) : inspection;
+  return accessibility.ok ? mergeAccessibilityInspection(inspection, accessibility.controls.filter(control => !control.sessionId)) : inspection;
 }
 
 function interpretInspection(inspection, interpretation) {
@@ -2029,30 +2029,47 @@ async function applyReviewedField({ tabId, frameId, applicationId, field, sugges
   if (!validation.ok || !sourceCompatible || inferSensitivity(field.label, field.id) === 'legal') {
     throw new Error(validation.ok ? 'This destination requires manual entry' : validation.reason);
   }
-  const request = {
+  const currentSnapshot = async () => {
+    const inspected = await sendToFrame(tabId, frameId, {type: 'JOB_APP_INSPECT'}, assertAuthority);
+    const current = inspected.inspection?.fields.find(item => item.id === field.id && item.handle === field.handle);
+    if (!current || current.currentValue !== field.currentValue || !sameFieldSnapshot(current, aiFieldSnapshot(field))) {
+      throw new Error('The field changed before the answer could be applied');
+    }
+    return {field: current, revision: inspected.inspection.observation?.revision || ''};
+  };
+  const requestFor = ({field: current, revision}) => ({
     type: 'JOB_APP_APPLY',
     applicationId,
+    observationRevision: revision,
     ...(approvalGuard ? {approvalGuard} : {}),
     decisions: [{
-      fieldId: field.id,
-      handle: field.handle,
+      fieldId: current.id,
+      handle: current.handle,
       action: 'fill',
       approved: true,
       value,
       evidenceKeys: sourceKeys,
-      sensitivity: inferSensitivity(field.label, field.id),
+      sensitivity: inferSensitivity(current.label, current.id),
       confidence: 'high',
       reason: candidate ? 'Explicitly approved saved answer' : 'Explicitly entered draft answer',
       ...(approvalGuard || {}),
+      expectedRawValue: current.rawValue ?? '',
+      expectedEditRevision: current.editRevision ?? 0,
     }],
-  };
-  let result = await sendToFrame(tabId, frameId, request, assertAuthority);
-  const needsTrustedOpen = field.widget === 'custom' && field.rect && result?.ok
+  });
+  let snapshot = await currentSnapshot();
+  let result = await sendToFrame(tabId, frameId, requestFor(snapshot), assertAuthority);
+  const needsTrustedOpen = frameId === 0 && field.widget === 'custom' && field.rect && result?.ok
     && result.result?.unresolved?.some(item => item.fieldId === field.id && /did not reveal any options/i.test(item.reason || ''));
-  if (needsTrustedOpen) await sendToFrame(tabId, frameId, {type: 'JOB_APP_EXPECT_TRUSTED_INPUT', handle: field.handle}, assertAuthority);
-  if (needsTrustedOpen && (await browserController.click(tabId, field.rect)).ok) {
-    assertAuthority?.();
-    result = await sendToFrame(tabId, frameId, request, assertAuthority);
+  if (needsTrustedOpen) {
+    await sendToFrame(tabId, frameId, {type: 'JOB_APP_EXPECT_TRUSTED_INPUT', handle: field.handle}, assertAuthority);
+    const opened = await browserController.click(tabId, field.rect, frameId);
+    await sendToFrame(tabId, frameId, {type: 'JOB_APP_EXPECT_TRUSTED_INPUT', clear: true}, assertAuthority);
+    if (opened.ok) {
+      snapshot = await currentSnapshot();
+      assertAuthority?.();
+      result = await sendToFrame(tabId, frameId, requestFor(snapshot), assertAuthority);
+    }
   }
   if (!result?.ok) throw new Error(result?.error || 'Could not apply the answer');
   assertAuthority?.();

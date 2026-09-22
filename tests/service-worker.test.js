@@ -785,6 +785,10 @@ test('inline panel child-frame focus and edited saved approval use the live sess
   const applied = await harness.dispatch({type: 'JOB_RUN_APPROVE_SUGGESTION', ...origin, sourceKey: 'full_name', answer: 'Nithin edited'});
   assert.equal(applied.ok, true, applied.error); assert.ok(applied.inlineSession);
   assert.equal(harness.tabs.get(7).frames[0].pages[0].values.name, 'Nithin edited');
+  const apply = harness.tabs.get(7).messages.find(message => message.type === 'JOB_APP_APPLY');
+  assert.ok(apply.observationRevision);
+  assert.equal(apply.decisions[0].expectedRawValue, '');
+  assert.equal(apply.decisions[0].expectedEditRevision, 0);
   assert.equal(harness.sessionData.applicationRun?.['7']?.status, 'answers_saved');
 });
 

@@ -240,9 +240,8 @@ if (!globalThis.__jobApplicationAutofillInstalled) {
           return true;
         }
         case 'JOB_APP_EXPECT_TRUSTED_INPUT':
-          document.__jobApplicationExpectedTrustedInput = {
-            handle: message.handle || '', remaining: 3, expiresAt: Date.now() + 1_000,
-          };
+          if (message.clear) delete document.__jobApplicationExpectedTrustedInput;
+          else document.__jobApplicationExpectedTrustedInput = {handle: message.handle || '', remaining: 1, expiresAt: Date.now() + 250};
           sendResponse({ok: true});
           break;
         case 'JOB_APP_CAPTURE':

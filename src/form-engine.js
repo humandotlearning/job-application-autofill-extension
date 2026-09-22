@@ -147,6 +147,7 @@ function ensureEditTracking(document) {
     if (isExtensionElement(element)) return;
     if (!element || element.__jobApplicationAutofillDispatch || document.__jobApplicationDiscovering
       || (document.__jobApplicationFilling && !event.isTrusted)) return;
+    const expectedTrustedInput = event.isTrusted && consumeExpectedTrustedInput(element);
     if (event.type === 'click') {
       const listbox = composedClosest(composedClosest(element, '[role="option"]'), '[role="listbox"]');
       if (!listbox?.id) return;
@@ -154,7 +155,6 @@ function ensureEditTracking(document) {
       if (!element) return;
       delete element.__jobApplicationSearchQuery;
     }
-    const expectedTrustedInput = event.isTrusted && consumeExpectedTrustedInput(element);
     if (document.__jobApplicationFilling && event.isTrusted && !expectedTrustedInput) document.__jobApplicationUserInterrupted = true;
     if (expectedTrustedInput) return;
     if (event.type === 'blur' && !element.__jobApplicationUserEdited) return;

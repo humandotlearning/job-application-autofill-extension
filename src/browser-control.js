@@ -1,4 +1,5 @@
 const CONTROL_ROLES = new Set(['textbox', 'combobox', 'checkbox', 'radio', 'listbox', 'option', 'button']);
+const ATTACH_SETTLE_MS = 75;
 
 function valueOf(value) {
   return String(value?.value ?? value ?? '');
@@ -51,6 +52,7 @@ export function mergeAccessibilityInspection(inspection, controls = []) {
 export function createBrowserController(browser = globalThis.chrome) {
   const attached = new Set();
   const childSessions = new Map();
+  const childAttachJobs = new Map();
   const target = tabId => ({tabId});
   let listenersInstalled = false;
 
@@ -64,14 +66,33 @@ export function createBrowserController(browser = globalThis.chrome) {
       sessions.set(params.sessionId, session);
       childSessions.set(source.tabId, sessions);
       // Flat sessions must recursively opt into child iframe targets.
-      browser.debugger.sendCommand(session, 'Target.setAutoAttach', {
-        autoAttach: true, waitForDebuggerOnStart: false, flatten: true, filter: [{type: 'iframe', exclude: false}],
-      }).catch(() => {});
+      void enableChildFrames(session, true);
     });
     browser.debugger.onDetach?.addListener?.(source => {
       attached.delete(source.tabId);
       childSessions.delete(source.tabId);
+      childAttachJobs.delete(source.tabId);
     });
+  }
+
+  function enableChildFrames(session, ignoreFailure = false) {
+    const work = browser.debugger.sendCommand(session, 'Target.setAutoAttach', {
+      autoAttach: true, waitForDebuggerOnStart: false, flatten: true, filter: [{type: 'iframe', exclude: false}],
+    });
+    const tracked = ignoreFailure ? work.catch(() => {}) : work;
+    const jobs = childAttachJobs.get(session.tabId) || new Set();
+    jobs.add(tracked);
+    childAttachJobs.set(session.tabId, jobs);
+    void tracked.finally(() => jobs.delete(tracked)).catch(() => {});
+    return tracked;
+  }
+
+  async function waitForChildFrames(tabId) {
+    const deadline = Date.now() + ATTACH_SETTLE_MS;
+    while (Date.now() < deadline) {
+      await Promise.all([...((childAttachJobs.get(tabId) || new Set()))]);
+      await new Promise(resolve => setTimeout(resolve, Math.min(10, deadline - Date.now())));
+    }
   }
 
   async function attach(tabId) {
@@ -88,17 +109,16 @@ export function createBrowserController(browser = globalThis.chrome) {
     if (!attached.delete(tabId)) return;
     try { await browser.debugger.detach?.(target(tabId)); } catch { /* Chrome can detach first. */ }
     childSessions.delete(tabId);
+    childAttachJobs.delete(tabId);
   }
 
   async function observe(tabId) {
     try {
       await attach(tabId);
       if (browser?.debugger?.onEvent?.addListener) {
-        await browser.debugger.sendCommand(target(tabId), 'Target.setAutoAttach', {
-          autoAttach: true, waitForDebuggerOnStart: false, flatten: true, filter: [{type: 'iframe', exclude: false}],
-        });
+        await enableChildFrames(target(tabId));
+        await waitForChildFrames(tabId);
       }
-      await Promise.resolve();
       const sessions = [target(tabId), ...(childSessions.get(tabId)?.values() || [])];
       const trees = await Promise.all(sessions.map(async session => {
         await browser.debugger.sendCommand(session, 'Accessibility.enable');
@@ -113,7 +133,8 @@ export function createBrowserController(browser = globalThis.chrome) {
     }
   }
 
-  async function click(tabId, rect) {
+  async function click(tabId, rect, frameId = 0) {
+    if (frameId !== 0) return {ok: false, code: 'frame_control_unavailable'};
     if (!rect || ![rect.x, rect.y, rect.width, rect.height].every(Number.isFinite) || rect.width <= 0 || rect.height <= 0) {
       return {ok: false, code: 'invalid_target'};
     }
