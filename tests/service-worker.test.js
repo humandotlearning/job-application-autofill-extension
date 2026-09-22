@@ -72,7 +72,8 @@ function createHarness({
       required: false,
       currentValue: '',
       ...field,
-      ...(Object.hasOwn(field, 'rawValue') ? {rawValue: Object.hasOwn(valueOverrides, field.id) ? valueOverrides[field.id] : field.rawValue} : {}),
+      rawValue: Object.hasOwn(valueOverrides, field.id) ? valueOverrides[field.id] : (field.rawValue ?? ''),
+      editRevision: field.editRevision ?? 0,
       currentValue: Object.prototype.hasOwnProperty.call(valueOverrides, field.id)
         ? valueOverrides[field.id]
         : (field.currentValue || ''),
@@ -90,10 +91,13 @@ function createHarness({
   function inspectionFor(tabId, frameId = 0) {
     const frame = frameFor(tabId, frameId);
     const page = frame.pages[frame.currentPage];
+    const fields = page.fields.map((field) => materializeField(field, page.values || {}));
+    const actions = page.actions || [];
     return {
       page: {...(page.page || { title: frame.context.title || `Step ${frame.currentPage + 1}`, domain: frame.context.domain || 'jobs.example.com' })},
-      fields: page.fields.map((field) => materializeField(field, page.values || {})),
-      actions: page.actions || [],
+      fields,
+      actions,
+      observation: {revision: JSON.stringify({controls: fields.map(field => [field.id, field.handle, field.type, field.currentValue, field.rawValue, field.editRevision]), actions})},
       pauseReasons: page.pauseReasons || [],
       ...(page.destination ? {destination: page.destination} : {}),
       ...(page.discovery ? {discovery: page.discovery} : {}),
@@ -178,13 +182,17 @@ function createHarness({
             optionsStatus: result.optionsStatus || (result.options?.length ? 'partial' : 'unavailable')};
         }
         if (message.type === 'JOB_APP_APPLY') {
+          if (message.observationRevision && message.observationRevision !== inspectionFor(tabId, frameId).observation.revision) {
+            return {ok: false, code: 'destination_changed', error: 'The form changed before the answer could be applied.'};
+          }
           await page.beforeApply?.({ page, message, tabId, frameId });
           const failed = [];
           for (const decision of message.decisions || []) {
             if (decision.action !== 'fill') continue;
             const field = page.fields.find(field => field.id === decision.fieldId);
-            if ((Object.hasOwn(decision, 'expectedRawValue') && (page.values?.[field.id] ?? field.rawValue) !== decision.expectedRawValue)
-              || (Object.hasOwn(decision, 'expectedEditRevision') && field.editRevision !== decision.expectedEditRevision)) {
+            const live = materializeField(field, page.values || {});
+            if ((Object.hasOwn(decision, 'expectedRawValue') && live.rawValue !== decision.expectedRawValue)
+              || (Object.hasOwn(decision, 'expectedEditRevision') && live.editRevision !== decision.expectedEditRevision)) {
               failed.push({ fieldId: decision.fieldId, reason: 'Destination changed' });
               continue;
             }
