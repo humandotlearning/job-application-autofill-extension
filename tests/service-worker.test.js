@@ -72,7 +72,8 @@ function createHarness({
       required: false,
       currentValue: '',
       ...field,
-      ...(Object.hasOwn(field, 'rawValue') ? {rawValue: Object.hasOwn(valueOverrides, field.id) ? valueOverrides[field.id] : field.rawValue} : {}),
+      rawValue: Object.hasOwn(valueOverrides, field.id) ? valueOverrides[field.id] : (field.rawValue ?? ''),
+      editRevision: field.editRevision ?? 0,
       currentValue: Object.prototype.hasOwnProperty.call(valueOverrides, field.id)
         ? valueOverrides[field.id]
         : (field.currentValue || ''),
@@ -90,10 +91,13 @@ function createHarness({
   function inspectionFor(tabId, frameId = 0) {
     const frame = frameFor(tabId, frameId);
     const page = frame.pages[frame.currentPage];
+    const fields = page.fields.map((field) => materializeField(field, page.values || {}));
+    const actions = page.actions || [];
     return {
       page: {...(page.page || { title: frame.context.title || `Step ${frame.currentPage + 1}`, domain: frame.context.domain || 'jobs.example.com' })},
-      fields: page.fields.map((field) => materializeField(field, page.values || {})),
-      actions: page.actions || [],
+      fields,
+      actions,
+      observation: {revision: JSON.stringify({controls: fields.map(field => [field.id, field.handle, field.type, field.currentValue, field.rawValue, field.editRevision]), actions})},
       pauseReasons: page.pauseReasons || [],
       ...(page.destination ? {destination: page.destination} : {}),
       ...(page.discovery ? {discovery: page.discovery} : {}),
@@ -178,13 +182,17 @@ function createHarness({
             optionsStatus: result.optionsStatus || (result.options?.length ? 'partial' : 'unavailable')};
         }
         if (message.type === 'JOB_APP_APPLY') {
+          if (message.observationRevision && message.observationRevision !== inspectionFor(tabId, frameId).observation.revision) {
+            return {ok: false, code: 'destination_changed', error: 'The form changed before the answer could be applied.'};
+          }
           await page.beforeApply?.({ page, message, tabId, frameId });
           const failed = [];
           for (const decision of message.decisions || []) {
             if (decision.action !== 'fill') continue;
             const field = page.fields.find(field => field.id === decision.fieldId);
-            if ((Object.hasOwn(decision, 'expectedRawValue') && (page.values?.[field.id] ?? field.rawValue) !== decision.expectedRawValue)
-              || (Object.hasOwn(decision, 'expectedEditRevision') && field.editRevision !== decision.expectedEditRevision)) {
+            const live = materializeField(field, page.values || {});
+            if ((Object.hasOwn(decision, 'expectedRawValue') && live.rawValue !== decision.expectedRawValue)
+              || (Object.hasOwn(decision, 'expectedEditRevision') && live.editRevision !== decision.expectedEditRevision)) {
               failed.push({ fieldId: decision.fieldId, reason: 'Destination changed' });
               continue;
             }
@@ -433,36 +441,20 @@ test('Fill this page batches unresolved saved-answer choices and skips drafting 
   assert.deepEqual(started.run.generatedSuggestions, {});
 });
 
-test('custom dropdown discovery gives JEV its rendered choices', async () => {
+test('background AI leaves unopened custom dropdowns untouched', async () => {
   const harness = createHarness({answerRecords: [{key: 'travel', question: 'Travel availability', answer: 'India', sensitivity: 'safe'}],
     pagesByTab: {7: {pages: [{page: {title: 'Application', domain: 'jobs.example.com'}, fields: [
       {id: 'full_name', handle: 'name-h', label: 'Full name', type: 'text', required: true, currentValue: 'Nithin', rawValue: 'Nithin', editRevision: 0},
       {id: 'country', handle: 'country-h', label: 'Country', type: 'select', widget: 'custom', required: true, rawValue: '', editRevision: 0},
-    ], discoveredOptions: {country: {options: ['India'], structuredOptions: [{label: 'India', value: 'IN'}], optionsStatus: 'partial'}}, actions: []}]}}});
+    ], actions: []}]}}});
   harness.localData.typesafeEnabled = true;
   harness.localData.typesafeApiKey = 'ts_test';
-  const calls = [];
-  globalThis.fetch = async (_url, options) => {
-    const body = JSON.parse(options.body);
-    calls.push(body);
-    return {ok: true, status: 200, json: async () => ({answers: jevAnswers(body, {f0: 'o0'})})};
-  };
+  globalThis.fetch = async () => ({ok: true, status: 200, json: async () => ({answers: {}})});
   await import(`../src/service-worker.js?test=custom-options-${Date.now()}`);
   const started = await harness.dispatch({type: 'JOB_RUN_START', tabId: 7});
   assert.equal(started.ok, true, started.error);
-  assert.equal(harness.tabs.get(7).messages.some(message => message.type === 'JOB_APP_DISCOVER_OPTIONS'), true);
-  await waitUntil(() => calls.length === 1);
-  assert.deepEqual(Object.values(calls[0].state.fields)[0].options, ['India']);
-  await waitUntil(() => Boolean(harness.sessionData.applicationRun['7'].suggestions.country));
-  const run = harness.sessionData.applicationRun['7'];
-  const suggestion = run.suggestions.country;
-  const candidate = suggestion.candidates[0];
-  assert.equal(candidate.kind, 'semantic_option');
-  const approved = await harness.dispatch({type: 'JOB_RUN_APPROVE_SUGGESTION', tabId: 7,
-    frameId: suggestion.frameId, applicationId: suggestion.applicationId, pageSignature: suggestion.pageSignature,
-    fieldId: 'country', handle: suggestion.field.handle, sourceKeys: candidate.sourceKeys});
-  assert.equal(approved.ok, true, approved.error);
-  assert.equal(harness.tabs.get(7).frames[0].pages[0].values.country, 'India');
+  assert.equal(harness.tabs.get(7).messages.some(message => message.type === 'JOB_APP_DISCOVER_OPTIONS'), false);
+  assert.equal(harness.tabs.get(7).frames[0].pages[0].values?.country, undefined);
 });
 
 test('opt-in JEV autofill applies a guarded low-risk option without user approval or learning promotion', async () => {
@@ -801,6 +793,10 @@ test('inline panel child-frame focus and edited saved approval use the live sess
   const applied = await harness.dispatch({type: 'JOB_RUN_APPROVE_SUGGESTION', ...origin, sourceKey: 'full_name', answer: 'Nithin edited'});
   assert.equal(applied.ok, true, applied.error); assert.ok(applied.inlineSession);
   assert.equal(harness.tabs.get(7).frames[0].pages[0].values.name, 'Nithin edited');
+  const apply = harness.tabs.get(7).messages.find(message => message.type === 'JOB_APP_APPLY');
+  assert.ok(apply.observationRevision);
+  assert.equal(apply.decisions[0].expectedRawValue, '');
+  assert.equal(apply.decisions[0].expectedEditRevision, 0);
   assert.equal(harness.sessionData.applicationRun?.['7']?.status, 'answers_saved');
 });
 

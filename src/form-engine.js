@@ -40,7 +40,7 @@ function isUtilityRegion(region) {
   const label = [region.id, region.getAttribute('role'), region.getAttribute('aria-label'), region.getAttribute('name'),
     ...queryAll(region, 'h1,h2,h3,legend').filter(el => composedClosest(el, 'form,[role="form"]') === region).map(composedText),
     ...queryAll(region, 'button,input[type="submit"]').filter(el => composedClosest(el, 'form,[role="form"]') === region).map(actionLabel)].join(' ');
-  return /\b(?:subscribe|newsletter|job.?alerts?|login|sign.?in)\b/i.test(label)
+  return /\b(?:subscribe|newsletter|job.?alerts?|login|sign.?in|chat|ask\s+(?:a\s+)?follow.?up)\b/i.test(label)
     || region.getAttribute('role') === 'search' || /^search$/i.test(region.id || '');
 }
 
@@ -121,6 +121,7 @@ function inApplication(document, element) {
   if (selectedField) return element === selectedField;
   if (root !== document) {
     const owner = composedClosest(element, 'form,[role="form"]') || element.form;
+    if (owner && owner !== root && isUtilityRegion(owner)) return false;
     if (owner && owner !== root && applicationRegions(document).candidates.includes(owner)) return false;
     return composedContains(root, element) || element.form === root;
   }
@@ -130,11 +131,23 @@ function inApplication(document, element) {
 
 function ensureEditTracking(document) {
   if (trackedDocuments.has(document)) return;
+  const consumeExpectedTrustedInput = (element) => {
+    const expected = document.__jobApplicationExpectedTrustedInput;
+    if (!expected || Date.now() > expected.expiresAt) {
+      delete document.__jobApplicationExpectedTrustedInput;
+      return false;
+    }
+    if (expected.handle && expected.handle !== controlHandle(element)) return false;
+    expected.remaining -= 1;
+    if (expected.remaining <= 0) delete document.__jobApplicationExpectedTrustedInput;
+    return true;
+  };
   const markEdited = (event) => {
     let element = eventControl(event);
     if (isExtensionElement(element)) return;
     if (!element || element.__jobApplicationAutofillDispatch || document.__jobApplicationDiscovering
       || (document.__jobApplicationFilling && !event.isTrusted)) return;
+    const expectedTrustedInput = event.isTrusted && consumeExpectedTrustedInput(element);
     if (event.type === 'click') {
       const listbox = composedClosest(composedClosest(element, '[role="option"]'), '[role="listbox"]');
       if (!listbox?.id) return;
@@ -142,6 +155,8 @@ function ensureEditTracking(document) {
       if (!element) return;
       delete element.__jobApplicationSearchQuery;
     }
+    if (document.__jobApplicationFilling && event.isTrusted && !expectedTrustedInput) document.__jobApplicationUserInterrupted = true;
+    if (expectedTrustedInput) return;
     if (event.type === 'blur' && !element.__jobApplicationUserEdited) return;
     if (event.type === 'input' || event.type === 'change') {
       element.__jobApplicationEditRevision = (element.__jobApplicationEditRevision || 0) + 1;
@@ -240,26 +255,34 @@ function fieldRequired(element) {
     if (group?.getAttribute('aria-required') === 'true') return true;
     if (group) labels.push(group.querySelector(':scope > legend'), ...referenced(group));
   }
-  return labels.filter(Boolean).some(label => labelBadge(label, label) === 'required'
-    || [...label.querySelectorAll('span,sup,abbr')].some(badge => labelBadge(badge, label) === 'required'));
+  if (labels.filter(Boolean).some(label => labelBadge(label, label) === 'required'
+    || [...label.querySelectorAll('span,sup,abbr')].some(badge => labelBadge(badge, label) === 'required'))) return true;
+  const question = nearbyQuestionElement(element);
+  return Boolean(question && (/(?:required)\s*$/i.test(question.textContent || '')
+    || /[*✱]\s*$/.test(question.textContent || '')));
 }
 
-function nearbyQuestion(element) {
+function nearbyQuestionElement(element) {
   const controls = 'input:not([type="hidden"]),textarea,select,[role="combobox"],button[aria-haspopup="listbox"]';
   for (let wrapper = composedParent(element), depth = 0; wrapper && depth < 6; wrapper = composedParent(wrapper), depth++) {
     if (wrapper.matches('form,section,main,body')) break;
     const peers = [...queryAll(wrapper, controls)].filter(isVisible);
     if (peers.some(peer => peer !== element && !(['radio', 'checkbox'].includes(element.type) && peer.type === element.type
       && element.name && peer.name === element.name && peer.form === element.form))) break;
-    const candidates = [...queryAll(wrapper, '.application-label .text,h3,h4,[role="heading"],legend,label')]
+    const candidates = [...queryAll(wrapper, '.application-label .text,h3,h4,[role="heading"],legend,label,p,[data-field-label],.font-semibold')]
       .filter(node => isVisible(node) && !node.contains(element) && !node.querySelector(controls)
         && !node.matches('[for]') && !node.closest('[role="alert"],.error,.help,.hint')
         && Boolean(node.compareDocumentPosition(element) & 4));
-    const labels = [...new Set(candidates.map(labelText).filter(text => text && text.length <= 500))];
-    if (labels.length > 1) return '';
-    if (labels.length === 1) return labels[0];
+    const labels = new Map(candidates.map(node => [labelText(node), node]).filter(([text]) => text && text.length <= 500));
+    if (labels.size > 1) return null;
+    if (labels.size === 1) return [...labels.values()][0];
   }
-  return '';
+  return null;
+}
+
+function nearbyQuestion(element) {
+  const question = nearbyQuestionElement(element);
+  return question ? labelText(question) : '';
 }
 
 function questionMetadata(document, element) {
@@ -356,9 +379,9 @@ function customWidgetElements(document) {
     .filter((element) => !hasNativeFormAction(element))
     .filter((element) => inApplication(document, element) && !isControlDisabled(element) && !element.readOnly && element.getAttribute('aria-readonly') !== 'true')
     .filter((element) => isVisible(element))
-    .filter((element) => composedClosest(element, 'form, main, [role="main"]') || hasNearbyFormControl(element))
+    .filter((element) => composedClosest(element, 'form, main, [role="main"]') || hasNearbyFormControl(element) || nearbyQuestion(element))
     .filter((element) => element.getAttribute('aria-label') || element.getAttribute('name')
-      || textFromIds(element, element.getAttribute('aria-labelledby')) || associatedLabelText(document, element) || hasNearbyFormControl(element)));
+      || textFromIds(element, element.getAttribute('aria-labelledby')) || associatedLabelText(document, element) || hasNearbyFormControl(element) || nearbyQuestion(element)));
 }
 
 function hasNearbyFormControl(element) {
@@ -575,6 +598,7 @@ function describeField(document, element, index) {
   const descriptor = {
     id: fieldIdentity(element, index, [...formElements(document), ...customWidgetElements(document)]),
     handle: controlHandle(element),
+    rect: visualRect(element),
     multiple: grouped || Boolean(element.multiple),
     ...(grouped ? {widget: 'checkbox-group'} : {}),
     selectedValues: element.tagName === 'SELECT' ? [...element.selectedOptions].filter((option) => option.value).map((option) => option.value) : [],
@@ -613,6 +637,7 @@ function collectFieldDescriptorsImpl(document) {
     .map((element, index) => ({ element, field: {
       id: fieldIdentity(element, formElements(document).length + index, [...formElements(document), ...customElements]),
       handle: controlHandle(element),
+      rect: visualRect(element),
       multiple: element.getAttribute('aria-multiselectable') === 'true' || rootElementById(element, element.getAttribute('aria-controls'))?.getAttribute('aria-multiselectable') === 'true',
       structuredOptions: customWidgetOptions(document, element).map((option) => ({ label: customOptionText(option), value: customOptionValue(option), selected: option.getAttribute('aria-selected') === 'true', disabled: option.getAttribute('aria-disabled') === 'true' })),
       label: customWidgetLabel(document, element),
@@ -816,29 +841,6 @@ function waitForCustomOptions(document, element, answer, timeoutMs = 1500) {
     };
     check();
   });
-}
-
-// Discovery opens a menu only long enough to read its rendered choices. It never
-// types, selects, or keeps the menu open, so it cannot change the application value.
-export async function discoverFieldOptions(document, fieldId, expectedHandle, { timeoutMs = 1500 } = {}) {
-  const field = collectFieldDescriptors(document).find(candidate => candidate.id === fieldId && candidate.handle === expectedHandle);
-  if (!field) return { ok: false, reason: 'The field changed before options could be read' };
-  if (field.widget !== 'custom') return { ok: true, fieldId, handle: expectedHandle, options: field.options, structuredOptions: field.structuredOptions || [], optionsStatus: 'complete' };
-  const element = elementForField(document, fieldId);
-  if (!element || controlHandle(element) !== expectedHandle || hasNativeFormAction(element)) return { ok: false, reason: 'The field changed before options could be read' };
-  const wasOpen = element.getAttribute('aria-expanded') === 'true' || customWidgetOptions(document, element).length > 0;
-  let openedHere = false;
-  document.__jobApplicationDiscovering = true;
-  try {
-    if (!wasOpen) { element.click(); openedHere = true; }
-    const options = await waitForCustomOptions(document, element, null, timeoutMs);
-    const structuredOptions = options.map(option => ({ label: customOptionText(option), value: customOptionValue(option), selected: option.getAttribute('aria-selected') === 'true', disabled: option.getAttribute('aria-disabled') === 'true' }));
-    const labels = [...new Set(structuredOptions.flatMap(option => [option.label, option.value]).filter(Boolean).map(String))];
-    return { ok: true, fieldId, handle: expectedHandle, options: labels, structuredOptions, optionsStatus: labels.length ? 'partial' : 'unavailable' };
-  } finally {
-    if (openedHere && element.isConnected) element.click();
-    document.__jobApplicationDiscovering = false;
-  }
 }
 
 async function setCustomChoiceValue(document, element, answer, deadline = Infinity) {
@@ -1187,6 +1189,10 @@ export async function applyDecisions(document, decisions = [], { deadline = Infi
   const result = { applied: [], kept: [], reviewRequired: [], unresolved: [], failed: [] };
   for (const decision of decisions) {
     try {
+    if (document.__jobApplicationUserInterrupted) {
+      result.failed.push({ fieldId: decision.fieldId, reason: 'Autofill paused after user interaction' });
+      break;
+    }
     if (Date.now() >= deadline) { result.unresolved.push({ fieldId: decision.fieldId, reason: 'Autofill deadline reached' }); continue; }
     const field = currentField(document, decision.fieldId);
     if (!field || (decision.handle && decision.handle !== field.handle)) {
@@ -1232,7 +1238,12 @@ export async function applyDecisions(document, decisions = [], { deadline = Infi
     const hasExpectedEditRevision = Object.hasOwn(decision, 'expectedEditRevision');
     const rawValueMatches = !hasExpectedRawValue || String(element?.value ?? '') === String(decision.expectedRawValue);
     const editRevisionMatches = !hasExpectedEditRevision || (element?.__jobApplicationEditRevision || 0) === decision.expectedEditRevision;
-    if (!beforeFill({field, element, decision}) || !rawValueMatches || !editRevisionMatches) {
+    const allowed = beforeFill({field, element, decision});
+    if (document.__jobApplicationUserInterrupted) {
+      result.failed.push({ fieldId: field.id, reason: 'Autofill paused after user interaction' });
+      break;
+    }
+    if (!allowed || !rawValueMatches || !editRevisionMatches) {
       result.failed.push({ fieldId: field.id, reason: 'The field changed before the answer could be applied' });
       continue;
     }
@@ -1320,17 +1331,24 @@ export function isFinalApplicationSubmit(document, event) {
 function pauseReasons(document) {
   const reasons = [];
   const visibleText = composedText(document.body);
-  if ([...queryAll(document, 'input[type="file"]:not([disabled])')].some((element) => isVisible(element) && !(element.files?.length || element.value))) reasons.push('file_upload');
+  const visibleUpload = (element) => {
+    if (isVisible(element)) return true;
+    const label = element.id && queryAll(document, 'label').find(item => item.getAttribute('for') === element.id);
+    if (label && isVisible(label)) return true;
+    for (let parent = composedParent(element), depth = 0; parent && depth < 4; parent = composedParent(parent), depth++) {
+      if (isVisible(parent) && /\b(?:upload|attach|resume|cv|file)\b/i.test(composedText(parent))) return true;
+    }
+    return false;
+  };
+  if ([...queryAll(document, 'input[type="file"]:not([disabled])')].some((element) => visibleUpload(element) && !(element.files?.length || element.value))) reasons.push('file_upload');
   const captchaElement = [...queryAll(document, '[id*="captcha" i], [class*="captcha" i], [id*="recaptcha" i], [class*="recaptcha" i]')].some(isVisible);
   if (captchaElement || /\bcaptcha\b/i.test(visibleText)) reasons.push('captcha');
   const loginPath = /(?:^|\/)(?:login|signin|sign-in)(?:\/|$)/i.test(document.location?.pathname || '');
   const loginForm = [...queryAll(document, 'form[action]')].some((form) => /login|signin|sign-in/i.test(form.action || form.getAttribute('action') || ''));
   const loginHeading = [...queryAll(document, 'h1, h2, h3')].some((element) => isVisible(element) && /^(?:sign in|log in|login)$/i.test(element.textContent.trim()));
   if ([...queryAll(document, 'input[type="password"]:not([disabled])')].some(isVisible) || loginPath || loginForm || loginHeading) reasons.push('login');
-  const unresolvedCustomWidget = customWidgetElements(document)
-    .some((element) => fieldRequired(element) && !customWidgetValue(element));
   const contentEditable = [...queryAll(document, '[contenteditable="true"]')].some(isVisible);
-  if (contentEditable || unresolvedCustomWidget) reasons.push('unsupported_widget');
+  if (contentEditable) reasons.push('unsupported_widget');
   const nextCount = collectActions(document).filter((action) => action.kind === 'next').length;
   const submitCount = collectActions(document).filter((action) => action.kind === 'submit').length;
   if (nextCount > 1 || submitCount > 1) reasons.push('ambiguous_navigation');
@@ -1342,6 +1360,23 @@ export function inspectDocument(document) {
   const inspection = withDomSnapshot(document, () => inspectDocumentImpl(document));
   inspection.discovery.elapsedMs = Date.now() - started;
   return inspection;
+}
+
+function observationFor(fields, actions) {
+  const controls = fields.map(field => ({
+    id: field.id,
+    handle: field.handle,
+    label: field.label,
+    type: field.type,
+    operations: field.widget === 'custom' || field.type === 'select' || field.type === 'radio' || field.type === 'checkbox' ? ['select'] : ['fill'],
+    ...(field.rect ? {rect: field.rect} : {}),
+  }));
+  const revision = JSON.stringify([
+    controls.map(control => [control.id, control.handle, control.label, control.type]),
+    fields.map(field => [field.handle, field.currentValue, field.options, field.editRevision || 0]),
+    actions.map(action => [action.handle, action.kind, action.label]),
+  ]);
+  return {revision, controls};
 }
 
 function inspectDocumentImpl(document) {
@@ -1371,6 +1406,7 @@ function inspectDocumentImpl(document) {
     applicationLabel,
     fields,
     actions,
+    observation: observationFor(fields, actions),
     pauseReasons: pauseReasons(document),
     destination,
     visualContext: {

@@ -19,6 +19,7 @@ import { buildLearningCandidates, callLearningReviewer } from './learning-review
 import { hostnameFromUrl, isHostnameDisabled, isSupportedSiteUrl, normalizeHostname, normalizeHostnames } from './site-control.js';
 import { createSemanticMatcher, semanticFingerprint } from './typesafe.js';
 import { createPhoenixTrace, flushPhoenixQueue, tracePhoenixEvent } from './phoenix.js';
+import { createBrowserController, mergeAccessibilityInspection } from './browser-control.js';
 
 const RUN_STORAGE_KEY = 'applicationRun';
 const PHOENIX_ACTIVE_ACTIONS_KEY = 'phoenixActiveActions';
@@ -53,6 +54,7 @@ const AMBIGUOUS_APPLICATION_FRAME_REASON = 'More than one application form was f
 const formSelections = new Map();
 const formInterpretationCache = new Map();
 const activeFormInterpretations = new Map();
+const browserController = createBrowserController();
 const FORM_SELECTION_TTL_MS = 60_000;
 const DISCOVERY_REASONS = {
   no_supported_controls: NO_APPLICATION_FRAME_REASON,
@@ -61,6 +63,7 @@ const DISCOVERY_REASONS = {
   inspection_error: 'The form could not be inspected. Retry the scan.',
   loading_timeout: 'The form did not finish loading. Wait for it to load, then retry the scan.',
   destination_changed: 'The selected form changed. Retry the scan before filling more details.',
+  form_interpretation_timeout: 'The form interpretation request timed out. Retry the scan, or select the form manually.',
 };
 const DISABLED_SITE_REASON = 'The extension is disabled on this site. Re-enable it from the side panel to use autofill.';
 const INACTIVE_FORM_REASON = 'Press Fill this form to enable autofill for this form.';
@@ -764,15 +767,23 @@ function scoreApplicationFrame(context, inspection, selectedDestination = null) 
   const actions = inspection?.actions || [];
   const applicationHint = APPLICATION_TITLE_PATTERN.test(frameInspectionText(context, inspection));
   const fieldText = fields.map(field => [field.label, field.autocomplete, field.canonicalKey].filter(Boolean).join(' '));
-  const applicationField = fieldText.some(text => /\b(?:full[ _-]?name|first[ _-]?name|last[ _-]?name|given[ _-]?name|family[ _-]?name|resume|cover[ _-]?letter|work[ _-]?authorization|employment|salary|experience|education)\b/i.test(text));
+  const fieldTextJoined = fieldText.join(' ');
+  const applicationField = fieldText.some(text => /\b(?:full[ _-]?name|first[ _-]?name|last[ _-]?name|given[ _-]?name|family[ _-]?name|resume|cover[ _-]?letter|work[ _-]?authorization|employment|salary|experience|education|notice\s+period|current\s+location)\b/i.test(text));
+  const concepts = new Set();
+  if (/\b(?:full[ _-]?name|first[ _-]?name|last[ _-]?name|email|phone|mobile|whatsapp)\b/i.test(fieldTextJoined)) concepts.add('identity');
+  if (/\b(?:resume|cover[ _-]?letter|work[ _-]?authorization|employment|salary|compensation|experience|education|notice\s+period|current\s+location|work\s+from\s+office)\b/i.test(fieldTextJoined)) concepts.add('application');
+  if (/\b(?:salary|compensation)\b/i.test(fieldTextJoined)) concepts.add('compensation');
+  if (/\b(?:experience|education|employment)\b/i.test(fieldTextJoined)) concepts.add('history');
+  if (/\b(?:location|notice\s+period|work\s+from\s+office)\b/i.test(fieldTextJoined)) concepts.add('availability');
+  const applicationCluster = fields.length >= 3 && concepts.has('identity') && concepts.has('application') && concepts.size >= 3;
   const utilityHint = UTILITY_FRAME_PATTERN.test(fieldText.join(' ')) && !applicationField;
   const applicationActions = actions.some(action => action.kind === 'next'
-    || (action.kind === 'submit' && (applicationField || /\b(?:application|apply)\b/i.test(action.label || ''))));
+    || (action.kind === 'submit' && (applicationField || applicationCluster || /\b(?:application|apply)\b/i.test(action.label || ''))));
   const explicitSelection = selectedDestination && context.frameId === selectedDestination.frameId
     && inspection.destination?.documentId === selectedDestination.documentId && inspection.destination?.regionId === selectedDestination.regionId;
   const ready = !inspection.discovery || (inspection.discovery.code === 'ready' && Boolean(inspection.destination?.regionId));
   const eligible = ready && fields.length > 0 && (explicitSelection || (!utilityHint
-    && (applicationActions || (applicationHint && fields.length >= 2))));
+    && (applicationActions || applicationCluster || (applicationHint && fields.length >= 2))));
   return {eligible};
 }
 
@@ -799,6 +810,11 @@ async function formScreenshot(tabId, inspected, enabled) {
     if (!after?.active || after.windowId !== before.windowId || after.url !== before.url) return null;
     return await prepareFormScreenshot({dataUrl, ...top});
   } catch { return null; }
+}
+
+async function enrichAccessibilityInspection(tabId, inspection) {
+  const accessibility = await browserController.observe(tabId);
+  return accessibility.ok ? mergeAccessibilityInspection(inspection, accessibility.controls.filter(control => !control.sessionId)) : inspection;
 }
 
 function interpretInspection(inspection, interpretation) {
@@ -932,7 +948,8 @@ async function discoverApplicationFrame(tabId, assertAuthority = null, selectedD
     try {
       const response = await sendToFrame(tabId, context.frameId, { type: 'JOB_APP_INSPECT' }, assertAuthority);
       if (!response?.ok || !response.inspection) return {...context, code: response?.code || 'inspection_error'};
-      return {...context, inspection: response.inspection, ...scoreApplicationFrame(context, response.inspection, selectedDestination), version: response.version};
+      const inspection = context.frameId === 0 ? await enrichAccessibilityInspection(tabId, response.inspection) : response.inspection;
+      return {...context, inspection, ...scoreApplicationFrame(context, inspection, selectedDestination), version: response.version};
     } catch { return {...context, code: 'script_unavailable'}; }
   }));
   // Only counts, outcomes and timings are persisted. Never store page text or answers here.
@@ -948,11 +965,13 @@ async function discoverApplicationFrame(tabId, assertAuthority = null, selectedD
     if (candidates.length !== 1) return discoveryFailure('destination_changed', diagnostics);
   } else if (candidates.length !== 1 || inspected.some(item => item.inspection?.discovery?.code === 'ambiguous_form')) {
     let interpreted = null;
+    let interpretationError = null;
     try {
       interpreted = await interpretApplicationFrames(tabId, inspected, sessionId);
       if (interpreted) candidates = [interpreted];
-    } catch { /* deterministic discovery and manual selection remain available */ }
+    } catch (error) { interpretationError = error; }
     if (!interpreted && (candidates.length > 1 || inspected.some(item => item.inspection?.discovery?.code === 'ambiguous_form'))) return discoveryFailure('ambiguous_form', diagnostics);
+    if (!interpreted && !candidates.length && /timed out/i.test(interpretationError?.message || '')) return discoveryFailure('form_interpretation_timeout', diagnostics);
   }
   if (!candidates.length) {
     const controls = diagnostics.filter(item => item.controlCount > 0);
@@ -1375,7 +1394,8 @@ async function applyPageDecisions(tabId, run, inspection, records, coverMessages
     });
     if (!fillable.length) break;
     const before = JSON.stringify(currentInspection.fields.map(field => [field.id, field.handle, field.currentValue, field.options]));
-    const localResult = await sendToApplicationFrame(tabId, run, { type: 'JOB_APP_APPLY', decisions: fillable, deadline: cycle.deadline, applicationId: run.startedAt });
+    const localResult = await sendToApplicationFrame(tabId, run, { type: 'JOB_APP_APPLY', decisions: fillable, deadline: cycle.deadline,
+      applicationId: run.startedAt, observationRevision: currentInspection.observation?.revision || '' });
     if (!localResult?.ok) throw new Error(localResult?.error || 'The page rejected local answers');
     appliedReviews.push(...(localResult.result?.reviewRequired || []));
     unresolvedResults.push(...(localResult.result?.unresolved || []));
@@ -2009,23 +2029,48 @@ async function applyReviewedField({ tabId, frameId, applicationId, field, sugges
   if (!validation.ok || !sourceCompatible || inferSensitivity(field.label, field.id) === 'legal') {
     throw new Error(validation.ok ? 'This destination requires manual entry' : validation.reason);
   }
-  const result = await sendToFrame(tabId, frameId, {
+  const currentSnapshot = async () => {
+    const inspected = await sendToFrame(tabId, frameId, {type: 'JOB_APP_INSPECT'}, assertAuthority);
+    const current = inspected.inspection?.fields.find(item => item.id === field.id && item.handle === field.handle);
+    if (!current || current.currentValue !== field.currentValue || !sameFieldSnapshot(current, aiFieldSnapshot(field))) {
+      throw new Error('The field changed before the answer could be applied');
+    }
+    return {field: current, revision: inspected.inspection.observation?.revision || ''};
+  };
+  const requestFor = ({field: current, revision}) => ({
     type: 'JOB_APP_APPLY',
     applicationId,
+    observationRevision: revision,
     ...(approvalGuard ? {approvalGuard} : {}),
     decisions: [{
-      fieldId: field.id,
-      handle: field.handle,
+      fieldId: current.id,
+      handle: current.handle,
       action: 'fill',
       approved: true,
       value,
       evidenceKeys: sourceKeys,
-      sensitivity: inferSensitivity(field.label, field.id),
+      sensitivity: inferSensitivity(current.label, current.id),
       confidence: 'high',
       reason: candidate ? 'Explicitly approved saved answer' : 'Explicitly entered draft answer',
       ...(approvalGuard || {}),
+      expectedRawValue: current.rawValue ?? '',
+      expectedEditRevision: current.editRevision ?? 0,
     }],
-  }, assertAuthority);
+  });
+  let snapshot = await currentSnapshot();
+  let result = await sendToFrame(tabId, frameId, requestFor(snapshot), assertAuthority);
+  const needsTrustedOpen = frameId === 0 && field.widget === 'custom' && field.rect && result?.ok
+    && result.result?.unresolved?.some(item => item.fieldId === field.id && /did not reveal any options/i.test(item.reason || ''));
+  if (needsTrustedOpen) {
+    await sendToFrame(tabId, frameId, {type: 'JOB_APP_EXPECT_TRUSTED_INPUT', handle: field.handle}, assertAuthority);
+    const opened = await browserController.click(tabId, field.rect, frameId);
+    await sendToFrame(tabId, frameId, {type: 'JOB_APP_EXPECT_TRUSTED_INPUT', clear: true}, assertAuthority);
+    if (opened.ok) {
+      snapshot = await currentSnapshot();
+      assertAuthority?.();
+      result = await sendToFrame(tabId, frameId, requestFor(snapshot), assertAuthority);
+    }
+  }
   if (!result?.ok) throw new Error(result?.error || 'Could not apply the answer');
   assertAuthority?.();
   const verified = await sendToFrame(tabId, frameId, { type: 'JOB_APP_INSPECT' }, assertAuthority);
@@ -3218,30 +3263,6 @@ async function currentSuggestionDestination(tabId, snapshot) {
   return { run, inspection: inspected.inspection };
 }
 
-async function discoverContextOptions(tabId, run, fields) {
-  const deadline = Date.now() + 5000;
-  const ordered = [...fields].filter(field => field.widget === 'custom' && structuredField(field)
-    && !String(field.currentValue || '').trim() && !(field.options || []).length)
-    .sort((left, right) => Number(Boolean(right.required)) - Number(Boolean(left.required)));
-  const discovered = new Map();
-  for (const field of ordered) {
-    if (Date.now() >= deadline) break;
-    try {
-      const response = await sendToApplicationFrame(tabId, run, {
-        type: 'JOB_APP_DISCOVER_OPTIONS', fieldId: field.id, handle: field.handle,
-        timeoutMs: Math.min(1500, deadline - Date.now()),
-      });
-      if (response?.ok && response.fieldId === field.id && response.handle === field.handle) {
-        discovered.set(field.id, {...field, options: response.options || [], structuredOptions: response.structuredOptions || [],
-          optionsStatus: response.optionsStatus || ((response.options || []).length ? 'partial' : 'unavailable')});
-      } else discovered.set(field.id, {...field, optionsStatus: 'unavailable'});
-    } catch {
-      discovered.set(field.id, {...field, optionsStatus: 'unavailable'});
-    }
-  }
-  return fields.map(field => discovered.get(field.id) || field);
-}
-
 async function scheduleAi(tabId,{retry=false}={}) {
   if(backgroundJobs.has(tabId) || processingTabs.has(tabId) || saveLocks.has(tabId)) return;
   const run=await getRun(tabId);
@@ -3263,8 +3284,7 @@ async function scheduleAi(tabId,{retry=false}={}) {
   const validated=await sendToApplicationFrame(tabId,run,{type:'JOB_APP_VALIDATE'});
   const invalidIds=new Set((validated?.validation?.invalid || []).map(field=>field.fieldId));
   const datasource=await getDatasource();
-  let fields=resolveEmploymentFields(run,inspected.inspection.fields,datasource.profile);
-  fields=await discoverContextOptions(tabId,run,fields);
+  const fields=resolveEmploymentFields(run,inspected.inspection.fields,datasource.profile);
   const eligibility = fields.map(field => ({
     fieldId: field.id, label: field.label, required: Boolean(field.required),
     reason: String(field.currentValue || '').trim() ? 'existing_value'

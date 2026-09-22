@@ -106,6 +106,7 @@ function sanitizedFormSnapshot(snapshot = {}) {
         labelConfidence: field.labelConfidence || '', type: field.type || '', autocomplete: field.autocomplete || '',
         placeholder: isOpaqueIdentifier(field.placeholder) ? '' : String(field.placeholder || '').slice(0, 500),
         required: Boolean(field.required), options: (field.options || []).filter(option => typeof option === 'string' && !isOpaqueIdentifier(option)).slice(0, 100),
+        accessibility: field.accessibility ? {role: field.accessibility.role || '', name: String(field.accessibility.name || '').slice(0, 1000), required: Boolean(field.accessibility.required), expanded: field.accessibility.expanded ?? null} : null,
       })),
       actions: (frame.inspection?.actions || []).slice(0, 50).map(action => ({
         handle: String(action.handle || ''), label: String(action.label || '').slice(0, 500), type: action.type || '', localRole: action.kind || 'other',
@@ -141,7 +142,7 @@ function validateFormInterpretation(payload, snapshot, contextMode) {
 
 export async function callFormInterpreter(
   {apiKey, snapshot, screenshot = null},
-  {sessionId = '', fetchImpl, traceContext = null, timeoutMs = 15_000, provider = 'openai', model = ''} = {},
+  {sessionId = '', fetchImpl, traceContext = null, timeoutMs = 30_000, provider = 'openai', model = ''} = {},
 ) {
   fetchImpl ||= createPhoenixFetch(sessionId, {traceContext});
   const normalizedApiKey = normalizeApiKey(apiKey);

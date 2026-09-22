@@ -12,7 +12,6 @@ import {
   selectApplicationRegion,
   selectApplicationField,
   clearApplicationSelection,
-  discoverFieldOptions,
 } from './form-engine.js';
 import { isExtensionElement, eventControl, withDomSnapshot } from './dom.js';
 import { createLearningSession } from './learning.js';
@@ -216,6 +215,10 @@ if (!globalThis.__jobApplicationAutofillInstalled) {
         }
         case 'JOB_APP_APPLY': {
           if (!active) { sendResponse({ok: false, disabled: true, result: {applied: [], kept: [], reviewRequired: [], unresolved: [], failed: []}}); break; }
+          if (message.observationRevision && inspectDocument(document).observation?.revision !== message.observationRevision) {
+            sendResponse({ok: false, code: 'destination_changed', error: 'The form changed before the answer could be applied.'});
+            break;
+          }
           const destination = message.destination || applicationDestination(document);
           if (!destination.regionId) {
             const focused = descriptorForElement(document, inline.activeField());
@@ -227,28 +230,20 @@ if (!globalThis.__jobApplicationAutofillInstalled) {
             selectApplicationField(document, inline.activeField());
           }
           if (message.applicationId) learning.activate(message.applicationId);
+          document.__jobApplicationUserInterrupted = false;
           applyDecisions(document, message.decisions || [], {deadline: message.deadline ?? Infinity,
-            beforeFill: args => active && destinationMatches(destination) && inline.beforeFill({...args, acceptanceToken: message.approvalGuard?.acceptanceToken})})
+            beforeFill: args => active && !document.__jobApplicationUserInterrupted && destinationMatches(destination)
+              && inline.beforeFill({...args, acceptanceToken: message.approvalGuard?.acceptanceToken})})
             .then((result) => sendResponse({ ok: true, result }))
-            .catch((error) => sendResponse({ ok: false, error: error.message }));
+            .catch((error) => sendResponse({ ok: false, error: error.message }))
+            .finally(() => { delete document.__jobApplicationUserInterrupted; });
           return true;
         }
-        case 'JOB_APP_DISCOVER_OPTIONS':
-          if (!active) { sendResponse({ok: false, disabled: true}); break; }
-          {
-            const timeoutMs = Math.min(1500, Math.max(0, Number(message.timeoutMs) || 1500));
-            document.__jobApplicationDiscoverySettlingUntil = Date.now() + timeoutMs + 500;
-            clearTimeout(pageChangeTimer);
-            const settleDiscovery = () => {
-              document.__jobApplicationDiscoverySettlingUntil = Date.now() + 500;
-              clearTimeout(pageChangeTimer);
-              observedPage = formShape();
-            };
-            discoverFieldOptions(document, message.fieldId, message.handle, {timeoutMs})
-              .then(result => { settleDiscovery(); sendResponse(result); })
-              .catch(error => { settleDiscovery(); sendResponse({ok: false, error: error.message}); });
-          }
-          return true;
+        case 'JOB_APP_EXPECT_TRUSTED_INPUT':
+          if (message.clear) delete document.__jobApplicationExpectedTrustedInput;
+          else document.__jobApplicationExpectedTrustedInput = {handle: message.handle || '', remaining: 1, expiresAt: Date.now() + 250};
+          sendResponse({ok: true});
+          break;
         case 'JOB_APP_CAPTURE':
           if (!active) { sendResponse({ok: false, disabled: true, records: []}); break; }
           sendResponse({ ok: true, records: collectAnswerRecords(document, { finalize: message.finalize === true }) });
