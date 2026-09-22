@@ -3194,8 +3194,9 @@ function sameSuggestionRun(run, snapshot) {
     && JSON.stringify(run.jobContext || {}) === JSON.stringify(snapshot.sourceJobContext || {}));
 }
 
-function hasUsableSuggestion(suggestion) {
-  return Boolean(suggestion?.candidates?.some(candidate => String(candidate?.answer || '').trim()));
+function hasUsableSuggestion(suggestion, field) {
+  return Boolean(suggestion?.candidates?.some(candidate => candidate.kind !== 'related'
+    && String(candidate?.answer || '').trim() && validateFillValue(field, candidate.answer).ok));
 }
 
 async function currentSuggestionDestination(tabId, snapshot) {
@@ -3264,9 +3265,20 @@ async function scheduleAi(tabId,{retry=false}={}) {
   const datasource=await getDatasource();
   let fields=resolveEmploymentFields(run,inspected.inspection.fields,datasource.profile);
   fields=await discoverContextOptions(tabId,run,fields);
-  const candidateFields=fields.filter(field=>!String(field.currentValue || '').trim()
-    && (!hasUsableSuggestion(run.suggestions?.[field.id]) || invalidIds.has(field.id)) && readableQuestion(field)
-    && inferSensitivity(field.label,field.id)!=='legal' && !field.entityUnresolved)
+  const eligibility = fields.map(field => ({
+    fieldId: field.id, label: field.label, required: Boolean(field.required),
+    reason: String(field.currentValue || '').trim() ? 'existing_value'
+      : !readableQuestion(field) ? 'unreadable_question'
+      : inferSensitivity(field.label,field.id)==='legal' ? 'legal_manual'
+      : field.entityUnresolved ? 'unresolved_employment'
+      : hasUsableSuggestion(run.suggestions?.[field.id], field) && !invalidIds.has(field.id) ? 'saved_answer_ready' : 'eligible',
+    candidates: (run.suggestions?.[field.id]?.candidates || []).map(candidate => ({
+      sourceKey: candidate.sourceKey, kind: candidate.kind, valueValid: validateFillValue(field, candidate.answer).ok,
+    })),
+  }));
+  void tracePhoenixEvent('fill_page_eligibility', {}, sessionId, {traceContext, output: {recordCount: datasource.answerRecords.length, fields: eligibility}});
+  const eligibleIds = new Set(eligibility.filter(field => field.reason === 'eligible').map(field => field.fieldId));
+  const candidateFields=fields.filter(field=>eligibleIds.has(field.id))
     .sort((left,right)=>Number(Boolean(right.required))-Number(Boolean(left.required)));
   const unresolved=candidateFields.filter(field=>field.required);
   if(!candidateFields.length) { traceSkip('no_eligible_fields'); return; }
@@ -3275,12 +3287,14 @@ async function scheduleAi(tabId,{retry=false}={}) {
   const semanticRetry=retry && unresolved.some(field=>run.semanticSearch?.[field.id]?.status==='failed');
   const plannerFields=(retry
     ? (retryableStates.has(planner?.status) || semanticRetry ? candidateFields : [])
-    : candidateFields).filter(field => writingField(field) || structuredField(field)
+    : candidateFields).filter(field => writingField(field) || structuredField(field) || field.type === 'number'
       || ((settings.typesafeEnabled && typesafeApiKey) && !writingField(field)));
   const suggestionFields=retry
     ? candidateFields.filter(writingField).filter(field=>retryableStates.has(run.aiOperations?.[`suggestion:${field.id}`]?.status) && !run.generatedSuggestions?.[field.id])
     : candidateFields.filter(writingField).filter(field=>!run.generatedSuggestions?.[field.id]);
-  const semanticFields=candidateFields.filter(field=>!hasUsableSuggestion(run.suggestions?.[field.id]));
+  // Related local evidence needs drafting, but does not need rediscovery.
+  const semanticFields=candidateFields.filter(field=>!run.suggestions?.[field.id]?.candidates?.some(candidate=>
+    String(candidate.answer || '').trim() && validateFillValue(field, candidate.answer).ok));
   if(!apiKey && !semanticFields.length) { traceSkip('missing_provider_key'); return; }
   if(!plannerFields.length && !semanticFields.length && !suggestionFields.length) { traceSkip('cached_or_no_pending_ai'); return; }
   const operationFields=[...new Map([...plannerFields,...semanticFields,...suggestionFields].map(field=>[field.id,field])).values()];
@@ -3425,7 +3439,7 @@ async function prepareAi(tabId,snapshot,plannerFields,semanticFields,suggestionF
         const committed=await mutateRun(tabId,current=>{
           if(current.aiOperations?.[snapshot.operationKey]?.id!==snapshot.id||current.pageSignature!==snapshot.pageSignature)return false;
           current.generatedSuggestions||={};
-          if(!current.suggestions?.[field.id])current.generatedSuggestions[field.id]={tabId,frameId:snapshot.frameId,applicationId:snapshot.startedAt,pageSignature:snapshot.pageSignature,field,...generated,snapshot:{...snapshot,field:aiFieldSnapshot(field)}};
+          if(!hasUsableSuggestion(current.suggestions?.[field.id], field))current.generatedSuggestions[field.id]={tabId,frameId:snapshot.frameId,applicationId:snapshot.startedAt,pageSignature:snapshot.pageSignature,field,...generated,snapshot:{...snapshot,field:aiFieldSnapshot(field)}};
           current.aiOperations[key].status='completed';
         });
         if(committed)void tracePhoenixEvent('answer_suggestions_result',{'application.field_id':field.id,'ai.suggestion_count':generated.suggestions?.length||0,'ai.retained':true},sessionId,{traceContext,output:{...generated,retained:true}});

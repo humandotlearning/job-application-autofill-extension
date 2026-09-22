@@ -20,6 +20,52 @@ function makeDocument(html) {
   return new JSDOM(html, { url: 'https://jobs.example.com/apply' }).window.document;
 }
 
+test('required badges work across native, ARIA, grouped and custom controls', () => {
+  const document = makeDocument(`<form>
+    <label>Native<input id="native" required></label>
+    <span id="aria-label">Start date<span>(Required)</span></span><input id="aria" aria-labelledby="aria-label">
+    <label for="select">Country<abbr title="required">*</abbr></label><select id="select"><option value="">Choose</option><option>India</option></select>
+    <fieldset><legend>Work mode<span>Required</span></legend><label><input id="radio" type="radio" name="mode" value="remote">Remote</label><label><input type="radio" name="mode" value="onsite">Onsite</label></fieldset>
+    <div role="group" aria-labelledby="check-label"><span id="check-label">Tools<span>Required</span></span><label><input id="check" type="checkbox" name="tools" value="Python">Python</label><label><input type="checkbox" name="tools" value="JS">JS</label></div>
+    <span id="custom-label">Department<span class="sr-only">Required</span></span><div id="custom" role="combobox" aria-labelledby="custom-label" aria-expanded="false" tabindex="0"></div>
+    <label for="optional">Optional field<span>Required</span></label><input id="optional" aria-required="false">
+    <label for="sentence">Tools <span>required</span> for this role</label><textarea id="sentence"></textarea>
+    <span id="split-question">Availability</span><span id="split-required">Required</span><input id="split" aria-labelledby="split-question split-required">
+    <label for="custom-for">Office<span>Required</span></label><div id="custom-for" role="combobox" aria-expanded="false" tabindex="0"></div>
+    <label for="hidden">Hidden marker<span hidden>Required</span></label><input id="hidden">
+  </form>`);
+  const fields = collectFieldDescriptors(document);
+  for (const id of ['native', 'aria', 'select', 'radio', 'check', 'custom', 'split', 'custom-for']) assert.equal(fields.find(f => f.id === id)?.required, true, id);
+  assert.equal(fields.find(f => f.id === 'optional').required, false);
+  assert.equal(fields.find(f => f.id === 'sentence').label, 'Tools required for this role');
+  assert.equal(fields.find(f => f.id === 'sentence').required, false);
+  assert.equal(fields.find(f => f.id === 'hidden').required, false);
+  assert.equal(fields.find(f => f.id === 'custom').label, 'Department');
+  assert.equal(fields.find(f => f.id === 'split').label, 'Availability');
+});
+
+test('required label references stay scoped to their shadow root', () => {
+  const document = makeDocument('<span id="question">Unrelated outside question</span><div id="host"></div>');
+  const shadow = document.querySelector('#host').attachShadow({mode:'open'});
+  shadow.innerHTML = '<span id="question">Start date<span>Required</span></span><input id="date" type="date" aria-labelledby="question">';
+  const field = collectFieldDescriptors(document).find(field => field.id === 'date');
+  assert.equal(field.label, 'Start date');
+  assert.equal(field.required, true);
+});
+
+test('Teamtailor required badges do not corrupt CTC questions or hide required fields', () => {
+  const document = makeDocument(`<form>
+    <label for="expected">What is your expected CTC<sup data-asterisk="true" aria-hidden="true">*</sup><span class="sr-only">Required</span></label>
+    <input id="expected" type="number" inputmode="numeric" pattern="[0-9]*">
+    <label for="current">What is your current CTC<sup aria-hidden="true">*</sup><span class="sr-only">Required</span></label><input id="current">
+    <label for="experience">Describe your <strong>required experience</strong><span>Optional</span></label><textarea id="experience"></textarea>
+  </form>`);
+  const fields = collectFieldDescriptors(document);
+  assert.deepEqual(fields.map(f => f.label), ['What is your expected CTC', 'What is your current CTC', 'Describe your required experience']);
+  assert.deepEqual(fields.map(f => f.required), [true, true, false]);
+  assert.deepEqual(validateDocument(document).requiredEmpty.map(f => f.fieldId), ['expected', 'current']);
+});
+
 test('Lever checkbox options share their question through reading, filling, focus and learning', async () => {
   const document = makeDocument(`<form><ul>
     <li class="application-question"><div class="application-label">Pronouns</div>

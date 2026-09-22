@@ -1573,11 +1573,12 @@ test('saved narrative and sensitive equivalents wait for scoped approval before 
     { id: 'ctc', handle: 'handle-ctc', label: 'Current CTC', type: 'textarea' },
   ], actions: [] }] } } });
   harness.localData.openaiApiKey = 'synthetic-test-key';
-  let plannerCalls = 0;
-  globalThis.fetch = async () => { plannerCalls++; throw new Error('synthetic planner unavailable'); };
+  const aiRequests = [];
+  globalThis.fetch = async (_url, options) => { aiRequests.push(JSON.parse(JSON.parse(options.body).input[1].content[0].text)); throw new Error('synthetic planner unavailable'); };
   await import(`../src/service-worker.js?test=reuse-${Date.now()}`);
   const started = await harness.dispatch({ type: 'JOB_RUN_START', tabId: 7 });
-  assert.equal(plannerCalls, 0, 'AI must not bypass local approval gates');
+  assert.ok(aiRequests.length > 0, 'related narrative evidence may be drafted');
+  assert.ok(aiRequests.every(request => request.field?.id === 'ml' || request.fields?.every(field => field.id === 'ml')), 'sensitive equivalents stay behind approval');
   assert.equal(harness.tabs.get(7).frames[0].pages[0].values?.ctc, undefined);
   const { JSDOM } = await import('jsdom');
   const { applyDecisions } = await import('../src/form-engine.js');
@@ -3100,6 +3101,49 @@ test('rewrite rejects unsafe requests and model failures without mutating a draf
   assert.equal(network.ok, false);
   assert.deepEqual(harness.tabs.get(7).frames[0].pages[0].values || {}, valuesBefore);
   assert.deepEqual(harness.localData.answerRecords, recordsBefore);
+});
+
+test('NeoXam related evidence still generates a draft and numeric CTC exposes its missing format', async () => {
+  const h = createHarness({answerRecords: [
+    {key:'project',question:'Experience building and deploying machine learning models',answer:'I built and deployed machine learning systems in production.',sensitivity:'safe'},
+    {key:'expected_ctc',question:'Expected CTC',answer:'40-60 LPA',sensitivity:'review'},
+    {key:'current_salary',question:'Current salary',answer:'Not currently salaried; last drawn salary was 21 LPA.',sensitivity:'review'},
+  ],pagesByTab:{7:{pages:[{fields:[
+    {id:'story',handle:'story-h',label:'Can you describe an AI/ML system you built and shipped to production?',type:'textarea',required:true},
+    {id:'expected',handle:'expected-h',label:'What is your expected CTC',type:'number',required:true},
+    {id:'current',handle:'current-h',label:'What is your current CTC',type:'text',required:true},
+  ],actions:[{id:'submit',label:'Submit application',kind:'submit'}]}]}}});
+  h.localData.openaiApiKey='test-key';
+  h.localData.phoenixTracing=true;
+  const requests=[], spans=[];
+  globalThis.fetch=async(url,options)=>{
+    const body=JSON.parse(options.body);
+    if(String(url).startsWith('http://127.0.0.1:6006')) {
+      spans.push(...body.data);
+      return {ok:true,status:200,json:async()=>({})};
+    }
+    const request=JSON.parse(body.input[1].content[0].text);
+    requests.push(request);
+    const payload=request.fields ? {decisions:request.fields.map(field=>({fieldId:field.id,action:'ask_user',value:null,evidenceKeys:[],transformation:null,confidence:'high',sensitivity:'review',reason:'Choose one amount and specify its currency and scale.'}))}
+      : {suggestions:[{answer:'I built and deployed production machine learning systems.',evidenceKeys:['project']}],missingContext:''};
+    return {ok:true,status:200,json:async()=>({output_text:JSON.stringify(payload)})};
+  };
+  await import(`../src/service-worker.js?neoxam-regression=${Date.now()}`);
+  const started=await h.dispatch({type:'JOB_RUN_START',tabId:7});
+  assert.equal(started.ok,true,started.error);
+  assert.ok(requests.some(request=>request.field?.id==='story'),JSON.stringify({requests,ops:started.run.aiOperations,error:started.run.llmError,spans:spans.filter(s=>s.name==='fill_page_eligibility').map(s=>s.attributes),suggestions:started.run.suggestions?.story}));
+  assert.ok(requests.some(request=>request.fields?.some(field=>field.id==='expected')),'numeric CTC must reach planning');
+  const run=h.sessionData.applicationRun['7'];
+  assert.equal(run.generatedSuggestions.story.suggestions.length,1);
+  assert.equal(run.suggestions.current.candidates[0].sourceKey,'current_salary');
+  assert.equal(run.suggestions.expected.candidates[0].answer,'40-60 LPA');
+  assert.equal(h.tabs.get(7).frames[0].pages[0].values?.expected,undefined);
+  await waitUntil(()=>spans.some(span=>span.name==='fill_page_eligibility'));
+  const diagnostic=JSON.parse(spans.find(span=>span.name==='fill_page_eligibility').attributes['output.value']);
+  assert.equal(diagnostic.recordCount,3);
+  assert.equal(diagnostic.fields.find(field=>field.fieldId==='story').reason,'eligible');
+  assert.equal(diagnostic.fields.find(field=>field.fieldId==='current').reason,'saved_answer_ready');
+  assert.equal(diagnostic.fields.find(field=>field.fieldId==='expected').candidates[0].valueValid,false);
 });
 
 test('worker uses the selected Fireworks key and default model for planner requests', async () => {

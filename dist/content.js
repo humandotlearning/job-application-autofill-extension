@@ -802,7 +802,7 @@ function extractJobContext(document) {
 function textFromIds(element, ids = '') {
   return String(ids)
     .split(/\s+/)
-    .map((id) => rootElementById(element, id) ? labelText(rootElementById(element, id)) : '')
+    .map((id) => { const label = rootElementById(element, id); return label && !labelBadge(label, label) ? labelText(label) : ''; })
     .filter(Boolean)
     .join(' ');
 }
@@ -825,6 +825,7 @@ function labelText(label) {
     // nested widget content without discarding the referenced label root.
     if (node !== label) {
       if (node.matches(excluded)) return '';
+      if (labelBadge(node, label)) return '';
       const style = node.ownerDocument.defaultView?.getComputedStyle(node);
       if (style?.display === 'none' || style?.visibility === 'hidden' || style?.contentVisibility === 'hidden') return '';
     }
@@ -832,6 +833,40 @@ function labelText(label) {
     return [...(assigned?.length ? assigned : node.shadowRoot?.childNodes || node.childNodes)].map(read).join('');
   }
   return cleanLabelString(read(label));
+}
+
+function labelBadge(node, label) {
+  if (!node.matches('span,sup,abbr') || node.hidden || node.getAttribute('aria-hidden') === 'true') return '';
+  const style = node.ownerDocument.defaultView?.getComputedStyle(node);
+  if (style?.display === 'none' || style?.visibility === 'hidden') return '';
+  const marker = (node.getAttribute('title') || node.textContent).trim().match(/^\(?(required|optional)\)?$/i)?.[1]?.toLowerCase();
+  if (!marker) return '';
+  // A word inside a sentence is not a badge. Explicit badge markup may occur
+  // before the question; otherwise only accept a trailing marker.
+  if (node.matches('.sr-only,.required,.optional,[data-asterisk],abbr[title]')) return marker;
+  for (let current = node; current && current !== label; current = current.parentElement) {
+    for (let next = current.nextSibling; next; next = next.nextSibling) {
+      if (next.textContent.trim()) return '';
+    }
+  }
+  return marker;
+}
+
+function fieldRequired(element) {
+  if (element.required || element.getAttribute('aria-required') === 'true') return true;
+  if (element.getAttribute('aria-required') === 'false') return false;
+  if (/(?:\([Rr]equired\)|(?:^|\s)Required)\s*$/.test(element.getAttribute('aria-label') || '')) return true;
+  const referenced = node => String(node.getAttribute('aria-labelledby') || '').split(/\s+/)
+    .map(id => rootElementById(node, id)).filter(Boolean);
+  const labels = [...(element.labels || []), ...referenced(element)];
+  if (!element.labels && element.id) labels.push(...queryAll(element.getRootNode(), 'label').filter(label => label.getAttribute('for') === element.id));
+  if (['radio', 'checkbox'].includes(element.type)) {
+    const group = composedClosest(element, 'fieldset,[role="radiogroup"],[role="group"]');
+    if (group?.getAttribute('aria-required') === 'true') return true;
+    if (group) labels.push(group.querySelector(':scope > legend'), ...referenced(group));
+  }
+  return labels.filter(Boolean).some(label => labelBadge(label, label) === 'required'
+    || [...label.querySelectorAll('span,sup,abbr')].some(badge => labelBadge(badge, label) === 'required'));
 }
 
 function nearbyQuestion(element) {
@@ -864,7 +899,8 @@ function questionMetadata(document, element) {
   }
   if (element.type === 'radio') {
     const group = composedClosest(element, 'fieldset,[role="radiogroup"],[role="group"]');
-    const explicit = group && (textFromIds(group, group.getAttribute('aria-labelledby')) || group.getAttribute('aria-label') || group.querySelector(':scope > legend')?.textContent?.trim());
+    const legend = group?.querySelector(':scope > legend');
+    const explicit = group && (textFromIds(group, group.getAttribute('aria-labelledby')) || group.getAttribute('aria-label') || (legend && labelText(legend)));
     if (explicit) return { label: explicit, labelSource: 'group', labelConfidence: 'high' };
     const peers = radioGroup(document, element);
     const aria = peer => textFromIds(peer, peer.getAttribute('aria-labelledby')) || peer.getAttribute('aria-label') || '';
@@ -966,12 +1002,6 @@ function customWidgetValue(element) {
   const value = String(selectedOptions.length ? selectedOptions.join(', ') : (element.getAttribute('aria-valuetext') || element.__jobApplicationCommittedLabel || typedValue || composedText(element) || ''))
     .replace(/\s+/g, ' ').trim();
   return EMPTY_CUSTOM_WIDGET_VALUE.test(value) || isOpaqueIdentifier(value) ? '' : value;
-}
-
-function customWidgetRequired(element) {
-  return element.getAttribute('aria-required') === 'true'
-    || /\brequired\b/i.test(element.getAttribute('aria-label') || '')
-    || Boolean(element.required);
 }
 
 function visibleText(element) {
@@ -1181,7 +1211,7 @@ function describeField(document, element, index) {
     autocomplete: element.autocomplete || '',
     inputMode: element.getAttribute('inputmode') || '',
     placeholder: element.getAttribute('placeholder') || '',
-    required: (grouped ? checkboxes : [element]).some(candidate => candidate.required || candidate.getAttribute('aria-required') === 'true'),
+    required: (grouped ? checkboxes : element.type === 'radio' ? radioGroup(document, element) : [element]).some(fieldRequired),
     currentValue: fieldValue(document, element),
     options: fieldOptions(document, element),
     optionsStatus: 'complete',
@@ -1217,7 +1247,7 @@ function collectFieldDescriptorsImpl(document) {
       widget: 'custom',
       autocomplete: element.getAttribute('autocomplete') || '',
       inputMode: element.getAttribute('inputmode') || '',
-      required: customWidgetRequired(element),
+      required: fieldRequired(element),
       currentValue: fieldValue(document, element),
       options: fieldOptions(document, element),
       optionsStatus: fieldOptions(document, element).length ? 'partial' : 'unavailable',
@@ -1923,7 +1953,7 @@ function pauseReasons(document) {
   const loginHeading = [...queryAll(document, 'h1, h2, h3')].some((element) => isVisible(element) && /^(?:sign in|log in|login)$/i.test(element.textContent.trim()));
   if ([...queryAll(document, 'input[type="password"]:not([disabled])')].some(isVisible) || loginPath || loginForm || loginHeading) reasons.push('login');
   const unresolvedCustomWidget = customWidgetElements(document)
-    .some((element) => customWidgetRequired(element) && !customWidgetValue(element));
+    .some((element) => fieldRequired(element) && !customWidgetValue(element));
   const contentEditable = [...queryAll(document, '[contenteditable="true"]')].some(isVisible);
   if (contentEditable || unresolvedCustomWidget) reasons.push('unsupported_widget');
   const nextCount = collectActions(document).filter((action) => action.kind === 'next').length;
