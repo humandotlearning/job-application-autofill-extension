@@ -5,7 +5,6 @@ import { JSDOM } from 'jsdom';
 import {
   applyDecisions,
   descriptorForElement,
-  discoverFieldOptions,
   collectAnswerRecords,
   collectFieldDescriptors,
   focusField,
@@ -503,7 +502,7 @@ test('phone instructions with dialing examples are preserved', () => {
   assert.equal(collectFieldDescriptors(document)[0].label, question);
 });
 
-test('pauses for an empty required custom choice field', () => {
+test('does not pause for a supported empty custom choice field', () => {
   const document = makeDocument(`
     <main>
       <button id="previous-worker" name="previousWorker" aria-haspopup="listbox" aria-label="Have you worked here? Required">Select One</button>
@@ -512,7 +511,7 @@ test('pauses for an empty required custom choice field', () => {
   `);
   const inspection = inspectDocument(document);
   const validation = validateDocument(document);
-  assert.equal(inspection.pauseReasons.includes('unsupported_widget'), true);
+  assert.equal(inspection.pauseReasons.includes('unsupported_widget'), false);
   assert.equal(validation.ok, false);
   assert.deepEqual(validation.requiredEmpty.map((field) => field.fieldId), ['previous-worker']);
 });
@@ -1020,22 +1019,42 @@ test('does not steal options when its controlled popup is missing', async () => 
   assert.deepEqual(collectFieldDescriptors(document)[0].options, []);
 });
 
-test('discovers custom choices without changing the field value or leaving the menu open', async () => {
-  const document = makeDocument('<form><button id="country" type="button" role="combobox" aria-label="Country" aria-controls="countries" aria-expanded="false">Select one</button><div id="countries" role="listbox" hidden><div role="option" data-value="IN">India</div></div></form>');
-  const button = document.querySelector('#country');
-  const listbox = document.querySelector('#countries');
-  button.addEventListener('click', () => {
-    listbox.hidden = !listbox.hidden;
-  });
-  const [field] = collectFieldDescriptors(document);
-  const result = await discoverFieldOptions(document, field.id, field.handle);
-  assert.equal(result.ok, true);
-  assert.deepEqual(result.options, ['India', 'IN']);
-  assert.equal(result.optionsStatus, 'partial');
-  assert.equal(button.getAttribute('aria-expanded'), 'false');
-  assert.equal(listbox.hidden, true);
-  assert.equal(field.currentValue, '');
-  assert.equal(button.__jobApplicationUserEdited, undefined);
+test('recovers sibling questions and required markers without including an embedded chat form', () => {
+  const document = makeDocument(`<main>
+    <div><p class="font-semibold">Full name <span>*</span></p><input id="name"></div>
+    <div><p>Email <span>*</span></p><input id="email" type="email"></div>
+    <div><p>Years of experience in TypeScript <span>*</span></p><input id="typescript" placeholder="Enter years"></div>
+    <div><p>Years of experience in React <span>*</span></p><input id="react" placeholder="Enter years"></div>
+    <div><p>Are you willing to work from office? <span>*</span></p><input id="office" role="combobox" aria-expanded="false"></div>
+    <div><p>Upload your resume <span>*</span></p><input id="resume" type="file" accept=".pdf" style="display:none"></div>
+    <form aria-label="Chat"><p>Ask a follow-up</p><input id="chat"></form>
+  </main>`);
+  const inspection = inspectDocument(document);
+  assert.deepEqual(inspection.fields.map(field => field.label), [
+    'Full name', 'Email', 'Years of experience in TypeScript', 'Years of experience in React', 'Are you willing to work from office?',
+  ]);
+  assert.ok(inspection.fields.every(field => field.required));
+  assert.equal(inspection.fields.find(field => field.id === 'office')?.widget, 'custom');
+  assert.equal(inspection.fields.some(field => field.id === 'chat'), false);
+  assert.ok(inspection.pauseReasons.includes('file_upload'));
+  assert.equal(inspection.observation.controls.length, inspection.fields.length);
+});
+
+test('stops a batch when user interaction interrupts the active fill', async () => {
+  const document = makeDocument('<form><label>First<input id="first"></label><label>Last<input id="last"></label></form>');
+  const fields = collectFieldDescriptors(document);
+  const result = await applyDecisions(document, [
+    {fieldId: fields[0].id, handle: fields[0].handle, action: 'fill', value: 'Ada', sensitivity: 'safe', confirmationState: 'confirmed', approved: true},
+    {fieldId: fields[1].id, handle: fields[1].handle, action: 'fill', value: 'Lovelace', sensitivity: 'safe', confirmationState: 'confirmed', approved: true},
+  ], {beforeFill: () => {
+    const nextAttempt = (document.__jobApplicationFillAttempts || 0) + 1;
+    document.__jobApplicationFillAttempts = nextAttempt;
+    if (nextAttempt === 2) document.__jobApplicationUserInterrupted = true;
+    return true;
+  }});
+  assert.equal(document.querySelector('#first').value, 'Ada');
+  assert.equal(document.querySelector('#last').value, '');
+  assert.match(result.failed[0].reason, /paused after user interaction/i);
 });
 
 test('composes full names locally from unambiguous name parts', () => {
