@@ -13,7 +13,7 @@ test('fresh classic bundle executes and same-version reinjection preserves value
   new Script(bundle).runInContext(context);
   assert.equal(listeners.size, 1);
   const ping = await new Promise(resolve => [...listeners][0]({ type: 'JOB_APP_PING' }, {}, resolve));
-  assert.equal(ping.version, 'autofill-ux-7');
+  assert.equal(ping.version, 'autofill-ux-8');
   const result = await new Promise(resolve => [...listeners][0]({ type: 'JOB_APP_INSPECT' }, {}, resolve));
   assert.equal(result.ok, true, result.error);
   assert.equal(result.inspection.fields[0].label, 'Current CTC');
@@ -85,6 +85,30 @@ test('inactive form-session status keeps the content script inert until explicit
   assert.equal(listeners.length, 1);
   await dispatch({type: 'JOB_APP_SITE_STATE_CHANGED', enabled: false});
   assert.equal(dom.window.document.querySelectorAll('[data-job-inline-autofill]').length, 0);
+  dom.window.close();
+});
+
+test('content ignores option-popup mutations while discovery is active', async () => {
+  const bundle = await readFile(new URL('../dist/content.js', import.meta.url), 'utf8');
+  const dom = new JSDOM('<form><label>Full name<input id="name"></label><button type="button" role="combobox" aria-label="Country" aria-controls="countries">Select one</button><div id="countries" role="listbox" hidden></div></form>', {url: 'https://jobs.example.com/apply', pretendToBeVisual: true});
+  const document = dom.window.document;
+  const listeners = []; const messages = [];
+  const context = createContext({document, setTimeout, clearTimeout, console, chrome: {runtime: {
+    sendMessage: async message => {
+      messages.push(message);
+      return message.type === 'JOB_APP_SITE_STATUS' ? {ok: true, enabled: true, supported: true} : {ok: true};
+    }, onMessage: {addListener: listener => listeners.push(listener)},
+  }}});
+  new Script(bundle).runInContext(context);
+  await new Promise(resolve => setTimeout(resolve, 0));
+  messages.length = 0;
+  document.__jobApplicationDiscovering = true;
+  const listbox = document.querySelector('#countries');
+  listbox.hidden = false;
+  listbox.innerHTML = '<div role="option">India</div>';
+  await new Promise(resolve => setTimeout(resolve, 450));
+  assert.equal(messages.some(message => message.type === 'JOB_APP_NAVIGATED'), false);
+  document.__jobApplicationDiscovering = false;
   dom.window.close();
 });
 

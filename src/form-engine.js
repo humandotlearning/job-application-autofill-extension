@@ -133,7 +133,8 @@ function ensureEditTracking(document) {
   const markEdited = (event) => {
     let element = eventControl(event);
     if (isExtensionElement(element)) return;
-    if (!element || element.__jobApplicationAutofillDispatch || (document.__jobApplicationFilling && !event.isTrusted)) return;
+    if (!element || element.__jobApplicationAutofillDispatch || document.__jobApplicationDiscovering
+      || (document.__jobApplicationFilling && !event.isTrusted)) return;
     if (event.type === 'click') {
       const listbox = composedClosest(composedClosest(element, '[role="option"]'), '[role="listbox"]');
       if (!listbox?.id) return;
@@ -527,7 +528,7 @@ function fieldValue(document, element) {
 
 function constraintsFor(element) {
   const constraints = {};
-  for (const attribute of ['min', 'max', 'pattern']) {
+  for (const attribute of ['min', 'max', 'step', 'pattern']) {
     if (element.hasAttribute(attribute)) constraints[attribute] = element.getAttribute(attribute);
   }
   for (const attribute of ['minLength', 'maxLength']) {
@@ -553,10 +554,12 @@ function describeField(document, element, index) {
     nearbyContext: nearbyQuestion(element).slice(0, 1000),
     type,
     autocomplete: element.autocomplete || '',
+    inputMode: element.getAttribute('inputmode') || '',
     placeholder: element.getAttribute('placeholder') || '',
     required: (grouped ? checkboxes : [element]).some(candidate => candidate.required || candidate.getAttribute('aria-required') === 'true'),
     currentValue: fieldValue(document, element),
     options: fieldOptions(document, element),
+    optionsStatus: 'complete',
     constraints: constraintsFor(element),
     ...fieldContext(element),
   };
@@ -588,9 +591,11 @@ function collectFieldDescriptorsImpl(document) {
       type: 'select',
       widget: 'custom',
       autocomplete: element.getAttribute('autocomplete') || '',
+      inputMode: element.getAttribute('inputmode') || '',
       required: customWidgetRequired(element),
       currentValue: fieldValue(document, element),
       options: fieldOptions(document, element),
+      optionsStatus: fieldOptions(document, element).length ? 'partial' : 'unavailable',
       constraints: {},
       ...fieldContext(element),
     } }));
@@ -772,8 +777,8 @@ function waitForCustomOptions(document, element, answer, timeoutMs = 1500) {
       const options = customWidgetOptions(document, element);
       const multiple = element.getAttribute('aria-multiselectable') === 'true'
         || options[0]?.closest('[role="listbox"]')?.getAttribute('aria-multiselectable') === 'true';
-      const requested = multiple ? String(answer).split(/\s*[,;]\s*/).map(normalizeText).filter(Boolean) : [normalizeText(answer)];
-      if ((options.length && requested.every((value) => matchingCustomOptions(options, value).length)) || Date.now() - startedAt >= timeoutMs) {
+      const requested = answer == null ? [] : (multiple ? String(answer).split(/\s*[,;]\s*/).map(normalizeText).filter(Boolean) : [normalizeText(answer)]);
+      if ((options.length && (!requested.length || requested.every((value) => matchingCustomOptions(options, value).length))) || Date.now() - startedAt >= timeoutMs) {
         resolve(options);
         return;
       }
@@ -781,6 +786,29 @@ function waitForCustomOptions(document, element, answer, timeoutMs = 1500) {
     };
     check();
   });
+}
+
+// Discovery opens a menu only long enough to read its rendered choices. It never
+// types, selects, or keeps the menu open, so it cannot change the application value.
+export async function discoverFieldOptions(document, fieldId, expectedHandle, { timeoutMs = 1500 } = {}) {
+  const field = collectFieldDescriptors(document).find(candidate => candidate.id === fieldId && candidate.handle === expectedHandle);
+  if (!field) return { ok: false, reason: 'The field changed before options could be read' };
+  if (field.widget !== 'custom') return { ok: true, fieldId, handle: expectedHandle, options: field.options, structuredOptions: field.structuredOptions || [], optionsStatus: 'complete' };
+  const element = elementForField(document, fieldId);
+  if (!element || controlHandle(element) !== expectedHandle || hasNativeFormAction(element)) return { ok: false, reason: 'The field changed before options could be read' };
+  const wasOpen = element.getAttribute('aria-expanded') === 'true' || customWidgetOptions(document, element).length > 0;
+  let openedHere = false;
+  document.__jobApplicationDiscovering = true;
+  try {
+    if (!wasOpen) { element.click(); openedHere = true; }
+    const options = await waitForCustomOptions(document, element, null, timeoutMs);
+    const structuredOptions = options.map(option => ({ label: customOptionText(option), value: customOptionValue(option), selected: option.getAttribute('aria-selected') === 'true', disabled: option.getAttribute('aria-disabled') === 'true' }));
+    const labels = [...new Set(structuredOptions.flatMap(option => [option.label, option.value]).filter(Boolean).map(String))];
+    return { ok: true, fieldId, handle: expectedHandle, options: labels, structuredOptions, optionsStatus: labels.length ? 'partial' : 'unavailable' };
+  } finally {
+    if (openedHere && element.isConnected) element.click();
+    document.__jobApplicationDiscovering = false;
+  }
 }
 
 async function setCustomChoiceValue(document, element, answer, deadline = Infinity) {
@@ -1165,7 +1193,7 @@ export async function applyDecisions(document, decisions = [], { deadline = Infi
     }
     // Custom options may be filtered, stale, or loaded only after opening/searching.
     // Validate their exact match against the live popup in setCustomChoiceValue.
-    const validation = validateFillValue(field.widget === 'custom' ? { ...field, options: [] } : field, decision.value);
+    const validation = validateFillValue(field.widget === 'custom' ? { ...field, options: [], optionsStatus: '' } : field, decision.value);
     if (!validation.ok) {
       result.failed.push({ fieldId: field.id, label: field.label, value: decision.value, reason: validation.reason });
       continue;

@@ -12,6 +12,7 @@ import {
   selectApplicationRegion,
   selectApplicationField,
   clearApplicationSelection,
+  discoverFieldOptions,
 } from './form-engine.js';
 import { isExtensionElement, eventControl, withDomSnapshot } from './dom.js';
 import { createLearningSession } from './learning.js';
@@ -32,7 +33,7 @@ function notifyNavigation() {
   waitForDocumentSettled(document).then(() => sendRuntimeMessage({ type: 'JOB_APP_NAVIGATED' })).catch(() => {});
 }
 
-const CONTENT_VERSION = 'autofill-ux-7';
+const CONTENT_VERSION = 'autofill-ux-8';
 if (!globalThis.__jobApplicationAutofillInstalled) {
   globalThis.__jobApplicationAutofillInstalled = CONTENT_VERSION;
   let inline = null;
@@ -64,10 +65,10 @@ if (!globalThis.__jobApplicationAutofillInstalled) {
   }
 
   function schedulePageCheck() {
-    if (!active) return;
+    if (!active || document.__jobApplicationDiscovering || Date.now() < Number(document.__jobApplicationDiscoverySettlingUntil || 0)) return;
     clearTimeout(pageChangeTimer);
     pageChangeTimer = setTimeout(() => {
-      if (!active) return;
+      if (!active || document.__jobApplicationDiscovering || Date.now() < Number(document.__jobApplicationDiscoverySettlingUntil || 0)) return;
       const current = formShape();
       if (current === observedPage) return;
       observedPage = current;
@@ -232,6 +233,22 @@ if (!globalThis.__jobApplicationAutofillInstalled) {
             .catch((error) => sendResponse({ ok: false, error: error.message }));
           return true;
         }
+        case 'JOB_APP_DISCOVER_OPTIONS':
+          if (!active) { sendResponse({ok: false, disabled: true}); break; }
+          {
+            const timeoutMs = Math.min(1500, Math.max(0, Number(message.timeoutMs) || 1500));
+            document.__jobApplicationDiscoverySettlingUntil = Date.now() + timeoutMs + 500;
+            clearTimeout(pageChangeTimer);
+            const settleDiscovery = () => {
+              document.__jobApplicationDiscoverySettlingUntil = Date.now() + 500;
+              clearTimeout(pageChangeTimer);
+              observedPage = formShape();
+            };
+            discoverFieldOptions(document, message.fieldId, message.handle, {timeoutMs})
+              .then(result => { settleDiscovery(); sendResponse(result); })
+              .catch(error => { settleDiscovery(); sendResponse({ok: false, error: error.message}); });
+          }
+          return true;
         case 'JOB_APP_CAPTURE':
           if (!active) { sendResponse({ok: false, disabled: true, records: []}); break; }
           sendResponse({ ok: true, records: collectAnswerRecords(document, { finalize: message.finalize === true }) });

@@ -5,6 +5,7 @@ import { JSDOM } from 'jsdom';
 import {
   applyDecisions,
   descriptorForElement,
+  discoverFieldOptions,
   collectAnswerRecords,
   collectFieldDescriptors,
   focusField,
@@ -971,6 +972,24 @@ test('does not steal options when its controlled popup is missing', async () => 
   const document = makeDocument('<form><button type="button" role="combobox" aria-label="Country" aria-controls="missing">Select one</button><div role="listbox" id="unrelated"><div role="option" aria-selected="true">India</div></div></form>');
   assert.equal(collectFieldDescriptors(document)[0].currentValue, '');
   assert.deepEqual(collectFieldDescriptors(document)[0].options, []);
+});
+
+test('discovers custom choices without changing the field value or leaving the menu open', async () => {
+  const document = makeDocument('<form><button id="country" type="button" role="combobox" aria-label="Country" aria-controls="countries" aria-expanded="false">Select one</button><div id="countries" role="listbox" hidden><div role="option" data-value="IN">India</div></div></form>');
+  const button = document.querySelector('#country');
+  const listbox = document.querySelector('#countries');
+  button.addEventListener('click', () => {
+    listbox.hidden = !listbox.hidden;
+  });
+  const [field] = collectFieldDescriptors(document);
+  const result = await discoverFieldOptions(document, field.id, field.handle);
+  assert.equal(result.ok, true);
+  assert.deepEqual(result.options, ['India', 'IN']);
+  assert.equal(result.optionsStatus, 'partial');
+  assert.equal(button.getAttribute('aria-expanded'), 'false');
+  assert.equal(listbox.hidden, true);
+  assert.equal(field.currentValue, '');
+  assert.equal(button.__jobApplicationUserEdited, undefined);
 });
 
 test('composes full names locally from unambiguous name parts', () => {

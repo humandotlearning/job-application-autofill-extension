@@ -94,3 +94,13 @@ test('planner rejects evidence for another field even if the value is a literal 
     fetchImpl: async () => response([ask(inputFields[0]), {...ask(fields[3]), action: 'fill', value: inputRecords[0].answer, evidenceKeys: ['ml'], transformation: 'copy'}]),
   }), /evidence not supplied/);
 });
+
+test('planner reports rejected partial decisions instead of silently succeeding', async () => {
+  const field = {id: 'country', label: 'Country', type: 'select', widget: 'custom', options: [], optionsStatus: 'unavailable'};
+  const result = await callAnswerPlanner({apiKey: 'test', fields: [field], records: [{key: 'country', question: 'Country', answer: 'India', sensitivity: 'safe'}]}, {
+    allowPartial: true,
+    fetchImpl: async () => response([{fieldId: 'country', action: 'fill', value: 'India', evidenceKeys: ['country'], confidence: 'high', sensitivity: 'safe', reason: 'Country record', transformation: 'map_option'}]),
+  });
+  assert.deepEqual(result.decisions, []);
+  assert.match(result.rejectedDecisions[0].reason, /allowed transformation/);
+});

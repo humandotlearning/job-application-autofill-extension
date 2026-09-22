@@ -366,6 +366,11 @@ function validateFillValue(field = {}, value) {
   const text = String(value).trim();
   if (isOpaqueIdentifier(text)) return { ok: false, reason: 'value is an opaque internal identifier' };
   const constraints = field.constraints || {};
+  const type = normalizeText(field.type);
+  if (['select', 'select-one', 'radio'].includes(type) && field.optionsStatus
+    && !(field.options || []).some(option => String(option || '').trim())) {
+    return { ok: false, reason: 'field options are unavailable' };
+  }
   if (Array.isArray(field.options) && field.options.length) {
     const exactOption = field.options.some(option => normalizeText(option) === normalizeText(text));
     const values = field.multiple && !exactOption ? text.split(/\s*[,;]\s*/) : [text];
@@ -382,7 +387,6 @@ function validateFillValue(field = {}, value) {
       return { ok: false, reason: 'field pattern is invalid' };
     }
   }
-  const type = normalizeText(field.type);
   if (type === 'email' && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(text)) return { ok: false, reason: 'value is not a valid email' };
   if (type === 'url') {
     try {
@@ -397,7 +401,12 @@ function validateFillValue(field = {}, value) {
     if (!Number.isFinite(numeric)) return { ok: false, reason: 'value is not numeric' };
     if (constraints.min != null && numeric < numberConstraint(constraints.min, -Infinity)) return { ok: false, reason: 'value is below the minimum' };
     if (constraints.max != null && numeric > numberConstraint(constraints.max, Infinity)) return { ok: false, reason: 'value is above the maximum' };
+    if (constraints.step && constraints.step !== 'any') {
+      const step = Number(constraints.step), min = constraints.min != null ? Number(constraints.min) : 0;
+      if (Number.isFinite(step) && step > 0 && Number.isFinite(min) && Math.abs((numeric - min) / step - Math.round((numeric - min) / step)) > 1e-9) return { ok: false, reason: 'value does not match the field step' };
+    }
   }
+  if (type === 'date' && !/^\d{4}-\d{2}-\d{2}$/.test(text)) return { ok: false, reason: 'date must use YYYY-MM-DD' };
   if (type === 'checkbox' && !['yes', 'no', 'true', 'false', 'checked', 'unchecked'].includes(normalizeText(text))) {
     return { ok: false, reason: 'checkbox value must be yes or no' };
   }
@@ -749,7 +758,8 @@ function ensureEditTracking(document) {
   const markEdited = (event) => {
     let element = eventControl(event);
     if (isExtensionElement(element)) return;
-    if (!element || element.__jobApplicationAutofillDispatch || (document.__jobApplicationFilling && !event.isTrusted)) return;
+    if (!element || element.__jobApplicationAutofillDispatch || document.__jobApplicationDiscovering
+      || (document.__jobApplicationFilling && !event.isTrusted)) return;
     if (event.type === 'click') {
       const listbox = composedClosest(composedClosest(element, '[role="option"]'), '[role="listbox"]');
       if (!listbox?.id) return;
@@ -1143,7 +1153,7 @@ function fieldValue(document, element) {
 
 function constraintsFor(element) {
   const constraints = {};
-  for (const attribute of ['min', 'max', 'pattern']) {
+  for (const attribute of ['min', 'max', 'step', 'pattern']) {
     if (element.hasAttribute(attribute)) constraints[attribute] = element.getAttribute(attribute);
   }
   for (const attribute of ['minLength', 'maxLength']) {
@@ -1169,10 +1179,12 @@ function describeField(document, element, index) {
     nearbyContext: nearbyQuestion(element).slice(0, 1000),
     type,
     autocomplete: element.autocomplete || '',
+    inputMode: element.getAttribute('inputmode') || '',
     placeholder: element.getAttribute('placeholder') || '',
     required: (grouped ? checkboxes : [element]).some(candidate => candidate.required || candidate.getAttribute('aria-required') === 'true'),
     currentValue: fieldValue(document, element),
     options: fieldOptions(document, element),
+    optionsStatus: 'complete',
     constraints: constraintsFor(element),
     ...fieldContext(element),
   };
@@ -1204,9 +1216,11 @@ function collectFieldDescriptorsImpl(document) {
       type: 'select',
       widget: 'custom',
       autocomplete: element.getAttribute('autocomplete') || '',
+      inputMode: element.getAttribute('inputmode') || '',
       required: customWidgetRequired(element),
       currentValue: fieldValue(document, element),
       options: fieldOptions(document, element),
+      optionsStatus: fieldOptions(document, element).length ? 'partial' : 'unavailable',
       constraints: {},
       ...fieldContext(element),
     } }));
@@ -1388,8 +1402,8 @@ function waitForCustomOptions(document, element, answer, timeoutMs = 1500) {
       const options = customWidgetOptions(document, element);
       const multiple = element.getAttribute('aria-multiselectable') === 'true'
         || options[0]?.closest('[role="listbox"]')?.getAttribute('aria-multiselectable') === 'true';
-      const requested = multiple ? String(answer).split(/\s*[,;]\s*/).map(normalizeText).filter(Boolean) : [normalizeText(answer)];
-      if ((options.length && requested.every((value) => matchingCustomOptions(options, value).length)) || Date.now() - startedAt >= timeoutMs) {
+      const requested = answer == null ? [] : (multiple ? String(answer).split(/\s*[,;]\s*/).map(normalizeText).filter(Boolean) : [normalizeText(answer)]);
+      if ((options.length && (!requested.length || requested.every((value) => matchingCustomOptions(options, value).length))) || Date.now() - startedAt >= timeoutMs) {
         resolve(options);
         return;
       }
@@ -1397,6 +1411,29 @@ function waitForCustomOptions(document, element, answer, timeoutMs = 1500) {
     };
     check();
   });
+}
+
+// Discovery opens a menu only long enough to read its rendered choices. It never
+// types, selects, or keeps the menu open, so it cannot change the application value.
+async function discoverFieldOptions(document, fieldId, expectedHandle, { timeoutMs = 1500 } = {}) {
+  const field = collectFieldDescriptors(document).find(candidate => candidate.id === fieldId && candidate.handle === expectedHandle);
+  if (!field) return { ok: false, reason: 'The field changed before options could be read' };
+  if (field.widget !== 'custom') return { ok: true, fieldId, handle: expectedHandle, options: field.options, structuredOptions: field.structuredOptions || [], optionsStatus: 'complete' };
+  const element = elementForField(document, fieldId);
+  if (!element || controlHandle(element) !== expectedHandle || hasNativeFormAction(element)) return { ok: false, reason: 'The field changed before options could be read' };
+  const wasOpen = element.getAttribute('aria-expanded') === 'true' || customWidgetOptions(document, element).length > 0;
+  let openedHere = false;
+  document.__jobApplicationDiscovering = true;
+  try {
+    if (!wasOpen) { element.click(); openedHere = true; }
+    const options = await waitForCustomOptions(document, element, null, timeoutMs);
+    const structuredOptions = options.map(option => ({ label: customOptionText(option), value: customOptionValue(option), selected: option.getAttribute('aria-selected') === 'true', disabled: option.getAttribute('aria-disabled') === 'true' }));
+    const labels = [...new Set(structuredOptions.flatMap(option => [option.label, option.value]).filter(Boolean).map(String))];
+    return { ok: true, fieldId, handle: expectedHandle, options: labels, structuredOptions, optionsStatus: labels.length ? 'partial' : 'unavailable' };
+  } finally {
+    if (openedHere && element.isConnected) element.click();
+    document.__jobApplicationDiscovering = false;
+  }
 }
 
 async function setCustomChoiceValue(document, element, answer, deadline = Infinity) {
@@ -1781,7 +1818,7 @@ async function applyDecisions(document, decisions = [], { deadline = Infinity, b
     }
     // Custom options may be filtered, stale, or loaded only after opening/searching.
     // Validate their exact match against the live popup in setCustomChoiceValue.
-    const validation = validateFillValue(field.widget === 'custom' ? { ...field, options: [] } : field, decision.value);
+    const validation = validateFillValue(field.widget === 'custom' ? { ...field, options: [], optionsStatus: '' } : field, decision.value);
     if (!validation.ok) {
       result.failed.push({ fieldId: field.id, label: field.label, value: decision.value, reason: validation.reason });
       continue;
@@ -2647,7 +2684,7 @@ function notifyNavigation() {
   waitForDocumentSettled(document).then(() => sendRuntimeMessage({ type: 'JOB_APP_NAVIGATED' })).catch(() => {});
 }
 
-const CONTENT_VERSION = 'autofill-ux-7';
+const CONTENT_VERSION = 'autofill-ux-8';
 if (!globalThis.__jobApplicationAutofillInstalled) {
   globalThis.__jobApplicationAutofillInstalled = CONTENT_VERSION;
   let inline = null;
@@ -2679,10 +2716,10 @@ if (!globalThis.__jobApplicationAutofillInstalled) {
   }
 
   function schedulePageCheck() {
-    if (!active) return;
+    if (!active || document.__jobApplicationDiscovering || Date.now() < Number(document.__jobApplicationDiscoverySettlingUntil || 0)) return;
     clearTimeout(pageChangeTimer);
     pageChangeTimer = setTimeout(() => {
-      if (!active) return;
+      if (!active || document.__jobApplicationDiscovering || Date.now() < Number(document.__jobApplicationDiscoverySettlingUntil || 0)) return;
       const current = formShape();
       if (current === observedPage) return;
       observedPage = current;
@@ -2847,6 +2884,22 @@ if (!globalThis.__jobApplicationAutofillInstalled) {
             .catch((error) => sendResponse({ ok: false, error: error.message }));
           return true;
         }
+        case 'JOB_APP_DISCOVER_OPTIONS':
+          if (!active) { sendResponse({ok: false, disabled: true}); break; }
+          {
+            const timeoutMs = Math.min(1500, Math.max(0, Number(message.timeoutMs) || 1500));
+            document.__jobApplicationDiscoverySettlingUntil = Date.now() + timeoutMs + 500;
+            clearTimeout(pageChangeTimer);
+            const settleDiscovery = () => {
+              document.__jobApplicationDiscoverySettlingUntil = Date.now() + 500;
+              clearTimeout(pageChangeTimer);
+              observedPage = formShape();
+            };
+            discoverFieldOptions(document, message.fieldId, message.handle, {timeoutMs})
+              .then(result => { settleDiscovery(); sendResponse(result); })
+              .catch(error => { settleDiscovery(); sendResponse({ok: false, error: error.message}); });
+          }
+          return true;
         case 'JOB_APP_CAPTURE':
           if (!active) { sendResponse({ok: false, disabled: true, records: []}); break; }
           sendResponse({ ok: true, records: collectAnswerRecords(document, { finalize: message.finalize === true }) });

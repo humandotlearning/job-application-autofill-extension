@@ -6,7 +6,7 @@ export function semanticEligible(field, record) {
   const choice = ['select', 'select-one', 'radio', 'checkbox'].includes(field.type)
     && Array.isArray(field.options) && field.options.some(option => String(option || '').trim());
   return (['text', 'textarea', 'email', 'tel', 'url'].includes(field.type) || choice)
-    && !field.widget && !field.multiple && !field.entityUnresolved
+    && !field.multiple && !field.entityUnresolved
     && !String(field.currentValue || field.rawValue || '').trim()
     && field.labelConfidence !== 'low' && !isOpaqueIdentifier(field.label)
     && Boolean(String(field.label || '').trim()) && inferSensitivity(field.label, field.id) !== 'legal'

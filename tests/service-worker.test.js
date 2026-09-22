@@ -171,6 +171,12 @@ function createHarness({
           return { ok: true, inspection, focusedFieldId: focused?.id ?? null, focusedHandle: focused?.handle ?? null,
             rawValue: focused ? (page.values?.[focused.id] ?? focused.rawValue) : null, editRevision: focused?.editRevision ?? null };
         }
+        if (message.type === 'JOB_APP_DISCOVER_OPTIONS') {
+          const result = page.discoveredOptions?.[message.fieldId] || {};
+          return {ok: true, fieldId: message.fieldId, handle: message.handle,
+            options: result.options || [], structuredOptions: result.structuredOptions || [],
+            optionsStatus: result.optionsStatus || (result.options?.length ? 'partial' : 'unavailable')};
+        }
         if (message.type === 'JOB_APP_APPLY') {
           await page.beforeApply?.({ page, message, tabId, frameId });
           const failed = [];
@@ -339,6 +345,21 @@ test('form-session authorization survives an explicit next-page advance', async 
   assert.equal(active.sessionActive, true);
 });
 
+test('reuses an accepted fact from an earlier page without sending it to an AI provider', async () => {
+  const harness = createHarness({pagesByTab: {7: {pages: [
+    {page: {title: 'Job application', domain: 'jobs.example.com'}, fields: [{id: 'country', label: 'Country', type: 'text', currentValue: 'India'}], actions: [{id: 'next', label: 'Next', kind: 'next'}], advanceOnClick: true},
+    {page: {title: 'Job application', domain: 'jobs.example.com'}, fields: [{id: 'country_confirm', label: 'Country', type: 'text', required: true}], actions: [{id: 'submit', label: 'Submit application', kind: 'submit', type: 'submit'}]},
+  ]}}});
+  await import(`../src/service-worker.js?application-memory=${Date.now()}`);
+  const started = await harness.dispatch({type: 'JOB_RUN_START', tabId: 7});
+  const advanced = await harness.dispatch({type: 'JOB_RUN_ADVANCE_PAGE', tabId: 7});
+  assert.equal(advanced.ok, true, advanced.error);
+  await harness.dispatch({type: 'JOB_APP_NAVIGATED'}, {tab: {id: 7}, frameId: 0});
+  assert.equal(harness.tabs.get(7).frames[0].pages[1].values.country_confirm, 'India');
+  assert.equal(harness.tabs.get(7).messages.some(message => message.type === 'JOB_APP_DISCOVER_OPTIONS'), false);
+  assert.equal(started.run.pages[0].values[0].answer, 'India');
+});
+
 test('disabled site rejects inline requests and prevents a late run write after revocation', async () => {
   const harness = createHarness({
     disabledHostnames: [],
@@ -410,6 +431,38 @@ test('Fill this page batches unresolved saved-answer choices and skips drafting 
   assert.equal(started.run.suggestions.impact.candidates[0].kind, 'semantic');
   assert.equal(started.run.suggestions.collaboration.candidates[0].kind, 'semantic');
   assert.deepEqual(started.run.generatedSuggestions, {});
+});
+
+test('custom dropdown discovery gives JEV its rendered choices', async () => {
+  const harness = createHarness({answerRecords: [{key: 'travel', question: 'Travel availability', answer: 'India', sensitivity: 'safe'}],
+    pagesByTab: {7: {pages: [{page: {title: 'Application', domain: 'jobs.example.com'}, fields: [
+      {id: 'full_name', handle: 'name-h', label: 'Full name', type: 'text', required: true, currentValue: 'Nithin', rawValue: 'Nithin', editRevision: 0},
+      {id: 'country', handle: 'country-h', label: 'Country', type: 'select', widget: 'custom', required: true, rawValue: '', editRevision: 0},
+    ], discoveredOptions: {country: {options: ['India'], structuredOptions: [{label: 'India', value: 'IN'}], optionsStatus: 'partial'}}, actions: []}]}}});
+  harness.localData.typesafeEnabled = true;
+  harness.localData.typesafeApiKey = 'ts_test';
+  const calls = [];
+  globalThis.fetch = async (_url, options) => {
+    const body = JSON.parse(options.body);
+    calls.push(body);
+    return {ok: true, status: 200, json: async () => ({answers: jevAnswers(body, {f0: 'o0'})})};
+  };
+  await import(`../src/service-worker.js?test=custom-options-${Date.now()}`);
+  const started = await harness.dispatch({type: 'JOB_RUN_START', tabId: 7});
+  assert.equal(started.ok, true, started.error);
+  assert.equal(harness.tabs.get(7).messages.some(message => message.type === 'JOB_APP_DISCOVER_OPTIONS'), true);
+  await waitUntil(() => calls.length === 1);
+  assert.deepEqual(Object.values(calls[0].state.fields)[0].options, ['India']);
+  await waitUntil(() => Boolean(harness.sessionData.applicationRun['7'].suggestions.country));
+  const run = harness.sessionData.applicationRun['7'];
+  const suggestion = run.suggestions.country;
+  const candidate = suggestion.candidates[0];
+  assert.equal(candidate.kind, 'semantic_option');
+  const approved = await harness.dispatch({type: 'JOB_RUN_APPROVE_SUGGESTION', tabId: 7,
+    frameId: suggestion.frameId, applicationId: suggestion.applicationId, pageSignature: suggestion.pageSignature,
+    fieldId: 'country', handle: suggestion.field.handle, sourceKeys: candidate.sourceKeys});
+  assert.equal(approved.ok, true, approved.error);
+  assert.equal(harness.tabs.get(7).frames[0].pages[0].values.country, 'India');
 });
 
 test('opt-in JEV autofill applies a guarded low-risk option without user approval or learning promotion', async () => {
@@ -3087,7 +3140,7 @@ test('invalid optional fields block; validation-only refresh never fills or call
   assert.equal(h.tabs.get(7).nextClicks,0);
 });
 
-test('local results return while the required fast draft runs and optional questions stay idle', async () => {
+test('local results return while the required fast draft runs, then optional questions are assisted', async () => {
   const h=createHarness({waitForAI:false,pagesByTab:{7:{pages:[{page:{title:'Application',domain:'example.test'},fields:[{id:'required',handle:'r-h',label:'Why this role?',type:'textarea',required:true},{id:'optional',handle:'o-h',label:'Additional information',type:'textarea'}],actions:[]}]}}});
   h.localData.openaiApiKey='test-key'; let release;const requests=[];
   globalThis.fetch=async(_url,options)=>{const body=JSON.parse(options.body);const request=JSON.parse(body.input[1].content[0].text);requests.push(request);if(request.field)await new Promise(resolve=>{release=resolve;});return{ok:true,json:async()=>({output_text:JSON.stringify(request.fields?{decisions:[]}:{suggestions:[],missingContext:'Add relevant experience'})})};};
@@ -3095,7 +3148,7 @@ test('local results return while the required fast draft runs and optional quest
   const response=await Promise.race([h.dispatch({type:'JOB_RUN_START',tabId:7}),new Promise(resolve=>setTimeout(()=>resolve({error:'Blocked on AI'}),600))]);
   try{assert.equal(response.ok,true,response.error);assert.notEqual(response.run.waitingFor,'extension_error');await waitUntil(()=>Boolean(release));}finally{release?.();}
   for(let n=0;n<100&&Object.values(h.sessionData.applicationRun['7'].aiOperations||{}).some(op=>op.status==='pending');n++)await new Promise(resolve=>setTimeout(resolve,5));
-  assert.equal(requests.filter(request=>request.field?.id==='optional').length,0);
+  assert.equal(requests.filter(request=>request.field?.id==='optional').length,1);
 });
 
 test('worker restart marks pending operations interrupted without replaying navigation', async () => {

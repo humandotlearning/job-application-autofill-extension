@@ -108,6 +108,12 @@ test('hard policy filters run before semantic selection', () => {
   assert.deepEqual(selectSemanticEvidence(target,[...blocked,valid]),[valid]);
 });
 
+test('custom choices with observed options are eligible for review-only JEV matching', () => {
+  const target = {...field('country', 'Country'), type: 'select', widget: 'custom', options: ['India'], optionsStatus: 'partial'};
+  const saved = record('country', 'Country', 'India');
+  assert.equal(semanticEligible(target, saved), true);
+});
+
 test('shortlists retain compatible answers beyond the lexical-match gate', () => {
   const target=field('ambiguity','What makes you effective in ambiguous situations?');
   const compatible=record('challenge','A challenge I handled','I clarified priorities, tested assumptions, and communicated tradeoffs early.');
