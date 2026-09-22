@@ -4,7 +4,7 @@ import { inferSensitivity, lowRiskSemanticField, semanticAutofillQualified } fro
 
 export const TYPESAFE_MODEL = 'jev-1.13.0';
 const TYPESAFE_URL = 'https://api.typesafe.ai/v1/systemone';
-const PROMPT_VERSION = 'jev-decisions-v3';
+const PROMPT_VERSION = 'jev-decisions-v4';
 const MIN_CONFIDENCE = 0.8;
 const MAX_REQUEST_BYTES = 24_000;
 const MAX_CACHE_ENTRIES = 256;
@@ -113,17 +113,6 @@ function createRequest(entries) {
         false: 'There are no unresolved contradictory answers.',
       },
     };
-    if (!isNarrativeField(entry.field)) {
-      questions[`${fieldId}_route`] = {
-        type: 'choice',
-        instructions: `${context}What kind of answer does this form question require?`,
-        criteria: {
-          factual: 'A specific factual value established by supplied evidence.',
-          narrative: 'New prose, an explanation, or a tailored narrative based on evidence.',
-          manual: 'A missing personal fact, preference, or context requires the user.',
-        },
-      };
-    }
   });
 
   return { payload: { model: TYPESAFE_MODEL, state, questions }, mappings: {fields: fieldMappings, records: recordMappings} };
@@ -238,9 +227,7 @@ export function createSemanticMatcher({fetchImpl, timeoutMs = 5000, traceImpl = 
         const answer = payload.answers[id];
         const sufficiency = payload.answers[`${id}_sufficiency`].noul;
         const conflict = payload.answers[`${id}_conflict`].noul;
-        const routeAnswer = payload.answers[`${id}_route`];
-        const route = isNarrativeField(entry.field) ? 'narrative'
-          : routeAnswer.confidence >= MIN_CONFIDENCE ? routeAnswer.choice : 'manual';
+        const route = isNarrativeField(entry.field) ? 'narrative' : 'factual';
         const record = entry.options.get(answer.choice);
         const option = entry.choiceOptions.get(answer.choice);
         const coverage = {
@@ -252,7 +239,6 @@ export function createSemanticMatcher({fetchImpl, timeoutMs = 5000, traceImpl = 
           choice: answer,
           sufficiency: payload.answers[`${id}_sufficiency`],
           conflict: payload.answers[`${id}_conflict`],
-          ...(routeAnswer ? { route: routeAnswer } : {}),
         };
         const metadata = { route, coverage, judgments,
           evidenceRevisions: entry.records.map(semanticRecordRevision) };
@@ -310,7 +296,12 @@ export function createSemanticMatcher({fetchImpl, timeoutMs = 5000, traceImpl = 
             ],
           }])),
         });
-        while (included.length > 1 && new TextEncoder().encode(JSON.stringify(requestFor(included))).length > MAX_REQUEST_BYTES) included.pop();
+        while (included.length && new TextEncoder().encode(JSON.stringify(requestFor(included))).length > MAX_REQUEST_BYTES) included.pop();
+        if (!included.length) {
+          void Promise.resolve(traceImpl('jev_narrative_ranking', {'llm.provider':'typesafe','llm.model_name':TYPESAFE_MODEL,
+            'typesafe.question_count':0,'typesafe.omitted':records.length},sessionId,{traceContext})).catch(()=>{});
+          return [];
+        }
         const request = requestFor(included);
         const controller = new AbortController();
         const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -326,7 +317,8 @@ export function createSemanticMatcher({fetchImpl, timeoutMs = 5000, traceImpl = 
             const answer = payload.answers[`r${index}`];
             validateScore(answer);
             return {record,score:answer.score,confidence:answer.confidence};
-          }).sort((a,b)=>b.score-a.score || b.confidence-a.confidence).slice(0,8).map(item=>item.record);
+          }).filter(item=>item.score>=2)
+            .sort((a,b)=>b.score-a.score || b.confidence-a.confidence).slice(0,8).map(item=>item.record);
           void Promise.resolve(traceImpl('jev_narrative_ranking', {'llm.provider':'typesafe','llm.model_name':TYPESAFE_MODEL,
             'typesafe.question_count':included.length,'typesafe.omitted':records.length-included.length,
             'llm.token_count.prompt':payload.usage?.input_tokens || 0,'llm.token_count.completion':payload.usage?.output_tokens || 0},
@@ -362,7 +354,7 @@ export function createSemanticMatcher({fetchImpl, timeoutMs = 5000, traceImpl = 
             shortlistOmitted: Math.max(0, records.filter(record => semanticEligible(field, record)).length - selected.length),
             optionsOmitted: Math.max(0, new Set(field.options || []).size - 254),
             contextTruncated: String(field.helpText || '').length > 1000 || String(field.nearbyContext || '').length > 500});
-          else finish({ status: 'none', route: isNarrativeField(field) ? 'narrative' : 'manual',
+          else finish({ status: 'none', route: isNarrativeField(field) ? 'narrative' : 'factual',
             disposition: isNarrativeField(field) ? 'draft' : 'manual',
             coverage: {complete: true, omittedRecords: 0, omittedOptions: 0}, judgments: {}, evidenceRevisions: [] });
           for (const [oldKey, oldValue] of cache) {
