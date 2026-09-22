@@ -4,6 +4,13 @@ import { readFile } from 'node:fs/promises';
 import { Script, createContext } from 'node:vm';
 import { JSDOM } from 'jsdom';
 
+const jevAnswers = (body, selected = {}) => Object.fromEntries(Object.entries(body.questions).map(([id, question]) => {
+  if (question.type === 'noul') return [id, {type:'noul',noul:id.endsWith('_conflict')?0:1}];
+  const choice=selected[id] || (id.endsWith('_route')?'factual':'none');
+  return [id,{type:'choice',choice,confidence:0.99,
+    probabilities:Object.fromEntries(Object.keys(question.criteria).map(key=>[key,key===choice?0.99:0.01/(Object.keys(question.criteria).length-1)]))}];
+}));
+
 function createHarness({
   autoAdvancePages = false,
   includeFormScreenshot = true,
@@ -175,6 +182,7 @@ function createHarness({
             }
             if (!page.values) page.values = {};
             if (!Object.prototype.hasOwnProperty.call(page.values, decision.fieldId)) page.values[decision.fieldId] = decision.value;
+            if (decision.matchKind === 'semantic') field.provenance = 'autofill';
           }
           page.onApply?.({ page, decisions: message.decisions || [] });
           return { ok: true, result: { applied: [], kept: [], reviewRequired: [], unresolved: [], failed } };
@@ -388,23 +396,55 @@ test('Fill this page batches unresolved saved-answer choices and skips drafting 
   globalThis.fetch = async (url, options) => {
     const body = JSON.parse(options.body);
     calls.push({url, body});
-    const probabilities = selected => Object.fromEntries(Object.keys(body.questions.f0.criteria)
-      .map(key => [key, key === selected ? 0.9 : 0.05]));
-    return {ok: true, status: 200, json: async () => ({answers: {
-      f0: {type: 'choice', choice: 'r0', confidence: 0.9, probabilities: probabilities('r0')},
-      f1: {type: 'choice', choice: 'r1', confidence: 0.9, probabilities: probabilities('r1')},
-    }})};
+    return {ok: true, status: 200, json: async () => ({answers:jevAnswers(body,{f0:'r0',f1:'r1'})})};
   };
   await import(`../src/service-worker.js?test=typesafe-batch-${Date.now()}`);
   const started = await harness.dispatch({type: 'JOB_RUN_START', tabId: 7});
   assert.equal(started.ok, true, started.error);
   assert.equal(calls.length, 1);
   assert.match(calls[0].url, /api\.typesafe\.ai/);
-  assert.deepEqual(Object.keys(calls[0].body.questions), ['f0', 'f1']);
+  assert.deepEqual(Object.keys(calls[0].body.questions), ['f0','f0_sufficiency','f0_conflict','f1','f1_sufficiency','f1_conflict']);
   assert.equal(calls[0].body.state.records.length, 2);
   assert.equal(started.run.suggestions.impact.candidates[0].kind, 'semantic');
   assert.equal(started.run.suggestions.collaboration.candidates[0].kind, 'semantic');
   assert.deepEqual(started.run.generatedSuggestions, {});
+});
+
+test('opt-in JEV autofill applies a guarded low-risk option without user approval or learning promotion', async () => {
+  const harness=createHarness({answerRecords:[{key:'phone_kind',question:'Preferred telephone kind',answer:'Cellular',sensitivity:'safe',confirmationState:'confirmed'}],
+    pagesByTab:{7:{pages:[{page:{title:'Application',domain:'jobs.example.com'},fields:[
+      {id:'device',handle:'device-h',label:'Phone device type',labelConfidence:'high',type:'select',options:['Mobile','Landline'],required:true,rawValue:'',editRevision:0},
+      {id:'name',handle:'name-h',label:'Full name',labelConfidence:'high',type:'text',required:true,currentValue:'Nithin',rawValue:'Nithin',editRevision:0},
+    ],actions:[]}]}}});
+  harness.localData.typesafeEnabled=true;
+  harness.localData.typesafeAutofillEnabled=true;
+  harness.localData.typesafeApiKey='ts_test';
+  const calls=[];
+  globalThis.fetch=async(_url,options)=>{
+    const body=JSON.parse(options.body);
+    calls.push(body);
+    return {ok:true,status:200,json:async()=>({answers:jevAnswers(body,{f0:'o0'})})};
+  };
+  await import(`../src/service-worker.js?test=typesafe-autofill-${Date.now()}`);
+  const started=await harness.dispatch({type:'JOB_RUN_START',tabId:7});
+  assert.equal(started.ok,true,started.error);
+  assert.equal(harness.tabs.get(7).frames[0].pages[0].values?.device,'Mobile',JSON.stringify({
+    semanticSearch:started.run.semanticSearch,
+    calls,
+    actionRequired:started.run.actionRequired,
+    reviewRequired:started.run.reviewRequired,
+    aiOperations:started.run.aiOperations,
+    messages:harness.tabs.get(7).messages.filter(message=>message.type==='JOB_APP_APPLY'),
+  }));
+  const decision=harness.tabs.get(7).messages.find(message=>message.type==='JOB_APP_APPLY'
+    && message.decisions?.some(item=>item.matchKind==='semantic')).decisions[0];
+  assert.equal(decision.approved,undefined);
+  assert.equal(decision.expectedRawValue,'');
+  assert.equal(decision.expectedEditRevision,0);
+  assert.deepEqual(started.run.semanticAutofills.map(item=>[item.fieldId,item.value]),[['device','Mobile']]);
+  assert.equal(harness.localData.answerRecords.some(record=>record.question==='Phone device type'),false);
+  assert.equal(Object.values(harness.localData.applicationDrafts || {}).flatMap(item=>item.records || [])
+    .find(record=>record.question==='Phone device type')?.provenance,'autofill');
 });
 
 test('Fill this page makes no TypeSafe request when a usable local suggestion exists', async () => {
@@ -445,11 +485,10 @@ test('Fill this page still uses TypeSafe after an explicit local search found no
   harness.sessionData.applicationRun['7'].aiOperations = {planner: {status: 'failed'}};
   harness.sessionData.applicationRun['7'].semanticSearch = {impact: {status: 'failed'}};
   let calls = 0;
-  globalThis.fetch = async () => {
+  globalThis.fetch = async (_url,options) => {
     calls += 1;
-    return {ok: true, status: 200, json: async () => ({answers: {
-      f0: {type: 'choice', choice: 'r0', confidence: 0.9, probabilities: {none: 0.1, r0: 0.9}},
-    }})};
+    const body=JSON.parse(options.body);
+    return {ok:true,status:200,json:async()=>({answers:jevAnswers(body,{f0:'r0'})})};
   };
   await harness.dispatch({type: 'JOB_RUN_RETRY_AI', tabId: 7});
   await waitUntil(() => harness.sessionData.applicationRun['7'].aiOperations.planner.status === 'completed');
@@ -512,10 +551,8 @@ test('inline TypeSafe search is explicit and rejects a source changed before app
   globalThis.fetch = async (_url, options) => {
     calls += 1;
     const body = JSON.parse(options.body);
-    assert.deepEqual(Object.keys(body.questions), ['f0']);
-    return {ok: true, status: 200, json: async () => ({answers: {
-      f0: {type: 'choice', choice: 'r0', confidence: 0.9, probabilities: {none: 0.1, r0: 0.9}},
-    }})};
+    assert.deepEqual(Object.keys(body.questions), ['f0','f0_sufficiency','f0_conflict']);
+    return {ok:true,status:200,json:async()=>({answers:jevAnswers(body,{f0:'r0'})})};
   };
   const query = await harness.dispatch(inlineQuery({fieldId: 'impact', handle: 'doc-a:impact'}), inlineSender());
   assert.equal(calls, 0, 'ordinary focus/query remains local');
@@ -539,11 +576,10 @@ test('inline panel can search saved answers after focus leaves the page without 
   harness.localData.typesafeEnabled = true;
   harness.localData.typesafeApiKey = 'ts_test';
   let calls = 0;
-  globalThis.fetch = async () => {
+  globalThis.fetch = async (_url,options) => {
     calls++;
-    return {ok: true, status: 200, json: async () => ({answers: {
-      f0: {type: 'choice', choice: 'r0', confidence: 0.9, probabilities: {none: 0.1, r0: 0.9}},
-    }})};
+    const body=JSON.parse(options.body);
+    return {ok:true,status:200,json:async()=>({answers:jevAnswers(body,{f0:'r0'})})};
   };
   const query = await harness.dispatch(inlineQuery(), inlineSender());
   await handoffInline(harness, query);
@@ -566,9 +602,10 @@ test('inline TypeSafe search preserves an existing candidate ID for a duplicate 
   ]});
   harness.localData.typesafeEnabled = true;
   harness.localData.typesafeApiKey = 'ts_test';
-  globalThis.fetch = async () => ({ok: true, status: 200, json: async () => ({answers: {
-    f0: {type: 'choice', choice: 'r0', confidence: 0.9, probabilities: {none: 0.1, r0: 0.9}},
-  }})});
+  globalThis.fetch = async (_url,options) => {
+    const body=JSON.parse(options.body);
+    return {ok:true,status:200,json:async()=>({answers:jevAnswers(body,{f0:'r0'})})};
+  };
   const query = await harness.dispatch(inlineQuery(), inlineSender());
   assert.equal(query.candidates.length, 1);
   const candidateId = query.candidates[0].candidateId;
@@ -940,25 +977,23 @@ test('inline generation reuses completed panel snapshots and deduplicates same-f
   }
 });
 
-test('inline Generate defers to same-field background work queued behind the planner', async () => {
+test('inline Generate deduplicates same-field background work started before the planner', async () => {
   const harness = await inlineHarness({waitForAI: false, field: {id: 'why', handle: 'doc-a:why', label: 'Why are you a good fit?', type: 'textarea', required: true},
     page: {actions: [{id: 'submit', kind: 'submit', label: 'Submit application'}]}});
   harness.localData.openaiApiKey = 'synthetic-test-key';
-  let releasePlanner, draftCalls = 0;
+  let releaseDraft, draftCalls = 0;
   globalThis.fetch = async (_url, options) => {
     const request = JSON.parse(JSON.parse(options.body).input[1].content[0].text);
-    if (request.fields) return new Promise(resolve => {releasePlanner = () => resolve({ok: true, json: async () => ({output_text: JSON.stringify({decisions: []})})});});
     draftCalls++;
-    return generatedResponse([], 'Add relevant experience.');
+    return new Promise(resolve => {releaseDraft = () => resolve(generatedResponse([], 'Add relevant experience.'));});
   };
   await harness.dispatch({type: 'JOB_RUN_START', tabId: 7});
-  await waitUntil(() => Boolean(releasePlanner));
+  await waitUntil(() => Boolean(releaseDraft));
   const query = await harness.dispatch(inlineQuery({fieldId: 'why', handle: 'doc-a:why'}), inlineSender());
-  let generated;
-  try { generated = await harness.dispatch(inlineGeneration(query), inlineSender()); }
-  finally { releasePlanner(); }
+  const generated = await harness.dispatch(inlineGeneration(query), inlineSender());
+  releaseDraft();
   await waitUntil(() => harness.sessionData.applicationRun['7'].aiOperations.planner.status === 'completed');
-  assert.equal(draftCalls, 1, 'planner release must not dispatch a second draft request for the inline field');
+  assert.equal(draftCalls, 1, 'the fast background draft remains the only provider request for the field');
   assert.equal(generated.ok, true, generated.error);
   assert.equal(generated.error, 'This answer is already being prepared');
   const cached = await harness.dispatch(inlineGeneration(query, 'generate-after-planner'), inlineSender());
@@ -984,16 +1019,16 @@ test('queued draft ownership keeps two background fields concurrent and blocks a
   await waitUntil(() => releases.size === 2);
   let generated, optional;
   try {
-    assert.deepEqual(calls, ['why1', 'why2'], 'existing two-consumer concurrency is preserved');
-    page.focusedFieldId = 'why3';
-    const query = await harness.dispatch(inlineQuery({fieldId: 'why3', handle: 'doc-a:why3'}), inlineSender());
+    assert.deepEqual(calls.slice(0,2).sort(), ['why2', 'why3'], 'company-specific drafts use the existing two-consumer concurrency');
+    page.focusedFieldId = 'why1';
+    const query = await harness.dispatch(inlineQuery({fieldId: 'why1', handle: 'doc-a:why1'}), inlineSender());
     generated = await harness.dispatch(inlineGeneration(query), inlineSender());
     page.focusedFieldId = 'optional';
     const other = await harness.dispatch(inlineQuery({fieldId: 'optional', handle: 'doc-a:optional', requestId: 'optional-query'}), inlineSender());
     optional = await harness.dispatch(inlineGeneration(other), inlineSender());
   } finally { for (const release of releases.values()) release(); }
   await waitUntil(() => harness.sessionData.applicationRun['7'].aiOperations.planner.status === 'completed');
-  assert.equal(calls.filter(id => id === 'why3').length, 1);
+  assert.equal(calls.filter(id => id === 'why1').length, 1);
   assert.equal(generated.error, 'This answer is already being prepared');
   assert.equal(optional.ok, true, optional.error);
   assert.equal(calls.filter(id => id === 'optional').length, 1, 'unrelated inline field can generate while background work is pending');
@@ -1470,20 +1505,20 @@ test('previous application drafts are source-qualified suggestions, not promoted
   assert.equal(harness.localData.answerRecords.find(record => record.question === 'Notice period').answer, 'Synthetic notice answer');
 });
 
-test('planner failure preserves diagnostics while required suggestion preparation continues', async () => {
+test('draft failure preserves diagnostics without invoking a planner when evidence is missing', async () => {
   const harness = createHarness({ pagesByTab: { 7: { pages: [{ fields: [{ id: 'unknown', label: 'Describe underwater welding', type: 'text', required: true }], actions: [{ id: 'submit', label: 'Submit application', kind: 'submit' }] }] } } });
   harness.localData.openaiApiKey = 'synthetic-key';
   const bodies = [];
   globalThis.fetch = async (_url, options) => { bodies.push(JSON.parse(options.body)); throw new Error('Synthetic network failure'); };
   await import(`../src/service-worker.js?test=bounded-${Date.now()}`);
   const first = await harness.dispatch({ type: 'JOB_RUN_START', tabId: 7 });
-  assert.deepEqual(JSON.parse(bodies[0].input[1].content[0].text).records, []);
+  assert.equal(JSON.parse(bodies[0].input[1].content[0].text).field.id, 'unknown');
   assert.match(first.run.llmError, /Synthetic network failure/);
   await harness.dispatch({ type: 'JOB_RUN_CHECK_PAGE', tabId: 7 });
-  assert.equal(bodies.length, 2);
+  assert.equal(bodies.length, 1);
 });
 
-test('Retry AI reruns only failed work and keeps completed drafts', async () => {
+test('Retry AI keeps completed drafts and avoids a planner call without factual evidence', async () => {
   const harness = createHarness({ answerRecords: [{
     key: 'experience', question: 'Experience', answer: 'Built reliable event processing services.', confirmationState: 'confirmed', sensitivity: 'safe',
   }], pagesByTab: { 7: { pages: [{
@@ -1495,7 +1530,7 @@ test('Retry AI reruns only failed work and keeps completed drafts', async () => 
   globalThis.fetch = async (_url, options) => {
     initialRequests += 1;
     const request = JSON.parse(JSON.parse(options.body).input[1].content[0].text);
-    if (request.fields) throw new Error('planner is temporarily unavailable');
+    if (request.fields) throw new Error('planner should not run without compatible factual evidence');
     return {
       ok: true, status: 200, statusText: 'OK',
       json: async () => ({ output_text: JSON.stringify({ suggestions: [{ answer: 'A reviewed draft.', evidenceKeys: ['experience'] }], missingContext: '' }) }),
@@ -1503,12 +1538,13 @@ test('Retry AI reruns only failed work and keeps completed drafts', async () => 
   };
   await import(`../src/service-worker.js?retry-completed=${Date.now()}`);
   const started = await harness.dispatch({ type: 'JOB_RUN_START', tabId: 7 });
-  assert.equal(initialRequests, 2);
-  assert.equal(started.run.aiOperations.planner.status, 'failed');
+  assert.equal(initialRequests, 1);
+  assert.equal(started.run.aiOperations.planner.status, 'completed');
   assert.equal(started.run.aiOperations['suggestion:why'].status, 'completed');
   assert.equal(started.run.generatedSuggestions.why.suggestions[0].answer, 'A reviewed draft.');
 
   let retryRequests = 0;
+  harness.sessionData.applicationRun['7'].aiOperations.planner.status = 'failed';
   globalThis.fetch = async (_url, options) => {
     retryRequests += 1;
     const request = JSON.parse(JSON.parse(options.body).input[1].content[0].text);
@@ -1521,7 +1557,7 @@ test('Retry AI reruns only failed work and keeps completed drafts', async () => 
     };
   };
   const retried = await harness.dispatch({ type: 'JOB_RUN_RETRY_AI', tabId: 7 });
-  assert.equal(retryRequests, 1);
+  assert.equal(retryRequests, 0);
   assert.equal(retried.run.aiOperations.planner.status, 'completed');
   assert.equal(retried.run.generatedSuggestions.why.suggestions[0].answer, 'A reviewed draft.');
 });
@@ -2568,14 +2604,14 @@ test('automatic generated drafts use job context and records, and regenerate onl
   assert.equal(started.run.status, 'waiting_user', JSON.stringify(started.run));
   const generated = started.run.generatedSuggestions.why;
   assert.equal(started.run.suggestions?.why, undefined, 'an adjacent experience record is context, not a verbatim saved answer');
-  assert.equal(bodies.length, 2, JSON.stringify(started.run));
+  assert.equal(bodies.length, 1, JSON.stringify(started.run));
   assert.ok(generated, started.run.llmError);
   assert.equal(generated.suggestions.length, 1);
-  assert.match(JSON.stringify(bodies[1]), /Build distributed systems/);
-  assert.match(JSON.stringify(bodies[1]), /event processing/);
+  assert.match(JSON.stringify(bodies[0]), /Build distributed systems/);
+  assert.match(JSON.stringify(bodies[0]), /event processing/);
   assert.deepEqual(harness.tabs.get(7).frames[0].pages[0].values || {}, {});
   const checked = await harness.dispatch({ type: 'JOB_RUN_CHECK_PAGE', tabId: 7 });
-  assert.equal(bodies.length, 2, 'the same page reuses cached generated drafts');
+  assert.equal(bodies.length, 1, 'the same page reuses cached generated drafts');
   assert.equal(checked.run.generatedSuggestions.why.suggestions.length, 1);
   const refreshed = await harness.dispatch({ type: 'JOB_RUN_GENERATE_SUGGESTIONS', tabId: 7, frameId: 0, applicationId: started.run.startedAt, pageSignature: started.run.pageSignature, fieldId: 'why', handle: 'why-h', jobDescription: 'Operate a large-scale distributed platform.' });
   assert.equal(refreshed.ok, true, refreshed.error);
@@ -2985,13 +3021,13 @@ test('invalid optional fields block; validation-only refresh never fills or call
   assert.equal(h.tabs.get(7).nextClicks,0);
 });
 
-test('local results return before AI and optional questions do not generate automatically', async () => {
+test('local results return while the required fast draft runs and optional questions stay idle', async () => {
   const h=createHarness({waitForAI:false,pagesByTab:{7:{pages:[{page:{title:'Application',domain:'example.test'},fields:[{id:'required',handle:'r-h',label:'Why this role?',type:'textarea',required:true},{id:'optional',handle:'o-h',label:'Additional information',type:'textarea'}],actions:[]}]}}});
   h.localData.openaiApiKey='test-key'; let release;const requests=[];
-  globalThis.fetch=async(_url,options)=>{const body=JSON.parse(options.body);const request=JSON.parse(body.input[1].content[0].text);requests.push(request);if(request.fields)await new Promise(resolve=>{release=resolve;});return{ok:true,json:async()=>({output_text:JSON.stringify(request.fields?{decisions:[]}:{suggestions:[],missingContext:'Add relevant experience'})})};};
+  globalThis.fetch=async(_url,options)=>{const body=JSON.parse(options.body);const request=JSON.parse(body.input[1].content[0].text);requests.push(request);if(request.field)await new Promise(resolve=>{release=resolve;});return{ok:true,json:async()=>({output_text:JSON.stringify(request.fields?{decisions:[]}:{suggestions:[],missingContext:'Add relevant experience'})})};};
   await import(`../src/service-worker.js?background-${Date.now()}`);
   const response=await Promise.race([h.dispatch({type:'JOB_RUN_START',tabId:7}),new Promise(resolve=>setTimeout(()=>resolve({error:'Blocked on AI'}),600))]);
-  try{assert.equal(response.ok,true,response.error);assert.notEqual(response.run.waitingFor,'extension_error');assert.ok(release,'planner actually started');}finally{release?.();}
+  try{assert.equal(response.ok,true,response.error);assert.notEqual(response.run.waitingFor,'extension_error');await waitUntil(()=>Boolean(release));}finally{release?.();}
   for(let n=0;n<100&&Object.values(h.sessionData.applicationRun['7'].aiOperations||{}).some(op=>op.status==='pending');n++)await new Promise(resolve=>setTimeout(resolve,5));
   assert.equal(requests.filter(request=>request.field?.id==='optional').length,0);
 });

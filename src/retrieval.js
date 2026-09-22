@@ -26,7 +26,7 @@ export function semanticRecordRevision(record) {
     record.entityId, record.entityType, record.employmentId, record.context, record.concept, record.updatedAt]);
 }
 
-export function selectSemanticEvidence(field, records, limit = 20) {
+export function selectSemanticEvidence(field, records, limit = 254) {
   const eligible = records.filter(record => semanticEligible(field, record));
   const ranked = rankEvidence(field, eligible, {limit});
   const order = new Map(ranked.map((item, index) => [item.sourceKey, index]));
@@ -116,6 +116,10 @@ function isNarrativeDraftField(field = {}) {
     || /\b(why|describe|explain|motivation|cover letter|additional information)\b/i.test(String(field.label || ''));
 }
 
+export function narrativeEvidence(field, records = []) {
+  return records.filter(record => isSafeNarrativeEvidence(field, record, suggestionTargetKey(field)));
+}
+
 function isSafeNarrativeEvidence(field, record, targetKey) {
   const answer = String(record?.answer || '').trim();
   if (!answer || record?.semantic?.reusePolicy === 'never' || record?.reusePolicy === 'never'
@@ -123,9 +127,8 @@ function isSafeNarrativeEvidence(field, record, targetKey) {
     || !recordScopeCompatible(field, record) || record?.confirmationState !== 'confirmed'
     || record?.sensitivity === 'legal' || inferSensitivity(record?.question) !== 'safe'
     || targetKey && record?.suppressedFor?.includes(targetKey)
-    || /\b(no|not|never|without|lack)\b/.test(normalizeText(answer))
-    || answer.split(/\s+/).length < 5 || /why.*(?:join|company|work)|motivat/.test(normalizeText(record?.question))) return false;
-  return /\b(build|built|develop|developed|design|designed|deploy|deployed|lead|led|manage|managed|implement|implemented)\b/i.test(answer);
+    || /why.*(?:join|company|work)|motivat/.test(normalizeText(record?.question))) return false;
+  return true;
 }
 
 export function selectPlannerEvidence(fields = [], records = [], { limit = 20 } = {}) {

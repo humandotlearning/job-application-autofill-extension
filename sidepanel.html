@@ -114,11 +114,15 @@
         <input id="openai-api-key" type="password" autocomplete="off" spellcheck="false" placeholder="sk-…">
         <label class="checkbox-row" for="typesafe-enabled">
           <input id="typesafe-enabled" type="checkbox">
-          <span>Use TypeSafe to find matching saved answers</span>
+          <span>Use JEV to assist form filling</span>
+        </label>
+        <label class="checkbox-row" for="typesafe-autofill-enabled">
+          <input id="typesafe-autofill-enabled" type="checkbox">
+          <span>Automatically fill low-risk JEV matches</span>
         </label>
         <label for="typesafe-api-key">TypeSafe API key <span class="muted">(stored locally)</span></label>
         <input id="typesafe-api-key" type="password" autocomplete="off" spellcheck="false" placeholder="ts_…">
-        <p class="muted">Uses Jev 1.13 only for unresolved questions and explicit saved-answer searches.</p>
+        <p class="muted">JEV selects supported saved facts and options. Sensitive, narrative, ambiguous, and incomplete matches still require review.</p>
         <label for="employer-name">Confirmed employer</label>
         <input id="employer-name" type="text" autocomplete="organization" value="DeepSight AI Labs">
         <p class="muted">Only saved employment for cross-site work-history fields.</p>
