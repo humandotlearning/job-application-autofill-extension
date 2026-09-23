@@ -794,7 +794,7 @@ function scoreApplicationFrame(context, inspection, selectedDestination = null) 
   const utilityHint = UTILITY_FRAME_PATTERN.test(fieldText.join(' ')) && !applicationField;
   const screening = smartRecruitersPublication(inspection?.page?.domain, context.pathname)
     && /\/screening(?:\/|$)/i.test(context.pathname)
-    && fields.length >= 2 && concepts.has('application');
+    && fields.length > 0 && concepts.has('application');
   const applicationActions = actions.some(action => action.kind === 'next'
     || (action.kind === 'submit' && (applicationField || applicationCluster || /\b(?:application|apply)\b/i.test(action.label || ''))));
   const explicitSelection = selectedDestination && context.frameId === selectedDestination.frameId

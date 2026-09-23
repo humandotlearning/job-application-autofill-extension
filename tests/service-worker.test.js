@@ -3644,8 +3644,6 @@ test('SmartRecruiters screening is recognized when opened directly without ident
       page:{title:'Senior AI Engineer',domain:'jobs.smartrecruiters.com'},
       fields:[
         {id:'salary',label:'What are your annual salary expectations?',type:'text',currentValue:'Existing answer'},
-        {id:'experience',label:'How many years of related experience do you have?',type:'select',required:true},
-        {id:'consent',label:'I confirm I am legally eligible to work',type:'radio',required:true},
       ],actions:[],
     }],
   }]}}});
