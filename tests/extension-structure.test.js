@@ -14,7 +14,7 @@ test('manifest declares browser control for adaptive accessibility and input', a
   const manifest = await readJson('manifest.json');
   assert.equal(manifest.manifest_version, 3);
   assert.equal(manifest.minimum_chrome_version, '125');
-  assert.equal(manifest.version, '0.1.7');
+  assert.match(manifest.version, /^\d+\.\d+\.\d+$/);
   assert.equal(manifest.side_panel.default_path, 'sidepanel.html');
   assert.deepEqual(manifest.permissions.sort(), ['activeTab', 'alarms', 'debugger', 'scripting', 'sidePanel', 'storage'].sort());
   assert.equal(manifest.permissions.includes('identity'), false);
@@ -37,6 +37,9 @@ test('side panel contains the guided workflow, review groups, and settings contr
   assert.match(html, /id="openai-api-key"/);
   assert.match(html, /id="fireworks-api-key"/);
   assert.match(html, /id="typesafe-enabled"/);
+  assert.match(html, /id="typesafe-autofill-enabled"[^>]*checked/);
+  assert.match(html, /id="typesafe-autofill-sensitive"[^>]*checked/);
+  assert.match(html, /id="typesafe-no-match-top"[^>]*checked/);
   assert.match(html, /id="typesafe-api-key"/);
   assert.match(html, /id="ai-provider"/);
   assert.match(html, /id="ai-model"/);

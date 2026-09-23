@@ -17,10 +17,10 @@ function isNarrativeField(field = {}) {
       .test(`${field.label || ''} ${field.helpText || ''}`);
 }
 
-function semanticSkipReason(field, records) {
+function semanticSkipReason(field, records, allowSensitive = false) {
   const choice = ['select', 'select-one', 'radio', 'checkbox'].includes(field.type);
   if (choice && !(field.options || []).some(option => String(option || '').trim())) return 'options_unavailable';
-  return records.some(record => semanticEligible(field, record)) ? '' : 'no_eligible_evidence';
+  return records.some(record => semanticEligible(field, record, { allowSensitive })) ? '' : 'no_eligible_evidence';
 }
 
 function compactField(field) {
@@ -39,14 +39,15 @@ function compactField(field) {
   }).filter(([, value]) => value != null && value !== ''));
 }
 
-export function semanticFingerprint(field, records) {
+export function semanticFingerprint(field, records, { allowSensitive = false } = {}) {
   return JSON.stringify([
     TYPESAFE_MODEL,
     PROMPT_VERSION,
     field.id,
     field.handle,
     compactField(field),
-    records.filter(record => semanticEligible(field, record)).map(semanticRecordRevision),
+    allowSensitive,
+    records.filter(record => semanticEligible(field, record, { allowSensitive })).map(semanticRecordRevision),
   ]);
 }
 
@@ -235,8 +236,13 @@ export function createSemanticMatcher({fetchImpl, timeoutMs = 5000, traceImpl = 
         const sufficiency = payload.answers[`${id}_sufficiency`].noul;
         const conflict = payload.answers[`${id}_conflict`].noul;
         const route = isNarrativeField(entry.field) ? 'narrative' : 'factual';
-        const record = entry.options.get(answer.choice);
-        const option = entry.choiceOptions.get(answer.choice);
+        const choices = entry.choiceOptions.size ? entry.choiceOptions : entry.options;
+        const fallback = entry.noMatchTop && answer.choice === 'none'
+          ? [...choices.keys()].sort((left, right) => answer.probabilities[right] - answer.probabilities[left])[0]
+          : null;
+        const selection = fallback ? { ...answer, choice: fallback } : answer;
+        const record = entry.options.get(selection.choice);
+        const option = entry.choiceOptions.get(selection.choice);
         const coverage = {
           complete: entry.shortlistOmitted === 0 && entry.optionsOmitted === 0 && !entry.contextTruncated,
           omittedRecords: entry.shortlistOmitted,
@@ -249,16 +255,17 @@ export function createSemanticMatcher({fetchImpl, timeoutMs = 5000, traceImpl = 
         };
         const metadata = { route, coverage, judgments,
           evidenceRevisions: entry.records.map(semanticRecordRevision) };
-        if (answer.confidence >= MIN_CONFIDENCE && sufficiency >= 0.8 && conflict <= 0.2 && (record || option)) {
-          const candidate = record ? semanticCandidate(record, answer, entry.field)
-            : semanticOptionCandidate(entry, answer, entry.field);
+        if ((entry.alwaysTop || answer.confidence >= MIN_CONFIDENCE && sufficiency >= 0.8 && conflict <= 0.2) && (record || option)) {
+          const candidate = record ? semanticCandidate(record, selection, entry.field)
+            : semanticOptionCandidate(entry, selection, entry.field);
+          if (fallback) candidate.semantic.noMatchFallback = true;
           candidate.semantic = { ...candidate.semantic, sufficiency, conflict, coverageComplete: coverage.complete };
           const sources = record ? [record] : entry.records;
           const safeSources = sources.every(source => source.sensitivity === 'safe'
             && source.confirmationState === 'confirmed'
             && inferSensitivity(source.question, source.key) === 'safe'
             && source.reusePolicy !== 'review_only' && source.semantic?.reusePolicy !== 'review_only');
-          const disposition = route === 'factual' && safeSources && lowRiskSemanticField(entry.field)
+          const disposition = entry.alwaysTop ? 'review' : route === 'factual' && safeSources && lowRiskSemanticField(entry.field)
             && semanticAutofillQualified(candidate.semantic) ? 'autofill' : 'review';
           entry.resolve({ ...metadata, status: 'matched', candidate, disposition });
         } else {
@@ -337,7 +344,8 @@ export function createSemanticMatcher({fetchImpl, timeoutMs = 5000, traceImpl = 
       try { return await operation; }
       catch (error) { rankingCache.delete(fingerprint); throw error; }
     },
-    async match({ fields, records, apiKey, enabled = true, scope = '', retry = false, sessionId = '', traceContext = null }) {
+    async match({ fields, records, apiKey, enabled = true, scope = '', retry = false, sessionId = '', traceContext = null,
+      alwaysTop = false, noMatchTop = false, allowSensitive = false }) {
       if (!enabled || !String(apiKey || '').trim()) {
         return fields.map(field => ({ fieldId: field.id, status: 'skipped' }));
       }
@@ -345,8 +353,8 @@ export function createSemanticMatcher({fetchImpl, timeoutMs = 5000, traceImpl = 
       const newEntries = [];
       let cacheHits = 0;
       for (const field of fields) {
-        const fingerprint = semanticFingerprint(field, records);
-        const cacheKey = JSON.stringify([scope, fingerprint]);
+        const fingerprint = semanticFingerprint(field, records, { allowSensitive });
+        const cacheKey = JSON.stringify([scope, fingerprint, alwaysTop, noMatchTop]);
         if (retry && cache.get(cacheKey)?.status === 'failed') cache.delete(cacheKey);
         let cached = cache.get(cacheKey);
         if (cached) cacheHits += 1;
@@ -356,13 +364,14 @@ export function createSemanticMatcher({fetchImpl, timeoutMs = 5000, traceImpl = 
           cached = { status: 'pending', promise };
           cache.set(cacheKey, cached);
           const finish = result => { cached.status = result.status; resolve(result); };
-          const selected = selectSemanticEvidence(field, records);
+          const selected = selectSemanticEvidence(field, records, 254, { allowSensitive });
           if (selected.length) newEntries.push({field, records: selected, resolve: finish,
-            shortlistOmitted: Math.max(0, records.filter(record => semanticEligible(field, record)).length - selected.length),
+            alwaysTop, noMatchTop,
+            shortlistOmitted: Math.max(0, records.filter(record => semanticEligible(field, record, { allowSensitive })).length - selected.length),
             optionsOmitted: Math.max(0, new Set(field.options || []).size - 254),
             contextTruncated: String(field.helpText || '').length > 1000 || String(field.nearbyContext || '').length > 500});
           else finish({ status: 'none', route: isNarrativeField(field) ? 'narrative' : 'factual',
-            disposition: isNarrativeField(field) ? 'draft' : 'manual', skipReason: semanticSkipReason(field, records),
+            disposition: isNarrativeField(field) ? 'draft' : 'manual', skipReason: semanticSkipReason(field, records, allowSensitive),
             coverage: {complete: true, omittedRecords: 0, omittedOptions: 0}, judgments: {}, evidenceRevisions: [] });
           for (const [oldKey, oldValue] of cache) {
             if (cache.size <= MAX_CACHE_ENTRIES) break;

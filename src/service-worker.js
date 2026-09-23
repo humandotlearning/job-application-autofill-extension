@@ -544,7 +544,7 @@ async function getCoverMessages() {
 }
 
 async function getSettings() {
-  const stored = await chrome.storage.local.get({ autoAdvancePages: false, includeFormScreenshot: true, voteAutofillEnabled: true, aiProvider: '', aiModel: '', openaiModel: '', openaiApiKey: '', fireworksApiKey: '', typesafeEnabled: false, typesafeAutofillEnabled: false });
+  const stored = await chrome.storage.local.get({ autoAdvancePages: false, includeFormScreenshot: true, voteAutofillEnabled: true, aiProvider: '', aiModel: '', openaiModel: '', openaiApiKey: '', fireworksApiKey: '', typesafeApiKey: '', typesafeEnabled: null, typesafeAutofillEnabled: true, typesafeAutofillSensitive: true, typesafeNoMatchTop: true });
   const aiProvider = stored.aiProvider === 'openai' || stored.aiProvider === 'fireworks'
     ? stored.aiProvider
     : (String(stored.openaiApiKey || '').trim() ? 'openai' : DEFAULT_PROVIDER);
@@ -557,8 +557,10 @@ async function getSettings() {
     aiProvider,
     aiModel,
     openaiModel: aiModel,
-    typesafeEnabled: Boolean(stored.typesafeEnabled),
-    typesafeAutofillEnabled: Boolean(stored.typesafeEnabled && stored.typesafeAutofillEnabled),
+    typesafeEnabled: stored.typesafeEnabled === null ? Boolean(stored.typesafeApiKey) : Boolean(stored.typesafeEnabled),
+    typesafeAutofillEnabled: stored.typesafeAutofillEnabled !== false,
+    typesafeAutofillSensitive: stored.typesafeAutofillSensitive !== false,
+    typesafeNoMatchTop: stored.typesafeNoMatchTop !== false,
   };
 }
 
@@ -1326,7 +1328,13 @@ function applicationRecordsForLocalReuse(run = {}) {
       provenance: 'this application', confirmationState: 'confirmed'}));
 }
 
-async function applyPageDecisions(tabId, run, inspection, records, coverMessages, profile = {}, datasourceRevision = '', voteAutofillEnabled = true, cycle = {pass: 0, deadline: Date.now() + 8000}) {
+function hasConflictingSemanticEvidence(field, records, allowSensitive) {
+  const answers = new Set(records.filter(record => semanticEligible(field, record, { allowSensitive }))
+    .map(record => String(record.answer).trim().replace(/\s+/g, ' ')));
+  return answers.size > 1;
+}
+
+async function applyPageDecisions(tabId, run, inspection, records, coverMessages, profile = {}, datasourceRevision = '', voteAutofillEnabled = true, cycle = {pass: 0, deadline: Date.now() + 8000}, jevOptions = {}) {
   const currentPageSignature = pageSignature(inspection, run.frame);
   if (run.lastAction === 'next' && run.pageSignature === currentPageSignature) {
     run.status = 'waiting_user';
@@ -1377,6 +1385,13 @@ async function applyPageDecisions(tabId, run, inspection, records, coverMessages
         return { ...decision, action: 'keep', value: null, reason: 'The current value does not satisfy the field constraints' };
       }
       if (String(field.currentValue || '').trim()) return decision;
+      if (jevOptions.enabled && hasConflictingSemanticEvidence(field, records, jevOptions.allowSensitive)) {
+        const candidates = savedFieldCandidates(field, records, draftRecords);
+        if (candidates.length) run.suggestions[field.id] = { tabId, frameId: run.frame.frameId, applicationId: run.startedAt,
+          pageSignature: currentSignature, field, candidates };
+        return { ...decision, action: 'ask_user', value: null, disposition: 'manual',
+          reason: 'JEV is choosing between conflicting saved answers' };
+      }
       const voteWinner = decision.matchKind === 'vote'
         ? voteRecords.find(record => record.key === decision.evidenceKeys?.[0])
         : null;
@@ -2313,6 +2328,8 @@ async function processPage(tabId, { autoAdvance, selectedDestination = null } = 
       datasource.profile,
       datasource.datasourceMeta?.updatedAt || '',
       settings.voteAutofillEnabled,
+      {pass: 0, deadline: Date.now() + 8000},
+      {enabled: settings.typesafeEnabled && Boolean(await getTypeSafeApiKey()), allowSensitive: settings.typesafeAutofillSensitive},
     );
     run = processed.run;
     const inspection = processed.inspection;
@@ -3219,7 +3236,7 @@ function aiEvidenceRevision(run, inspection, datasource) {
 }
 
 function aiFingerprint(run, fields, settings, evidenceRevision) {
-  return JSON.stringify({applicationId:run.startedAt,frame:run.frame?.frameId,page:run.pageSignature,fields:fields.map(({id,handle,entityId,employmentId})=>({id,handle,entityId,employmentId})),evidenceRevision,provider:settings.aiProvider,model:settings.aiModel,typesafeEnabled:settings.typesafeEnabled,typesafeAutofillEnabled:settings.typesafeAutofillEnabled,promptVersion:'jev-fast-path-4'});
+  return JSON.stringify({applicationId:run.startedAt,frame:run.frame?.frameId,page:run.pageSignature,fields:fields.map(({id,handle,entityId,employmentId})=>({id,handle,entityId,employmentId})),evidenceRevision,provider:settings.aiProvider,model:settings.aiModel,typesafeEnabled:settings.typesafeEnabled,typesafeAutofillEnabled:settings.typesafeAutofillEnabled,typesafeAutofillSensitive:settings.typesafeAutofillSensitive,typesafeNoMatchTop:settings.typesafeNoMatchTop,promptVersion:'jev-top-answer-1'});
 }
 
 function suggestionRequestSnapshot(run, field, inspection, datasource, settings, jobContext) {
@@ -3293,13 +3310,17 @@ async function scheduleAi(tabId,{retry=false}={}) {
   const invalidIds=new Set((validated?.validation?.invalid || []).map(field=>field.fieldId));
   const datasource=await getDatasource();
   const fields=resolveEmploymentFields(run,inspected.inspection.fields,datasource.profile);
+  const jevReady = settings.typesafeEnabled && Boolean(typesafeApiKey);
+  const conflicting = new Set(jevReady ? fields.filter(field => hasConflictingSemanticEvidence(field, datasource.answerRecords, settings.typesafeAutofillSensitive)).map(field => field.id) : []);
   const eligibility = fields.map(field => ({
     fieldId: field.id, label: field.label, required: Boolean(field.required),
     reason: String(field.currentValue || '').trim() ? 'existing_value'
       : !readableQuestion(field) ? 'unreadable_question'
-      : inferSensitivity(field.label,field.id)==='legal' ? 'legal_manual'
+      : inferSensitivity(field.label,field.id)==='legal' && !(jevReady && settings.typesafeAutofillSensitive) ? 'legal_manual'
       : field.entityUnresolved ? 'unresolved_employment'
-      : hasUsableSuggestion(run.suggestions?.[field.id], field) && !invalidIds.has(field.id) ? 'saved_answer_ready' : 'eligible',
+      : hasUsableSuggestion(run.suggestions?.[field.id], field) && !(jevReady && settings.typesafeAutofillEnabled
+        && datasource.answerRecords.some(record => semanticEligible(field, record, { allowSensitive: settings.typesafeAutofillSensitive })))
+        && !conflicting.has(field.id) && !invalidIds.has(field.id) ? 'saved_answer_ready' : 'eligible',
     candidates: (run.suggestions?.[field.id]?.candidates || []).map(candidate => ({
       sourceKey: candidate.sourceKey, kind: candidate.kind, valueValid: validateFillValue(field, candidate.answer).ok,
     })),
@@ -3321,7 +3342,9 @@ async function scheduleAi(tabId,{retry=false}={}) {
     ? candidateFields.filter(writingField).filter(field=>retryableStates.has(run.aiOperations?.[`suggestion:${field.id}`]?.status) && !run.generatedSuggestions?.[field.id])
     : candidateFields.filter(writingField).filter(field=>!run.generatedSuggestions?.[field.id]);
   // Related local evidence needs drafting, but does not need rediscovery.
-  const semanticFields=candidateFields.filter(field=>!run.suggestions?.[field.id]?.candidates?.some(candidate=>
+  const semanticFields=candidateFields.filter(field=>conflicting.has(field.id)
+    || jevReady && settings.typesafeAutofillEnabled && datasource.answerRecords.some(record=>semanticEligible(field,record,{allowSensitive:settings.typesafeAutofillSensitive}))
+    || !run.suggestions?.[field.id]?.candidates?.some(candidate=>
     String(candidate.answer || '').trim() && validateFillValue(field, candidate.answer).ok));
   if(!apiKey && !semanticFields.length) { traceSkip('missing_provider_key'); return; }
   if(!plannerFields.length && !semanticFields.length && !suggestionFields.length) { traceSkip('cached_or_no_pending_ai'); return; }
@@ -3365,7 +3388,9 @@ async function currentAiDestination(tabId,snapshot,field=null) {
   const settings=await getSettings();
   if(settings.aiProvider!==snapshot.settings.aiProvider || settings.aiModel!==snapshot.settings.aiModel
     || settings.typesafeEnabled!==snapshot.settings.typesafeEnabled
-    || settings.typesafeAutofillEnabled!==snapshot.settings.typesafeAutofillEnabled) return null;
+    || settings.typesafeAutofillEnabled!==snapshot.settings.typesafeAutofillEnabled
+    || settings.typesafeAutofillSensitive!==snapshot.settings.typesafeAutofillSensitive
+    || settings.typesafeNoMatchTop!==snapshot.settings.typesafeNoMatchTop) return null;
   const [datasource, inspected]=await Promise.all([getDatasource(),sendToFrame(tabId,snapshot.frameId,{type:'JOB_APP_INSPECT'}, authority)]);
   if(!inspected?.ok || pageSignature(inspected.inspection,run.frame)!==snapshot.pageSignature) return null;
   if(aiEvidenceRevision(run,inspected.inspection,datasource)!==snapshot.evidenceRevision) return null;
@@ -3382,17 +3407,20 @@ async function applySemanticAutofills(tabId, snapshot, destination, results, fie
   const decisions = results.flatMap(result=>{
     const field=fields.find(item=>item.id===result.fieldId);
     const candidate=result.candidate;
-    if(result.status!=='matched'||result.disposition!=='autofill'||!field||field.widget||field.multiple||!candidate)return [];
+    if(result.status!=='matched'||result.coverage?.complete!==true||!field||field.multiple||!candidate)return [];
     const keys=sourceKeysForCandidate(candidate);
     const sources=keys.map(key=>records.get(key));
     const revisions=candidate.kind==='semantic'
       ? sources.length===1 && semanticRecordRevision(sources[0])===candidate.sourceRevision
       : sources.every(source=>source&&candidate.sourceRevisions?.[source.key]===semanticRecordRevision(source));
-    if(!keys.length||sources.some(source=>!source)||!revisions||!validateFillValue(field,candidate.answer).ok)return [];
+    if(!keys.length||sources.some(source=>!source)||!revisions||!validateFillValue(field,candidate.answer).ok
+      ||sources.some(source=>source.reusePolicy==='review_only'||source.semantic?.reusePolicy==='review_only'))return [];
+    if(!snapshot.settings.typesafeAutofillSensitive && (inferSensitivity(field.label,field.id)!=='safe'
+      || sources.some(source=>source.sensitivity!=='safe'||inferSensitivity(source.question,source.key)!=='safe')))return [];
     return [{fieldId:field.id,handle:field.handle,action:'fill',value:candidate.answer,evidenceKeys:keys,
-      sensitivity:'safe',confidence:'high',confirmationState:'confirmed',matchKind:'semantic',compatible:true,
+      sensitivity:inferSensitivity(field.label,field.id),confidence:'high',confirmationState:'confirmed',matchKind:'semantic',compatible:true,jevAutofill:true,
       semantic:candidate.semantic,expectedRawValue:field.rawValue,expectedEditRevision:field.editRevision,
-      reason:'Validated low-risk JEV match'}];
+      reason:'JEV-selected saved answer'}];
   });
   if(!decisions.length)return {applied:new Set(),destination};
   const result=await sendToFrame(tabId,snapshot.frameId,{type:'JOB_APP_APPLY',applicationId:snapshot.startedAt,
@@ -3415,7 +3443,7 @@ async function applySemanticAutofills(tabId, snapshot, destination, results, fie
     for(const decision of decisions)if(applied.has(decision.fieldId)){
       const field=fields.find(item=>item.id===decision.fieldId);
       byId.set(decision.fieldId,{fieldId:decision.fieldId,label:field?.label||decision.fieldId,value:decision.value,
-        reason:'Automatically filled from a validated JEV match'});
+        reason:'Automatically filled from JEV top saved answer'});
     }
     current.semanticAutofills=[...byId.values()];
   });
@@ -3483,6 +3511,8 @@ async function prepareAi(tabId,snapshot,plannerFields,semanticFields,suggestionF
   if(snapshot.settings.typesafeEnabled && typesafeApiKey && semanticFields.length) {
     const semanticResults=await semanticMatcher.match({fields:semanticFields,records:datasource.answerRecords,
       apiKey:typesafeApiKey,enabled:true,scope:`${snapshot.startedAt}:${snapshot.pageSignature}`,retry,
+      alwaysTop:true,noMatchTop:snapshot.settings.typesafeNoMatchTop,
+      allowSensitive:snapshot.settings.typesafeAutofillSensitive,
       sessionId, traceContext});
     let destination=await currentAiDestination(tabId,snapshot);
     if(destination) {

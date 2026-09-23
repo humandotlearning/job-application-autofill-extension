@@ -2,17 +2,17 @@ import { canonicalConcept, chooseRecord, inferSensitivity, isOpaqueIdentifier, m
 
 // Shared by semantic discovery and approval: relevance is a model judgment,
 // but eligibility and compatibility remain local policy.
-export function semanticEligible(field, record) {
+export function semanticEligible(field, record, { allowSensitive = false } = {}) {
   const choice = ['select', 'select-one', 'radio', 'checkbox'].includes(field.type)
     && Array.isArray(field.options) && field.options.some(option => String(option || '').trim());
-  return (['text', 'textarea', 'email', 'tel', 'url'].includes(field.type) || choice)
+  return (['text', 'textarea', 'email', 'tel', 'url', 'number', 'date'].includes(field.type) || choice)
     && !field.multiple && !field.entityUnresolved
     && !String(field.currentValue || field.rawValue || '').trim()
     && field.labelConfidence !== 'low' && !isOpaqueIdentifier(field.label)
-    && Boolean(String(field.label || '').trim()) && inferSensitivity(field.label, field.id) !== 'legal'
-    && record.confirmationState === 'confirmed' && record.sensitivity !== 'legal'
+    && Boolean(String(field.label || '').trim()) && (allowSensitive || inferSensitivity(field.label, field.id) !== 'legal')
+    && record.confirmationState === 'confirmed' && (allowSensitive || record.sensitivity !== 'legal')
     && record.semantic?.reusePolicy !== 'never' && record.reusePolicy !== 'never'
-    && inferSensitivity(record.question) !== 'legal'
+    && (allowSensitive || inferSensitivity(record.question) !== 'legal')
     && Boolean(String(record.answer || '').trim()) && String(record.answer).length <= 8000
     && ![record.key, record.question, record.answer].some(isOpaqueIdentifier)
     && !record.suppressedFor?.includes(suggestionTargetKey(field))
@@ -26,8 +26,8 @@ export function semanticRecordRevision(record) {
     record.entityId, record.entityType, record.employmentId, record.context, record.concept, record.updatedAt]);
 }
 
-export function selectSemanticEvidence(field, records, limit = 254) {
-  const eligible = records.filter(record => semanticEligible(field, record));
+export function selectSemanticEvidence(field, records, limit = 254, options = {}) {
+  const eligible = records.filter(record => semanticEligible(field, record, options));
   const ranked = rankEvidence(field, eligible, {limit});
   const order = new Map(ranked.map((item, index) => [item.sourceKey, index]));
   // Zero-overlap records remain available: re-ranking only lexical hits would
