@@ -2775,6 +2775,16 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       return {ok:true,run:await validatePageOnly(tabId)};
     })().then(sendResponse).catch(error=>sendResponse({ok:false,error:error.message}));return true;
   }
+  if (message?.type === 'JOB_APP_DEBUG_AUTHORIZE') {
+    if (sender?.id !== chrome.runtime.id || !Number.isInteger(sender?.tab?.id) || !Number.isInteger(sender?.frameId)) {
+      sendResponse({ok: false});
+      return false;
+    }
+    chrome.storage.local.get({developerMode: false})
+      .then(settings => sendResponse({ok: settings.developerMode === true}))
+      .catch(() => sendResponse({ok: false}));
+    return true;
+  }
   if (message?.type === 'JOB_APP_FINAL_SUBMISSION') {
     (async () => {
       await assertTabSiteEnabled(sender?.tab?.id, sender?.tab);

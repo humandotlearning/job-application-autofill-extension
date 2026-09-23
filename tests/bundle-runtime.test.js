@@ -13,7 +13,7 @@ test('fresh classic bundle executes and same-version reinjection preserves value
   new Script(bundle).runInContext(context);
   assert.equal(listeners.size, 1);
   const ping = await new Promise(resolve => [...listeners][0]({ type: 'JOB_APP_PING' }, {}, resolve));
-  assert.equal(ping.version, 'autofill-ux-9');
+  assert.equal(ping.version, 'autofill-ux-10');
   const result = await new Promise(resolve => [...listeners][0]({ type: 'JOB_APP_INSPECT' }, {}, resolve));
   assert.equal(result.ok, true, result.error);
   assert.equal(result.inspection.fields[0].label, 'Current CTC');
@@ -53,6 +53,37 @@ test('classic content listener inspects the live focused descriptor and exact ra
   assert.equal(utility.focusedHandle, null);
   assert.equal(utility.rawValue, null);
   dom.window.close();
+});
+
+test('content debug handlers require Developer-mode authorization before inspecting or snapshotting', async () => {
+  const bundle = await readFile(new URL('../dist/content.js', import.meta.url), 'utf8');
+  const dom = new JSDOM('<form aria-label="Application"><label>Name<input name="name" value="Private"></label></form>', {url: 'https://jobs.example.com/apply'});
+  const listeners = [], messages = [];
+  let developerMode = false;
+  const context = createContext({document: dom.window.document, setTimeout, clearTimeout, console, chrome: {runtime: {
+    sendMessage: async message => {
+      messages.push(message);
+      if (message.type === 'JOB_APP_DEBUG_AUTHORIZE') return {ok: developerMode};
+      if (message.type === 'JOB_APP_SITE_STATUS') return {ok: true, enabled: true, supported: true};
+      return {};
+    }, onMessage: {addListener: listener => listeners.push(listener)},
+  }}});
+  new Script(bundle).runInContext(context);
+  const dispatch = message => new Promise(resolve => listeners[0](message, {}, resolve));
+  try {
+    for (const type of ['JOB_APP_DEBUG_INSPECT', 'JOB_APP_DEBUG_SNAPSHOT']) {
+      const response = await dispatch({type});
+      assert.equal(response.ok, false);
+      assert.equal(response.code, 'developer_mode_disabled');
+    }
+    assert.equal(messages.filter(message => message.type === 'JOB_APP_DEBUG_AUTHORIZE').length, 2);
+    developerMode = true;
+    const inspection = await dispatch({type: 'JOB_APP_DEBUG_INSPECT'});
+    assert.equal(inspection.ok, true);
+    const snapshot = await dispatch({type: 'JOB_APP_DEBUG_SNAPSHOT'});
+    assert.equal(snapshot.ok, true);
+    assert.doesNotMatch(snapshot.snapshot.html, /Private/);
+  } finally { dom.window.close(); }
 });
 
 test('inactive form-session status keeps the content script inert until explicitly enabled', async () => {

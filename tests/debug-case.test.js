@@ -56,6 +56,22 @@ test('debug snapshot removes entered values and secrets while retaining replayab
   } finally { dom.window.close(); }
 });
 
+test('debug snapshot removes visible URLs and short answers from custom widget text', () => {
+  const dom = new JSDOM(`<form aria-label="Application">
+    <label>Eligibility answer<input name="eligibility" value="No"></label>
+    <label>Country<input name="country" value="US"></label>
+    <div role="option">No</div><div role="option">US</div>
+    <p>Reference https://private.example/path and www.private.example/help</p>
+  </form>`, {url: 'https://example.test/apply'});
+  try {
+    const snapshot = captureDebugSnapshot(dom.window.document);
+    const body = JSON.stringify(snapshot);
+    assert.doesNotMatch(body, /https:\/\/private\.example\/path|www\.private\.example\/help/);
+    assert.doesNotMatch(snapshot.html, />No<\/div>|>US<\/div>/);
+    assert.match(snapshot.html, /\[redacted URL\]/);
+  } finally { dom.window.close(); }
+});
+
 test('Phoenix export follows cursors and returns only one application session', async () => {
   const calls = [];
   const spans = await fetchSessionSpans('7:123', {fetchImpl: async url => {

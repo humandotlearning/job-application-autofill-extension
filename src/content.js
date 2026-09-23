@@ -33,7 +33,7 @@ function notifyNavigation() {
   waitForDocumentSettled(document).then(() => sendRuntimeMessage({ type: 'JOB_APP_NAVIGATED' })).catch(() => {});
 }
 
-const CONTENT_VERSION = 'autofill-ux-9';
+const CONTENT_VERSION = 'autofill-ux-10';
 if (!globalThis.__jobApplicationAutofillInstalled) {
   globalThis.__jobApplicationAutofillInstalled = CONTENT_VERSION;
   let inline = null;
@@ -196,12 +196,25 @@ if (!globalThis.__jobApplicationAutofillInstalled) {
             .catch((error) => sendResponse({ ok: false, code: 'inspection_error', error: error.message }));
           return true;
         case 'JOB_APP_DEBUG_INSPECT':
-          inspectWhenReady().then(inspection => sendResponse({ok: true, inspection, version: CONTENT_VERSION}))
-            .catch(error => sendResponse({ok: false, code: 'inspection_error', error: error.message}));
+          sendRuntimeMessage({type: 'JOB_APP_DEBUG_AUTHORIZE'}).then(async authorization => {
+            if (!authorization?.ok) {
+              sendResponse({ok: false, disabled: true, code: 'developer_mode_disabled', error: 'Enable Developer mode in Settings to capture debug cases.'});
+              return;
+            }
+            const inspection = await inspectWhenReady();
+            sendResponse({ok: true, inspection, version: CONTENT_VERSION});
+          }).catch(error => sendResponse({ok: false, code: 'inspection_error', error: error.message}));
           return true;
         case 'JOB_APP_DEBUG_SNAPSHOT':
-          sendResponse({ok: true, snapshot: captureDebugSnapshot(document)});
-          break;
+          sendRuntimeMessage({type: 'JOB_APP_DEBUG_AUTHORIZE'}).then(authorization => {
+            if (!authorization?.ok) {
+              sendResponse({ok: false, disabled: true, code: 'developer_mode_disabled', error: 'Enable Developer mode in Settings to capture debug cases.'});
+              return;
+            }
+            try { sendResponse({ok: true, snapshot: captureDebugSnapshot(document)}); }
+            catch (error) { sendResponse({ok: false, code: 'snapshot_error', error: error.message}); }
+          }).catch(error => sendResponse({ok: false, code: 'snapshot_error', error: error.message}));
+          return true;
         case 'JOB_APP_INSPECT_INLINE': {
           if (!active) { sendResponse({ok: false, disabled: true}); break; }
           let focused, focusInspected = false;

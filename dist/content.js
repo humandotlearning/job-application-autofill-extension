@@ -2227,15 +2227,29 @@ function waitForDocumentSettled(document, { quietMs = 150, minWaitMs = 400, time
 
 const OMIT_TAGS = new Set(['script', 'style', 'link', 'meta', 'iframe', 'object', 'embed', 'img', 'svg', 'canvas', 'video', 'audio', 'template']);
 const KEEP_ATTRIBUTES = new Set(['id', 'class', 'name', 'type', 'for', 'role', 'required', 'disabled', 'readonly', 'multiple', 'autocomplete', 'inputmode', 'placeholder', 'min', 'max', 'step', 'pattern', 'minlength', 'maxlength', 'hidden', 'contenteditable']);
+const URL_PATTERN = /\b(?:https?:\/\/|www\.)[^\s<>"'`]+/gi;
 
 function captureDebugSnapshot(document) {
   const inspection = inspectDocument(document);
   if (!inspection.destination?.regionId || !inspection.fields.length) throw new Error('Select a loaded application form before capturing it.');
   const root = applicationRoot(document);
   const entered = [...new Set(inspection.fields.flatMap(field => [field.rawValue, field.currentValue])
-    .filter(value => typeof value === 'string' && value.trim().length >= 3))]
+    .filter(value => typeof value === 'string' && value.trim()))]
     .sort((a, b) => b.length - a.length);
-  const scrub = value => entered.reduce((text, answer) => text.replaceAll(answer, '[redacted]'), String(value || ''));
+  const scrub = value => {
+    let text = String(value ?? '');
+    for (const answer of entered) {
+      if (answer.trim().length >= 3) {
+        text = text.replaceAll(answer, '[redacted]');
+      } else if (/^[\p{L}\p{N}_]+$/u.test(answer.trim())) {
+        const escaped = answer.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        text = text.replace(new RegExp(`(^|[^\\p{L}\\p{N}_])${escaped}(?=$|[^\\p{L}\\p{N}_])`, 'giu'), '$1[redacted]');
+      } else if (text.trim() === answer.trim()) {
+        text = text.replace(answer.trim(), '[redacted]');
+      }
+    }
+    return text.replace(URL_PATTERN, '[redacted URL]');
+  };
   const clean = value => {
     if (!value || typeof value !== 'object') return typeof value === 'string' ? scrub(value) : value;
     if (Array.isArray(value)) return value.map(clean);
@@ -2858,7 +2872,7 @@ function notifyNavigation() {
   waitForDocumentSettled(document).then(() => sendRuntimeMessage({ type: 'JOB_APP_NAVIGATED' })).catch(() => {});
 }
 
-const CONTENT_VERSION = 'autofill-ux-9';
+const CONTENT_VERSION = 'autofill-ux-10';
 if (!globalThis.__jobApplicationAutofillInstalled) {
   globalThis.__jobApplicationAutofillInstalled = CONTENT_VERSION;
   let inline = null;
@@ -3021,12 +3035,25 @@ if (!globalThis.__jobApplicationAutofillInstalled) {
             .catch((error) => sendResponse({ ok: false, code: 'inspection_error', error: error.message }));
           return true;
         case 'JOB_APP_DEBUG_INSPECT':
-          inspectWhenReady().then(inspection => sendResponse({ok: true, inspection, version: CONTENT_VERSION}))
-            .catch(error => sendResponse({ok: false, code: 'inspection_error', error: error.message}));
+          sendRuntimeMessage({type: 'JOB_APP_DEBUG_AUTHORIZE'}).then(async authorization => {
+            if (!authorization?.ok) {
+              sendResponse({ok: false, disabled: true, code: 'developer_mode_disabled', error: 'Enable Developer mode in Settings to capture debug cases.'});
+              return;
+            }
+            const inspection = await inspectWhenReady();
+            sendResponse({ok: true, inspection, version: CONTENT_VERSION});
+          }).catch(error => sendResponse({ok: false, code: 'inspection_error', error: error.message}));
           return true;
         case 'JOB_APP_DEBUG_SNAPSHOT':
-          sendResponse({ok: true, snapshot: captureDebugSnapshot(document)});
-          break;
+          sendRuntimeMessage({type: 'JOB_APP_DEBUG_AUTHORIZE'}).then(authorization => {
+            if (!authorization?.ok) {
+              sendResponse({ok: false, disabled: true, code: 'developer_mode_disabled', error: 'Enable Developer mode in Settings to capture debug cases.'});
+              return;
+            }
+            try { sendResponse({ok: true, snapshot: captureDebugSnapshot(document)}); }
+            catch (error) { sendResponse({ok: false, code: 'snapshot_error', error: error.message}); }
+          }).catch(error => sendResponse({ok: false, code: 'snapshot_error', error: error.message}));
+          return true;
         case 'JOB_APP_INSPECT_INLINE': {
           if (!active) { sendResponse({ok: false, disabled: true}); break; }
           let focused, focusInspected = false;

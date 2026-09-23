@@ -335,6 +335,21 @@ test('debug capture requires Developer mode and inspects without starting a fill
   assert.equal(harness.sessionData.applicationRun, undefined);
 });
 
+test('content-side debug authorization requires a content sender and Developer mode', async () => {
+  const harness = createHarness();
+  await import(`../src/service-worker.js?debug-content-auth=${Date.now()}`);
+  const contentSender = {id: 'test-extension', tab: {id: 7, url: 'https://jobs.example.com/apply'}, frameId: 0, url: 'https://jobs.example.com/apply'};
+  const blocked = await harness.dispatch({type: 'JOB_APP_DEBUG_AUTHORIZE'}, contentSender);
+  assert.equal(blocked.ok, false);
+  harness.localData.developerMode = true;
+  const authorized = await harness.dispatch({type: 'JOB_APP_DEBUG_AUTHORIZE'}, contentSender);
+  assert.equal(authorized.ok, true);
+  const extensionPage = await harness.dispatch({type: 'JOB_APP_DEBUG_AUTHORIZE'}, {id: 'test-extension', url: 'chrome-extension://test-extension/sidepanel.html'});
+  assert.equal(extensionPage.ok, false);
+  const otherExtension = await harness.dispatch({type: 'JOB_APP_DEBUG_AUTHORIZE'}, {...contentSender, id: 'other-extension'});
+  assert.equal(otherExtension.ok, false);
+});
+
 test('ambiguous debug capture selects a form without invoking the fill workflow', async () => {
   const frames = [0, 2].map(frameId => ({frameId, context: {title: 'Job application'}, pages: [{
     page: {title: 'Job application', domain: 'jobs.example.com'},
