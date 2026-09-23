@@ -19,6 +19,31 @@ function makeDocument(html) {
   return new JSDOM(html, { url: 'https://jobs.example.com/apply' }).window.document;
 }
 
+test('adjacent block labels allow safe saved answers on Nutpaa-style forms', () => {
+  const document = makeDocument(`<form>
+    <div><div>First Name *</div><input name="firstname" required></div>
+    <div><div>Last Name *</div><input name="lastname" required></div>
+    <div><div>Email Address *</div><input name="email" type="email" required></div>
+    <div><div class="hint">Optional explanation</div><input name="opaque"></div>
+  </form>`);
+  const fields = collectFieldDescriptors(document);
+  assert.deepEqual(fields.slice(0, 3).map(field => [field.label, field.labelConfidence]), [
+    ['First Name', 'high'], ['Last Name', 'high'], ['Email Address', 'high'],
+  ]);
+  assert.equal(fields[3].labelConfidence, 'low');
+  const records = [
+    {key: 'first_name_one', question: 'First Name', answer: 'Example', confirmationState: 'confirmed', sensitivity: 'safe'},
+    {key: 'first_name_two', question: 'First Name', answer: 'Example', confirmationState: 'confirmed', sensitivity: 'safe'},
+    {key: 'first_name_three', question: 'First Name', answer: 'Other', confirmationState: 'confirmed', sensitivity: 'safe'},
+    {key: 'last_name', question: 'Last Name', answer: 'Person', confirmationState: 'confirmed', sensitivity: 'safe'},
+    {key: 'email', question: 'Email Address', answer: 'example@example.com', confirmationState: 'confirmed', sensitivity: 'safe'},
+  ];
+  const decisions = planDeterministicFill(fields, records);
+  assert.equal(decisions[0].matchKind, 'vote');
+  assert.deepEqual(decisions.slice(0, 3).map(decision => decision.disposition),
+    ['autofill', 'autofill', 'autofill']);
+});
+
 test('required badges work across native, ARIA, grouped and custom controls', () => {
   const document = makeDocument(`<form>
     <label>Native<input id="native" required></label>

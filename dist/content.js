@@ -911,6 +911,15 @@ function fieldRequired(element) {
 
 function nearbyQuestionElement(element) {
   const controls = 'input:not([type="hidden"]),textarea,select,[role="combobox"],button[aria-haspopup="listbox"]';
+  const sibling = element.previousElementSibling;
+  const parent = composedParent(element);
+  if (parent && sibling?.matches('div,span') && isVisible(sibling)
+    && !sibling.closest('[role="alert"],.error,.help,.hint')
+    && !sibling.querySelector(controls)
+    && [...queryAll(parent, controls)].filter(isVisible).every(peer => peer === element)) {
+    const text = labelText(sibling);
+    if (text && text.length <= 500) return sibling;
+  }
   for (let wrapper = composedParent(element), depth = 0; wrapper && depth < 6; wrapper = composedParent(wrapper), depth++) {
     if (wrapper.matches('form,section,main,body')) break;
     const peers = [...queryAll(wrapper, controls)].filter(isVisible);
