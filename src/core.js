@@ -261,7 +261,7 @@ export function chooseRecord(field = {}, records = []) {
     const sources = new Set();
     for (const record of candidates) {
       if (recordConceptFor(record) !== concept || record.confirmationState !== 'confirmed' || record.sensitivity === 'legal') continue;
-      const source = record.key || record.id || record.question;
+      const source = record.id || record.key || record.question;
       if (!source || sources.has(source)) continue;
       sources.add(source);
       const answer = String(record.answer).trim();

@@ -177,6 +177,13 @@ test('uses the most supported confirmed identity answer and leaves tied votes un
   ]), null);
 });
 
+test('does not count a local reuse clone as another identity vote', () => {
+  const original = { id: 'saved-first-name', key: 'first_name', question: 'First name', answer: 'Nitin', confirmationState: 'confirmed', sensitivity: 'safe' };
+  const clone = { ...original, key: 'application_1_first_name' };
+  const conflict = { id: 'saved-old-first-name', key: 'old_first_name', question: 'First name', answer: 'Nithin', confirmationState: 'confirmed', sensitivity: 'safe' };
+  assert.equal(chooseRecord({ label: 'First name' }, [original, conflict, clone]), null);
+});
+
 test('does not vote through conflicting employment facts', () => {
   assert.equal(chooseRecord({ label: 'Current company' }, [
     { key: 'a', question: 'Current company', answer: 'Old Co', confirmationState: 'confirmed' },

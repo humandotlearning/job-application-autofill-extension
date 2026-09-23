@@ -1321,7 +1321,8 @@ async function focusFirstProblem(tabId, run, inspection, validation) {
 
 function applicationRecordsForLocalReuse(run = {}) {
   return (run.answers || []).filter(record => ['user', 'autofill'].includes(record?.provenance) && String(record?.answer || '').trim())
-    .map((record, index) => ({...record, key: `application_${Number(record.pageNumber) || 0}_${record.key || index}`,
+    .map((record, index) => ({...record, id: record.id || record.key || record.question || index,
+      key: `application_${Number(record.pageNumber) || 0}_${record.key || index}`,
       provenance: 'this application', confirmationState: 'confirmed'}));
 }
 
@@ -1365,7 +1366,8 @@ async function applyPageDecisions(tabId, run, inspection, records, coverMessages
     const validationResponse = await sendToApplicationFrame(tabId, run, { type: 'JOB_APP_VALIDATE' });
     currentValidation = validationResponse?.validation || { ok: false, requiredEmpty: [], invalid: [] };
     const invalidFieldIds = new Set((currentValidation.invalid || []).map((field) => field.fieldId));
-    const localDecisions = planDeterministicFill(scopedFields, [...applicationRecordsForLocalReuse(run), ...records], coverMessages, profile, currentInspection.page, { voteAutofillEnabled }).map(decision => {
+    const voteRecords = [...applicationRecordsForLocalReuse(run), ...records];
+    const localDecisions = planDeterministicFill(scopedFields, voteRecords, coverMessages, profile, currentInspection.page, { voteAutofillEnabled }).map(decision => {
       const field = scopedFields.find(field => field.id === decision.fieldId);
       if (!field) return decision;
       if (field.entityUnresolved) return {...decision, action:'ask_user',value:null,disposition:'manual',reason:'Choose the employer for this work-history section'};
@@ -1375,7 +1377,10 @@ async function applyPageDecisions(tabId, run, inspection, records, coverMessages
         return { ...decision, action: 'keep', value: null, reason: 'The current value does not satisfy the field constraints' };
       }
       if (String(field.currentValue || '').trim()) return decision;
-      const candidates = savedFieldCandidates(field, records, draftRecords);
+      const voteWinner = decision.matchKind === 'vote'
+        ? voteRecords.find(record => record.key === decision.evidenceKeys?.[0])
+        : null;
+      const candidates = savedFieldCandidates(field, records, draftRecords, voteWinner ? [voteWinner] : []);
       const choiceMapping = choiceEvidenceNeedsPlanner(field, candidates);
       const gated = candidates.length && !choiceMapping && (decision.action !== 'fill' || decision.disposition !== 'autofill' || field.type === 'textarea' || decision.sensitivity !== 'safe' || inferSensitivity(field.label, field.id) !== 'safe');
       if (gated) {

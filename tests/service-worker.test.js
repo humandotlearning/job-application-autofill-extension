@@ -326,6 +326,20 @@ test('saved-answer vote autofills by default and becomes review-only when disabl
   }
 });
 
+test('disabled vote autofill keeps the leading answer in review candidates', async () => {
+  const harness = createHarness({answerRecords: [
+    ...['aaa', 'bbb', 'ccc'].map(key => ({key, question:'First name', answer:key.toUpperCase(), sensitivity:'safe'})),
+    ...['zzz1', 'zzz2', 'zzz3', 'zzz4'].map(key => ({key, question:'First name', answer:'Nitin', sensitivity:'safe'})),
+  ],pagesByTab:{7:{pages:[{fields:[{id:'first_name',handle:'first-h',label:'First Name',type:'text',required:true}],
+    actions:[{id:'submit',label:'Submit application',kind:'submit'}]}]}}});
+  harness.localData.voteAutofillEnabled = false;
+  await import(`../src/service-worker.js?vote-review-winner=${Date.now()}`);
+  const response = await harness.dispatch({type:'JOB_RUN_START',tabId:7});
+  assert.equal(response.ok, true, response.error);
+  assert.equal(harness.tabs.get(7).frames[0].pages[0].values?.first_name, undefined);
+  assert.ok(response.run.suggestions.first_name.candidates.some(candidate => candidate.answer === 'Nitin'));
+});
+
 test('supported tabs stay content-disabled until Fill this form starts a session', async () => {
   const harness = createHarness({pagesByTab: {7: {pages: [{
     page: {title: 'Job application', domain: 'jobs.example.com'},

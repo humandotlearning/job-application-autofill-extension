@@ -168,8 +168,11 @@ export function retrieveEvidence(field, records = [], { limit = 3 } = {}) {
   return searchEvidence(field, records, { limit: Math.min(3, limit) });
 }
 
-export function savedFieldCandidates(field, records, draftRecords = []) {
-  const candidates = retrieveEvidence(field, records);
+export function savedFieldCandidates(field, records, draftRecords = [], preferredRecords = []) {
+  const candidates = retrieveEvidence(field, preferredRecords);
+  for (const candidate of retrieveEvidence(field, records)) {
+    if (!candidates.some(saved => saved.answer === candidate.answer)) candidates.push(candidate);
+  }
   for (const candidate of retrieveEvidence(field, draftRecords)) {
     if (!candidates.some(saved => saved.answer === candidate.answer)) {
       candidates.push({...candidate, kind: 'draft',
