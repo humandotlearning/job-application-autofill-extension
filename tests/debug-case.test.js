@@ -63,12 +63,12 @@ test('debug snapshot removes visible URLs and short answers from custom widget t
     <label>Choice<select name="choice"><option value="No" selected>No</option><option value="US">US</option></select></label>
     <div role="option">No</div><div role="option">US</div>
     <p>Current answers: No and US</p>
-    <p>References https://private.example/path, www.private.example/help, //cdn.private.example/asset, ftp://files.private.example/archive, and portal.private.example/apply</p>
+    <p>References https://private.example/path, www.private.example/help, //cdn.private.example/asset, ftp://files.private.example/archive, portal.private.example/apply, /candidate/private?token=secret, and ../profile/private</p>
   </form>`, {url: 'https://example.test/apply'});
   try {
     const snapshot = captureDebugSnapshot(dom.window.document);
     const body = JSON.stringify(snapshot);
-    assert.doesNotMatch(body, /https:\/\/private\.example\/path|www\.private\.example\/help|\/\/cdn\.private\.example\/asset|ftp:\/\/files\.private\.example\/archive|portal\.private\.example\/apply/);
+    assert.doesNotMatch(body, /https:\/\/private\.example\/path|www\.private\.example\/help|\/\/cdn\.private\.example\/asset|ftp:\/\/files\.private\.example\/archive|portal\.private\.example\/apply|\/candidate\/private\?token=secret|\.\.\/profile\/private/);
     assert.match(snapshot.html, /<option value="No">No<\/option>/);
     assert.match(snapshot.html, /<div role="option">No<\/div><div role="option">US<\/div>/);
     assert.match(snapshot.html, /Current answers: \[redacted\] and \[redacted\]/);
@@ -78,8 +78,8 @@ test('debug snapshot removes visible URLs and short answers from custom widget t
 });
 
 test('outcome text scrubbing removes URL forms and short entered answers', () => {
-  const cleaned = scrubDebugText('Retry https://private.example/x, //cdn.private.example/y, ftp://files.private.example/z, and portal.private.example/apply. Answer No.', ['No']);
-  assert.doesNotMatch(cleaned, /https:\/\/private\.example\/x|\/\/cdn\.private\.example\/y|ftp:\/\/files\.private\.example\/z|portal\.private\.example\/apply|Answer No/);
+  const cleaned = scrubDebugText('Retry https://private.example/x, //cdn.private.example/y, ftp://files.private.example/z, portal.private.example/apply, /candidate/private?token=secret, and ../profile/private. Answer No.', ['No']);
+  assert.doesNotMatch(cleaned, /https:\/\/private\.example\/x|\/\/cdn\.private\.example\/y|ftp:\/\/files\.private\.example\/z|portal\.private\.example\/apply|\/candidate\/private\?token=secret|\.\.\/profile\/private|Answer No/);
   assert.match(cleaned, /Answer \[redacted\]/);
 });
 

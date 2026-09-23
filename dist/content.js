@@ -2227,7 +2227,7 @@ function waitForDocumentSettled(document, { quietMs = 150, minWaitMs = 400, time
 
 const OMIT_TAGS = new Set(['script', 'style', 'link', 'meta', 'iframe', 'object', 'embed', 'img', 'svg', 'canvas', 'video', 'audio', 'template']);
 const KEEP_ATTRIBUTES = new Set(['id', 'class', 'name', 'type', 'for', 'role', 'required', 'disabled', 'readonly', 'multiple', 'autocomplete', 'inputmode', 'placeholder', 'min', 'max', 'step', 'pattern', 'minlength', 'maxlength', 'hidden', 'contenteditable']);
-const URL_PATTERN = /(?:\b[a-z][a-z\d+.-]*:\/\/|\/\/|www\.)[^\s<>"'`]+|\b[a-z][a-z\d+.-]*:[^\s<>"'`]+|\b[a-z\d](?:[a-z\d-]*[a-z\d])?(?:\.[a-z\d](?:[a-z\d-]*[a-z\d])?)+(?::\d+)?(?:[/?#][^\s<>"'`]+)?/gi;
+const URL_PATTERN = /(?:\b[a-z][a-z\d+.-]*:\/\/|\/\/|www\.)[^\s<>"'`]+|\b[a-z][a-z\d+.-]*:[^\s<>"'`]+|\b[a-z\d](?:[a-z\d-]*[a-z\d])?(?:\.[a-z\d](?:[a-z\d-]*[a-z\d])?)+(?::\d+)?(?:[/?#][^\s<>"'`]+)?|(?<![\w/])\/(?:[a-z\d._~-]+\/)*[a-z\d._~-]+(?:[?#][^\s<>"'`]+)?|(?<![\w.])\.{1,2}\/[^\s<>"'`]+/gi;
 
 function scrubDebugText(value, enteredValues = []) {
   let text = String(value ?? '');

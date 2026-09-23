@@ -338,7 +338,7 @@ test('debug capture requires Developer mode and inspects without starting a fill
 test('content-side debug authorization requires a content sender and Developer mode', async () => {
   const harness = createHarness();
   await import(`../src/service-worker.js?debug-content-auth=${Date.now()}`);
-  const contentSender = {id: 'test-extension', tab: {id: 7, url: 'https://jobs.example.com/apply'}, frameId: 0, url: 'https://jobs.example.com/apply'};
+  const contentSender = {id: 'test-extension', tab: {id: 7, url: 'https://jobs.example.com/apply'}, frameId: 2, url: 'https://forms.other.example/frame'};
   const blocked = await harness.dispatch({type: 'JOB_APP_DEBUG_AUTHORIZE'}, contentSender);
   assert.equal(blocked.ok, false);
   harness.localData.developerMode = true;
@@ -347,6 +347,9 @@ test('content-side debug authorization requires a content sender and Developer m
   harness.localData.disabledHostnames = ['jobs.example.com'];
   const disabledSite = await harness.dispatch({type: 'JOB_APP_DEBUG_AUTHORIZE'}, contentSender);
   assert.equal(disabledSite.ok, false);
+  harness.localData.disabledHostnames = ['forms.other.example'];
+  const enabledTopLevelSite = await harness.dispatch({type: 'JOB_APP_DEBUG_AUTHORIZE'}, contentSender);
+  assert.equal(enabledTopLevelSite.ok, true);
   harness.localData.disabledHostnames = [];
   const extensionPage = await harness.dispatch({type: 'JOB_APP_DEBUG_AUTHORIZE'}, {id: 'test-extension', url: 'chrome-extension://test-extension/sidepanel.html'});
   assert.equal(extensionPage.ok, false);

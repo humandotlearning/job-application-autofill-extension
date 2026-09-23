@@ -2783,8 +2783,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     }
     (async () => {
       try {
-        const tabHint = {...sender.tab, ...(sender.url ? {url: sender.url} : {})};
-        await assertTabSiteEnabled(sender.tab.id, tabHint);
+        await assertTabSiteEnabled(sender.tab.id, sender.tab);
         const settings = await chrome.storage.local.get({developerMode: false});
         return {ok: settings.developerMode === true};
       } catch { return {ok: false}; }
