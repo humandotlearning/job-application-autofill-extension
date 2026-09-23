@@ -551,6 +551,18 @@ test('visual form context defaults on and persists an explicit opt-out', async (
   } finally { disabled.cleanup(); }
 });
 
+test('saved-answer vote autofill defaults on and persists an explicit opt-out', async () => {
+  const harness = await setupPanel({localData: {}});
+  try {
+    const checkbox = harness.dom.window.document.querySelector('#vote-autofill-enabled');
+    assert.equal(checkbox.checked, true);
+    checkbox.checked = false;
+    checkbox.dispatchEvent(new harness.dom.window.Event('change', {bubbles: true}));
+    await panelTick();
+    assert.equal(harness.localData.voteAutofillEnabled, false);
+  } finally { harness.cleanup(); }
+});
+
 test('panel persists settings, focuses blockers, and saves answers without any submit control', async () => {
   const run = {
     status: 'ready_for_user_submit',

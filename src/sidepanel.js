@@ -5,6 +5,7 @@ const elements = {
   openaiApiKey: byId('openai-api-key'),
   typesafeEnabled: byId('typesafe-enabled'),
   typesafeAutofillEnabled: byId('typesafe-autofill-enabled'),
+  voteAutofillEnabled: byId('vote-autofill-enabled'),
   typesafeApiKey: byId('typesafe-api-key'),
   apiKey: byId('openai-api-key'),
   apiModel: byId('ai-model'),
@@ -1481,7 +1482,7 @@ async function refresh() {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
   activeTabId = tab?.id || null;
   await refreshSiteState();
-  const stored = await chrome.storage.local.get({ answerRecords: [], openaiApiKey: '', fireworksApiKey: '', typesafeApiKey: '', typesafeEnabled: false, typesafeAutofillEnabled: false, aiProvider: '', aiModel: '', openaiModel: 'gpt-5.6-terra', includeFormScreenshot: true, autoAdvancePages: false, phoenixTracing: true });
+  const stored = await chrome.storage.local.get({ answerRecords: [], openaiApiKey: '', fireworksApiKey: '', typesafeApiKey: '', typesafeEnabled: false, typesafeAutofillEnabled: false, voteAutofillEnabled: true, aiProvider: '', aiModel: '', openaiModel: 'gpt-5.6-terra', includeFormScreenshot: true, autoAdvancePages: false, phoenixTracing: true });
   const provider = stored.aiProvider === 'openai' || stored.aiProvider === 'fireworks'
     ? stored.aiProvider
     : (stored.openaiApiKey ? 'openai' : 'fireworks');
@@ -1493,6 +1494,7 @@ async function refresh() {
   elements.typesafeApiKey.value = stored.typesafeApiKey || '';
   elements.typesafeEnabled.checked = Boolean(stored.typesafeEnabled);
   elements.typesafeAutofillEnabled.checked = Boolean(stored.typesafeAutofillEnabled);
+  elements.voteAutofillEnabled.checked = stored.voteAutofillEnabled !== false;
   elements.typesafeAutofillEnabled.disabled = !elements.typesafeEnabled.checked;
   elements.apiModel.value = stored.aiModel || (provider === 'openai' ? stored.openaiModel : '') || defaultModel;
   elements.includeFormScreenshot.checked = stored.includeFormScreenshot !== false;
@@ -1593,6 +1595,11 @@ async function saveTypeSafeAutofillSetting() {
   setStatus(elements.typesafeAutofillEnabled.checked ? 'Low-risk JEV autofill enabled.' : 'Low-risk JEV matches require review.');
 }
 
+async function saveVoteAutofillSetting() {
+  await chrome.storage.local.set({ voteAutofillEnabled: elements.voteAutofillEnabled.checked });
+  setStatus(elements.voteAutofillEnabled.checked ? 'Saved-answer vote autofill enabled.' : 'Saved-answer vote matches require review.');
+}
+
 async function saveProfile(changedField) {
   try {
     const company = elements.employerName.value.trim() || 'DeepSight AI Labs';
@@ -1628,6 +1635,7 @@ elements.autoAdvance.addEventListener('change', saveSettings);
 elements.includeFormScreenshot.addEventListener('change', saveScreenshotSetting);
 elements.typesafeEnabled.addEventListener('change', saveTypeSafeSetting);
 elements.typesafeAutofillEnabled.addEventListener('change', saveTypeSafeAutofillSetting);
+elements.voteAutofillEnabled.addEventListener('change', saveVoteAutofillSetting);
 elements.phoenixTracing.addEventListener('change', async () => {
   await chrome.storage.local.set({ phoenixTracing: elements.phoenixTracing.checked });
   setStatus(elements.phoenixTracing.checked ? 'Local Phoenix tracing enabled.' : 'AI tracing disabled.');
@@ -1684,6 +1692,7 @@ chrome.storage.onChanged.addListener((changes, area) => {
   if (area === 'local' && changes.phoenixTracing) elements.phoenixTracing.checked = changes.phoenixTracing.newValue !== false;
   if (area === 'local' && (changes.phoenixTraceQueue || changes.phoenixTraceStatus || changes.phoenixTracing)) refreshPhoenixStatus().catch(() => {});
   if (area === 'local' && changes.includeFormScreenshot) elements.includeFormScreenshot.checked = changes.includeFormScreenshot.newValue !== false;
+  if (area === 'local' && changes.voteAutofillEnabled) elements.voteAutofillEnabled.checked = changes.voteAutofillEnabled.newValue !== false;
   if (area === 'local' && changes.disabledHostnames) refreshSiteState().catch(error => setStatus(error.message, 'error'));
   if (area === 'session' && changes.applicationRun && activeTabId) renderRun(changes.applicationRun.newValue?.[String(activeTabId)] || null);
   if (area === 'session' && changes.inlineFieldSessions) loadInlineField().catch(error => setStatus(error.message, 'error'));

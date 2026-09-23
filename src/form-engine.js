@@ -1129,7 +1129,7 @@ function hiringCompanyDefault(field, profile = {}, page = {}) {
   return null;
 }
 
-export function planDeterministicFill(fields, records, coverMessages = [], profile = {}, page = {}) {
+export function planDeterministicFill(fields, records, coverMessages = [], profile = {}, page = {}, { voteAutofillEnabled = true } = {}) {
   const phoneDecisions = phoneBlockDecisions(fields, records, profile);
   return fields.map((field) => {
     const phonePlan = phoneDecisions.get(field.id);
@@ -1172,11 +1172,12 @@ export function planDeterministicFill(fields, records, coverMessages = [], profi
       confidence: usableMatch.confidence === 'exact' ? 'high' : usableMatch.confidence,
       sensitivity: usableMatch.record.sensitivity || inferSensitivity(field.label, field.id),
       reason: usableMatch.reason,
-      matchKind: usableMatch.score === 1 ? (usableMatch.reason.startsWith('concept:') ? 'concept' : 'exact') : 'fuzzy',
+      matchKind: usableMatch.score === 1 ? (usableMatch.reason.startsWith('vote:') ? 'vote' : usableMatch.reason.startsWith('concept:') ? 'concept' : 'exact') : 'fuzzy',
     };
   }).map((decision, index) => {
     const sources = (decision.evidenceKeys || []).map(key => records.find(record => record.key === key)).filter(Boolean);
     const decorated = { ...decision, handle: fields[index].handle,
+      voteAutofillEnabled,
       confirmationState: sources.length && sources.every(record => record.confirmationState === 'confirmed') ? 'confirmed' : 'unconfirmed',
       reusePolicy: sources.some(record => (record.semantic?.reusePolicy || record.reusePolicy) === 'never') ? 'never' : sources.some(record => (record.semantic?.reusePolicy || record.reusePolicy) === 'review_only') ? 'review_only' : 'allowed',
       matchKind: decision.matchKind || (decision.transformation ? 'derived' : 'exact'),

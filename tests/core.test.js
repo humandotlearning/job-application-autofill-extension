@@ -159,6 +159,32 @@ test('does not confuse different name concepts or choose conflicting canonical r
   ]), null);
 });
 
+test('uses the most supported confirmed identity answer and leaves tied votes unresolved', () => {
+  const records = [
+    { key: 'first_name', question: 'First name', answer: 'Nitin', confirmationState: 'confirmed', sensitivity: 'safe' },
+    { key: 'given_name', question: 'Given name', answer: 'Nitin', confirmationState: 'confirmed', sensitivity: 'safe' },
+    { key: 'application_first_name', question: 'First name', answer: 'Nithin', confirmationState: 'confirmed', sensitivity: 'safe' },
+  ];
+  assert.equal(chooseRecord({ label: 'First Name', type: 'text' }, records)?.record.answer, 'Nitin');
+  assert.equal(chooseRecord({ label: 'First Name', type: 'text' }, [...records, {
+    key: 'legal_first_name', question: 'First name', answer: 'Nithin', confirmationState: 'confirmed', sensitivity: 'safe',
+  }]), null);
+  assert.equal(chooseRecord({ label: 'First Name', type: 'text' }, [records[0], { ...records[0] }, records[2]]), null);
+  assert.equal(chooseRecord({ label: 'First Name', type: 'text' }, [
+    {...records[0], confirmationState: 'unconfirmed'},
+    {...records[1], confirmationState: 'unconfirmed'},
+    records[2],
+  ]), null);
+});
+
+test('does not vote through conflicting employment facts', () => {
+  assert.equal(chooseRecord({ label: 'Current company' }, [
+    { key: 'a', question: 'Current company', answer: 'Old Co', confirmationState: 'confirmed' },
+    { key: 'b', question: 'Current company', answer: 'Old Co', confirmationState: 'confirmed' },
+    { key: 'c', question: 'Current company', answer: 'New Co', confirmationState: 'confirmed' },
+  ]), null);
+});
+
 test('keeps scoped repeated records separate while retaining the shared label alias', () => {
   const merged = upsertAnswerRecords([], [
     { key: 'company__entry_1', question: 'Company', answer: 'Analytical Engines', aliases: ['Company'], entityId: 'employment-1' },

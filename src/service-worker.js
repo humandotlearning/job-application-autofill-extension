@@ -544,7 +544,7 @@ async function getCoverMessages() {
 }
 
 async function getSettings() {
-  const stored = await chrome.storage.local.get({ autoAdvancePages: false, includeFormScreenshot: true, aiProvider: '', aiModel: '', openaiModel: '', openaiApiKey: '', fireworksApiKey: '', typesafeEnabled: false, typesafeAutofillEnabled: false });
+  const stored = await chrome.storage.local.get({ autoAdvancePages: false, includeFormScreenshot: true, voteAutofillEnabled: true, aiProvider: '', aiModel: '', openaiModel: '', openaiApiKey: '', fireworksApiKey: '', typesafeEnabled: false, typesafeAutofillEnabled: false });
   const aiProvider = stored.aiProvider === 'openai' || stored.aiProvider === 'fireworks'
     ? stored.aiProvider
     : (String(stored.openaiApiKey || '').trim() ? 'openai' : DEFAULT_PROVIDER);
@@ -553,6 +553,7 @@ async function getSettings() {
   return {
     autoAdvancePages: Boolean(stored.autoAdvancePages),
     includeFormScreenshot: stored.includeFormScreenshot !== false,
+    voteAutofillEnabled: stored.voteAutofillEnabled !== false,
     aiProvider,
     aiModel,
     openaiModel: aiModel,
@@ -1324,7 +1325,7 @@ function applicationRecordsForLocalReuse(run = {}) {
       provenance: 'this application', confirmationState: 'confirmed'}));
 }
 
-async function applyPageDecisions(tabId, run, inspection, records, coverMessages, profile = {}, datasourceRevision = '', cycle = {pass: 0, deadline: Date.now() + 8000}) {
+async function applyPageDecisions(tabId, run, inspection, records, coverMessages, profile = {}, datasourceRevision = '', voteAutofillEnabled = true, cycle = {pass: 0, deadline: Date.now() + 8000}) {
   const currentPageSignature = pageSignature(inspection, run.frame);
   if (run.lastAction === 'next' && run.pageSignature === currentPageSignature) {
     run.status = 'waiting_user';
@@ -1364,7 +1365,7 @@ async function applyPageDecisions(tabId, run, inspection, records, coverMessages
     const validationResponse = await sendToApplicationFrame(tabId, run, { type: 'JOB_APP_VALIDATE' });
     currentValidation = validationResponse?.validation || { ok: false, requiredEmpty: [], invalid: [] };
     const invalidFieldIds = new Set((currentValidation.invalid || []).map((field) => field.fieldId));
-    const localDecisions = planDeterministicFill(scopedFields, [...applicationRecordsForLocalReuse(run), ...records], coverMessages, profile, currentInspection.page).map(decision => {
+    const localDecisions = planDeterministicFill(scopedFields, [...applicationRecordsForLocalReuse(run), ...records], coverMessages, profile, currentInspection.page, { voteAutofillEnabled }).map(decision => {
       const field = scopedFields.find(field => field.id === decision.fieldId);
       if (!field) return decision;
       if (field.entityUnresolved) return {...decision, action:'ask_user',value:null,disposition:'manual',reason:'Choose the employer for this work-history section'};
@@ -2283,10 +2284,11 @@ async function processPage(tabId, { autoAdvance, selectedDestination = null } = 
       return await saveRun(run);
     }
 
-    const [records, coverMessages, datasource] = await Promise.all([
+    const [records, coverMessages, datasource, settings] = await Promise.all([
       getRecords(),
       getCoverMessages(),
       getDatasource(),
+      getSettings(),
     ]);
     const discovery = await discoverApplicationFrame(tabId, () => assertRunSiteAuthority(tabId, run), selectedDestination || run.selectedDestination, String(tabId) + ':' + run.startedAt);
     if (discovery.errorCode) return await saveRun(pauseForFrame(run, discovery));
@@ -2305,6 +2307,7 @@ async function processPage(tabId, { autoAdvance, selectedDestination = null } = 
       coverMessages,
       datasource.profile,
       datasource.datasourceMeta?.updatedAt || '',
+      settings.voteAutofillEnabled,
     );
     run = processed.run;
     const inspection = processed.inspection;
