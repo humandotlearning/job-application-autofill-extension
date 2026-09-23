@@ -344,10 +344,37 @@ test('content-side debug authorization requires a content sender and Developer m
   harness.localData.developerMode = true;
   const authorized = await harness.dispatch({type: 'JOB_APP_DEBUG_AUTHORIZE'}, contentSender);
   assert.equal(authorized.ok, true);
+  harness.localData.disabledHostnames = ['jobs.example.com'];
+  const disabledSite = await harness.dispatch({type: 'JOB_APP_DEBUG_AUTHORIZE'}, contentSender);
+  assert.equal(disabledSite.ok, false);
+  harness.localData.disabledHostnames = [];
   const extensionPage = await harness.dispatch({type: 'JOB_APP_DEBUG_AUTHORIZE'}, {id: 'test-extension', url: 'chrome-extension://test-extension/sidepanel.html'});
   assert.equal(extensionPage.ok, false);
   const otherExtension = await harness.dispatch({type: 'JOB_APP_DEBUG_AUTHORIZE'}, {...contentSender, id: 'other-extension'});
   assert.equal(otherExtension.ok, false);
+});
+
+test('debug capture redacts URLs and entered answers from stored outcomes', async () => {
+  const destination = {documentId: 'document-1', regionId: 'form-1'};
+  const harness = createHarness({pagesByTab: {7: {pages: [{
+    page: {title: 'Job application', domain: 'jobs.example.com'},
+    fields: [{id: 'availability', label: 'Availability', type: 'text', currentValue: 'No'}],
+    actions: [], destination,
+  }]}}});
+  harness.localData.developerMode = true;
+  harness.sessionData.applicationRun = {'7': {
+    tabId: 7, startedAt: 'session-1', status: 'waiting_user', pageNumber: 1,
+    formOrigin: {domain: 'jobs.example.com', pathname: '/apply'},
+    frame: {frameId: 0, destination},
+    actionRequired: [{code: 'review', category: 'pause', reason: 'Review portal.private.example/apply; answer No.'}],
+    reviewRequired: [{label: 'No', reason: 'Retry at ftp://files.private.example/archive.'}],
+  }};
+  await import(`../src/service-worker.js?debug-outcome-redaction=${Date.now()}`);
+  const captured = await harness.dispatch({type: 'JOB_RUN_DEBUG_CAPTURE'});
+  assert.equal(captured.ok, true, captured.error);
+  assert.equal(captured.case.sessionId, '7:session-1');
+  assert.doesNotMatch(JSON.stringify(captured.case.outcomes), /portal\.private\.example|ftp:\/\/files\.private\.example|answer No/);
+  assert.match(captured.case.outcomes.actionRequired[0].reason, /answer \[redacted\]/);
 });
 
 test('ambiguous debug capture selects a form without invoking the fill workflow', async () => {

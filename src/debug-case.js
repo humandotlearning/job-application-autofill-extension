@@ -3,7 +3,22 @@ import {composedContains, isExtensionElement, queryAll, rootElementById} from '.
 
 const OMIT_TAGS = new Set(['script', 'style', 'link', 'meta', 'iframe', 'object', 'embed', 'img', 'svg', 'canvas', 'video', 'audio', 'template']);
 const KEEP_ATTRIBUTES = new Set(['id', 'class', 'name', 'type', 'for', 'role', 'required', 'disabled', 'readonly', 'multiple', 'autocomplete', 'inputmode', 'placeholder', 'min', 'max', 'step', 'pattern', 'minlength', 'maxlength', 'hidden', 'contenteditable']);
-const URL_PATTERN = /\b(?:https?:\/\/|www\.)[^\s<>"'`]+/gi;
+const URL_PATTERN = /(?:\b[a-z][a-z\d+.-]*:\/\/|\/\/|www\.)[^\s<>"'`]+|\b[a-z][a-z\d+.-]*:[^\s<>"'`]+|\b[a-z\d](?:[a-z\d-]*[a-z\d])?(?:\.[a-z\d](?:[a-z\d-]*[a-z\d])?)+(?::\d+)?(?:[/?#][^\s<>"'`]+)?/gi;
+
+export function scrubDebugText(value, enteredValues = []) {
+  let text = String(value ?? '');
+  for (const answer of enteredValues) {
+    if (answer.trim().length >= 3) {
+      text = text.replaceAll(answer, '[redacted]');
+    } else if (/^[\p{L}\p{N}_]+$/u.test(answer.trim())) {
+      const escaped = answer.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      text = text.replace(new RegExp(`(^|[^\\p{L}\\p{N}_])${escaped}(?=$|[^\\p{L}\\p{N}_])`, 'giu'), '$1[redacted]');
+    } else if (text.trim() === answer.trim()) {
+      text = text.replace(answer.trim(), '[redacted]');
+    }
+  }
+  return text.replace(URL_PATTERN, '[redacted URL]');
+}
 
 export function captureDebugSnapshot(document) {
   const inspection = inspectDocument(document);
@@ -12,45 +27,42 @@ export function captureDebugSnapshot(document) {
   const entered = [...new Set(inspection.fields.flatMap(field => [field.rawValue, field.currentValue])
     .filter(value => typeof value === 'string' && value.trim()))]
     .sort((a, b) => b.length - a.length);
-  const scrub = value => {
-    let text = String(value ?? '');
-    for (const answer of entered) {
-      if (answer.trim().length >= 3) {
-        text = text.replaceAll(answer, '[redacted]');
-      } else if (/^[\p{L}\p{N}_]+$/u.test(answer.trim())) {
-        const escaped = answer.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-        text = text.replace(new RegExp(`(^|[^\\p{L}\\p{N}_])${escaped}(?=$|[^\\p{L}\\p{N}_])`, 'giu'), '$1[redacted]');
-      } else if (text.trim() === answer.trim()) {
-        text = text.replace(answer.trim(), '[redacted]');
-      }
-    }
-    return text.replace(URL_PATTERN, '[redacted URL]');
-  };
+  const scrub = value => scrubDebugText(value, entered);
   const clean = value => {
     if (!value || typeof value !== 'object') return typeof value === 'string' ? scrub(value) : value;
     if (Array.isArray(value)) return value.map(clean);
     return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, clean(item)]));
   };
-  const copy = node => {
-    if (node.nodeType === 3) return document.createTextNode(scrub(node.textContent));
+  const cleanStatic = value => {
+    if (typeof value === 'string') return scrubDebugText(value);
+    if (!value || typeof value !== 'object') return value;
+    if (Array.isArray(value)) return value.map(cleanStatic);
+    return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, cleanStatic(item)]));
+  };
+  const copy = (node, preserveAnswerText = false) => {
+    if (node.nodeType === 3) return document.createTextNode(scrubDebugText(node.textContent, preserveAnswerText ? [] : entered));
     if (node.nodeType !== 1 || isExtensionElement(node)) return null;
     const tag = node.localName;
     if (OMIT_TAGS.has(tag) || (tag === 'input' && ['hidden', 'password'].includes(node.type))) return null;
+    const isChoice = tag === 'option' || node.getAttribute('role') === 'option';
+    const preserveChildren = preserveAnswerText || isChoice || ['label', 'legend'].includes(tag);
     const clone = document.createElement(tag);
     for (const attribute of node.attributes) {
       const name = attribute.name.toLowerCase();
       if (KEEP_ATTRIBUTES.has(name) || (name.startsWith('aria-') && !['aria-valuenow', 'aria-valuetext', 'aria-selected', 'aria-checked'].includes(name))
         || (name === 'value' && (tag === 'option' || (tag === 'input' && ['radio', 'checkbox'].includes(node.type))))
-        || (name === 'data-value' && node.getAttribute('role') === 'option')) clone.setAttribute(name, scrub(attribute.value));
+        || (name === 'data-value' && node.getAttribute('role') === 'option')) {
+        clone.setAttribute(name, scrubDebugText(attribute.value, isChoice ? [] : entered));
+      }
     }
     if (node.shadowRoot) {
       const template = document.createElement('template');
       template.setAttribute('shadowrootmode', 'open');
-      for (const child of node.shadowRoot.childNodes) { const safe = copy(child); if (safe) template.content.append(safe); }
+      for (const child of node.shadowRoot.childNodes) { const safe = copy(child, preserveChildren); if (safe) template.content.append(safe); }
       clone.append(template);
     }
     if (tag !== 'textarea' && !node.hasAttribute('contenteditable')) {
-      for (const child of node.childNodes) { const safe = copy(child); if (safe) clone.append(safe); }
+      for (const child of node.childNodes) { const safe = copy(child, preserveChildren); if (safe) clone.append(safe); }
     }
     return clone;
   };
@@ -77,12 +89,12 @@ export function captureDebugSnapshot(document) {
   return {
     html,
     inspection: {
-      fields: inspection.fields.map(field => clean({label: field.label, type: field.type, required: field.required,
-        options: field.options, widget: field.widget || '', section: field.section || '',
-        helpText: field.helpText || '', placeholder: field.placeholder || '', constraints: field.constraints || {}})),
-      actions: inspection.actions.map(action => clean({label: action.label, kind: action.kind, type: action.type})),
-      discovery: inspection.discovery,
-      pauseReasons: inspection.pauseReasons,
+      fields: inspection.fields.map(field => ({label: cleanStatic(field.label), type: field.type, required: field.required,
+        options: cleanStatic(field.options), widget: cleanStatic(field.widget || ''), section: cleanStatic(field.section || ''),
+        helpText: clean(field.helpText || ''), placeholder: clean(field.placeholder || ''), constraints: cleanStatic(field.constraints || {})})),
+      actions: inspection.actions.map(action => ({label: cleanStatic(action.label), kind: action.kind, type: action.type})),
+      discovery: clean(inspection.discovery),
+      pauseReasons: clean(inspection.pauseReasons),
     },
     limitations: {closedShadowRoots: 'Closed shadow roots cannot be captured or replayed.'},
   };

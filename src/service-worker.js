@@ -20,6 +20,7 @@ import { hostnameFromUrl, isHostnameDisabled, isSupportedSiteUrl, normalizeHostn
 import { createSemanticMatcher, semanticFingerprint } from './typesafe.js';
 import { createPhoenixTrace, flushPhoenixQueue, tracePhoenixEvent } from './phoenix.js';
 import { createBrowserController, mergeAccessibilityInspection } from './browser-control.js';
+import { scrubDebugText } from './debug-case.js';
 
 const RUN_STORAGE_KEY = 'applicationRun';
 const PHOENIX_ACTIVE_ACTIONS_KEY = 'phoenixActiveActions';
@@ -1048,8 +1049,8 @@ async function captureDebugCase(tabId, tab) {
   if (!response?.ok || !response.snapshot) throw new Error(response?.error || 'The selected form changed. Capture it again.');
   if ((await chrome.storage.local.get({developerMode: false})).developerMode !== true) throw new Error('Developer mode was disabled during capture.');
   const enteredValues = target.inspection.fields.flatMap(field => [field.rawValue, field.currentValue])
-    .filter(value => typeof value === 'string' && value.trim().length >= 3);
-  const scrub = value => enteredValues.reduce((text, answer) => text.replaceAll(answer, '[redacted]'), String(value || ''));
+    .filter(value => typeof value === 'string' && value.trim());
+  const scrub = value => scrubDebugText(value, enteredValues);
   return {ok: true, case: {
     schemaVersion: 1,
     capturedAt: new Date().toISOString(),
@@ -2780,9 +2781,14 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       sendResponse({ok: false});
       return false;
     }
-    chrome.storage.local.get({developerMode: false})
-      .then(settings => sendResponse({ok: settings.developerMode === true}))
-      .catch(() => sendResponse({ok: false}));
+    (async () => {
+      try {
+        const tabHint = {...sender.tab, ...(sender.url ? {url: sender.url} : {})};
+        await assertTabSiteEnabled(sender.tab.id, tabHint);
+        const settings = await chrome.storage.local.get({developerMode: false});
+        return {ok: settings.developerMode === true};
+      } catch { return {ok: false}; }
+    })().then(sendResponse);
     return true;
   }
   if (message?.type === 'JOB_APP_FINAL_SUBMISSION') {

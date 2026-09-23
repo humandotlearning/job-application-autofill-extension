@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {JSDOM} from 'jsdom';
 import {readdir, readFile} from 'node:fs/promises';
-import {captureDebugSnapshot} from '../src/debug-case.js';
+import {captureDebugSnapshot, scrubDebugText} from '../src/debug-case.js';
 import {collectFieldDescriptors, inspectDocument} from '../src/form-engine.js';
 import {fetchSessionSpans, prepareFixture} from '../scripts/export-debug-case.mjs';
 
@@ -60,16 +60,27 @@ test('debug snapshot removes visible URLs and short answers from custom widget t
   const dom = new JSDOM(`<form aria-label="Application">
     <label>Eligibility answer<input name="eligibility" value="No"></label>
     <label>Country<input name="country" value="US"></label>
+    <label>Choice<select name="choice"><option value="No" selected>No</option><option value="US">US</option></select></label>
     <div role="option">No</div><div role="option">US</div>
-    <p>Reference https://private.example/path and www.private.example/help</p>
+    <p>Current answers: No and US</p>
+    <p>References https://private.example/path, www.private.example/help, //cdn.private.example/asset, ftp://files.private.example/archive, and portal.private.example/apply</p>
   </form>`, {url: 'https://example.test/apply'});
   try {
     const snapshot = captureDebugSnapshot(dom.window.document);
     const body = JSON.stringify(snapshot);
-    assert.doesNotMatch(body, /https:\/\/private\.example\/path|www\.private\.example\/help/);
-    assert.doesNotMatch(snapshot.html, />No<\/div>|>US<\/div>/);
+    assert.doesNotMatch(body, /https:\/\/private\.example\/path|www\.private\.example\/help|\/\/cdn\.private\.example\/asset|ftp:\/\/files\.private\.example\/archive|portal\.private\.example\/apply/);
+    assert.match(snapshot.html, /<option value="No">No<\/option>/);
+    assert.match(snapshot.html, /<div role="option">No<\/div><div role="option">US<\/div>/);
+    assert.match(snapshot.html, /Current answers: \[redacted\] and \[redacted\]/);
+    assert.ok(snapshot.inspection.fields.find(field => field.label === 'Choice').options.includes('No'));
     assert.match(snapshot.html, /\[redacted URL\]/);
   } finally { dom.window.close(); }
+});
+
+test('outcome text scrubbing removes URL forms and short entered answers', () => {
+  const cleaned = scrubDebugText('Retry https://private.example/x, //cdn.private.example/y, ftp://files.private.example/z, and portal.private.example/apply. Answer No.', ['No']);
+  assert.doesNotMatch(cleaned, /https:\/\/private\.example\/x|\/\/cdn\.private\.example\/y|ftp:\/\/files\.private\.example\/z|portal\.private\.example\/apply|Answer No/);
+  assert.match(cleaned, /Answer \[redacted\]/);
 });
 
 test('Phoenix export follows cursors and returns only one application session', async () => {
