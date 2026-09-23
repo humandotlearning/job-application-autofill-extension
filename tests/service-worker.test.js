@@ -453,6 +453,7 @@ test('Fill this page batches unresolved saved-answer choices and skips drafting 
     ], actions: [],
   }]}}});
   harness.localData.typesafeEnabled = true;
+  harness.localData.typesafeAutofillEnabled = false;
   harness.localData.typesafeApiKey = 'ts_test';
   const calls = [];
   globalThis.fetch = async (url, options) => {
@@ -525,6 +526,58 @@ test('opt-in JEV autofill applies a guarded low-risk option without user approva
     .find(record=>record.question==='Phone device type')?.provenance,'autofill');
 });
 
+test('JEV chooses between conflicting saved first names before the local vote can fill', async () => {
+  const harness = createHarness({answerRecords: [
+    {key: 'first_name', question: 'First name', answer: 'Nitin', sensitivity: 'safe'},
+    {key: 'given_name', question: 'Given name', answer: 'Nitin', sensitivity: 'safe'},
+    {key: 'corrected_name', question: 'First name', answer: 'Nithin', sensitivity: 'safe'},
+  ], pagesByTab: {7: {pages: [{fields: [
+    {id: 'first_name', handle: 'first-h', label: 'First Name', type: 'text', required: true, rawValue: '', editRevision: 0},
+  ], actions: [{id: 'submit', label: 'Submit application', kind: 'submit'}]}]}}});
+  harness.localData.typesafeApiKey = 'ts_test';
+  let calls = 0;
+  globalThis.fetch = async (_url, options) => {
+    calls += 1;
+    const body = JSON.parse(options.body);
+    const choice = body.state.records.find(record => record.answer === 'Nithin').id;
+    return {ok: true, status: 200, json: async () => ({answers: jevAnswers(body, {f0: choice})})};
+  };
+  await import(`../src/service-worker.js?test=jev-conflicting-name-${Date.now()}`);
+  const started = await harness.dispatch({type: 'JOB_RUN_START', tabId: 7});
+  assert.equal(started.ok, true, started.error);
+  assert.equal(calls, 1, JSON.stringify({run: started.run, values: harness.tabs.get(7).frames[0].pages[0].values}));
+  assert.equal(harness.tabs.get(7).frames[0].pages[0].values?.first_name, 'Nithin');
+  assert.deepEqual(started.run.semanticAutofills.map(item => item.value), ['Nithin']);
+});
+
+test('JEV sensitive and no-match settings control automatic declaration answers', async () => {
+  for (const policy of [{sensitive: true, top: true, expected: 'Yes'},
+    {sensitive: false, top: true, expected: undefined},
+    {sensitive: true, top: false, expected: undefined},
+    {sensitive: true, top: true, reusePolicy: 'review_only', expected: undefined}]) {
+    const harness = createHarness({answerRecords: [
+      {key: 'consent', question: 'I agree to the terms and conditions', answer: 'Yes', sensitivity: 'legal', reusePolicy: policy.reusePolicy},
+    ], pagesByTab: {7: {pages: [{fields: [
+      {id: 'consent', handle: 'consent-h', label: 'I agree to the terms and conditions',
+        type: 'checkbox', options: ['Yes', 'No'], required: true, rawValue: '', editRevision: 0},
+    ], actions: [{id: 'submit', label: 'Submit application', kind: 'submit'}]}]}}});
+    harness.localData.typesafeApiKey = 'ts_test';
+    harness.localData.typesafeAutofillSensitive = policy.sensitive;
+    harness.localData.typesafeNoMatchTop = policy.top;
+    globalThis.fetch = async (_url, options) => {
+      const body = JSON.parse(options.body);
+      const answers = jevAnswers(body);
+      answers.f0 = {type: 'choice', choice: 'none', confidence: 0.4,
+        probabilities: {none: 0.6, o0: 0.3, o1: 0.1}};
+      return {ok: true, status: 200, json: async () => ({answers})};
+    };
+    await import(`../src/service-worker.js?test=jev-legal-${policy.sensitive}-${policy.top}-${Date.now()}`);
+    const started = await harness.dispatch({type: 'JOB_RUN_START', tabId: 7});
+    assert.equal(started.ok, true, started.error);
+    assert.equal(harness.tabs.get(7).frames[0].pages[0].values?.consent, policy.expected, JSON.stringify({run: started.run, policy}));
+  }
+});
+
 test('Fill this page makes no TypeSafe request when a usable local suggestion exists', async () => {
   const harness = createHarness({answerRecords: [{key: 'story', question: 'Model deployment project',
     answer: 'I trained machine learning models and deployed them to production.', sensitivity: 'safe'}],
@@ -532,6 +585,7 @@ test('Fill this page makes no TypeSafe request when a usable local suggestion ex
     {id: 'ml', handle: 'handle-ml', label: 'Describe your ML experience', type: 'textarea', required: true},
   ], actions: [{id: 'submit', label: 'Submit application', kind: 'submit'}]}]}}});
   harness.localData.typesafeEnabled = true;
+  harness.localData.typesafeAutofillEnabled = false;
   harness.localData.typesafeApiKey = 'ts_test';
   let calls = 0;
   globalThis.fetch = async () => { calls += 1; throw new Error('TypeSafe should not be called'); };
@@ -559,6 +613,7 @@ test('Fill this page still uses TypeSafe after an explicit local search found no
   assert.deepEqual(searched.candidates, []);
 
   harness.localData.typesafeEnabled = true;
+  harness.localData.typesafeAutofillEnabled = false;
   harness.localData.typesafeApiKey = 'ts_test';
   harness.sessionData.applicationRun['7'].aiOperations = {planner: {status: 'failed'}};
   harness.sessionData.applicationRun['7'].semanticSearch = {impact: {status: 'failed'}};

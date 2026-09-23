@@ -121,8 +121,16 @@
           <span>Use JEV to assist form filling</span>
         </label>
         <label class="checkbox-row" for="typesafe-autofill-enabled">
-          <input id="typesafe-autofill-enabled" type="checkbox">
-          <span>Automatically fill low-risk JEV matches</span>
+          <input id="typesafe-autofill-enabled" type="checkbox" checked>
+          <span>Automatically fill JEV's top saved answer</span>
+        </label>
+        <label class="checkbox-row" for="typesafe-autofill-sensitive">
+          <input id="typesafe-autofill-sensitive" type="checkbox" checked>
+          <span>Include sensitive answers and declarations</span>
+        </label>
+        <label class="checkbox-row" for="typesafe-no-match-top">
+          <input id="typesafe-no-match-top" type="checkbox" checked>
+          <span>Fill the top candidate even when JEV says no match</span>
         </label>
         <label for="typesafe-api-key">TypeSafe API key <span class="muted">(stored locally)</span></label>
         <input id="typesafe-api-key" type="password" autocomplete="off" spellcheck="false" placeholder="ts_…">

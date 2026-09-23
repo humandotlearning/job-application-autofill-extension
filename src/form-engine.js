@@ -1237,8 +1237,8 @@ export async function applyDecisions(document, decisions = [], { deadline = Infi
     }
     const hasExpectedRawValue = Object.hasOwn(decision, 'expectedRawValue');
     const hasExpectedEditRevision = Object.hasOwn(decision, 'expectedEditRevision');
-    const rawValueMatches = !hasExpectedRawValue || String(element?.value ?? '') === String(decision.expectedRawValue);
-    const editRevisionMatches = !hasExpectedEditRevision || (element?.__jobApplicationEditRevision || 0) === decision.expectedEditRevision;
+    const rawValueMatches = !hasExpectedRawValue || String(field.rawValue ?? '') === String(decision.expectedRawValue ?? '');
+    const editRevisionMatches = !hasExpectedEditRevision || (element?.__jobApplicationEditRevision || 0) === (decision.expectedEditRevision ?? 0);
     const allowed = beforeFill({field, element, decision});
     if (document.__jobApplicationUserInterrupted) {
       result.failed.push({ fieldId: field.id, reason: 'Autofill paused after user interaction' });

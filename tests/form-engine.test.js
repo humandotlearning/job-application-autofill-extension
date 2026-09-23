@@ -892,6 +892,18 @@ test('keeps untouched legal checkbox manual', async () => {
   assert.equal(collectFieldDescriptors(document)[0].currentValue, '');
 });
 
+test('applies a JEV-selected declaration only through the explicit autofill policy', async () => {
+  const document = makeDocument('<form><label><input id="consent" type="checkbox">I agree to terms and conditions</label></form>');
+  const field = collectFieldDescriptors(document)[0];
+  const result = await applyDecisions(document, [{
+    fieldId: field.id, handle: field.handle, action: 'fill', value: 'Yes',
+    matchKind: 'semantic', jevAutofill: true, confirmationState: 'confirmed',
+    expectedRawValue: field.rawValue, expectedEditRevision: field.editRevision,
+  }]);
+  assert.equal(result.applied.length, 1, JSON.stringify({field, result}));
+  assert.equal(document.querySelector('#consent').checked, true);
+});
+
 test('fills an anonymous native input without throwing', async () => {
   const document = makeDocument('<label>Email<input type="email"></label>');
   const field = collectFieldDescriptors(document)[0];

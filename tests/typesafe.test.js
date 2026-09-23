@@ -134,6 +134,32 @@ test('low-confidence and unknown choices cannot become recommendations', async (
   }
 });
 
+test('top-answer mode uses the strongest saved candidate even when JEV selects none', async () => {
+  const target = {...field('name', 'First name'), type: 'text'};
+  const records = [record('old', 'First name', 'Nitin'), record('new', 'First name', 'Nithin')];
+  const matcher = createSemanticMatcher({fetchImpl: async (_url, options) => {
+    const body = JSON.parse(options.body);
+    const preferred = body.state.records.find(item => item.answer === 'Nithin').id;
+    const probabilities = Object.fromEntries(Object.keys(body.questions.f0.criteria).map(key =>
+      [key, key === 'none' ? 0.6 : key === preferred ? 0.3 : 0.1]));
+    return jsonResponse({answers: answersFor(body, {f0: {type: 'choice', choice: 'none', confidence: 0.4, probabilities}})});
+  }});
+  const [forced] = await matcher.match({fields: [target], records, apiKey: 'ts_test', alwaysTop: true, noMatchTop: true});
+  assert.equal(forced.status, 'matched');
+  assert.equal(forced.candidate.answer, 'Nithin');
+  assert.equal(forced.candidate.semantic.noMatchFallback, true);
+  const [stopped] = await matcher.match({fields: [target], records, apiKey: 'ts_test', alwaysTop: true, noMatchTop: false});
+  assert.equal(stopped.status, 'none');
+});
+
+test('sensitive saved answers require explicit eligibility for JEV selection', () => {
+  const consent = {...field('consent', 'I agree to the terms and conditions'), type: 'checkbox', options: ['Yes', 'No']};
+  const saved = record('consent', 'I agree to the terms and conditions', 'Yes', {sensitivity: 'legal'});
+  assert.equal(semanticEligible(consent, saved), false);
+  assert.equal(semanticEligible(consent, saved, {allowSensitive: true}), true);
+  assert.equal(semanticEligible(consent, {...saved, confirmationState: 'pending'}, {allowSensitive: true}), false);
+});
+
 test('maps a confirmed fact to an exact visible option for one-time review', async () => {
   let request;
   const matcher=createSemanticMatcher({traceImpl:()=>{},fetchImpl:async(_url,options)=>{

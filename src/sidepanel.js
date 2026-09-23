@@ -5,6 +5,8 @@ const elements = {
   openaiApiKey: byId('openai-api-key'),
   typesafeEnabled: byId('typesafe-enabled'),
   typesafeAutofillEnabled: byId('typesafe-autofill-enabled'),
+  typesafeAutofillSensitive: byId('typesafe-autofill-sensitive'),
+  typesafeNoMatchTop: byId('typesafe-no-match-top'),
   voteAutofillEnabled: byId('vote-autofill-enabled'),
   typesafeApiKey: byId('typesafe-api-key'),
   apiKey: byId('openai-api-key'),
@@ -1482,7 +1484,7 @@ async function refresh() {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
   activeTabId = tab?.id || null;
   await refreshSiteState();
-  const stored = await chrome.storage.local.get({ answerRecords: [], openaiApiKey: '', fireworksApiKey: '', typesafeApiKey: '', typesafeEnabled: false, typesafeAutofillEnabled: false, voteAutofillEnabled: true, aiProvider: '', aiModel: '', openaiModel: 'gpt-5.6-terra', includeFormScreenshot: true, autoAdvancePages: false, phoenixTracing: true });
+  const stored = await chrome.storage.local.get({ answerRecords: [], openaiApiKey: '', fireworksApiKey: '', typesafeApiKey: '', typesafeEnabled: null, typesafeAutofillEnabled: true, typesafeAutofillSensitive: true, typesafeNoMatchTop: true, voteAutofillEnabled: true, aiProvider: '', aiModel: '', openaiModel: 'gpt-5.6-terra', includeFormScreenshot: true, autoAdvancePages: false, phoenixTracing: true });
   const provider = stored.aiProvider === 'openai' || stored.aiProvider === 'fireworks'
     ? stored.aiProvider
     : (stored.openaiApiKey ? 'openai' : 'fireworks');
@@ -1492,10 +1494,14 @@ async function refresh() {
   elements.fireworksApiKey.value = stored.fireworksApiKey || '';
   elements.openaiApiKey.value = stored.openaiApiKey || '';
   elements.typesafeApiKey.value = stored.typesafeApiKey || '';
-  elements.typesafeEnabled.checked = Boolean(stored.typesafeEnabled);
-  elements.typesafeAutofillEnabled.checked = Boolean(stored.typesafeAutofillEnabled);
+  elements.typesafeEnabled.checked = stored.typesafeEnabled === null ? Boolean(stored.typesafeApiKey) : Boolean(stored.typesafeEnabled);
+  elements.typesafeAutofillEnabled.checked = stored.typesafeAutofillEnabled !== false;
+  elements.typesafeAutofillSensitive.checked = stored.typesafeAutofillSensitive !== false;
+  elements.typesafeNoMatchTop.checked = stored.typesafeNoMatchTop !== false;
   elements.voteAutofillEnabled.checked = stored.voteAutofillEnabled !== false;
   elements.typesafeAutofillEnabled.disabled = !elements.typesafeEnabled.checked;
+  elements.typesafeAutofillSensitive.disabled = !elements.typesafeEnabled.checked || !elements.typesafeAutofillEnabled.checked;
+  elements.typesafeNoMatchTop.disabled = !elements.typesafeEnabled.checked || !elements.typesafeAutofillEnabled.checked;
   elements.apiModel.value = stored.aiModel || (provider === 'openai' ? stored.openaiModel : '') || defaultModel;
   elements.includeFormScreenshot.checked = stored.includeFormScreenshot !== false;
   elements.phoenixTracing.checked = stored.phoenixTracing !== false;
@@ -1551,6 +1557,15 @@ async function importDatasource(file) {
 async function saveApiKey(input, storageKey, providerLabel) {
   const value = input.value.trim();
   await chrome.storage.local.set({ [storageKey]: value });
+  if (storageKey === 'typesafeApiKey' && value) {
+    const { typesafeEnabled } = await chrome.storage.local.get({ typesafeEnabled: null });
+    if (typesafeEnabled === null) {
+      elements.typesafeEnabled.checked = true;
+      elements.typesafeAutofillEnabled.disabled = false;
+      elements.typesafeAutofillSensitive.disabled = !elements.typesafeAutofillEnabled.checked;
+      elements.typesafeNoMatchTop.disabled = !elements.typesafeAutofillEnabled.checked;
+    }
+  }
   setStatus(value ? `${providerLabel} API key saved in trusted extension storage.` : `${providerLabel} API key cleared. Local answers still work.`);
 }
 
@@ -1584,15 +1599,26 @@ async function saveScreenshotSetting() {
 
 async function saveTypeSafeSetting() {
   const typesafeEnabled = Boolean(elements.typesafeEnabled.checked);
-  const typesafeAutofillEnabled = typesafeEnabled && Boolean(elements.typesafeAutofillEnabled.checked);
   elements.typesafeAutofillEnabled.disabled = !typesafeEnabled;
-  await chrome.storage.local.set({ typesafeEnabled, typesafeAutofillEnabled });
+  elements.typesafeAutofillSensitive.disabled = !typesafeEnabled || !elements.typesafeAutofillEnabled.checked;
+  elements.typesafeNoMatchTop.disabled = !typesafeEnabled || !elements.typesafeAutofillEnabled.checked;
+  await chrome.storage.local.set({ typesafeEnabled });
   setStatus(typesafeEnabled ? 'JEV-assisted filling enabled.' : 'JEV-assisted filling disabled.');
 }
 
 async function saveTypeSafeAutofillSetting() {
-  await chrome.storage.local.set({ typesafeAutofillEnabled: Boolean(elements.typesafeEnabled.checked && elements.typesafeAutofillEnabled.checked) });
-  setStatus(elements.typesafeAutofillEnabled.checked ? 'Low-risk JEV autofill enabled.' : 'Low-risk JEV matches require review.');
+  await chrome.storage.local.set({ typesafeAutofillEnabled: elements.typesafeAutofillEnabled.checked });
+  elements.typesafeAutofillSensitive.disabled = !elements.typesafeEnabled.checked || !elements.typesafeAutofillEnabled.checked;
+  elements.typesafeNoMatchTop.disabled = !elements.typesafeEnabled.checked || !elements.typesafeAutofillEnabled.checked;
+  setStatus(elements.typesafeAutofillEnabled.checked ? 'JEV top-answer autofill enabled.' : 'JEV matches require review.');
+}
+
+async function saveTypeSafeAnswerPolicy() {
+  await chrome.storage.local.set({
+    typesafeAutofillSensitive: elements.typesafeAutofillSensitive.checked,
+    typesafeNoMatchTop: elements.typesafeNoMatchTop.checked,
+  });
+  setStatus('JEV answer policy saved.');
 }
 
 async function saveVoteAutofillSetting() {
@@ -1635,6 +1661,8 @@ elements.autoAdvance.addEventListener('change', saveSettings);
 elements.includeFormScreenshot.addEventListener('change', saveScreenshotSetting);
 elements.typesafeEnabled.addEventListener('change', saveTypeSafeSetting);
 elements.typesafeAutofillEnabled.addEventListener('change', saveTypeSafeAutofillSetting);
+elements.typesafeAutofillSensitive.addEventListener('change', saveTypeSafeAnswerPolicy);
+elements.typesafeNoMatchTop.addEventListener('change', saveTypeSafeAnswerPolicy);
 elements.voteAutofillEnabled.addEventListener('change', saveVoteAutofillSetting);
 elements.phoenixTracing.addEventListener('change', async () => {
   await chrome.storage.local.set({ phoenixTracing: elements.phoenixTracing.checked });

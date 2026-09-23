@@ -456,10 +456,11 @@ function decideDisposition(decision = {}, field = {}) {
   const sensitivity = inferSensitivity(field.label || field.question, `${field.name || ''} ${field.id || ''}`);
   if (field.labelConfidence === 'low') return manual('Field meaning is unclear');
   if (field.entityUnresolved) return manual('Employment identity is unresolved');
-  if (sensitivity === 'legal' || decision.sensitivity === 'legal') return manual('Legal and consent answers require manual entry');
   if (decision.reusePolicy === 'never' || decision.semantic?.reusePolicy === 'never') return manual('Source prohibits reuse');
   if (decision.action === 'ask_user' || decision.value == null || !String(decision.value).trim() || decision.compatible === false || decision.conflicting) return manual('Missing, conflicting, or incompatible evidence');
   if (decision.confirmationState === 'pending') return manual('Saved answer has a pending conflict');
+  if (decision.matchKind === 'semantic' && decision.jevAutofill === true) return { disposition: 'autofill', reason: 'JEV-selected saved answer' };
+  if (sensitivity === 'legal' || decision.sensitivity === 'legal') return manual('Legal and consent answers require manual entry');
   if (decision.approved === true) return { disposition: 'autofill', reason: 'Explicitly approved answer' };
   if (decision.reusePolicy === 'review_only' || decision.semantic?.reusePolicy === 'review_only') return review('Source requires review on every reuse');
   if (sensitivity !== 'safe' || decision.sensitivity !== 'safe') return review('Sensitive answer requires approval');
@@ -1883,8 +1884,8 @@ async function applyDecisions(document, decisions = [], { deadline = Infinity, b
     }
     const hasExpectedRawValue = Object.hasOwn(decision, 'expectedRawValue');
     const hasExpectedEditRevision = Object.hasOwn(decision, 'expectedEditRevision');
-    const rawValueMatches = !hasExpectedRawValue || String(element?.value ?? '') === String(decision.expectedRawValue);
-    const editRevisionMatches = !hasExpectedEditRevision || (element?.__jobApplicationEditRevision || 0) === decision.expectedEditRevision;
+    const rawValueMatches = !hasExpectedRawValue || String(field.rawValue ?? '') === String(decision.expectedRawValue ?? '');
+    const editRevisionMatches = !hasExpectedEditRevision || (element?.__jobApplicationEditRevision || 0) === (decision.expectedEditRevision ?? 0);
     const allowed = beforeFill({field, element, decision});
     if (document.__jobApplicationUserInterrupted) {
       result.failed.push({ fieldId: field.id, reason: 'Autofill paused after user interaction' });
