@@ -236,7 +236,7 @@ export function createSemanticMatcher({fetchImpl, timeoutMs = 5000, traceImpl = 
         const sufficiency = payload.answers[`${id}_sufficiency`].noul;
         const conflict = payload.answers[`${id}_conflict`].noul;
         const route = isNarrativeField(entry.field) ? 'narrative' : 'factual';
-        const choices = entry.options.size ? entry.options : entry.choiceOptions;
+        const choices = entry.choiceOptions.size ? entry.choiceOptions : entry.options;
         const fallback = entry.noMatchTop && answer.choice === 'none'
           ? [...choices.keys()].sort((left, right) => answer.probabilities[right] - answer.probabilities[left])[0]
           : null;
