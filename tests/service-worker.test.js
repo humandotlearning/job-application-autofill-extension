@@ -166,7 +166,12 @@ function createHarness({
         state.messages.push(message);
         state.messageTargets.push({ message, frameId });
         const page = frame.pages[frame.currentPage];
-        if (message.type === 'JOB_APP_INSPECT') return { ok: true, inspection: inspectionFor(tabId, frameId) };
+        if (message.type === 'JOB_APP_INSPECT' || message.type === 'JOB_APP_DEBUG_INSPECT') return { ok: true, inspection: inspectionFor(tabId, frameId) };
+        if (message.type === 'JOB_APP_DEBUG_SNAPSHOT') return {ok: true, snapshot: page.debugSnapshot || {
+          html: '<form><label>Full name<input></label></form>',
+          inspection: {fields: [{label: 'Full name', type: 'text'}], actions: [], discovery: {code: 'ready'}, pauseReasons: []},
+        }};
+        if (message.type === 'JOB_APP_SELECT_FORM') return {ok: true, destination: inspectionFor(tabId, frameId).destination};
         if (message.type === 'JOB_APP_INSPECT_INLINE') {
           await page.onInlineInspect?.({ page, tabId, frameId });
           const inspection = inspectionFor(tabId, frameId);
@@ -307,6 +312,50 @@ test('site controls normalize, persist, and match only the active exact hostname
   assert.equal(enabled.ok, true, enabled.error);
   assert.equal(enabled.site.disabled, false);
   assert.deepEqual(harness.localData.disabledHostnames, []);
+});
+
+test('debug capture requires Developer mode and inspects without starting a fill', async () => {
+  const harness = createHarness({pagesByTab: {7: {pages: [{
+    page: {title: 'Job application', domain: 'jobs.example.com'},
+    fields: [{id: 'name', label: 'Full name', type: 'text'}, {id: 'resume', label: 'Resume', type: 'file'}],
+    actions: [{id: 'submit', label: 'Submit application', kind: 'submit'}],
+    destination: {documentId: 'document-1', regionId: 'form-1'},
+  }]}}});
+  await import(`../src/service-worker.js?debug-gate=${Date.now()}`);
+  const blocked = await harness.dispatch({type: 'JOB_RUN_DEBUG_CAPTURE'});
+  assert.equal(blocked.ok, false);
+  assert.match(blocked.error, /Developer mode/);
+  harness.localData.developerMode = true;
+  const captured = await harness.dispatch({type: 'JOB_RUN_DEBUG_CAPTURE'});
+  assert.equal(captured.ok, true, captured.error);
+  assert.equal(captured.case.schemaVersion, 1);
+  assert.equal(captured.case.sessionId, null);
+  assert.equal(captured.case.snapshot.inspection.fields[0].label, 'Full name');
+  assert.equal(harness.tabs.get(7).messages.some(message => ['JOB_APP_APPLY', 'JOB_APP_CLICK_NEXT'].includes(message.type)), false);
+  assert.equal(harness.sessionData.applicationRun, undefined);
+});
+
+test('ambiguous debug capture selects a form without invoking the fill workflow', async () => {
+  const frames = [0, 2].map(frameId => ({frameId, context: {title: 'Job application'}, pages: [{
+    page: {title: 'Job application', domain: 'jobs.example.com'},
+    fields: [{id: 'name', label: 'Full name', type: 'text'}, {id: 'resume', label: 'Resume', type: 'file'}],
+    actions: [{id: 'submit', label: 'Submit application', kind: 'submit'}],
+    destination: {documentId: `document-${frameId}`, regionId: `form-${frameId}`},
+  }]}));
+  const harness = createHarness({pagesByTab: {7: {frames}}});
+  harness.localData.developerMode = true;
+  await import(`../src/service-worker.js?debug-select=${Date.now()}`);
+  const first = await harness.dispatch({type: 'JOB_RUN_DEBUG_CAPTURE'});
+  assert.equal(first.selectionRequired, true);
+  const selection = harness.tabs.get(7).messages.find(message => message.type === 'JOB_APP_SELECT_FORM');
+  assert.equal(selection.debug, true);
+  const selected = await harness.dispatch({type: 'JOB_APP_FORM_SELECTED', token: selection.token,
+    destination: {documentId: 'document-2', regionId: 'form-2'}},
+    {id: 'test-extension', tab: {id: 7, url: 'https://jobs.example.com/apply'}, frameId: 2});
+  assert.equal(selected.debugSelection, true, selected.error);
+  const captured = await harness.dispatch({type: 'JOB_RUN_DEBUG_CAPTURE'});
+  assert.equal(captured.case.frameId, 2);
+  assert.equal(harness.tabs.get(7).messages.some(message => ['JOB_APP_APPLY', 'JOB_APP_CLICK_NEXT'].includes(message.type)), false);
 });
 
 test('saved-answer vote autofills by default and becomes review-only when disabled', async () => {
@@ -3197,6 +3246,7 @@ test('NeoXam related evidence still generates a draft and numeric CTC exposes it
   ],actions:[{id:'submit',label:'Submit application',kind:'submit'}]}]}}});
   h.localData.openaiApiKey='test-key';
   h.localData.phoenixTracing=true;
+  h.localData.developerMode=true;
   const requests=[], spans=[];
   globalThis.fetch=async(url,options)=>{
     const body=JSON.parse(options.body);

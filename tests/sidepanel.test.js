@@ -118,6 +118,7 @@ async function setupPanel({
         if (message.type === 'JOB_RUN_SEMANTIC_SEARCH') return typeof semanticSearchResponse === 'function' ? semanticSearchResponse(message) : semanticSearchResponse;
         if (message.type === 'JOB_RUN_SELECT_EMPLOYMENT') return selectEmploymentResponse;
         if (message.type === 'JOB_DATASOURCE_EXPORT') return { ok: true, backup: '{"schemaVersion":1}' };
+        if (message.type === 'JOB_RUN_DEBUG_CAPTURE') return {ok: true, case: {schemaVersion: 1, snapshot: {html: '<form></form>'}}};
         if (message.type === 'JOB_DATASOURCE_IMPORT') return { ok: true, datasource };
         return { ok: true };
       },
@@ -170,6 +171,31 @@ async function setupPanel({
 }
 
 const panelTick = () => new Promise(resolve => setTimeout(resolve, 0));
+
+test('Developer mode reveals capture and Phoenix controls and can be turned off again', async () => {
+  const harness = await setupPanel();
+  try {
+    const document = harness.dom.window.document;
+    const toggle = document.getElementById('developer-mode');
+    const tools = document.getElementById('developer-tools');
+    assert.equal(toggle.checked, false);
+    assert.equal(tools.hidden, true);
+    toggle.checked = true;
+    toggle.dispatchEvent(new Event('change'));
+    await panelTick();
+    assert.equal(harness.localData.developerMode, true);
+    assert.equal(tools.hidden, false);
+    document.getElementById('capture-debug-case').click();
+    await panelTick();
+    assert.equal(harness.sentMessages.some(message => message.type === 'JOB_RUN_DEBUG_CAPTURE'), true);
+    assert.equal(harness.clickedDownloads.length, 1);
+    toggle.checked = false;
+    toggle.dispatchEvent(new Event('change'));
+    await panelTick();
+    assert.equal(harness.localData.developerMode, false);
+    assert.equal(tools.hidden, true);
+  } finally { harness.cleanup(); }
+});
 function panelInlineSession(kind = 'saved') {
   const field = {id: 'name', handle: 'doc:name', label: 'Full name', type: 'text'};
   const candidate = {candidateId: 'choice-1', answer: 'Selected answer', kind: kind === 'saved' ? 'equivalent' : 'generated', sourceKey: 'name-source', sourceQuestion: 'Full name'};

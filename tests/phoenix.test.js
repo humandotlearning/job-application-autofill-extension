@@ -48,6 +48,26 @@ test('disabled tracing makes only the original request', async () => {
   assert.equal(calls, 1);
 });
 
+test('Developer mode and Phoenix checkbox both gate automatic trace capture', async () => {
+  const original = globalThis.chrome;
+  const state = {developerMode: false, phoenixTracing: true};
+  globalThis.chrome = {runtime: {id: 'test-extension'}, storage: {local: {
+    get: async defaults => ({...defaults, ...state}),
+    set: async values => Object.assign(state, values),
+  }}};
+  try {
+    await tracePhoenixEvent('disabled', {}, 'session-1', {fetchImpl: async () => { throw new Error('Unexpected delivery'); }});
+    assert.equal(state.phoenixTraceQueue, undefined);
+    state.developerMode = true;
+    state.phoenixTracing = false;
+    await tracePhoenixEvent('disabled', {}, 'session-1', {fetchImpl: async () => { throw new Error('Unexpected delivery'); }});
+    assert.equal(state.phoenixTraceQueue, undefined);
+    state.phoenixTracing = true;
+    await tracePhoenixEvent('enabled', {}, 'session-1', {fetchImpl: async () => { throw new Error('Collector offline'); }});
+    assert.equal(state.phoenixTraceQueue.length, 1);
+  } finally { globalThis.chrome = original; }
+});
+
 test('collector failures preserve successful provider response', async () => {
   const traced = createPhoenixFetch('', {enabled: async () => true, fetchImpl: async endpoint => {
     if (endpoint !== url) throw new Error('collector offline');

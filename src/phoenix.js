@@ -12,7 +12,10 @@ function storageAvailable() { return Boolean(globalThis.chrome?.storage?.local?.
 function id() { return crypto.randomUUID().replaceAll('-', ''); }
 async function tracingEnabled() {
   if (!globalThis.chrome?.runtime?.id) return false;
-  try { return (await chrome.storage.local.get({phoenixTracing: true})).phoenixTracing !== false; } catch { return false; }
+  try {
+    const settings = await chrome.storage.local.get({developerMode: false, phoenixTracing: true});
+    return settings.developerMode === true && settings.phoenixTracing !== false;
+  } catch { return false; }
 }
 
 export function createPhoenixTrace(sessionId = '', attributes = {}) {

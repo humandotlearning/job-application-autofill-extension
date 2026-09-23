@@ -100,7 +100,7 @@ function controlHandle(element) {
   return handle;
 }
 
-function applicationRoot(document) {
+export function applicationRoot(document) {
   const fieldSelection = applicationFieldSelections.get(document);
   if (fieldSelection && fieldSelection.documentId === documentIdentity(document) && fieldSelection.element.isConnected) return document.createDocumentFragment();
   if (fieldSelection) applicationFieldSelections.delete(document);
