@@ -7,3 +7,4 @@ Thumbs.db
 .venv-phoenix/
 .phoenix/
 .phoenix-uv-cache/
+logs/cases/

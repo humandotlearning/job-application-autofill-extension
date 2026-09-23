@@ -276,4 +276,4 @@ Start Phoenix from the project folder:
 powershell -ExecutionPolicy Bypass -File scripts/start-phoenix.ps1
 ```
 
-Then reload the extension, open http://127.0.0.1:6006, and select **job-autofill**. The Settings checkbox **Save AI traces to local Phoenix** controls capture. See [Phoenix setup and storage details](docs/phoenix.md).
+Then reload the extension, open http://127.0.0.1:6006, and select **job-autofill**. Under **Settings & data**, enable **Developer mode** to use local Phoenix tracing and **Capture debug case**. See [Phoenix setup and storage details](docs/phoenix.md) and [real-form debug cases](docs/debug-cases.md).

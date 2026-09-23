@@ -14,6 +14,7 @@ import {
   clearApplicationSelection,
 } from './form-engine.js';
 import { isExtensionElement, eventControl, withDomSnapshot } from './dom.js';
+import { captureDebugSnapshot } from './debug-case.js';
 import { createLearningSession } from './learning.js';
 import { createInlineAutofill } from './inline-autofill.js';
 
@@ -32,7 +33,7 @@ function notifyNavigation() {
   waitForDocumentSettled(document).then(() => sendRuntimeMessage({ type: 'JOB_APP_NAVIGATED' })).catch(() => {});
 }
 
-const CONTENT_VERSION = 'autofill-ux-8';
+const CONTENT_VERSION = 'autofill-ux-10';
 if (!globalThis.__jobApplicationAutofillInstalled) {
   globalThis.__jobApplicationAutofillInstalled = CONTENT_VERSION;
   let inline = null;
@@ -92,7 +93,7 @@ if (!globalThis.__jobApplicationAutofillInstalled) {
   document.defaultView.addEventListener('hashchange', invalidateDestination);
   document.addEventListener('click', event => {
     const request = selectionRequest;
-    if (!active || !request || !event.isTrusted || Date.now() > request.expiresAt) return;
+    if ((!active && !request?.debug) || !request || !event.isTrusted || Date.now() > request.expiresAt) return;
     const control = eventControl(event);
     const destination = selectApplicationRegion(document, control);
     if (!destination?.regionId && !selectApplicationField(document, control)) return;
@@ -171,9 +172,9 @@ if (!globalThis.__jobApplicationAutofillInstalled) {
       }
       switch (message?.type) {
         case 'JOB_APP_SELECT_FORM':
-          if (!active) { sendResponse({ok: false, disabled: true}); break; }
+          if (!active && !message.debug) { sendResponse({ok: false, disabled: true}); break; }
           cancelSelection();
-          selectionRequest = {token: message.token, expiresAt: Math.min(message.expiresAt, Date.now() + 60_000)};
+          selectionRequest = {token: message.token, expiresAt: Math.min(message.expiresAt, Date.now() + 60_000), debug: message.debug === true};
           selectionTimer = setTimeout(cancelSelection, Math.max(0, selectionRequest.expiresAt - Date.now()));
           sendResponse({ok: true, destination: applicationDestination(document)});
           break;
@@ -193,6 +194,26 @@ if (!globalThis.__jobApplicationAutofillInstalled) {
           if (!active) { sendResponse({ok: false, disabled: true}); break; }
           inspectWhenReady().then(inspection => sendResponse({ ok: true, inspection, version: CONTENT_VERSION }))
             .catch((error) => sendResponse({ ok: false, code: 'inspection_error', error: error.message }));
+          return true;
+        case 'JOB_APP_DEBUG_INSPECT':
+          sendRuntimeMessage({type: 'JOB_APP_DEBUG_AUTHORIZE'}).then(async authorization => {
+            if (!authorization?.ok) {
+              sendResponse({ok: false, disabled: true, code: 'developer_mode_disabled', error: 'Enable Developer mode in Settings to capture debug cases.'});
+              return;
+            }
+            const inspection = await inspectWhenReady();
+            sendResponse({ok: true, inspection, version: CONTENT_VERSION});
+          }).catch(error => sendResponse({ok: false, code: 'inspection_error', error: error.message}));
+          return true;
+        case 'JOB_APP_DEBUG_SNAPSHOT':
+          sendRuntimeMessage({type: 'JOB_APP_DEBUG_AUTHORIZE'}).then(authorization => {
+            if (!authorization?.ok) {
+              sendResponse({ok: false, disabled: true, code: 'developer_mode_disabled', error: 'Enable Developer mode in Settings to capture debug cases.'});
+              return;
+            }
+            try { sendResponse({ok: true, snapshot: captureDebugSnapshot(document)}); }
+            catch (error) { sendResponse({ok: false, code: 'snapshot_error', error: error.message}); }
+          }).catch(error => sendResponse({ok: false, code: 'snapshot_error', error: error.message}));
           return true;
         case 'JOB_APP_INSPECT_INLINE': {
           if (!active) { sendResponse({ok: false, disabled: true}); break; }

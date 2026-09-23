@@ -4,11 +4,13 @@
 
 1. From the project folder run `powershell -ExecutionPolicy Bypass -File scripts/start-phoenix.ps1`.
 2. Reload this unpacked extension at `chrome://extensions` to load the tracing code.
-3. In Settings, leave **Save AI traces to local Phoenix** enabled (the default).
+3. In **Settings & data**, enable **Developer mode**. Within Developer mode, leave **Save AI traces to local Phoenix** enabled.
 4. Use an AI action such as Generate answer, Rewrite, or Fill this page when AI assistance is needed.
 5. Open http://127.0.0.1:6006 and select **job-autofill**. Open the application session whose ID is `tabId:startedAt`; each fill, retry, rewrite, and search action is a root trace with provider calls nested below it.
 
-Local matching and cached answers make no AI request and create no trace. Historical calls cannot be recovered; collection starts after reloading the extension. The synthetic setup check is named `phoenix_setup_check`.
+Developer mode is off by default. Local matching and cached answers make no AI request and create no trace. Historical calls cannot be recovered; collection starts after enabling Developer mode. The synthetic setup check is named `phoenix_setup_check`.
+
+For a selected live form, use **Capture debug case** under Developer mode. The downloaded JSON includes a sanitized form snapshot and, when a run exists, its Phoenix session ID. Run `node scripts/export-debug-case.mjs <downloaded-capture.json>` to fetch that session's spans into ignored `logs/cases/` and prepare a candidate test fixture. Review the candidate for personal text before copying it into `tests/fixtures/real/`. See [debug cases](debug-cases.md).
 
 ## What is captured
 
@@ -24,7 +26,7 @@ Provider HTTP boundaries and subsequent local validation/rejection results are b
 
 Phoenix listens at 127.0.0.1:6006 and persists data in this project's `.phoenix/` directory. Full prompts and responses may contain personal application data. API authorization headers are never included. This directory and the Python environment are ignored by Git. Removing the extension does not remove Phoenix data.
 
-Turn off **Save AI traces to local Phoenix** to stop capture. Stop a foreground server with Ctrl+C. Use Phoenix's UI to delete traces you no longer need.
+Turn off **Developer mode** or **Save AI traces to local Phoenix** to stop new capture and delivery. Existing Phoenix data and queued spans remain local. Stop a foreground server with Ctrl+C. Use Phoenix's UI to delete traces you no longer need.
 
 Exports are persisted in a bounded local queue (100 spans, 4 MiB, seven days) before delivery. The queue retries on worker startup and once per minute while Phoenix is unavailable. The Settings panel shows pending, dropped, and last-error counts. Exports time out after 750 ms and never replace the AI result with a tracing error.
 

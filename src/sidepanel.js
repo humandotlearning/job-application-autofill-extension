@@ -14,6 +14,9 @@ const elements = {
   includeFormScreenshot: byId('include-form-screenshot'),
   phoenixTracing: byId('phoenix-tracing'),
   phoenixStatus: byId('phoenix-status'),
+  developerMode: byId('developer-mode'),
+  developerTools: byId('developer-tools'),
+  captureDebugCase: byId('capture-debug-case'),
   autoAdvance: byId('auto-advance-pages'),
   employerName: byId('employer-name'),
   relatedDefault: byId('related-default'),
@@ -1484,7 +1487,7 @@ async function refresh() {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
   activeTabId = tab?.id || null;
   await refreshSiteState();
-  const stored = await chrome.storage.local.get({ answerRecords: [], openaiApiKey: '', fireworksApiKey: '', typesafeApiKey: '', typesafeEnabled: null, typesafeAutofillEnabled: true, typesafeAutofillSensitive: true, typesafeNoMatchTop: true, voteAutofillEnabled: true, aiProvider: '', aiModel: '', openaiModel: 'gpt-5.6-terra', includeFormScreenshot: true, autoAdvancePages: false, phoenixTracing: true });
+  const stored = await chrome.storage.local.get({ answerRecords: [], openaiApiKey: '', fireworksApiKey: '', typesafeApiKey: '', typesafeEnabled: null, typesafeAutofillEnabled: true, typesafeAutofillSensitive: true, typesafeNoMatchTop: true, voteAutofillEnabled: true, aiProvider: '', aiModel: '', openaiModel: 'gpt-5.6-terra', includeFormScreenshot: true, autoAdvancePages: false, phoenixTracing: true, developerMode: false });
   const provider = stored.aiProvider === 'openai' || stored.aiProvider === 'fireworks'
     ? stored.aiProvider
     : (stored.openaiApiKey ? 'openai' : 'fireworks');
@@ -1505,6 +1508,8 @@ async function refresh() {
   elements.apiModel.value = stored.aiModel || (provider === 'openai' ? stored.openaiModel : '') || defaultModel;
   elements.includeFormScreenshot.checked = stored.includeFormScreenshot !== false;
   elements.phoenixTracing.checked = stored.phoenixTracing !== false;
+  elements.developerMode.checked = stored.developerMode === true;
+  elements.developerTools.hidden = !elements.developerMode.checked;
   await refreshPhoenixStatus();
   elements.autoAdvance.checked = Boolean(stored.autoAdvancePages);
   updateDatasourceSummary({ answerCount: stored.answerRecords.length });
@@ -1669,6 +1674,30 @@ elements.phoenixTracing.addEventListener('change', async () => {
   setStatus(elements.phoenixTracing.checked ? 'Local Phoenix tracing enabled.' : 'AI tracing disabled.');
   await refreshPhoenixStatus();
 });
+elements.developerMode.addEventListener('change', async () => {
+  const enabled = elements.developerMode.checked;
+  await chrome.storage.local.set({developerMode: enabled});
+  elements.developerTools.hidden = !enabled;
+  setStatus(enabled ? 'Developer mode enabled.' : 'Developer mode disabled.');
+  await refreshPhoenixStatus();
+});
+elements.captureDebugCase.addEventListener('click', async () => {
+  elements.captureDebugCase.disabled = true;
+  try {
+    const response = await chrome.runtime.sendMessage({type: 'JOB_RUN_DEBUG_CAPTURE'});
+    if (!response?.ok) throw new Error(response?.error || 'Could not capture the form.');
+    if (response.selectionRequired) { setStatus('Click a field in the application form, then Capture debug case again.'); return; }
+    const blob = new Blob([JSON.stringify(response.case, null, 2)], {type: 'application/json'});
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = `job-form-debug-${new Date().toISOString().replaceAll(':', '-')}.json`;
+    link.click();
+    URL.revokeObjectURL(url);
+    setStatus('Debug case downloaded. Review it before sharing.');
+  } catch (error) { setStatus(error.message, 'error'); }
+  finally { elements.captureDebugCase.disabled = false; }
+});
 for (const [field, key] of [[elements.employerName, 'employerName'], [elements.relatedDefault, 'relatedToHiringCompany'], [elements.knownDefault, 'knownAtHiringCompany'], [elements.phoneDeviceDefault, 'phoneDeviceType']]) field.addEventListener('change', () => saveProfile(key));
 elements.exportDatasource.addEventListener('click', exportDatasource);
 elements.importDatasourceButton.addEventListener('click', () => elements.importDatasource.click());
@@ -1718,6 +1747,10 @@ chrome.storage.onChanged.addListener((changes, area) => {
     if (currentRun?.status === 'running') renderRun(currentRun);
   }
   if (area === 'local' && changes.phoenixTracing) elements.phoenixTracing.checked = changes.phoenixTracing.newValue !== false;
+  if (area === 'local' && changes.developerMode) {
+    elements.developerMode.checked = changes.developerMode.newValue === true;
+    elements.developerTools.hidden = !elements.developerMode.checked;
+  }
   if (area === 'local' && (changes.phoenixTraceQueue || changes.phoenixTraceStatus || changes.phoenixTracing)) refreshPhoenixStatus().catch(() => {});
   if (area === 'local' && changes.includeFormScreenshot) elements.includeFormScreenshot.checked = changes.includeFormScreenshot.newValue !== false;
   if (area === 'local' && changes.voteAutofillEnabled) elements.voteAutofillEnabled.checked = changes.voteAutofillEnabled.newValue !== false;

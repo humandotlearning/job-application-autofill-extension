@@ -1,0 +1,1 @@
+Place only reviewed `fixture-candidate.json` files here, renamed for the form and page. Run `node --test tests/debug-case.test.js` to replay every JSON file in this folder. Review labels, options, help text, and HTML for personal information before adding a file to Git. Raw Phoenix traces belong in ignored `logs/cases/`.

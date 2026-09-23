@@ -20,6 +20,7 @@ import { hostnameFromUrl, isHostnameDisabled, isSupportedSiteUrl, normalizeHostn
 import { createSemanticMatcher, semanticFingerprint } from './typesafe.js';
 import { createPhoenixTrace, flushPhoenixQueue, tracePhoenixEvent } from './phoenix.js';
 import { createBrowserController, mergeAccessibilityInspection } from './browser-control.js';
+import { scrubDebugText } from './debug-case.js';
 
 const RUN_STORAGE_KEY = 'applicationRun';
 const PHOENIX_ACTIVE_ACTIONS_KEY = 'phoenixActiveActions';
@@ -52,6 +53,7 @@ const UTILITY_FRAME_PATTERN = /\b(?:search|cookie|job[\s-]?alerts?|talent[\s-]?c
 const NO_APPLICATION_FRAME_REASON = 'No supported application controls were found. Retry the scan after the form loads, or complete inaccessible controls manually.';
 const AMBIGUOUS_APPLICATION_FRAME_REASON = 'More than one application form was found. Click Select form, then click a field in the form you want to fill.';
 const formSelections = new Map();
+const debugSelections = new Map();
 const formInterpretationCache = new Map();
 const activeFormInterpretations = new Map();
 const browserController = createBrowserController();
@@ -90,10 +92,15 @@ function updatePhoenixActions(change) {
 }
 
 function persistPhoenixAction(traceContext, name, sessionId, attributes = {}) {
+  // Keep interruption metadata only while developer tracing is active.
+  if (!chrome.runtime?.id) return Promise.resolve(false);
   const key = `${traceContext.traceId}:${traceContext.spanId}`;
-  return updatePhoenixActions(actions => ({...actions, [key]: {
+  return chrome.storage.local.get({developerMode: false, phoenixTracing: true}).then(settings => {
+    if (settings.developerMode !== true || settings.phoenixTracing === false) return false;
+    return updatePhoenixActions(actions => ({...actions, [key]: {
     key, name, sessionId, traceContext: {...traceContext}, attributes: {...attributes}, startedAt: traceContext.startedAt || new Date().toISOString(),
-  }}));
+    }}));
+  }).catch(() => false);
 }
 
 function clearPhoenixAction(traceContext) {
@@ -913,21 +920,23 @@ async function cancelFormSelection(tabId) {
   if (request) await Promise.allSettled(request.frames.map(frame => chrome.tabs.sendMessage(tabId, {type: 'JOB_APP_CANCEL_FORM_SELECTION'}, {frameId: frame.frameId})));
 }
 
-async function requestFormSelection(tabId) {
+async function requestFormSelection(tabId, {debug = false} = {}) {
   await cancelFormSelection(tabId);
-  const run = await getRun(tabId);
-  if (!run || processingTabs.has(tabId)) throw new Error('Check the page before selecting a form.');
+  const run = debug ? null : await getRun(tabId);
+  if (!debug && (!run || processingTabs.has(tabId))) throw new Error('Check the page before selecting a form.');
   const contexts = await enumerateFrames(tabId);
-  const request = {token: crypto.randomUUID(), expiresAt: Date.now() + FORM_SELECTION_TTL_MS, applicationId: run.startedAt, frames: []};
+  const request = {token: crypto.randomUUID(), expiresAt: Date.now() + FORM_SELECTION_TTL_MS, applicationId: run?.startedAt, debug, frames: []};
   formSelections.set(tabId, request);
   await Promise.allSettled(contexts.map(async context => {
-    const response = await sendToFrame(tabId, context.frameId, {type: 'JOB_APP_SELECT_FORM', token: request.token, expiresAt: request.expiresAt});
+    const response = await sendToFrame(tabId, context.frameId, {type: 'JOB_APP_SELECT_FORM', token: request.token, expiresAt: request.expiresAt, debug});
     if (response?.ok && response.destination?.documentId) request.frames.push({frameId: context.frameId, documentId: response.destination.documentId});
   }));
   if (!request.frames.length) {
     formSelections.delete(tabId);
+    if (debug) throw new Error('Could not select a form on this page. Reload it and try again.');
     return {ok: false, run: await saveRun(pauseForFrame(run, discoveryFailure('script_unavailable')))};
   }
+  if (debug) return {ok: true, selectionRequired: true};
   run.waitingFor = 'selecting_form';
   run.progress = null;
   run.actionRequired = [{code: 'selecting_form', category: 'pause', reason: 'Click a field in the form you want to fill. Selection expires in 60 seconds.'}];
@@ -939,6 +948,17 @@ async function acceptFormSelection(message, sender) {
   const request = formSelections.get(tabId);
   if (sender?.id !== chrome.runtime.id || !request || request.token !== message.token || Date.now() > request.expiresAt
     || !request.frames.some(frame => frame.frameId === sender.frameId && frame.documentId === message.destination?.documentId)) throw new Error('Form selection expired. Click Select form again.');
+  if (request.debug) {
+    await assertTabSiteEnabled(tabId, sender.tab);
+    const settings = await chrome.storage.local.get({developerMode: false});
+    if (settings.developerMode !== true) throw new Error('Enable Developer mode to capture debug cases.');
+    await cancelFormSelection(tabId);
+    if (!message.fieldOnly && message.destination?.regionId) {
+      debugSelections.set(tabId, {frameId: sender.frameId, destination: message.destination, expiresAt: Date.now() + 5 * 60_000});
+      return {ok: true, debugSelection: true};
+    }
+    return {ok: false, error: 'Select a field inside one application form.'};
+  }
   await assertTabFormActive(tabId, sender);
   const run = await getRun(tabId);
   if (!run || run.startedAt !== request.applicationId || processingTabs.has(tabId)) throw new Error('The application changed. Select the form again.');
@@ -999,6 +1019,52 @@ async function discoverApplicationFrame(tabId, assertAuthority = null, selectedD
   }
   const selected = candidates[0];
   return {frameId: selected.frameId, context: {title: selected.title, pathname: selected.pathname}, inspection: selected.inspection, diagnostics};
+}
+
+async function captureDebugCase(tabId, tab) {
+  const settings = await chrome.storage.local.get({developerMode: false});
+  if (settings.developerMode !== true) throw new Error('Enable Developer mode in Settings to capture debug cases.');
+  await assertTabSiteEnabled(tabId, tab);
+  const contexts = await enumerateFrames(tabId);
+  await ensureContentScripts(tabId, contexts.map(frame => frame.frameId));
+  const inspected = await Promise.all(contexts.map(async context => {
+    try {
+      const response = await sendToFrame(tabId, context.frameId, {type: 'JOB_APP_DEBUG_INSPECT'});
+      return response?.ok ? {...context, inspection: response.inspection} : {...context};
+    } catch { return {...context}; }
+  }));
+  const run = await getRun(tabId);
+  const currentRun = run && formSessionMatchesTab(run, tab) ? run : null;
+  const selected = debugSelections.get(tabId);
+  const selectedDestination = selected?.expiresAt > Date.now() ? selected : null;
+  const matching = (frame, destination) => Boolean(destination?.documentId && destination?.regionId)
+    && frame?.inspection?.destination?.documentId === destination.documentId
+    && frame?.inspection?.destination?.regionId === destination?.regionId;
+  const chosen = inspected.find(frame => selectedDestination && frame.frameId === selectedDestination.frameId && matching(frame, selectedDestination.destination))
+    || inspected.find(frame => currentRun?.frame?.frameId === frame.frameId && matching(frame, currentRun.frame.destination));
+  const candidates = inspected.filter(frame => frame.inspection?.destination?.regionId && scoreApplicationFrame(frame, frame.inspection).eligible);
+  const target = chosen || (candidates.length === 1 ? candidates[0] : null);
+  if (!target) return requestFormSelection(tabId, {debug: true});
+  const response = await sendToFrame(tabId, target.frameId, {type: 'JOB_APP_DEBUG_SNAPSHOT', destination: target.inspection.destination});
+  if (!response?.ok || !response.snapshot) throw new Error(response?.error || 'The selected form changed. Capture it again.');
+  if ((await chrome.storage.local.get({developerMode: false})).developerMode !== true) throw new Error('Developer mode was disabled during capture.');
+  const enteredValues = target.inspection.fields.flatMap(field => [field.rawValue, field.currentValue])
+    .filter(value => typeof value === 'string' && value.trim());
+  const scrub = value => scrubDebugText(value, enteredValues);
+  return {ok: true, case: {
+    schemaVersion: 1,
+    capturedAt: new Date().toISOString(),
+    site: {hostname: new URL(tab.url).hostname},
+    frameId: target.frameId,
+    pageNumber: currentRun?.frame?.frameId === target.frameId ? currentRun.pageNumber : null,
+    sessionId: currentRun?.frame?.frameId === target.frameId ? `${tabId}:${currentRun.startedAt}` : null,
+    outcomes: currentRun?.frame?.frameId === target.frameId ? {
+      status: currentRun.status,
+      actionRequired: (currentRun.actionRequired || []).map(item => ({code: item.code, category: item.category, reason: scrub(item.reason)})),
+      reviewRequired: (currentRun.reviewRequired || []).map(item => ({label: scrub(item.label), reason: scrub(item.reason)})),
+    } : null,
+    snapshot: response.snapshot,
+  }};
 }
 
 function selectedFrame(run) {
@@ -2710,6 +2776,20 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       return {ok:true,run:await validatePageOnly(tabId)};
     })().then(sendResponse).catch(error=>sendResponse({ok:false,error:error.message}));return true;
   }
+  if (message?.type === 'JOB_APP_DEBUG_AUTHORIZE') {
+    if (sender?.id !== chrome.runtime.id || !Number.isInteger(sender?.tab?.id) || !Number.isInteger(sender?.frameId)) {
+      sendResponse({ok: false});
+      return false;
+    }
+    (async () => {
+      try {
+        await assertTabSiteEnabled(sender.tab.id, sender.tab);
+        const settings = await chrome.storage.local.get({developerMode: false});
+        return {ok: settings.developerMode === true};
+      } catch { return {ok: false}; }
+    })().then(sendResponse);
+    return true;
+  }
   if (message?.type === 'JOB_APP_FINAL_SUBMISSION') {
     (async () => {
       await assertTabSiteEnabled(sender?.tab?.id, sender?.tab);
@@ -2792,6 +2872,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     'JOB_RUN_SEARCH_ANSWERS',
     'JOB_RUN_SEMANTIC_SEARCH',
     'JOB_RUN_STATE',
+    'JOB_RUN_DEBUG_CAPTURE',
     'JOB_DATASOURCE_STATE',
     'JOB_DATASOURCE_UNDO_LAST_AUTOSAVE',
     'JOB_DATASOURCE_EXPORT',
@@ -2869,6 +2950,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       return { ok: true, run: site.disabled ? null : await getRun(tabId), site: siteStateReply(site) };
     }
     await assertTabSiteEnabled(tabId, null);
+    if (message.type === 'JOB_RUN_DEBUG_CAPTURE') return captureDebugCase(tabId, tab);
     if (message.type === 'JOB_RUN_SELECT_FORM') return requestFormSelection(tabId);
     if (message.type === 'JOB_RUN_VALIDATE_PAGE') return { ok: true, run: await validatePageOnly(tabId) };
     if (message.type === 'JOB_RUN_RETRY_AI') { await scheduleAi(tabId, { retry: true }); return { ok: true, run: await getRun(tabId) }; }
@@ -2887,6 +2969,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 });
 
 chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
+  if (changeInfo.url || changeInfo.status === 'loading') debugSelections.delete(tabId);
   if (changeInfo.url || changeInfo.status === 'loading') activeFormInterpretations.delete(tabId);
   if (changeInfo.url || changeInfo.status === 'loading') for (const key of formInterpretationCache.keys()) if (key.includes(`\"tabId\":${tabId},`)) formInterpretationCache.delete(key);
   if (changeInfo.url || changeInfo.status === 'loading') cancelFormSelection(tabId).catch(() => {});
@@ -2915,6 +2998,7 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
 });
 
 chrome.tabs.onRemoved.addListener((tabId) => {
+  debugSelections.delete(tabId);
   activeFormInterpretations.delete(tabId);
   for (const key of formInterpretationCache.keys()) if (key.includes(`\"tabId\":${tabId},`)) formInterpretationCache.delete(key);
   formSelections.delete(tabId);
@@ -2926,10 +3010,11 @@ chrome.tabs.onRemoved.addListener((tabId) => {
 chrome.runtime.onInstalled.addListener(async () => {
   await chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true });
   await chrome.storage.session.clear();
-  const settings = await chrome.storage.local.get({ autoAdvancePages: false, includeFormScreenshot: true, [SITE_SETTINGS_KEY]: [] });
+  const settings = await chrome.storage.local.get({ autoAdvancePages: false, includeFormScreenshot: true, developerMode: false, [SITE_SETTINGS_KEY]: [] });
   await chrome.storage.local.set({
     autoAdvancePages: Boolean(settings.autoAdvancePages),
     includeFormScreenshot: settings.includeFormScreenshot !== false,
+    developerMode: settings.developerMode === true,
     [SITE_SETTINGS_KEY]: normalizeHostnames(settings[SITE_SETTINGS_KEY]),
   });
   let datasourceReady = false;
@@ -2966,7 +3051,12 @@ if (chrome.alarms?.onAlarm?.addListener) {
 }
 if (chrome.storage?.onChanged?.addListener) {
   chrome.storage.onChanged.addListener((changes, area) => {
-    if (area === 'local' && changes.phoenixTracing && changes.phoenixTracing.newValue !== false) flushPhoenixQueue().catch(() => {});
+    if (area === 'local' && changes.developerMode && changes.developerMode.newValue !== true) {
+      debugSelections.clear();
+      for (const tabId of formSelections.keys()) if (formSelections.get(tabId)?.debug) cancelFormSelection(tabId).catch(() => {});
+    }
+    if (area === 'local' && ((changes.phoenixTracing && changes.phoenixTracing.newValue !== false)
+      || changes.developerMode?.newValue === true)) flushPhoenixQueue().catch(() => {});
   });
 }
 void ensurePhoenixDelivery();
