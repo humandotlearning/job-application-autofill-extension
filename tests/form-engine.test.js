@@ -1066,6 +1066,27 @@ test('composes full names locally from unambiguous name parts', () => {
   assert.equal(decisions[0].transformation, 'compose_name');
 });
 
+test('fills identity fields from the leading saved-answer vote', async () => {
+  const document = makeDocument('<form><label>First Name *<input name="firstName" required></label><label>Email Address *<input name="email" type="email" required></label></form>');
+  const records = [
+    { key: 'first_name', question: 'First name', answer: 'Nitin', sensitivity: 'safe', confirmationState: 'confirmed' },
+    { key: 'given_name', question: 'Given name', answer: 'Nitin', sensitivity: 'safe', confirmationState: 'confirmed' },
+    { key: 'old_first_name', question: 'First name', answer: 'Nithin', sensitivity: 'safe', confirmationState: 'confirmed' },
+    { key: 'email', question: 'Email', answer: 'nitin@example.com', sensitivity: 'safe', confirmationState: 'confirmed' },
+    { key: 'email_address', question: 'Email address', answer: 'nitin@example.com', sensitivity: 'safe', confirmationState: 'confirmed' },
+    { key: 'old_email', question: 'Email', answer: 'other@example.com', sensitivity: 'safe', confirmationState: 'confirmed' },
+  ];
+  const decisions = planDeterministicFill(collectFieldDescriptors(document), records);
+  assert.deepEqual(decisions.map(({ action, disposition }) => [action, disposition]), [['fill', 'autofill'], ['fill', 'autofill']]);
+  const result = await applyDecisions(document, decisions);
+  assert.equal(result.applied.length, 2);
+  assert.equal(document.querySelector('[name="firstName"]').value, 'Nitin');
+  assert.equal(document.querySelector('[name="email"]').value, 'nitin@example.com');
+  const reviewed = planDeterministicFill(collectFieldDescriptors(makeDocument('<label>First Name<input></label>')), records, [], {}, {}, { voteAutofillEnabled: false });
+  assert.equal(reviewed[0].matchKind, 'vote');
+  assert.equal(reviewed[0].disposition, 'review');
+});
+
 test('round trips repeated employers with their original entity IDs', () => {
   const document = makeDocument('<form><fieldset id="job1"><legend>Employment</legend><label>Company<input value="Acme"></label></fieldset><fieldset id="job2"><legend>Employment</legend><label>Company<input value="Other"></label></fieldset></form>');
   const records = collectAnswerRecords(document);

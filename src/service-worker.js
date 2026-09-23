@@ -544,7 +544,7 @@ async function getCoverMessages() {
 }
 
 async function getSettings() {
-  const stored = await chrome.storage.local.get({ autoAdvancePages: false, includeFormScreenshot: true, aiProvider: '', aiModel: '', openaiModel: '', openaiApiKey: '', fireworksApiKey: '', typesafeEnabled: false, typesafeAutofillEnabled: false });
+  const stored = await chrome.storage.local.get({ autoAdvancePages: false, includeFormScreenshot: true, voteAutofillEnabled: true, aiProvider: '', aiModel: '', openaiModel: '', openaiApiKey: '', fireworksApiKey: '', typesafeEnabled: false, typesafeAutofillEnabled: false });
   const aiProvider = stored.aiProvider === 'openai' || stored.aiProvider === 'fireworks'
     ? stored.aiProvider
     : (String(stored.openaiApiKey || '').trim() ? 'openai' : DEFAULT_PROVIDER);
@@ -553,6 +553,7 @@ async function getSettings() {
   return {
     autoAdvancePages: Boolean(stored.autoAdvancePages),
     includeFormScreenshot: stored.includeFormScreenshot !== false,
+    voteAutofillEnabled: stored.voteAutofillEnabled !== false,
     aiProvider,
     aiModel,
     openaiModel: aiModel,
@@ -1320,11 +1321,12 @@ async function focusFirstProblem(tabId, run, inspection, validation) {
 
 function applicationRecordsForLocalReuse(run = {}) {
   return (run.answers || []).filter(record => ['user', 'autofill'].includes(record?.provenance) && String(record?.answer || '').trim())
-    .map((record, index) => ({...record, key: `application_${Number(record.pageNumber) || 0}_${record.key || index}`,
+    .map((record, index) => ({...record, id: record.id || record.key || record.question || index,
+      key: `application_${Number(record.pageNumber) || 0}_${record.key || index}`,
       provenance: 'this application', confirmationState: 'confirmed'}));
 }
 
-async function applyPageDecisions(tabId, run, inspection, records, coverMessages, profile = {}, datasourceRevision = '', cycle = {pass: 0, deadline: Date.now() + 8000}) {
+async function applyPageDecisions(tabId, run, inspection, records, coverMessages, profile = {}, datasourceRevision = '', voteAutofillEnabled = true, cycle = {pass: 0, deadline: Date.now() + 8000}) {
   const currentPageSignature = pageSignature(inspection, run.frame);
   if (run.lastAction === 'next' && run.pageSignature === currentPageSignature) {
     run.status = 'waiting_user';
@@ -1364,7 +1366,8 @@ async function applyPageDecisions(tabId, run, inspection, records, coverMessages
     const validationResponse = await sendToApplicationFrame(tabId, run, { type: 'JOB_APP_VALIDATE' });
     currentValidation = validationResponse?.validation || { ok: false, requiredEmpty: [], invalid: [] };
     const invalidFieldIds = new Set((currentValidation.invalid || []).map((field) => field.fieldId));
-    const localDecisions = planDeterministicFill(scopedFields, [...applicationRecordsForLocalReuse(run), ...records], coverMessages, profile, currentInspection.page).map(decision => {
+    const voteRecords = [...applicationRecordsForLocalReuse(run), ...records];
+    const localDecisions = planDeterministicFill(scopedFields, voteRecords, coverMessages, profile, currentInspection.page, { voteAutofillEnabled }).map(decision => {
       const field = scopedFields.find(field => field.id === decision.fieldId);
       if (!field) return decision;
       if (field.entityUnresolved) return {...decision, action:'ask_user',value:null,disposition:'manual',reason:'Choose the employer for this work-history section'};
@@ -1374,7 +1377,10 @@ async function applyPageDecisions(tabId, run, inspection, records, coverMessages
         return { ...decision, action: 'keep', value: null, reason: 'The current value does not satisfy the field constraints' };
       }
       if (String(field.currentValue || '').trim()) return decision;
-      const candidates = savedFieldCandidates(field, records, draftRecords);
+      const voteWinner = decision.matchKind === 'vote'
+        ? voteRecords.find(record => record.key === decision.evidenceKeys?.[0])
+        : null;
+      const candidates = savedFieldCandidates(field, records, draftRecords, voteWinner ? [voteWinner] : []);
       const choiceMapping = choiceEvidenceNeedsPlanner(field, candidates);
       const gated = candidates.length && !choiceMapping && (decision.action !== 'fill' || decision.disposition !== 'autofill' || field.type === 'textarea' || decision.sensitivity !== 'safe' || inferSensitivity(field.label, field.id) !== 'safe');
       if (gated) {
@@ -2283,10 +2289,11 @@ async function processPage(tabId, { autoAdvance, selectedDestination = null } = 
       return await saveRun(run);
     }
 
-    const [records, coverMessages, datasource] = await Promise.all([
+    const [records, coverMessages, datasource, settings] = await Promise.all([
       getRecords(),
       getCoverMessages(),
       getDatasource(),
+      getSettings(),
     ]);
     const discovery = await discoverApplicationFrame(tabId, () => assertRunSiteAuthority(tabId, run), selectedDestination || run.selectedDestination, String(tabId) + ':' + run.startedAt);
     if (discovery.errorCode) return await saveRun(pauseForFrame(run, discovery));
@@ -2305,6 +2312,7 @@ async function processPage(tabId, { autoAdvance, selectedDestination = null } = 
       coverMessages,
       datasource.profile,
       datasource.datasourceMeta?.updatedAt || '',
+      settings.voteAutofillEnabled,
     );
     run = processed.run;
     const inspection = processed.inspection;

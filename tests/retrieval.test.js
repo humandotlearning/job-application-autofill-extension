@@ -27,6 +27,18 @@ test('saved field candidates keep saved evidence first and add distinct complete
   assert.equal(candidates.some((candidate) => candidate.answer === 'Pending answer' || candidate.answer === 'Opaque answer' || candidate.answer === 'Built unrelated services for a different domain.'), false);
 });
 
+test('saved field candidates pin the voted answer for review', async () => {
+  const { savedFieldCandidates } = await import('../src/retrieval.js');
+  const field = { label: 'First name', type: 'text' };
+  const records = [
+    ...['aaa', 'bbb', 'ccc'].map(key => ({ key, question: 'First name', answer: key.toUpperCase(), confirmationState: 'confirmed', sensitivity: 'safe' })),
+    ...['zzz1', 'zzz2', 'zzz3', 'zzz4'].map(key => ({ key, question: 'First name', answer: 'Nitin', confirmationState: 'confirmed', sensitivity: 'safe' })),
+  ];
+  const candidates = savedFieldCandidates(field, records, [], [records[3]]);
+  assert.equal(candidates.length, 3);
+  assert.equal(candidates[0].answer, 'Nitin');
+});
+
 test('unspecified compensation units expose verbatim LPA evidence only for review', async () => {
   const { retrieveEvidence } = await import('../src/retrieval.js');
   const { chooseRecord } = await import('../src/core.js');

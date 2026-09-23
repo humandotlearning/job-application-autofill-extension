@@ -20,6 +20,7 @@ const AUTOCOMPLETE_KEYS = {
 };
 
 const GENERIC_NAME_LABELS = new Set(['name', 'your name', 'applicant name', 'candidate name']);
+const VOTABLE_IDENTITY_CONCEPTS = new Set(['first_name', 'last_name', 'full_name', 'preferred_name', 'email', 'github_url', 'linkedin_url', 'portfolio_url']);
 
 export function isOpaqueIdentifier(value) {
   const text = String(value ?? '').trim();
@@ -254,16 +255,35 @@ export function chooseRecord(field = {}, records = []) {
   const preferredKeys = AUTOCOMPLETE_KEYS[autocompleteToken] || AUTOCOMPLETE_KEYS[autocomplete] || [];
   const fieldConcept = canonicalConcept(field.label || field.name || field.id || '');
   const unambiguous = (candidates) => new Set(candidates.map((record) => String(record.answer).trim())).size === 1 ? candidates[0] : null;
+  const voted = (candidates, concept) => {
+    if (!VOTABLE_IDENTITY_CONCEPTS.has(concept) || inferSensitivity(field.label, field.id) !== 'safe') return null;
+    const votes = new Map();
+    const sources = new Set();
+    for (const record of candidates) {
+      if (recordConceptFor(record) !== concept || record.confirmationState !== 'confirmed' || record.sensitivity === 'legal') continue;
+      const source = record.id || record.key || record.question;
+      if (!source || sources.has(source)) continue;
+      sources.add(source);
+      const answer = String(record.answer).trim();
+      if (!votes.has(answer)) votes.set(answer, []);
+      votes.get(answer).push(record);
+    }
+    const ranked = [...votes.values()].sort((a, b) => b.length - a.length);
+    return ranked[0]?.length >= 2 && ranked[0].length > (ranked[1]?.length || 0) ? ranked[0][0] : null;
+  };
   if (fieldConcept === 'generic_name') {
-    const fullName = unambiguous(records.filter((record) => recordConceptFor(record) === 'full_name' && String(record.answer ?? '').trim()));
-    return fullName ? { record: fullName, confidence: 'high', score: 1, reason: 'generic-name:full_name' } : null;
+    const candidates = records.filter((record) => recordConceptFor(record) === 'full_name' && String(record.answer ?? '').trim());
+    const unanimous = unambiguous(candidates);
+    const fullName = unanimous || voted(candidates, 'full_name');
+    return fullName ? { record: fullName, confidence: 'high', score: 1, reason: unanimous ? 'generic-name:full_name' : 'vote:full_name' } : null;
   }
   if (fieldConcept) {
     const conceptCandidates = records.filter((record) => String(record.answer ?? '').trim()
       && [record.concept, record.key, record.question, ...(record.aliases || [])].filter(Boolean).some(label => canonicalConcept(label) === fieldConcept));
-    if (conceptCandidates.length > 1 && !unambiguous(conceptCandidates)) return null;
-    const conceptMatch = unambiguous(conceptCandidates);
-    if (conceptMatch) return { record: conceptMatch, confidence: 'high', score: 1, reason: `concept:${fieldConcept}` };
+    const unanimous = unambiguous(conceptCandidates);
+    const conceptMatch = unanimous || voted(conceptCandidates, fieldConcept);
+    if (conceptCandidates.length > 1 && !conceptMatch) return null;
+    if (conceptMatch) return { record: conceptMatch, confidence: 'high', score: 1, reason: `${unanimous ? 'concept' : 'vote'}:${fieldConcept}` };
   }
   if (preferredKeys.length || autocompleteToken === 'url') {
     let candidates = records.filter((record) => preferredKeys.includes(slugify(record.key)) && String(record.answer ?? '').trim());
@@ -402,9 +422,10 @@ export function decideDisposition(decision = {}, field = {}) {
   if (sensitivity !== 'safe' || decision.sensitivity !== 'safe') return review('Sensitive answer requires approval');
   if (normalizeText(field.type) === 'textarea' || String(decision.value).length > 240 || /describe|tell us|why.*(?:join|company|work)|motivat/.test(normalizeText(field.label))) return review('Narrative answer requires approval');
   if (decision.confirmationState !== 'confirmed') return review('Saved answer is not confirmed');
+  if (decision.matchKind === 'vote' && decision.voteAutofillEnabled === false) return review('Vote-based autofill is disabled');
   if (decision.matchKind === 'semantic' && decision.compatible === true && lowRiskSemanticField(field)
     && semanticAutofillQualified(decision.semantic)) return { disposition: 'autofill', reason: 'Validated low-risk JEV match' };
-  if (!['exact', 'concept'].includes(decision.matchKind) || decision.confidence !== 'high') return review('Match requires explicit approval');
+  if (!['exact', 'concept', 'vote'].includes(decision.matchKind) || decision.confidence !== 'high') return review('Match requires explicit approval');
   return { disposition: 'autofill', reason: 'Unique confirmed compatible short fact' };
 }
 
