@@ -189,14 +189,22 @@ function formSessionMatchesTab(run, tab) {
   const expected = run.formOrigin;
   if (!expected?.domain) return run.status === 'running';
   if (parsed.hostname !== expected.domain) return false;
+  const samePublication = smartRecruitersPublication(expected.domain, expected.pathname)
+    && smartRecruitersPublication(parsed.hostname, parsed.pathname) === smartRecruitersPublication(expected.domain, expected.pathname);
   const expectedDocumentId = run.frame?.destination?.documentId;
   if (tab?.documentId && expectedDocumentId && tab.documentId !== expectedDocumentId
-    && !(run.status === 'running' && run.lastAction === 'next')) return false;
-  if (!expected.pathname || parsed.pathname === expected.pathname) return true;
+    && !samePublication && !(run.status === 'running' && run.lastAction === 'next')) return false;
+  if (!expected.pathname || parsed.pathname === expected.pathname || samePublication) return true;
   // A user-approved Next/Continue click may update the URL before the new
   // content script reports navigation. Keep that transition authorized for
   // this session, then processPage replaces the frame identity.
   return run.status === 'running' && run.lastAction === 'next';
+}
+
+function smartRecruitersPublication(domain, pathname) {
+  if (domain !== 'jobs.smartrecruiters.com') return '';
+  const match = /^\/oneclick-ui\/company\/([^/]+)\/publication\/([^/]+)(?:\/|$)/i.exec(pathname || '');
+  return match ? `${match[1].toLowerCase()}/${match[2].toLowerCase()}` : '';
 }
 
 function assertRunSiteAuthority(tabId, run) {
@@ -696,6 +704,10 @@ async function getApiKey(provider = null) {
   return String(stored[selectedProvider === 'fireworks' ? 'fireworksApiKey' : 'openaiApiKey'] || '').trim();
 }
 
+function missingProviderKeyMessage(provider) {
+  return `Add ${provider === 'fireworks' ? 'a Fireworks' : 'an OpenAI'} API key in Settings to use AI answers.`;
+}
+
 async function getTypeSafeApiKey() {
   return String((await chrome.storage.local.get({ typesafeApiKey: '' })).typesafeApiKey || '').trim();
 }
@@ -780,13 +792,16 @@ function scoreApplicationFrame(context, inspection, selectedDestination = null) 
   if (/\b(?:location|notice\s+period|work\s+from\s+office)\b/i.test(fieldTextJoined)) concepts.add('availability');
   const applicationCluster = fields.length >= 3 && concepts.has('identity') && concepts.has('application') && concepts.size >= 3;
   const utilityHint = UTILITY_FRAME_PATTERN.test(fieldText.join(' ')) && !applicationField;
+  const screening = smartRecruitersPublication(inspection?.page?.domain, context.pathname)
+    && /\/screening(?:\/|$)/i.test(context.pathname)
+    && fields.length > 0 && concepts.has('application');
   const applicationActions = actions.some(action => action.kind === 'next'
     || (action.kind === 'submit' && (applicationField || applicationCluster || /\b(?:application|apply)\b/i.test(action.label || ''))));
   const explicitSelection = selectedDestination && context.frameId === selectedDestination.frameId
     && inspection.destination?.documentId === selectedDestination.documentId && inspection.destination?.regionId === selectedDestination.regionId;
   const ready = !inspection.discovery || (inspection.discovery.code === 'ready' && Boolean(inspection.destination?.regionId));
   const eligible = ready && fields.length > 0 && (explicitSelection || (!utilityHint
-    && (applicationActions || applicationCluster || (applicationHint && fields.length >= 2))));
+    && (applicationActions || applicationCluster || (applicationHint && fields.length >= 2) || screening)));
   return {eligible};
 }
 
@@ -1862,7 +1877,7 @@ async function generateInlineField(message, sender, {requireFocus = true, jobDes
   if (!reusable && !apiKey) {
     void tracePhoenixEvent('answer_suggestions', {'ai.skipped': true, 'ai.reason': 'missing_provider_key'}, sessionId, {traceContext, root: true, output: {retained: false, reason: 'missing_provider_key'}});
     void clearPhoenixAction(traceContext);
-    throw new Error(`Add a ${settings.aiProvider === 'fireworks' ? 'Fireworks' : 'OpenAI'} API key before generating answer suggestions`);
+    throw new Error(missingProviderKeyMessage(settings.aiProvider));
   }
   const draftKey = draftFieldKey(origin.tabId, origin.frameId, field), owner = crypto.randomUUID();
   if (!reusable && !claimDraftField(draftKey, owner)) return inlineReply(session, message.requestId, {error: 'This answer is already being prepared'});
@@ -2181,7 +2196,7 @@ async function rewriteAnswer(message, inlineContext = null) {
   if (!apiKey) {
     void tracePhoenixEvent('answer_rewrite', {'ai.skipped': true, 'ai.reason': 'missing_provider_key'}, sessionId, {traceContext, root: true, output: {retained: false, reason: 'missing_provider_key'}});
     void clearPhoenixAction(traceContext);
-    throw new Error(`Add a ${settings.aiProvider === 'fireworks' ? 'Fireworks' : 'OpenAI'} API key before requesting a rewrite`);
+    throw new Error(missingProviderKeyMessage(settings.aiProvider));
   }
   const records = await rewriteEvidence(suggestion, message);
   let rewritten;
@@ -2244,7 +2259,7 @@ async function generateSuggestions(message) {
   if (!apiKey) {
     void tracePhoenixEvent('answer_suggestions', {'ai.skipped': true, 'ai.reason': 'missing_provider_key'}, sessionId, {traceContext, root: true, output: {retained: false, reason: 'missing_provider_key'}});
     void clearPhoenixAction(traceContext);
-    throw new Error(`Add a ${settings.aiProvider === 'fireworks' ? 'Fireworks' : 'OpenAI'} API key before generating answer suggestions`);
+    throw new Error(missingProviderKeyMessage(settings.aiProvider));
   }
   const [records, datasource, inspected] = await Promise.all([getRecords(), getDatasource(), sendToFrame(message.tabId, message.frameId, { type: 'JOB_APP_INSPECT' }, authority)]);
   const jobContext = mergeJobContext(run.jobContext, inspected.inspection?.page);
@@ -2257,7 +2272,7 @@ async function generateSuggestions(message) {
     const current = await currentSuggestionDestination(message.tabId, snapshot);
     if (!current) throw new Error('The page or supporting evidence changed. Generate again.');
     const updated = await mutateRun(message.tabId, (run) => {
-      if (!sameSuggestionRun(run, snapshot)) return false;
+      if (!sameSuggestionRun(run, snapshot) || run.revision !== current.run.revision) return false;
       run.jobContext = jobContext;
       run.generatedSuggestions = run.generatedSuggestions || {};
       run.generatedSuggestions[field.id] = {
@@ -3243,7 +3258,7 @@ function suggestionRequestSnapshot(run, field, inspection, datasource, settings,
   const contextualRun = { ...run, jobContext };
   return {
     startedAt: run.startedAt,
-    runRevision: Number(run.revision) || 0,
+    waitingFor: run.waitingFor,
     pageSignature: run.pageSignature,
     frameId: run.frame?.frameId,
     field: aiFieldSnapshot(field),
@@ -3257,7 +3272,7 @@ function suggestionRequestSnapshot(run, field, inspection, datasource, settings,
 function sameSuggestionRun(run, snapshot) {
   return Boolean(run
     && run.startedAt === snapshot.startedAt
-    && Number(run.revision || 0) === snapshot.runRevision
+    && run.waitingFor === snapshot.waitingFor
     && run.pageSignature === snapshot.pageSignature
     && run.frame?.frameId === snapshot.frameId
     && SAVABLE_RUN_STATUSES.has(run.status)
@@ -3303,7 +3318,6 @@ async function scheduleAi(tabId,{retry=false}={}) {
   void tracePhoenixEvent('fill_page', {'ai.retry': Boolean(retry)}, sessionId, {traceContext, root: true, defer: true, input: {pageSignature: run.pageSignature, frameId: run.frame.frameId}});
   const settings=await getSettings();
   const [apiKey,typesafeApiKey]=await Promise.all([getApiKey(settings.aiProvider),getTypeSafeApiKey()]);
-  if(!apiKey && !(settings.typesafeEnabled && typesafeApiKey)) { traceSkip('missing_provider_key'); return; }
   const inspected=await sendToApplicationFrame(tabId,run,{type:'JOB_APP_INSPECT'});
   if(!inspected?.ok || pageSignature(inspected.inspection,run.frame)!==run.pageSignature) { traceSkip('page_changed_before_ai'); return; }
   const validated=await sendToApplicationFrame(tabId,run,{type:'JOB_APP_VALIDATE'});
@@ -3331,6 +3345,14 @@ async function scheduleAi(tabId,{retry=false}={}) {
     .sort((left,right)=>Number(Boolean(right.required))-Number(Boolean(left.required)));
   const unresolved=candidateFields.filter(field=>field.required);
   if(!candidateFields.length) { traceSkip('no_eligible_fields'); return; }
+  if(!apiKey && !jevReady) {
+    await mutateRun(tabId,current=>{
+      if(current.startedAt!==run.startedAt || current.pageSignature!==run.pageSignature) return false;
+      current.llmError=missingProviderKeyMessage(settings.aiProvider);
+    });
+    traceSkip('missing_provider_key');
+    return;
+  }
   const planner=run.aiOperations?.planner;
   const retryableStates=new Set(['failed','interrupted']);
   const semanticRetry=retry && unresolved.some(field=>run.semanticSearch?.[field.id]?.status==='failed');

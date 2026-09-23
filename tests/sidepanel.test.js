@@ -1459,6 +1459,35 @@ test('first rewrite completes in the visible editor after a background run refre
   } finally { harness.cleanup(); }
 });
 
+test('AI errors remain visible beside the field after a background panel refresh', async () => {
+  const run = {status:'waiting_user',applicationId:'ai-errors',pageSignature:'one',frameId:0,
+    actionRequired:[{fieldId:'why',label:'Why this role?'}],optionalUnresolved:[],reviewRequired:[],audit:[]};
+  const harness = await setupPanel({run,
+    generateResponse:{ok:false,error:'Add a Fireworks API key in Settings to use AI answers.'},
+    rewriteResponse:{ok:false,error:'Answer rewrite request timed out'},
+  });
+  try {
+    const doc = harness.dom.window.document;
+    doc.querySelector('[data-generate-suggestions]').click();
+    await panelTick();
+    harness.storageListeners.forEach(listener => listener({applicationRun:{newValue:{'7':{...run}}}},'session'));
+    assert.match(doc.querySelector('[data-draft-status]').textContent,/Fireworks API key.*Settings/);
+    assert.equal(doc.querySelector('[data-generate-suggestions]').disabled,false);
+    const draft = doc.querySelector('[data-answer-draft]');
+    draft.value = 'I built reliable systems.';
+    draft.dispatchEvent(new Event('input'));
+    doc.querySelector('[data-rewrite-answer]').click();
+    const prompt = doc.querySelector('[data-rewrite-prompt]');
+    prompt.value = 'Be concise.';
+    prompt.dispatchEvent(new Event('input'));
+    doc.querySelector('[data-submit-rewrite]').click();
+    await panelTick();
+    harness.storageListeners.forEach(listener => listener({applicationRun:{newValue:{'7':{...run}}}},'session'));
+    assert.match(doc.querySelector('[data-draft-status]').textContent,/timed out/);
+    assert.equal(doc.querySelector('[data-submit-rewrite]').disabled,false);
+  } finally { harness.cleanup(); }
+});
+
 test('empty drafts can generate directly, retry failure, and rewrite the generated answer', async () => {
   const run = {status: 'waiting_user', applicationId: 'generate', pageSignature: 'one', frameId: 0,
     actionRequired: [{fieldId: 'why', label: 'Why this company?'}], optionalUnresolved: [], reviewRequired: [], audit: []};

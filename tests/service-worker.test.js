@@ -3588,6 +3588,112 @@ test('manual same-document navigation exposes the new page without filling and c
   assert.equal(h.tabs.get(7).submitCalls, 0);
 });
 
+test('on-demand AI keeps a valid result after an unrelated background status update', async () => {
+  const h = createHarness({waitForAI:false,pagesByTab:{7:{pages:[{
+    page:{title:'Application',domain:'jobs.example.com'},
+    fields:[{id:'why',handle:'why-h',label:'Why are you a good fit?',type:'textarea',required:true}],
+    actions:[{id:'submit',label:'Submit application',kind:'submit'}],
+  }]}}});
+  await import(`../src/service-worker.js?on-demand-background=${Date.now()}`);
+  const started = await h.dispatch({type:'JOB_RUN_START',tabId:7});
+  h.localData.aiProvider='openai';
+  h.localData.openaiApiKey='synthetic-test-key';
+  let release;
+  const requested = new Promise(resolve => { globalThis.fetch = async (url) => {
+    assert.equal(url,'https://api.openai.com/v1/responses');
+    resolve();
+    return new Promise(done => { release = () => done(generatedResponse([{answer:'I built reliable systems.',evidenceKeys:[]}])); });
+  }; });
+  const pending = h.dispatch({type:'JOB_RUN_GENERATE_SUGGESTIONS',...draftOrigin(started.run,{id:'why',handle:'why-h'})});
+  await requested;
+  const run = h.sessionData.applicationRun['7'];
+  h.sessionData.applicationRun['7'] = {...run,revision:run.revision+1,aiOperations:{...run.aiOperations,other:{status:'completed'}}};
+  release();
+  const response = await pending;
+  assert.equal(response.ok,true,response.error);
+  assert.equal(response.run.generatedSuggestions.why.suggestions[0].answer,'I built reliable systems.');
+});
+
+test('missing selected-provider key shows an AI error and sends no request', async () => {
+  const h = createHarness({waitForAI:false,pagesByTab:{7:{pages:[{
+    page:{title:'Application',domain:'jobs.example.com'},
+    fields:[{id:'why',handle:'why-h',label:'Why this role?',type:'textarea',required:true}],
+    actions:[{id:'submit',label:'Submit application',kind:'submit'}],
+  }]}}});
+  h.localData.aiProvider='fireworks';
+  h.localData.fireworksApiKey='';
+  let requests = 0;
+  globalThis.fetch = async () => {requests++; throw new Error('Unexpected AI request');};
+  await import(`../src/service-worker.js?missing-ai-key=${Date.now()}`);
+  const started = await h.dispatch({type:'JOB_RUN_START',tabId:7});
+  const origin = draftOrigin(started.run,{id:'why',handle:'why-h'});
+  const generated = await h.dispatch({type:'JOB_RUN_GENERATE_SUGGESTIONS',...origin});
+  const rewritten = await h.dispatch({type:'JOB_RUN_REWRITE_ANSWER',...origin,draft:'I built systems.',instruction:'Be concise.'});
+  assert.equal(generated.ok,false);
+  assert.equal(rewritten.ok,false);
+  assert.match(generated.error,/Fireworks.*Settings/);
+  assert.match(rewritten.error,/Fireworks.*Settings/);
+  assert.match(h.sessionData.applicationRun['7'].llmError,/Fireworks.*Settings/);
+  assert.equal(requests,0);
+});
+
+test('SmartRecruiters screening is recognized when opened directly without identity or Next controls', async () => {
+  const path = '/oneclick-ui/company/Assent/publication/3ecc84c8-7ad3-485f-9937-ac5728efc2d9/screening';
+  const h = createHarness({pagesByTab:{7:{url:`https://jobs.smartrecruiters.com${path}`,frames:[{
+    frameId:0,context:{title:'Senior AI Engineer',pathname:path},pages:[{
+      page:{title:'Senior AI Engineer',domain:'jobs.smartrecruiters.com'},
+      fields:[
+        {id:'salary',label:'What are your annual salary expectations?',type:'text',currentValue:'Existing answer'},
+      ],actions:[],
+    }],
+  }]}}});
+  await import(`../src/service-worker.js?smart-screening-direct=${Date.now()}`);
+  const first = await h.dispatch({type:'JOB_RUN_START',tabId:7});
+  assert.equal(first.ok,true,first.error);
+  assert.equal(first.run.frame.frameId,0);
+  assert.equal(first.run.waitingFor === 'no_supported_controls',false);
+  await h.dispatch({type:'JOB_RUN_CHECK_PAGE',tabId:7});
+  assert.equal(h.tabs.get(7).frames[0].pages[0].fields[0].currentValue,'Existing answer');
+  assert.equal(h.tabs.get(7).submitCalls,0);
+});
+
+test('manual SmartRecruiters Next keeps one publication session and rescans screening', async () => {
+  const publication = '/oneclick-ui/company/Assent/publication/3ecc84c8-7ad3-485f-9937-ac5728efc2d9';
+  const h = createHarness({pagesByTab:{7:{url:`https://jobs.smartrecruiters.com${publication}/personal`,frames:[{
+    frameId:0,context:{title:'Senior AI Engineer',pathname:`${publication}/personal`},pages:[
+      {destination:{documentId:'first-doc',regionId:'first-form'},page:{title:'Job application',domain:'jobs.smartrecruiters.com'},fields:[{id:'email',label:'Email address',type:'email',required:true}],actions:[{id:'next',label:'Next',kind:'next'}]},
+      {destination:{documentId:'screening-doc',regionId:'screening-form'},page:{title:'Senior AI Engineer',domain:'jobs.smartrecruiters.com'},fields:[
+        {id:'salary',label:'What are your annual salary expectations?',type:'text',currentValue:'Existing answer'},
+        {id:'experience',label:'How many years of related experience do you have?',type:'select',required:true},
+      ],actions:[]},
+    ],
+  }]}}});
+  await import(`../src/service-worker.js?smart-screening-next=${Date.now()}`);
+  const first = await h.dispatch({type:'JOB_RUN_START',tabId:7});
+  assert.equal(first.run.frame.destination.documentId,'first-doc');
+  const tab = h.tabs.get(7);
+  tab.currentPage = 1;
+  tab.url = `https://jobs.smartrecruiters.com${publication}/screening`;
+  tab.frames[0].context.pathname = `${publication}/screening`;
+  const site = await h.dispatch({type:'JOB_APP_SITE_STATUS'}, {id:'test-extension',tab:{id:7,url:tab.url,documentId:'screening-doc'},frameId:0});
+  assert.equal(site.sessionActive,true);
+  const send = chrome.tabs.sendMessage;
+  chrome.tabs.sendMessage = async (tabId,message,options) => message.destination?.documentId === 'first-doc'
+    ? {ok:false,code:'destination_changed'} : send(tabId,message,options);
+  h.updatedListeners[0](7,{status:'complete'});
+  await waitUntil(() => h.sessionData.applicationRun?.['7']?.waitingFor === 'page_changed');
+  const changed = await h.dispatch({type:'JOB_APP_NAVIGATED'},{tab:{id:7},frameId:0});
+  assert.equal(changed.run.waitingFor,'page_changed');
+  assert.equal(changed.run.frame.destination.documentId,'screening-doc');
+  assert.equal(changed.run.pageNumber,2);
+  await h.dispatch({type:'JOB_RUN_CHECK_PAGE',tabId:7});
+  await h.dispatch({type:'JOB_RUN_CHECK_PAGE',tabId:7});
+  assert.equal(tab.frames[0].pages[1].fields[0].currentValue,'Existing answer');
+  assert.equal(tab.submitCalls,0);
+  const other = await h.dispatch({type:'JOB_APP_SITE_STATUS'}, {id:'test-extension',tab:{id:7,url:tab.url.replace(publication,publication.replace('3ecc84c8','another-id'))},frameId:0});
+  assert.equal(other.sessionActive,false);
+});
+
 
 test('manual replacement of an explicitly selected form refreshes the selection used by Fill this page', async () => {
   const destination = regionId => ({documentId:'document', regionId});
