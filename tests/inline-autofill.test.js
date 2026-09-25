@@ -459,6 +459,42 @@ test('coordinates flip and clamp to the frame viewport and update after scroll',
   assert.equal(parseFloat(f.host().style.top), 56);
 });
 
+test('dropdown search inputs get no inline suggestion and dropdown keys stay on the page', async t => {
+  const f = fixture(t, null, '<form><label>Name<input id="name"></label><button type="button" role="combobox" aria-label="Source" aria-expanded="true" aria-controls="source-options">Search</button><div id="source-options" role="listbox"><input id="dropdown-search" type="text"><div role="option">Recruiter</div></div></form>');
+  const dropdownSearch = f.document.getElementById('dropdown-search');
+  dropdownSearch.focus(); await tick();
+  assert.equal(f.host(), null);
+  f.field.focus(); await tick();
+  assert.equal(f.host().hidden, false);
+  const arrow = f.key('ArrowDown', {}, dropdownSearch);
+  assert.equal(arrow.defaultPrevented, false);
+  dropdownSearch.focus();
+  assert.equal(f.host().hidden, true);
+});
+
+test('suggestion handle drags and moves by arrow keys within the viewport, then resets', async t => {
+  const f = fixture(t); f.field.focus(); await new Promise(resolve => setTimeout(resolve, 25));
+  const handle = f.root().querySelector('[data-drag-handle]');
+  const initialLeft = parseFloat(f.host().style.left);
+  const initialTop = parseFloat(f.host().style.top);
+  handle.dispatchEvent(new f.dom.window.MouseEvent('pointerdown', {bubbles: true, composed: true, cancelable: true, button: 0, clientX: 20, clientY: 20}));
+  assert.equal(f.host().hidden, false);
+  f.dom.window.dispatchEvent(new f.dom.window.MouseEvent('pointermove', {clientX: 120, clientY: 100}));
+  assert.ok(parseFloat(f.host().style.left) > initialLeft);
+  assert.ok(parseFloat(f.host().style.top) > initialTop);
+  f.dom.window.dispatchEvent(new f.dom.window.MouseEvent('pointermove', {clientX: 10000, clientY: 10000}));
+  assert.ok(parseFloat(f.host().style.left) + parseFloat(f.host().style.width) <= f.dom.window.innerWidth);
+  assert.ok(parseFloat(f.host().style.top) + parseFloat(f.host().style.maxHeight) <= f.dom.window.innerHeight);
+  f.dom.window.dispatchEvent(new f.dom.window.MouseEvent('pointerup'));
+  const left = parseFloat(f.host().style.left);
+  assert.equal(f.key('ArrowLeft', {}, handle).defaultPrevented, true);
+  assert.ok(parseFloat(f.host().style.left) < left);
+  f.key('Escape', {}, handle);
+  f.field.click(); await new Promise(resolve => setTimeout(resolve, 25));
+  assert.equal(parseFloat(f.host().style.left), initialLeft);
+  assert.equal(parseFloat(f.host().style.top), initialTop);
+});
+
 test('invalidated extension shows recovery instructions and preserves form entries', async t => {
   const f = fixture(t, () => { throw new Error('Extension context invalidated.'); });
   f.document.querySelector('#bio').value = 'Unsaved application text';

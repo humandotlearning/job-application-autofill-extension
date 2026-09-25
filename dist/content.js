@@ -1504,6 +1504,11 @@ async function setCustomChoiceValue(document, element, answer, deadline = Infini
   if (hasNativeFormAction(element)) {
     return { ok: false, unresolved: true, reason: 'Refusing to activate a native submit/reset control' };
   }
+  const controlledIds = String(element.getAttribute('aria-controls') || element.getAttribute('aria-owns') || '').split(/\s+/).filter(Boolean);
+  const expectsClosure = element.hasAttribute('aria-expanded') || controlledIds.some((id) => {
+    const popup = rootElementById(element, id);
+    return !popup || !isVisible(popup);
+  });
   if (element.getAttribute('aria-expanded') !== 'true') element.click();
   const expected = normalizeText(answer);
   const initialText = normalizeText(element.textContent || '');
@@ -1565,6 +1570,23 @@ async function setCustomChoiceValue(document, element, answer, deadline = Infini
     : acceptedSingleValues.includes(displayed) || acceptedSingleValues.includes(backingValue);
   if (!displayedMatches && backingValue !== expected) {
     return { ok: false, unresolved: true, reason: 'The custom widget did not accept the selected option' };
+  }
+  if (!multiple && expectsClosure) {
+    const popup = composedClosest(matches[0], '[role="listbox"]');
+    const closed = () => element.getAttribute('aria-expanded') === 'false' || !popup?.isConnected || !isVisible(popup);
+    const waitForClose = async (timeoutMs) => {
+      const until = Math.min(deadline, Date.now() + timeoutMs);
+      while (!closed() && Date.now() < until) await new Promise((resolve) => setTimeout(resolve, 25));
+      return closed();
+    };
+    if (!await waitForClose(300)) {
+      element.dispatchEvent(new document.defaultView.KeyboardEvent('keydown', { key: 'Escape', bubbles: true, composed: true, cancelable: true }));
+      if (!await waitForClose(150)) return { ok: false, unresolved: true, reason: 'The selected dropdown option did not close the menu' };
+    }
+    const retained = normalizeText(fieldValue(document, element));
+    if (!acceptedSingleValues.includes(retained) && !acceptedSingleValues.includes(normalizeText(backingInput?.value || ''))) {
+      return { ok: false, unresolved: true, reason: 'The dropdown did not retain the selected option after closing' };
+    }
   }
   return { ok: true };
 }
@@ -2389,13 +2411,14 @@ function createLearningSession(document, { capture, send, onFinalSubmit, onReval
 
 function createInlineAutofill(document, {send, describe}) {
   const view = document.defaultView;
-  let host, shadow, dialog, question, searchInput, list, preview, status, use, generate, edit, findSaved, hint, retrySearch;
+  let host, shadow, dialog, dragHandle, question, searchInput, list, preview, status, use, generate, edit, findSaved, hint, retrySearch;
   let target = null, snapshot = null, sessionId = null, requestId = null;
   let answers = [], index = -1, epoch = 0, acceptance = null;
   let loading = false, retry = false, semanticSearching = false, semanticRetry = false, composing = false, disposed = false, restoringFocus = false;
   let searchTimer = null;
   let searchVersion = 0, searchPending = null, searchReady = false, searching = false;
   let positionFrame = null, mutationObserver = null, resizeObserver = null;
+  let drag = null, manualPosition = null;
   const listeners = [];
   const requestFrame = callback => view.requestAnimationFrame ? view.requestAnimationFrame(callback) : view.setTimeout(callback, 0);
   const cancelFrame = id => view.cancelAnimationFrame ? view.cancelAnimationFrame(id) : view.clearTimeout(id);
@@ -2405,6 +2428,7 @@ function createInlineAutofill(document, {send, describe}) {
   function eligible(element) {
     if (!element?.isConnected || element.ownerDocument !== document || isExtensionElement(element)
       || !((element.tagName === 'INPUT' && ['text', 'email', 'tel', 'url'].includes(element.type)) || element.tagName === 'TEXTAREA')) return null;
+    if (composedClosest(element, '[role="listbox"],[role="option"],[role="combobox"],[aria-haspopup="listbox"]')) return null;
     const field = describe(document, element);
     return field && !field.widget && !field.multiple && ['text', 'textarea', 'email', 'tel', 'url'].includes(field.type) ? field : null;
   }
@@ -2473,8 +2497,13 @@ function createInlineAutofill(document, {send, describe}) {
       [data-search] { width: 100%; margin: 0; padding: 9px 10px; border: 1px solid #bdcad8; border-radius: 7px;
         flex-shrink: 0; color: #17212b; background: #fff; font: inherit; }
       [data-secondary] { margin-top: 4px; }
+      [data-drag-handle] { align-self: flex-start; margin: 0 0 8px; padding: 3px 8px; font-size: 12px; cursor: grab; touch-action: none; }
+      [data-drag-handle]:active { cursor: grabbing; }
     `));
     dialog = node('section', null, {role: 'dialog', 'aria-label': 'Application answer suggestions'});
+    dragHandle = node('button', 'Move suggestions', {type: 'button', tabindex: '-1', 'data-drag-handle': '', 'aria-label': 'Move suggestions: drag or use arrow keys'});
+    dragHandle.addEventListener('pointerdown', startDrag);
+    dragHandle.addEventListener('keydown', moveWithKeys);
     question = node('p', null, {'data-question': ''});
     searchInput = node('input', null, {type: 'search', maxlength: '200', 'data-search': '', 'aria-label': 'Search previous answers', placeholder: 'Search previous answers'});
     searchInput.addEventListener('input', scheduleSearch);
@@ -2492,7 +2521,7 @@ function createInlineAutofill(document, {send, describe}) {
     secondary.append(findSaved, generate, edit);
     const results = node('div', null, {'data-results': ''});
     results.append(list, preview, secondary, hint);
-    dialog.append(question, searchInput, status, retrySearch, results, use);
+    dialog.append(dragHandle, question, searchInput, status, retrySearch, results, use);
     shadow.append(dialog);
   }
   function controlsMode(enabled) {
@@ -2558,6 +2587,33 @@ function createInlineAutofill(document, {send, describe}) {
   function cancelSession(id = sessionId, request = requestId) {
     if (id && request) message({type: 'JOB_INLINE_CANCEL', sessionId: id, requestId: request}).catch(() => {});
   }
+  function startDrag(event) {
+    if (event.button !== 0 || host.hidden) return;
+    position();
+    drag = {id: event.pointerId, x: event.clientX, y: event.clientY, left: parseFloat(host.style.left), top: parseFloat(host.style.top)};
+    dragHandle.focus();
+    try { dragHandle.setPointerCapture?.(event.pointerId); } catch {}
+    event.preventDefault();
+  }
+  function moveDrag(event) {
+    if (!drag || event.pointerId !== drag.id) return;
+    manualPosition = {left: drag.left + event.clientX - drag.x, top: drag.top + event.clientY - drag.y};
+    position();
+  }
+  function endDrag(event) {
+    if (!drag || (event && event.pointerId !== drag.id)) return;
+    try { dragHandle.releasePointerCapture?.(drag.id); } catch {}
+    drag = null;
+  }
+  function moveWithKeys(event) {
+    const steps = {ArrowLeft: [-1, 0], ArrowRight: [1, 0], ArrowUp: [0, -1], ArrowDown: [0, 1]};
+    const step = steps[event.key];
+    if (!step || event.ctrlKey || event.altKey || event.metaKey) return;
+    event.preventDefault();
+    manualPosition ||= {left: parseFloat(host.style.left), top: parseFloat(host.style.top)};
+    manualPosition = {left: manualPosition.left + step[0] * (event.shiftKey ? 48 : 16), top: manualPosition.top + step[1] * (event.shiftKey ? 48 : 16)};
+    position();
+  }
   function stopObserving() {
     mutationObserver?.disconnect(); resizeObserver?.disconnect();
     mutationObserver = resizeObserver = null;
@@ -2574,6 +2630,7 @@ function createInlineAutofill(document, {send, describe}) {
     if (searchInput) searchInput.value = '';
     searchVersion++; searchPending = null; searchReady = searching = false;
     target = snapshot = null; answers = []; index = -1; loading = false; retry = false; semanticSearching = semanticRetry = false;
+    endDrag(); manualPosition = null;
     stopObserving();
     if (host) { host.hidden = true; controlsMode(false); }
     if ((returnFocus || popupFocused) && previous?.isConnected) {
@@ -2667,11 +2724,14 @@ function createInlineAutofill(document, {send, describe}) {
     const above = Math.max(0, rect.top - topEdge - 14);
     const desiredHeight = Math.min(360, dialog.scrollHeight || 300);
     const flip = below < desiredHeight && above > below;
-    const popupHeight = Math.min(desiredHeight, flip ? above : below, Math.max(0, height - 16));
+    const popupHeight = Math.min(desiredHeight, manualPosition ? height - 16 : flip ? above : below, Math.max(0, height - 16));
+    const left = Math.max(leftEdge + 8, Math.min(manualPosition?.left ?? rect.left, leftEdge + width - popupWidth - 8));
+    const top = Math.max(topEdge + 8, Math.min(manualPosition?.top ?? (flip ? rect.top - popupHeight - 6 : rect.bottom + 6), topEdge + height - popupHeight - 8));
     host.style.width = `${popupWidth}px`;
     host.style.maxHeight = `${popupHeight}px`;
-    host.style.left = `${Math.max(leftEdge + 8, Math.min(rect.left, leftEdge + width - popupWidth - 8))}px`;
-    host.style.top = `${Math.max(topEdge + 8, Math.min(flip ? rect.top - popupHeight - 6 : rect.bottom + 6, topEdge + height - popupHeight - 8))}px`;
+    host.style.left = `${left}px`;
+    host.style.top = `${top}px`;
+    if (manualPosition) manualPosition = {left, top};
   }
   function show(element, field) {
     dismiss();
@@ -2702,6 +2762,7 @@ function createInlineAutofill(document, {send, describe}) {
   function activate(element) {
     if (disposed || composing || restoringFocus) return;
     if (element === host) return;
+    if (document.__jobApplicationFilling) { dismiss(); return; }
     const field = eligible(element);
     if (!field) { dismiss(); return; }
     if (target === element && !host?.hidden && fingerprint(field) === fingerprint(snapshot) && !retry) return;
@@ -2784,6 +2845,7 @@ function createInlineAutofill(document, {send, describe}) {
   function keydown(event) {
     if (composing || event.isComposing || event.keyCode === 229 || !target || host.hidden) return;
     const inPopup = event.composedPath().includes(host);
+    if (!inPopup && eventControl(event) !== target) return;
     if (event.key === 'Escape' && !event.ctrlKey && !event.altKey && !event.metaKey) {
       event.preventDefault(); dismiss({returnFocus: inPopup}); return;
     }
@@ -2828,10 +2890,13 @@ function createInlineAutofill(document, {send, describe}) {
   listen(document, 'focusout', event => {
     if (restoringFocus || !target) return;
     if (event.relatedTarget === host || event.relatedTarget === target) return;
-    if (event.composedPath().includes(host) && event.relatedTarget?.getRootNode() === shadow) return;
+    if (event.relatedTarget?.getRootNode() === shadow) return;
     dismiss();
   });
   listen(document, 'keydown', keydown, true);
+  listen(view, 'pointermove', moveDrag);
+  listen(view, 'pointerup', endDrag);
+  listen(view, 'pointercancel', endDrag);
   listen(document, 'input', event => {
     if (document.__jobApplicationFilling || eventControl(event)?.__jobApplicationAutofillDispatch || composing) return;
     if (eventControl(event) === target || eventControl(event) === deepActiveElement(document)) { acceptance = null; activate(event.composedPath().includes(host) ? host : eventControl(event)); }

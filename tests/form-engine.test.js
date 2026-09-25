@@ -318,9 +318,9 @@ test('includes external form-associated actions when classifying a submitter-les
 });
 
 test('fills a custom dropdown identified by a linked label', async () => {
-  const document = makeDocument('<form><label id="country-label" for="country">Country</label><button type="button" id="country" role="combobox" aria-labelledby="country-label" aria-controls="countries">Select one</button><div id="countries" role="listbox"><div role="option">India</div></div></form>');
+  const document = makeDocument('<form><label id="country-label" for="country">Country</label><button type="button" id="country" role="combobox" aria-labelledby="country-label" aria-expanded="true" aria-controls="countries">Select one</button><div id="countries" role="listbox"><div role="option">India</div></div></form>');
   const button = document.getElementById('country');
-  document.querySelector('[role="option"]').onclick = () => { button.textContent = 'India'; };
+  document.querySelector('[role="option"]').onclick = () => { button.textContent = 'India'; button.setAttribute('aria-expanded', 'false'); document.getElementById('countries').hidden = true; };
   const fields = collectFieldDescriptors(document);
   assert.equal(fields.length, 1);
   const result = await applyDecisions(document, planDeterministicFill(fields, [{ key: 'country', answer: 'India', sensitivity: 'safe', confirmationState: 'confirmed', matchKind: 'exact' }]));
@@ -375,14 +375,50 @@ test('leaves ambiguous numbered dropdown labels unresolved', async () => {
   assert.equal(selections, 0);
 });
 
-test('uses an already open dropdown without toggling it closed', async () => {
+test('uses an already open dropdown without clicking its trigger again', async () => {
   const document = makeDocument('<form><button id="country" type="button" role="combobox" aria-label="Country" aria-expanded="true" aria-controls="countries">Select one</button><ul id="countries" role="listbox"><li role="option">India</li></ul></form>');
   const button = document.getElementById('country');
-  button.onclick = () => { document.getElementById('countries').remove(); };
-  document.querySelector('[role="option"]').onclick = () => { button.textContent = 'India'; };
+  let triggerClicks = 0;
+  button.onclick = () => { triggerClicks++; document.getElementById('countries').remove(); };
+  document.querySelector('[role="option"]').onclick = () => { button.textContent = 'India'; button.setAttribute('aria-expanded', 'false'); document.getElementById('countries').hidden = true; };
   const result = await applyDecisions(document, [{ fieldId: 'country', action: 'fill', value: 'India', approved: true }]);
   assert.equal(result.applied.length, 1);
   assert.equal(button.textContent, 'India');
+  assert.equal(triggerClicks, 0);
+});
+
+test('closes a Workday-like single-choice dropdown with Escape after autofill selection', async () => {
+  const document = makeDocument('<form><label for="heard">How did you hear about us?</label><div><button id="heard" type="button" role="combobox" aria-expanded="false" aria-controls="heard-options">Search</button><input type="hidden"><div id="heard-options" role="listbox" hidden><div role="option" data-value="recruiter">Recruiter</div></div></div></form>');
+  const button = document.getElementById('heard');
+  const popup = document.getElementById('heard-options');
+  button.onclick = () => { button.setAttribute('aria-expanded', 'true'); popup.hidden = false; };
+  popup.firstChild.onclick = () => { button.textContent = 'Recruiter'; button.parentElement.querySelector('input').value = 'recruiter'; };
+  let escapes = 0;
+  button.onkeydown = event => { if (event.key === 'Escape') { escapes++; button.setAttribute('aria-expanded', 'false'); popup.hidden = true; } };
+  const result = await applyDecisions(document, [{ fieldId: 'heard', action: 'fill', value: 'Recruiter', approved: true }]);
+  assert.equal(result.applied.length, 1);
+  assert.equal(escapes, 1);
+  assert.equal(button.getAttribute('aria-expanded'), 'false');
+  assert.equal(popup.hidden, true);
+});
+
+test('does not report a single-choice dropdown as filled while its menu remains open', async () => {
+  const document = makeDocument('<form><button id="heard" type="button" role="combobox" aria-label="How did you hear about us?" aria-expanded="true" aria-controls="heard-options">Search</button><div id="heard-options" role="listbox"><div role="option">Recruiter</div></div></form>');
+  const button = document.getElementById('heard');
+  document.querySelector('[role="option"]').onclick = () => { button.textContent = 'Recruiter'; };
+  const result = await applyDecisions(document, [{ fieldId: 'heard', action: 'fill', value: 'Recruiter', approved: true }]);
+  assert.equal(result.applied.length, 0);
+  assert.equal(result.unresolved[0]?.reason, 'The selected dropdown option did not close the menu');
+});
+
+test('does not report a dropdown as filled when Escape discards its selection', async () => {
+  const document = makeDocument('<form><button id="heard" type="button" role="combobox" aria-label="How did you hear about us?" aria-expanded="true" aria-controls="heard-options">Search</button><div id="heard-options" role="listbox"><div role="option">Recruiter</div></div></form>');
+  const button = document.getElementById('heard');
+  document.querySelector('[role="option"]').onclick = () => { button.textContent = 'Recruiter'; };
+  button.onkeydown = event => { if (event.key === 'Escape') { button.textContent = 'Search'; button.setAttribute('aria-expanded', 'false'); document.getElementById('heard-options').hidden = true; } };
+  const result = await applyDecisions(document, [{ fieldId: 'heard', action: 'fill', value: 'Recruiter', approved: true }]);
+  assert.equal(result.applied.length, 0);
+  assert.equal(result.unresolved[0]?.reason, 'The dropdown did not retain the selected option after closing');
 });
 
 test('replaces a disabled native dropdown placeholder with a real selection', async () => {

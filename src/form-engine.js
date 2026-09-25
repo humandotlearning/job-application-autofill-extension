@@ -857,6 +857,11 @@ async function setCustomChoiceValue(document, element, answer, deadline = Infini
   if (hasNativeFormAction(element)) {
     return { ok: false, unresolved: true, reason: 'Refusing to activate a native submit/reset control' };
   }
+  const controlledIds = String(element.getAttribute('aria-controls') || element.getAttribute('aria-owns') || '').split(/\s+/).filter(Boolean);
+  const expectsClosure = element.hasAttribute('aria-expanded') || controlledIds.some((id) => {
+    const popup = rootElementById(element, id);
+    return !popup || !isVisible(popup);
+  });
   if (element.getAttribute('aria-expanded') !== 'true') element.click();
   const expected = normalizeText(answer);
   const initialText = normalizeText(element.textContent || '');
@@ -918,6 +923,23 @@ async function setCustomChoiceValue(document, element, answer, deadline = Infini
     : acceptedSingleValues.includes(displayed) || acceptedSingleValues.includes(backingValue);
   if (!displayedMatches && backingValue !== expected) {
     return { ok: false, unresolved: true, reason: 'The custom widget did not accept the selected option' };
+  }
+  if (!multiple && expectsClosure) {
+    const popup = composedClosest(matches[0], '[role="listbox"]');
+    const closed = () => element.getAttribute('aria-expanded') === 'false' || !popup?.isConnected || !isVisible(popup);
+    const waitForClose = async (timeoutMs) => {
+      const until = Math.min(deadline, Date.now() + timeoutMs);
+      while (!closed() && Date.now() < until) await new Promise((resolve) => setTimeout(resolve, 25));
+      return closed();
+    };
+    if (!await waitForClose(300)) {
+      element.dispatchEvent(new document.defaultView.KeyboardEvent('keydown', { key: 'Escape', bubbles: true, composed: true, cancelable: true }));
+      if (!await waitForClose(150)) return { ok: false, unresolved: true, reason: 'The selected dropdown option did not close the menu' };
+    }
+    const retained = normalizeText(fieldValue(document, element));
+    if (!acceptedSingleValues.includes(retained) && !acceptedSingleValues.includes(normalizeText(backingInput?.value || ''))) {
+      return { ok: false, unresolved: true, reason: 'The dropdown did not retain the selected option after closing' };
+    }
   }
   return { ok: true };
 }
