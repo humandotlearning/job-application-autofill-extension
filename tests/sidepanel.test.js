@@ -274,6 +274,7 @@ test('inline saved search remains selectable after its storage echo and uses the
   try {
     const card = harness.dom.window.document.querySelector('#inline-field-card');
     card.querySelector('[data-field-id]').click(); await panelTick();
+    card.querySelector('[data-search-query]').value = 'Other name';
     card.querySelector('[data-search-answers]').click(); await panelTick();
     harness.handoff(searched); await panelTick();
     card.querySelector('[data-search-result]').click();
@@ -377,7 +378,7 @@ test('panel hides opaque saved values without exposing an internal-ID control', 
   const harness = await setupPanel({ run });
   try {
     const list = harness.dom.window.document.querySelector('#action-required-list');
-    assert.match(list.textContent, /choose a value for Phone Device Type on the application page/i);
+    assert.match(list.textContent, /choose a value on the application page/i);
     assert.equal(list.querySelector('[data-internal-id]'), null);
     assert.equal(list.querySelector('[data-internal-id-popover]'), null);
     assert.doesNotMatch(list.textContent, new RegExp(opaqueValue, 'i'));
@@ -408,7 +409,14 @@ test('panel orders named fields before generic notices and emphasizes each quest
     const actionItems = [...doc.querySelectorAll('#action-required-list .result-item')];
     assert.deepEqual(actionItems.map((item) => item.querySelector('.result-label').textContent), ['First question', 'Later question', 'Second question', 'Field']);
     assert.equal(actionItems[0].querySelector('.result-label').tagName, 'H3');
-    assert.match(actionItems[0].textContent, /Enter or select an answer.*Check again/i);
+    assert.doesNotMatch(actionItems[0].textContent, /Enter or select an answer|No validated answer|Check again/i);
+    const title = actionItems[0].querySelector('.result-label button');
+    assert.equal(title.textContent, 'First question');
+    assert.equal(title.type, 'button');
+    title.click();
+    await panelTick();
+    assert.equal(harness.sentMessages.find(({type}) => type === 'JOB_RUN_FOCUS_FIELD').fieldId, 'first');
+    assert.match(actionItems[3].textContent, /Complete the unsupported or inaccessible widget manually/);
     assert.deepEqual([...doc.querySelectorAll('#optional-list .result-item .result-label')].map((item) => item.textContent), ['Optional question']);
     assert.deepEqual([...doc.querySelectorAll('#review-list .result-item .result-label')].map((item) => item.textContent), ['Review question']);
     assert.deepEqual([...doc.querySelectorAll('#audit-list .result-item .result-label')].map((item) => item.textContent), ['First question', 'Second question']);
@@ -1315,6 +1323,8 @@ test('unanswered fields can search saved answers and use a returned candidate', 
     row.querySelector('[data-search-result]').click();
     assert.equal(row.querySelector('[data-answer-draft]').value, '₹25,00,000');
     assert.equal(harness.sentMessages.find(({ type }) => type === 'JOB_RUN_SEARCH_ANSWERS').fieldId, 'salary');
+    assert.equal(harness.sentMessages.find(({ type }) => type === 'JOB_RUN_SEARCH_ANSWERS').query, 'salary');
+    assert.equal(harness.sentMessages.some(({type}) => type === 'JOB_RUN_SEMANTIC_SEARCH'), false);
   } finally { harness.cleanup(); }
 });
 
@@ -1330,10 +1340,11 @@ test('unanswered fields explicitly find one complete saved answer without changi
     assert.equal(card.open, true, 'field actions are visible without opening a disclosure');
     const row = harness.dom.window.document.querySelector('#action-required-list .result-item');
     const draft = row.querySelector('[data-answer-draft]');
-    assert.ok(row.querySelector('[data-find-saved-answer]').compareDocumentPosition(draft) & 4,
+    assert.ok(row.querySelector('[data-search-answers]').compareDocumentPosition(draft) & 4,
       'saved-answer search comes before the draft editor');
+    assert.equal(row.querySelectorAll('.answer-search button').length, 1);
     assert.equal(harness.sentMessages.some(({type}) => type === 'JOB_RUN_SEMANTIC_SEARCH'), false);
-    row.querySelector('[data-find-saved-answer]').click();
+    row.querySelector('[data-search-answers]').click();
     await panelTick();
     assert.equal(draft.value, '');
     const result = row.querySelector('[data-search-result]');
@@ -1356,12 +1367,49 @@ test('saved-answer search shows the actionable settings error instead of a no-ma
     error: 'Enable TypeSafe saved-answer search and add its API key in Settings.'}});
   try {
     const row = harness.dom.window.document.querySelector('#action-required-list .result-item');
-    row.querySelector('[data-find-saved-answer]').click();
+    row.querySelector('[data-search-answers]').click();
     await panelTick();
     assert.match(row.querySelector('.answer-search [role="status"]').textContent, /Enable TypeSafe.*Settings/);
     assert.doesNotMatch(row.querySelector('.answer-search').textContent, /No clear match/);
     assert.equal(pageMutationMessages(harness.sentMessages).length, 0);
   } finally { harness.cleanup(); }
+});
+
+test('the shared search form submits either mode, prevents duplicates, and retries failures', async () => {
+  for (const query of ['', '  company  ']) {
+    const run = {status: 'waiting_user', applicationId: 'search-retry', pageSignature: 'page',
+      actionRequired: [{fieldId: 'company', label: 'Company'}]};
+    let complete;
+    const respond = () => new Promise(resolve => { complete = resolve; });
+    const harness = await setupPanel({run, searchResponse: respond, semanticSearchResponse: respond});
+    try {
+      const row = harness.dom.window.document.querySelector('#action-required-list .result-item');
+      const form = row.querySelector('.answer-search');
+      const input = row.querySelector('[data-search-query]');
+      const button = row.querySelector('[data-search-answers]');
+      const type = query ? 'JOB_RUN_SEARCH_ANSWERS' : 'JOB_RUN_SEMANTIC_SEARCH';
+      input.value = query;
+      form.dispatchEvent(new harness.dom.window.Event('submit', {bubbles: true, cancelable: true}));
+      button.click();
+      assert.equal(harness.sentMessages.filter(message => message.type === type).length, 1);
+      assert.equal(input.disabled, true);
+      assert.equal(button.disabled, true);
+      complete({ok: false, error: 'Search unavailable. Try again.'});
+      await panelTick();
+      assert.equal(button.textContent, 'Retry');
+      assert.match(form.textContent, /Search unavailable/);
+      assert.equal(input.disabled, false);
+      button.click();
+      const request = harness.sentMessages.filter(message => message.type === type).at(-1);
+      if (query) assert.equal(request.query, 'company');
+      else assert.equal(request.retry, true);
+      complete({ok: true, semanticStatus: 'none', candidates: [], run});
+      await panelTick();
+      assert.equal(button.textContent, 'Search');
+      assert.match(form.textContent, query ? /No saved answers found/ : /No clear match/);
+      assert.equal(pageMutationMessages(harness.sentMessages).length, 0);
+    } finally { harness.cleanup(); }
+  }
 });
 
 test('inline semantic search preserves its editor during storage refresh and returns a selectable answer', async () => {
@@ -1372,7 +1420,7 @@ test('inline semantic search preserves its editor during storage refresh and ret
   try {
     const row = harness.dom.window.document.querySelector('#inline-field-list .result-item');
     const draft = row.querySelector('[data-answer-draft]');
-    row.querySelector('[data-find-saved-answer]').click();
+    row.querySelector('[data-search-answers]').click();
     await panelTick();
     const candidate = {sourceKey: 'new-source', sourceQuestion: 'Original question', answer: 'New saved answer', kind: 'semantic'};
     const updated = {...session, suggestions: {name: {field: session.field, candidates: [candidate]}}};
@@ -1411,12 +1459,17 @@ test('saved-answer search remains available beside a recommendation', async () =
     field: { id: 'salary', handle: 'salary-h' },
     candidates: [{ sourceKey: 'salary_first', answer: '₹20,00,000', sourceQuestion: 'Expected salary', kind: 'review' }],
   };
-  const run = { status: 'waiting_user', applicationId: 'run-search-recommendation', pageSignature: 'page-one', actionRequired: [{ fieldId: 'salary', label: 'Expected salary', suggestion }], optionalUnresolved: [], reviewRequired: [], audit: [] };
+  const run = { status: 'waiting_user', applicationId: 'run-search-recommendation', pageSignature: 'page-one', actionRequired: [{ fieldId: 'salary', label: 'Expected salary', suggestion, reason: 'Saved answer found — review it before use' }], optionalUnresolved: [], reviewRequired: [], audit: [] };
   const harness = await setupPanel({ run });
   try {
     const row = harness.dom.window.document.querySelector('#action-required-list .result-item');
     assert.ok(row.querySelector('[data-search-query]'));
     assert.ok(row.querySelector('[data-search-answers]'));
+    assert.equal(row.querySelectorAll('[data-generate-suggestions]').length, 1);
+    assert.equal(row.querySelector('.generated-drafts'), null);
+    assert.equal(row.querySelector('.result-reason'), null);
+    assert.equal(row.querySelector('[data-draft-status]').hidden, true);
+    assert.doesNotMatch(row.textContent, /Show on page|Find saved answer|Generate a new answer|Enter or select an answer/);
   } finally { harness.cleanup(); }
 });
 

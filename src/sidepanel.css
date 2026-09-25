@@ -249,10 +249,10 @@ button:disabled { cursor: default; opacity: .55; }
 .result-item:first-child { border-top: 0; }
 .result-label { max-width: 100%; margin: 0; color: var(--color-text); font-size: var(--font-lg); line-height: var(--line-tight); font-weight: 500; letter-spacing: var(--tracking-heading); overflow-wrap: anywhere; }
 .result-label.collapsed { max-height: 3.2em; overflow: hidden; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; }
+.field-link { max-width: 100%; min-height: var(--size-compact-control); padding: 0; border: 0; border-radius: var(--radius-mark); background: transparent; color: var(--color-accent); font: inherit; text-align: left; overflow-wrap: anywhere; text-decoration: underline; text-decoration-color: var(--color-border-strong); text-underline-offset: 3px; }
+.field-link:hover:not(:disabled) { background: transparent; text-decoration-color: currentColor; }
 .result-detail,
-.result-reason,
-.result-next-action { display: block; margin-top: var(--space-xxs); color: var(--color-text-muted); font-size: var(--font-xs); overflow-wrap: anywhere; }
-.result-next-action { color: var(--color-text); font-weight: 500; }
+.result-reason { display: block; margin-top: var(--space-xxs); color: var(--color-text-muted); font-size: var(--font-xs); overflow-wrap: anywhere; }
 .inline-action { min-height: var(--size-compact-control); margin-top: var(--space-sm); padding: var(--space-xs) var(--space-sm); color: var(--color-text); background: var(--color-surface-raised); font-size: var(--font-xs); }
 
 .saved-evidence,
@@ -288,9 +288,10 @@ button:disabled { cursor: default; opacity: .55; }
 .answer-field-status { margin: var(--space-xs) 0 0; color: var(--color-warning); font-size: var(--font-xs); }
 .generated-drafts { display: grid; gap: var(--space-sm); margin-top: var(--space-md); }
 .answer-search, .employment-choice { display: grid; gap: var(--space-xs); margin-top: var(--space-md); }
-.answer-search { grid-template-columns: 1fr auto; }
-.answer-search > [data-find-saved-answer] { grid-column: 1 / -1; }
+.answer-search { grid-template-columns: minmax(0, 1fr) auto; }
+.answer-search > input { min-width: 0; }
 .answer-search > div { grid-column: 1 / -1; display: grid; gap: var(--space-xs); }
+.answer-search > div:empty { display: none; }
 .generated-drafts-heading { color: var(--color-text); font-size: var(--font-xs); font-weight: 500; }
 .generated-draft { padding: var(--space-sm); border: var(--border-width) solid var(--color-border); color: var(--color-text); font-size: var(--font-sm); line-height: var(--line-body); overflow-wrap: anywhere; }
 .generated-draft button { min-height: var(--size-compact-control); margin-top: var(--space-sm); padding: var(--space-xs) var(--space-sm); color: var(--color-text); background: transparent; font-size: var(--font-xs); }
@@ -298,7 +299,7 @@ button:disabled { cursor: default; opacity: .55; }
 .generated-draft button:focus-visible { border-color: var(--color-accent); color: var(--color-accent-ink); background: var(--color-accent); }
 .generated-drafts-context { color: var(--color-warning); font-size: var(--font-xs); }
 
-.job-description-editor { color: var(--color-text-muted); font-size: var(--font-xs); }
+.job-description-editor { margin-bottom: var(--space-sm); color: var(--color-text-muted); font-size: var(--font-xs); }
 .job-description-editor summary { cursor: pointer; color: var(--color-text); font-weight: 500; }
 .job-description-editor textarea { margin-top: var(--space-sm); color: var(--color-text); background: var(--color-surface-inset); }
 .saved-evidence button[data-choose-answer] { border-color: var(--color-accent); color: var(--color-accent-ink); background: var(--color-accent); }

@@ -621,12 +621,12 @@ function answerWorkspace(item, displayLabel, responseHandler = response => rende
   const workspace = document.createElement('section');
   workspace.className = 'answer-workspace';
   const workspaceLabel = document.createElement('label');
-  workspaceLabel.textContent = 'Answer to send to the form';
+  workspaceLabel.textContent = 'Your answer';
   const textarea = document.createElement('textarea');
   textarea.className = 'answer-draft';
   textarea.dataset.answerDraft = 'true';
   textarea.value = state.answer;
-  textarea.placeholder = item.generatedSuggestion ? 'Choose an AI draft, or write your own.' : item.suggestion ? 'Choose a saved answer, or write your own.' : 'Write the answer you want to send to the form.';
+  textarea.placeholder = 'Write an answer…';
   textarea.setAttribute('aria-label', `Answer for ${displayLabel}`);
   textarea.readOnly = Boolean(state.answer.trim() && item.suggestion && !state.editing);
   workspaceLabel.htmlFor = `answer-draft-${draftKey(origin, origin.fieldId)}`;
@@ -641,7 +641,7 @@ function answerWorkspace(item, displayLabel, responseHandler = response => rende
   const rewrite = document.createElement('button');
   rewrite.type = 'button';
   rewrite.dataset.rewriteAnswer = 'true';
-  rewrite.textContent = 'Ask AI to rewrite';
+  rewrite.textContent = 'Rewrite';
   const generate = document.createElement('button');
   generate.type = 'button';
   generate.dataset.generateSuggestions = 'true';
@@ -666,8 +666,8 @@ function answerWorkspace(item, displayLabel, responseHandler = response => rende
   const contextSummary = [jobContext.role, jobContext.company].filter(Boolean).join(' at ');
   const context = document.createElement('p');
   context.className = 'answer-job-context';
-  context.textContent = contextSummary ? `Tailoring context: ${contextSummary}`
-    : jobContext.jobDescription ? 'Tailoring context: job description detected' : 'Add the job description to tailor this answer.';
+  context.textContent = contextSummary || (jobContext.jobDescription ? 'Job description added' : '');
+  context.hidden = !context.textContent;
   const contextEditor = document.createElement('details');
   contextEditor.className = 'job-description-editor';
   contextEditor.hidden = Boolean(jobContext.role || jobContext.jobDescription);
@@ -714,7 +714,9 @@ function answerWorkspace(item, displayLabel, responseHandler = response => rende
     textarea.disabled = pending && !origin.inlineSessionId;
     prompt.disabled = pending;
     edit.disabled = pending || !state.answer.trim();
+    edit.hidden = !textarea.readOnly;
     rewrite.disabled = pending || !state.answer.trim();
+    rewrite.hidden = !state.answer.trim();
     submitRewrite.disabled = pending || !state.answer.trim() || !prompt.value.trim();
     retryRewrite.disabled = pending || !state.lastRewrite;
     restoreDraft.disabled = pending || !state.previousDraft;
@@ -730,7 +732,8 @@ function answerWorkspace(item, displayLabel, responseHandler = response => rende
     generate.textContent = state.pending === 'generate' ? 'Generating…' : 'Generate AI answer';
     submitRewrite.textContent = ['rewrite', 'tailor'].includes(state.pending) ? 'Rewriting…' : 'Rewrite draft';
     workspace.setAttribute('aria-busy', String(pending));
-    feedback.textContent = state.feedback || 'Generate from saved answers, or write a draft. Review before sending.';
+    feedback.textContent = state.feedback || '';
+    feedback.hidden = !feedback.textContent;
   };
   // A storage refresh can replace this editor before an AI request returns.
   // Always refresh the current editor, not the detached request-time nodes.
@@ -898,7 +901,7 @@ function itemRow(item, { focus = false, detail = '', responseHandler = response 
   const candidates = Array.isArray(item.suggestion?.candidates) ? item.suggestion.candidates : [];
   const readableCandidates = candidates.filter((candidate) => !isOpaqueIdentifier(candidate.answer));
   const onlyOpaqueSuggestions = candidates.length > 0 && readableCandidates.length === 0;
-  const generated = item.generatedSuggestion || (item.suggestion && readableCandidates.length && !item.filled ? {suggestions: []} : null);
+  const generated = item.generatedSuggestion;
   const hasReadableGeneratedDraft = Array.isArray(generated?.suggestions)
     && generated.suggestions.some((suggestion) => !isOpaqueIdentifier(suggestion.answer));
   const labelCandidates = [item.label, item.question, item.fieldId].filter(Boolean).map((value) => String(value));
@@ -907,16 +910,12 @@ function itemRow(item, { focus = false, detail = '', responseHandler = response 
   const itemValue = item.value ?? item.answer;
   const hasOpaqueValue = isOpaqueIdentifier(itemValue);
   const unclearQuestion = item.labelConfidence === 'low';
-  const fieldAction = focus && item.fieldId && !item.filled
-    ? onlyOpaqueSuggestions
-      ? `Choose a value for ${displayLabel} on the application page, then click Check again.`
-      : hasOpaqueValue
-        ? 'This saved value cannot be used automatically.'
-        : itemValue
-          ? 'Update this value on the application page, then click Check again.'
-          : 'Enter or select an answer on the application page, then click Check again.'
-    : '';
-  const hasPrimaryDetail = Boolean(detail || onlyOpaqueSuggestions || itemValue || fieldAction);
+  const reason = [
+    'No validated answer is available', 'No local answer matched this field',
+    'Saved answer found — review it before use',
+    'Relevant saved evidence available — approve an answer before use',
+    'AI drafts are ready for review before sending',
+  ].includes(item.reason) ? '' : item.reason;
   const label = document.createElement('h3');
   label.className = 'result-label';
   label.textContent = displayLabel;
@@ -924,14 +923,14 @@ function itemRow(item, { focus = false, detail = '', responseHandler = response 
   const value = document.createElement('span');
   value.className = 'result-detail';
   if (detail) value.textContent = detail;
-  else if (onlyOpaqueSuggestions) value.textContent = fieldAction;
+  else if (onlyOpaqueSuggestions) value.textContent = 'Choose a value on the application page.';
   else if (hasOpaqueValue) {
-    value.append(document.createTextNode(`${fieldAction || 'This saved value cannot be used automatically.'} `));
+    value.append(document.createTextNode('This saved value cannot be used automatically. '));
     value.append(internalIdDisclosure(itemValue, 'Internal answer ID'));
   } else if (itemValue) value.append(answerNode(itemValue, panelDetailKey(origin, 'value')));
-  else if (unclearQuestion) value.textContent = `${item.nearbyContext ? `Nearby text: ${item.nearbyContext}. ` : ''}Use Show on page to identify this question, then write your answer.`;
-  else value.textContent = fieldAction || item.reason || 'Review this field';
-  content.append(label, value);
+  else if (unclearQuestion) value.textContent = item.nearbyContext || 'Check this question on the page.';
+  content.append(label);
+  if (value.textContent) content.append(value);
   if (item.filled) {
     const filled = document.createElement('span');
     filled.className = 'pill answer-filled';
@@ -951,25 +950,20 @@ function itemRow(item, { focus = false, detail = '', responseHandler = response 
     });
     label.after(expand);
   }
-  if (item.reason && hasPrimaryDetail) {
-    const reason = document.createElement('p');
-    reason.className = 'result-reason';
-    reason.textContent = item.reason;
-    content.append(reason);
-  }
-  if (fieldAction && itemValue && !hasOpaqueValue && !onlyOpaqueSuggestions) {
-    const nextAction = document.createElement('p');
-    nextAction.className = 'result-next-action';
-    nextAction.textContent = fieldAction;
-    content.append(nextAction);
+  if (reason) {
+    const notice = document.createElement('p');
+    notice.className = 'result-reason';
+    notice.textContent = reason;
+    content.append(notice);
   }
 
   if (focus && item.fieldId) {
     const button = document.createElement('button');
     button.type = 'button';
-    button.className = 'inline-action';
+    button.className = 'field-link';
     button.dataset.fieldId = item.fieldId;
-    button.textContent = 'Show on page';
+    button.textContent = displayLabel;
+    button.title = 'Show on page';
     if (origin.inlineSessionId) button.addEventListener('click', async () => {
       try {
         const response = await sendFieldAction('JOB_RUN_FOCUS_FIELD', origin);
@@ -977,7 +971,7 @@ function itemRow(item, { focus = false, detail = '', responseHandler = response 
         setStatus('Showing the matching field on the application page.');
       } catch (error) { setStatus(error.message, 'error'); }
     });
-    content.append(button);
+    label.firstChild.replaceWith(button);
   }
   const workspace = focus && item.fieldId && (!onlyOpaqueSuggestions || hasReadableGeneratedDraft)
     ? answerWorkspace(item, displayLabel, responseHandler)
@@ -1013,18 +1007,17 @@ function itemRow(item, { focus = false, detail = '', responseHandler = response 
     content.append(workspace.workspace);
   }
   if (workspace && !item.filled) {
-    const search = document.createElement('div');
+    const search = document.createElement('form');
     search.className = 'answer-search';
     const query = document.createElement('input');
     query.dataset.searchQuery = 'true';
     query.placeholder = 'Search saved answers';
     query.setAttribute('aria-label', 'Search previous answers');
+    query.title = 'Leave blank to find an answer for this question';
     query.maxLength = 200;
     query.value = workspace.state.searchQuery;
     const button = document.createElement('button');
-    button.type = 'button'; button.dataset.searchAnswers = 'true'; button.textContent = 'Search';
-    const semanticButton = document.createElement('button');
-    semanticButton.type = 'button'; semanticButton.dataset.findSavedAnswer = 'true'; semanticButton.textContent = 'Find saved answer';
+    button.type = 'submit'; button.dataset.searchAnswers = 'true'; button.textContent = 'Search';
     const results = document.createElement('div');
     results.setAttribute('role', 'status');
     const showCandidates = (candidates, emptyText, complete = false) => {
@@ -1042,63 +1035,50 @@ function itemRow(item, { focus = false, detail = '', responseHandler = response 
       }
       if (!results.children.length) results.textContent = emptyText;
     };
-    button.addEventListener('click', async () => {
+    search.addEventListener('submit', async (event) => {
+      event.preventDefault();
       if (button.disabled) return;
-      const submittedQuery = workspace.state.searchQuery.trim();
+      workspace.state.searchQuery = query.value;
+      const submittedQuery = query.value.trim();
       button.disabled = true;
+      button.textContent = 'Searching…';
       query.disabled = true;
-      results.replaceChildren();
+      results.textContent = 'Searching saved answers…';
       if (origin.inlineSessionId) workspace.state.pending = 'search';
       try {
-        const response = await sendFieldAction('JOB_RUN_SEARCH_ANSWERS', origin, { fieldId: origin.fieldId, query: submittedQuery });
+        const response = submittedQuery
+          ? await sendFieldAction('JOB_RUN_SEARCH_ANSWERS', origin, { query: submittedQuery })
+          : await sendFieldAction('JOB_RUN_SEMANTIC_SEARCH', origin, { retry: button.dataset.retry === 'true' });
         if (!search.isConnected || workspace.state.searchQuery.trim() !== submittedQuery) return;
         if (!response?.ok) throw new Error(response?.error || 'Could not search saved answers.');
         if (origin.inlineSessionId) responseHandler(response, {preserveContent: true});
-        showCandidates(response.candidates, 'No saved answers found.');
-      } catch (error) { if (search.isConnected) setStatus(error.message, 'error'); } finally {
+        if (!submittedQuery && !['matched', 'none', 'skipped'].includes(response.semanticStatus)) {
+          throw new Error('Couldn’t search saved answers—try again.');
+        }
+        button.dataset.retry = 'false';
+        showCandidates(response.candidates, submittedQuery ? 'No saved answers found.' : 'No clear match.', !submittedQuery);
+      } catch (error) {
+        button.dataset.retry = 'true';
+        if (search.isConnected) results.textContent = error.message;
+      } finally {
         if (workspace.state.pending === 'search') workspace.state.pending = null;
         button.disabled = false;
+        button.textContent = button.dataset.retry === 'true' ? 'Retry' : 'Search';
         query.disabled = false;
         workspace.updateControls();
       }
     });
-    semanticButton.addEventListener('click', async () => {
-      if (semanticButton.disabled) return;
-      semanticButton.disabled = true; results.textContent = 'Searching saved answers…';
-      if (origin.inlineSessionId) workspace.state.pending = 'search';
-      try {
-        const response = await sendFieldAction('JOB_RUN_SEMANTIC_SEARCH', origin, {fieldId:origin.fieldId,retry:semanticButton.dataset.retry==='true'});
-        if (!search.isConnected) return;
-        if (!response?.ok) throw new Error(response?.error || 'Couldn’t search saved answers—try again.');
-        if (origin.inlineSessionId) responseHandler(response, {preserveContent: true});
-        if (response.semanticStatus === 'matched') {
-          semanticButton.dataset.retry = 'false'; semanticButton.textContent = 'Find saved answer';
-          showCandidates(response.candidates, 'No clear match.', true);
-        } else if (response.semanticStatus === 'none' || response.semanticStatus === 'skipped') {
-          semanticButton.dataset.retry = 'false'; semanticButton.textContent = 'Find saved answer'; results.textContent = 'No clear match.';
-        } else {
-          semanticButton.dataset.retry = 'true'; semanticButton.textContent = 'Try saved-answer search again'; results.textContent = 'Couldn’t search saved answers—try again.';
-        }
-      } catch (error) {
-        semanticButton.dataset.retry = 'true'; semanticButton.textContent = 'Try saved-answer search again';
-        if (search.isConnected) results.textContent = error.message;
-      } finally {
-        if (workspace.state.pending === 'search') workspace.state.pending = null;
-        semanticButton.disabled = false;
-        workspace.updateControls();
-      }
-    });
-    query.addEventListener('input', () => { workspace.state.searchQuery = query.value; results.replaceChildren(); });
-    search.append(semanticButton, query, button, results);
+    query.addEventListener('input', () => { workspace.state.searchQuery = query.value; button.dataset.retry = 'false'; button.textContent = 'Search'; results.replaceChildren(); });
+    search.append(query, button, results);
     content.insertBefore(search, workspace.workspace);
   }
-  if (generated) {
+  if (generated && (hasReadableGeneratedDraft || generated.missingContext)) {
     const drafts = Array.isArray(generated.suggestions) ? generated.suggestions : [];
     const draftList = document.createElement('div');
     draftList.className = 'generated-drafts';
     const heading = document.createElement('p');
     heading.className = 'generated-drafts-heading';
-    heading.textContent = drafts.length ? 'Suggested answers' : generated.missingContext ? 'More context needed' : 'Generate a new answer';
+    heading.textContent = hasReadableGeneratedDraft ? 'Suggested answers' : 'More context needed';
     draftList.append(heading);
     for (const suggestion of drafts) {
       if (isOpaqueIdentifier(suggestion.answer)) continue;
@@ -1143,37 +1123,6 @@ function itemRow(item, { focus = false, detail = '', responseHandler = response 
       context.textContent = generated.missingContext;
       draftList.append(context);
     }
-    const regenerate = document.createElement('button');
-    regenerate.type = 'button';
-    regenerate.className = 'inline-action';
-    regenerate.dataset.generateSuggestions = 'true';
-    regenerate.textContent = drafts.length ? 'Generate new answer' : 'Generate answer';
-    regenerate.addEventListener('click', async () => {
-      if (!workspace || workspace.state.pending) return;
-      const jobDescription = String(workspace.workspace.querySelector('[data-job-description]')?.value ?? workspace.state.jobDescription).trim();
-      workspace.state.jobDescription = jobDescription;
-      const actionRevision = runRevision;
-      workspace.state.pending = 'generate';
-      workspace.updateControls();
-      regenerate.disabled = true;
-      regenerate.textContent = 'Generating…';
-      try {
-        const response = await sendFieldAction('JOB_RUN_GENERATE_SUGGESTIONS', workspace.origin, { jobDescription });
-        if (!response?.ok || (origin.inlineSessionId ? !response.inlineSession : !response.run)) throw new Error(response?.error || 'Could not generate answer suggestions.');
-        if (origin.inlineSessionId || canRenderActionResponse(response.run, actionRevision)) {
-          workspace.state.pending = null;
-          responseHandler(response);
-          setStatus('New suggestions are ready for review.');
-        } else setStatus('The page changed while suggestions were prepared. Check the page again.', 'error');
-      } catch (error) { setStatus(error.message, 'error'); }
-      finally {
-        workspace.state.pending = null;
-        regenerate.disabled = false;
-        regenerate.textContent = drafts.length ? 'Generate new answer' : 'Generate answer';
-        workspace.updateControls();
-      }
-    });
-    draftList.append(regenerate);
     content.insertBefore(draftList, workspace?.workspace || null);
   }
   if (item.suggestion && !item.filled) {
