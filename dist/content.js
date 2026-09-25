@@ -1604,15 +1604,20 @@ async function fillElement(document, element, answer, deadline = Infinity) {
 }
 
 function elementsForField(document, fieldId) {
+  return withDomSnapshot(document, () => elementsForFieldSnapshot(document, fieldId));
+}
+
+function elementsForFieldSnapshot(document, fieldId) {
   const nativeElements = formElements(document);
-  const nativeMatch = nativeElements.find((element, index) => fieldIdentity(element, index, [...nativeElements, ...customWidgetElements(document)]) === fieldId);
-  if (nativeMatch) return [nativeMatch];
   const customFields = customWidgetElements(document);
-  const generatedCustomIndex = customFields.findIndex((element, index) => fieldIdentity(element, nativeElements.length + index, [...nativeElements, ...customFields]) === fieldId);
+  const allElements = [...nativeElements, ...customFields];
+  const nativeMatch = nativeElements.find((element, index) => fieldIdentity(element, index, allElements) === fieldId);
+  if (nativeMatch) return [nativeMatch];
+  const generatedCustomIndex = customFields.findIndex((element, index) => fieldIdentity(element, nativeElements.length + index, allElements) === fieldId);
   if (generatedCustomIndex >= 0) return [customFields[generatedCustomIndex]];
   const byId = document.getElementById(fieldId);
   if (byId && (isSupported(byId) || customFields.includes(byId))) return [byId];
-  return [...nativeElements, ...customFields]
+  return allElements
     .filter((element) => element.name === fieldId || element.id === fieldId);
 }
 
@@ -1873,12 +1878,14 @@ async function applyDecisions(document, decisions = [], { deadline = Infinity, b
       break;
     }
     if (Date.now() >= deadline) { result.unresolved.push({ fieldId: decision.fieldId, reason: 'Autofill deadline reached' }); continue; }
-    const field = currentField(document, decision.fieldId);
+    const {field, element} = withDomSnapshot(document, () => ({
+      field: currentField(document, decision.fieldId),
+      element: elementForField(document, decision.fieldId),
+    }));
     if (!field || (decision.handle && decision.handle !== field.handle)) {
       result.failed.push({ fieldId: decision.fieldId, reason: 'Field is no longer on the page' });
       continue;
     }
-    const element = elementForField(document, decision.fieldId);
     if (decision.action === 'keep') {
       result.kept.push({ fieldId: field.id, value: field.currentValue });
       addReviewIfNeeded(result, field, decision, field.currentValue);
@@ -1930,12 +1937,15 @@ async function applyDecisions(document, decisions = [], { deadline = Infinity, b
     const fillResult = await fillElement(document, element, decision.value, deadline);
     const immediateValue = fieldValue(document, element);
     await waitForDocumentSettled(document, { quietMs: 75, minWaitMs: 120, timeoutMs: Math.max(0, Math.min(400, deadline - Date.now())) });
-    const retained = fieldValue(document, element);
+    const {retained, retainedField} = withDomSnapshot(document, () => ({
+      retained: fieldValue(document, element),
+      retainedField: currentField(document, field.id),
+    }));
     const expected = field.type === 'checkbox' ? (/^(yes|true|checked)$/i.test(String(decision.value)) ? 'Yes' : 'No') : String(decision.value).trim();
     const valuesEqual = (left, right) => field.multiple
       ? left.split(/\s*[,;]\s*/).sort().join('|') === right.split(/\s*[,;]\s*/).sort().join('|')
       : left === right;
-    if (fillResult?.ok && (!valuesEqual(retained, field.widget === 'custom' ? immediateValue : expected) || !currentField(document, field.id) || currentField(document, field.id).handle !== field.handle)) {
+    if (fillResult?.ok && (!valuesEqual(retained, field.widget === 'custom' ? immediateValue : expected) || retainedField?.handle !== field.handle)) {
       result.failed.push({ fieldId: field.id, reason: 'The control did not retain the exact approved value after settling' });
       continue;
     }

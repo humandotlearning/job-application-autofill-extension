@@ -192,6 +192,7 @@ function createHarness({
           }
           await page.beforeApply?.({ page, message, tabId, frameId });
           const failed = [];
+          const applied = [];
           for (const decision of message.decisions || []) {
             if (decision.action !== 'fill') continue;
             const field = page.fields.find(field => field.id === decision.fieldId);
@@ -202,11 +203,14 @@ function createHarness({
               continue;
             }
             if (!page.values) page.values = {};
-            if (!Object.prototype.hasOwnProperty.call(page.values, decision.fieldId)) page.values[decision.fieldId] = decision.value;
+            if (!Object.hasOwn(page.values, decision.fieldId) || Object.hasOwn(decision, 'expectedRawValue')) {
+              page.values[decision.fieldId] = decision.value;
+            }
+            applied.push({ fieldId: decision.fieldId, value: decision.value });
             if (decision.matchKind === 'semantic') field.provenance = 'autofill';
           }
           page.onApply?.({ page, decisions: message.decisions || [] });
-          return { ok: true, result: { applied: [], kept: [], reviewRequired: [], unresolved: [], failed } };
+          return { ok: true, result: { applied, kept: [], reviewRequired: [], unresolved: [], failed } };
         }
         if (message.type === 'JOB_APP_VALIDATE') {
           const validation = await page.onValidate?.({ page, tabId, frameId });
@@ -3277,6 +3281,93 @@ test('rewrite rejects unsafe requests and model failures without mutating a draf
   assert.equal(network.ok, false);
   assert.deepEqual(harness.tabs.get(7).frames[0].pages[0].values || {}, valuesBefore);
   assert.deepEqual(harness.localData.answerRecords, recordsBefore);
+});
+
+test('filled answers can be tailored and replaced only while the verified field receipt is current', async () => {
+  const harness = createHarness({
+    answerRecords: [{key: 'story', question: 'Project history', answer: 'I delivered a reliable platform.', type: 'textarea', sensitivity: 'safe'}],
+    pagesByTab: {7: {pages: [{
+      page: {title: 'Application', domain: 'example.test', role: 'Platform Engineer'},
+      fields: [{id: 'summary', handle: 'summary-h', label: 'Project history', type: 'textarea', required: true, rawValue: '', editRevision: 0}],
+      actions: [{id: 'submit', label: 'Submit application', kind: 'submit', type: 'submit'}],
+    }] }},
+  });
+  harness.localData.openaiApiKey = 'synthetic-test-key';
+  globalThis.fetch = async () => ({ok: true, status: 200, statusText: 'OK',
+    json: async () => ({output: [{content: [{type: 'output_text', text: JSON.stringify({answer: 'I delivered a reliable platform for this role.'})}]}]})});
+  await import(`../src/service-worker.js?replacement=${Date.now()}`);
+  const started = await harness.dispatch({type: 'JOB_RUN_START', tabId: 7});
+  const origin = draftOrigin(started.run, {id: 'summary', handle: 'summary-h'});
+  const approved = await harness.dispatch({type: 'JOB_RUN_APPROVE_SUGGESTION', ...origin, sourceKey: 'story'});
+  assert.equal(approved.ok, true, approved.error);
+  assert.deepEqual(approved.run.appliedAnswers.summary.replacement, {rawValue: 'I delivered a reliable platform.', editRevision: 0});
+
+  const replacement = approved.run.appliedAnswers.summary.replacement;
+  const rewritten = await harness.dispatch({type: 'JOB_RUN_REWRITE_ANSWER', ...origin, sourceKey: 'story',
+    draft: 'I delivered a reliable platform.', instruction: 'Tailor this to the role.', tailorToJob: true, replacement});
+  assert.equal(rewritten.ok, true, rewritten.error);
+  const replaced = await harness.dispatch({type: 'JOB_RUN_APPROVE_SUGGESTION', ...origin, sourceKey: 'story',
+    answer: rewritten.answer, replacement});
+  assert.equal(replaced.ok, true, replaced.error);
+  assert.equal(harness.tabs.get(7).frames[0].pages[0].values.summary, rewritten.answer);
+  assert.deepEqual(replaced.run.appliedAnswers.summary.replacement, {rawValue: rewritten.answer, editRevision: 0});
+
+  const page = harness.tabs.get(7).frames[0].pages[0];
+  page.beforeApply = ({page: livePage, message}) => {
+    livePage.values.summary = message.decisions[0].value;
+    livePage.fields[0].editRevision += 1;
+    livePage.beforeApply = null;
+  };
+  const raced = await harness.dispatch({type: 'JOB_RUN_APPROVE_SUGGESTION', ...origin, sourceKey: 'story',
+    answer: 'Applicant entered the same replacement first.', replacement: replaced.run.appliedAnswers.summary.replacement});
+  assert.equal(raced.ok, false);
+  assert.match(raced.error, /destination changed/i);
+  assert.deepEqual(harness.sessionData.applicationRun['7'].appliedAnswers.summary.replacement,
+    replaced.run.appliedAnswers.summary.replacement);
+
+  page.values.summary = 'Applicant typed a newer answer.';
+  page.fields[0].editRevision += 1;
+  const stale = await harness.dispatch({type: 'JOB_RUN_APPROVE_SUGGESTION', ...origin, sourceKey: 'story',
+    answer: 'A late replacement.', replacement: replaced.run.appliedAnswers.summary.replacement});
+  assert.equal(stale.ok, false);
+  assert.match(stale.error, /filled answer changed/i);
+  assert.equal(page.values.summary, 'Applicant typed a newer answer.');
+});
+
+test('a page edit during tailoring rejects the late AI result', async () => {
+  const harness = createHarness({
+    answerRecords: [{key: 'story', question: 'Project history', answer: 'I delivered a reliable platform.', type: 'textarea', sensitivity: 'safe'}],
+    pagesByTab: {7: {pages: [{
+      page: {title: 'Application', domain: 'example.test', role: 'Platform Engineer'},
+      fields: [{id: 'summary', handle: 'summary-h', label: 'Project history', type: 'textarea', required: true, rawValue: '', editRevision: 0}],
+      actions: [{id: 'submit', label: 'Submit application', kind: 'submit', type: 'submit'}],
+    }] }},
+  });
+  harness.localData.openaiApiKey = 'synthetic-test-key';
+  let releaseFetch;
+  let markFetchStarted;
+  const fetchStarted = new Promise(resolve => { markFetchStarted = resolve; });
+  globalThis.fetch = async () => {
+    markFetchStarted();
+    return new Promise(resolve => { releaseFetch = () => resolve({ok: true, status: 200, statusText: 'OK',
+      json: async () => ({output: [{content: [{type: 'output_text', text: JSON.stringify({answer: 'Late tailored answer.'})}]}]})}); });
+  };
+  await import(`../src/service-worker.js?late-replacement=${Date.now()}`);
+  const started = await harness.dispatch({type: 'JOB_RUN_START', tabId: 7});
+  const origin = draftOrigin(started.run, {id: 'summary', handle: 'summary-h'});
+  const approved = await harness.dispatch({type: 'JOB_RUN_APPROVE_SUGGESTION', ...origin, sourceKey: 'story'});
+  const replacement = approved.run.appliedAnswers.summary.replacement;
+  const pending = harness.dispatch({type: 'JOB_RUN_REWRITE_ANSWER', ...origin, sourceKey: 'story',
+    draft: 'I delivered a reliable platform.', instruction: 'Tailor this to the role.', tailorToJob: true, replacement});
+  await fetchStarted;
+  const page = harness.tabs.get(7).frames[0].pages[0];
+  page.values.summary = 'Applicant edit during tailoring.';
+  page.fields[0].editRevision += 1;
+  releaseFetch();
+  const result = await pending;
+  assert.equal(result.ok, false);
+  assert.match(result.error, /filled answer changed|page or supporting evidence changed/i);
+  assert.equal(page.values.summary, 'Applicant edit during tailoring.');
 });
 
 test('NeoXam related evidence still generates a draft and numeric CTC exposes its missing format', async () => {

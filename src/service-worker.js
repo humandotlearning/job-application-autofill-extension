@@ -1360,6 +1360,8 @@ function fieldIssue(field, invalidIds, unresolvedById = new Map(), pageNumber = 
 }
 
 function categorizeRun(run, inspection, validation, unresolvedResults = []) {
+  if (run.appliedAnswers) run.appliedAnswers = Object.fromEntries(Object.entries(run.appliedAnswers)
+    .filter(([, receipt]) => receipt.pageSignature === run.pageSignature));
   const invalidIds = new Set((validation.invalid || []).map((field) => field.fieldId));
   const unresolvedById = new Map(unresolvedResults.filter((item) => item?.fieldId).map((item) => [item.fieldId, item]));
   const unresolvedFieldsOnPage = inspection.fields
@@ -1533,6 +1535,11 @@ async function approveSuggestion(message) {
   if (!Number.isInteger(tabId) || processingTabs.has(tabId) || saveLocks.has(tabId)) throw new Error('Application is busy or unavailable');
   saveLocks.add(tabId);
   try {
+    if (message.replacement) {
+      const {run, field, suggestion} = await guardedDraftField(message, {allowSaveLock: true});
+      if (!suggestion) throw new Error('Saved evidence changed; choose an answer again');
+      return await completeReviewedRun(run, field, suggestion, message);
+    }
     const run = await getRun(tabId);
     const suggestion = run?.suggestions?.[fieldId];
     if (!suggestion || !SAVABLE_RUN_STATUSES.has(run.status) || message.frameId !== run.frame?.frameId
@@ -1547,13 +1554,7 @@ async function approveSuggestion(message) {
       || (field.widget !== 'custom' && JSON.stringify(field.options) !== JSON.stringify(suggestion.field.options))
       || field.label !== suggestion.field.label || field.type !== suggestion.field.type
       || pageSignature(inspected.inspection, run.frame) !== message.pageSignature) throw new Error('Destination changed; check the page again');
-    const applied = await applyReviewedField({
-      tabId, frameId: message.frameId, applicationId: run.startedAt, field, suggestion, message, approvalGuard: null,
-      assertAuthority: () => assertRunSiteAuthority(tabId, run),
-    });
-    delete run.suggestions[fieldId];
-    categorizeRun(run, applied.inspection, applied.validation);
-    return { ok: true, run: await saveRun(run) };
+    return await completeReviewedRun(run, field, suggestion, message);
   } finally { saveLocks.delete(tabId); }
 }
 
@@ -2018,8 +2019,15 @@ async function guardedDraftField(message, { allowSaveLock = false } = {}) {
   if (processingTabs.has(tabId) || (!allowSaveLock && saveLocks.has(tabId))) throw new Error('Application is busy or unavailable');
   const run = await getRun(tabId);
   const authority = siteAuthority(tabId);
-  const listed = listedRunField(run, fieldId);
-  const suggestion = run?.suggestions?.[fieldId] || null;
+  const receipt = message.replacement ? run?.appliedAnswers?.[fieldId] : null;
+  if (message.replacement && (!receipt || receipt.pageSignature !== run?.pageSignature
+    || typeof message.replacement.rawValue !== 'string' || !Number.isInteger(message.replacement.editRevision)
+    || message.replacement.rawValue !== receipt.replacement?.rawValue
+    || message.replacement.editRevision !== receipt.replacement?.editRevision)) {
+    throw new Error('The filled answer changed. Your draft was kept; check the page again.');
+  }
+  const listed = receipt || listedRunField(run, fieldId);
+  const suggestion = receipt?.suggestion || run?.suggestions?.[fieldId] || null;
   if (!run || !listed || !SAVABLE_RUN_STATUSES.has(run.status)
     || message.frameId !== run.frame?.frameId || message.applicationId !== run.startedAt
     || message.pageSignature !== run.pageSignature || !message.handle || message.handle !== listed.handle) {
@@ -2041,13 +2049,52 @@ async function guardedDraftField(message, { allowSaveLock = false } = {}) {
     || pageSignature(inspected.inspection, run.frame) !== message.pageSignature) {
     throw new Error('Destination changed; check the page again');
   }
-  if (field.currentValue) {
+  if (receipt && (!['text', 'textarea', 'email', 'tel', 'url'].includes(field.type)
+    || field.rawValue !== message.replacement.rawValue || field.editRevision !== message.replacement.editRevision)) {
+    throw new Error('The filled answer changed. Your draft was kept; check the page again.');
+  }
+  if (field.currentValue && !receipt) {
     const validation = await sendToFrame(tabId, message.frameId, { type: 'JOB_APP_VALIDATE' }, authority);
     if (!validation?.validation?.invalid?.some((item) => item.fieldId === fieldId)) {
       throw new Error('Destination changed; check the page again');
     }
   }
-  return { run, listed, suggestion, field, authority };
+  return { run, listed, suggestion, field, authority, inspection: inspected.inspection };
+}
+
+async function completeReviewedRun(run, field, suggestion, message) {
+  let applied;
+  let saveError;
+  try {
+    applied = await applyReviewedField({
+      tabId: message.tabId, frameId: message.frameId, applicationId: run.startedAt, field, suggestion, message,
+      approvalGuard: {
+        ...(typeof field.rawValue === 'string' ? {expectedRawValue: field.rawValue} : {}),
+        ...(Number.isInteger(field.editRevision) ? {expectedEditRevision: field.editRevision} : {}),
+      },
+      assertAuthority: () => assertRunSiteAuthority(message.tabId, run),
+    });
+  } catch (error) {
+    if (!error.appliedResult) throw error;
+    applied = error.appliedResult;
+    saveError = error.message;
+  }
+  const verified = applied.inspection.fields.find(item => item.id === field.id && item.handle === field.handle);
+  const candidate = suggestion?.candidates.find(item => sameKeys(sourceKeysForCandidate(item), sourceKeysFromMessage(message)));
+  const previous = run.appliedAnswers?.[field.id];
+  run.appliedAnswers = {...run.appliedAnswers, [field.id]: {
+    ...fieldIssue(verified, new Set(), new Map(), run.pageNumber),
+    filled: true, value: applied.value, field: verified, pageSignature: run.pageSignature,
+    list: previous?.list || ((run.actionRequired || []).some(item => item.fieldId === field.id) ? 'required' : 'optional'),
+    replacement: {rawValue: verified.rawValue, editRevision: verified.editRevision},
+    ...(candidate ? {suggestion: {...suggestion, field: verified, candidates: [candidate]}} : {}),
+    ...(saveError ? {saveError} : {}),
+  }};
+  if (run.suggestions) delete run.suggestions[field.id];
+  if (run.generatedSuggestions) delete run.generatedSuggestions[field.id];
+  categorizeRun(run, applied.inspection, applied.validation);
+  const saved = await saveRun(run);
+  return saveError ? {ok: false, applied: true, error: saveError, run: saved} : {ok: true, run: saved};
 }
 
 function sourceKeysFromMessage(message = {}) {
@@ -2174,11 +2221,19 @@ async function applyReviewedField({ tabId, frameId, applicationId, field, sugges
     }
   }
   if (!result?.ok) throw new Error(result?.error || 'Could not apply the answer');
+  const failed = Array.isArray(result.result?.failed) ? result.result.failed : [];
+  const applied = Array.isArray(result.result?.applied)
+    ? result.result.applied.filter((item) => item.fieldId === field.id)
+    : [];
+  if (failed.length || applied.length !== 1) {
+    throw new Error(failed.find((item) => item.fieldId === field.id)?.reason || 'The page did not apply the answer');
+  }
   assertAuthority?.();
   const verified = await sendToFrame(tabId, frameId, { type: 'JOB_APP_INSPECT' }, assertAuthority);
   if (verified.inspection?.fields.find((item) => item.id === field.id && item.handle === field.handle)?.currentValue !== value) {
     throw new Error(candidate ? 'The page did not retain the approved answer' : 'The page did not retain the entered answer');
   }
+  let saveError;
   if (candidate) {
     const source = sources[0];
     datasourceWriteChain = datasourceWriteChain.catch(() => {}).then(async () => {
@@ -2200,14 +2255,16 @@ async function applyReviewedField({ tabId, frameId, applicationId, field, sugges
         : readback.answerRecords.find((record) => record.question === field.label && record.answer === value && sourceKeys.every((key) => record.evidenceKeys?.includes(key)));
       if (!persisted) throw new Error('Answer applied, but reusable save could not be verified');
     });
-    await datasourceWriteChain.catch(error => { throw new Error(`Answer applied, but not saved: ${error.message}`); });
+    await datasourceWriteChain.catch(error => { saveError = new Error(`Answer applied, but not saved: ${error.message}`); });
   }
   const validationResponse = await sendToFrame(tabId, frameId, { type: 'JOB_APP_VALIDATE' }, assertAuthority);
-  if(candidate?.kind==='semantic') void tracePhoenixEvent('saved_answer_match_feedback', {
-    'llm.provider':'typesafe','llm.model_name':candidate.semantic?.model || '',
-    'typesafe.accepted':1,'typesafe.corrected':Number(value!==candidate.answer),
-  },`${tabId}:${applicationId}`);
-  return { inspection: verified.inspection, validation: validationResponse?.validation || {}, value };
+  if (candidate?.kind === 'semantic') void tracePhoenixEvent('saved_answer_match_feedback', {
+    'llm.provider': 'typesafe', 'llm.model_name': candidate.semantic?.model || '',
+    'typesafe.accepted': 1, 'typesafe.corrected': Number(value !== candidate.answer),
+  }, `${tabId}:${applicationId}`);
+  const appliedResult = { inspection: verified.inspection, validation: validationResponse?.validation || {}, value };
+  if (saveError) { saveError.appliedResult = appliedResult; throw saveError; }
+  return appliedResult;
 }
 
 async function rewriteEvidence(suggestion, message) {
@@ -2236,12 +2293,7 @@ async function applyDraft(message) {
   saveLocks.add(tabId);
   try {
     const { run, field } = await guardedDraftField(message, { allowSaveLock: true });
-    const applied = await applyReviewedField({
-      tabId, frameId: message.frameId, applicationId: run.startedAt, field, suggestion: null, message: { ...message, answer }, approvalGuard: null,
-      assertAuthority: () => assertRunSiteAuthority(tabId, run),
-    });
-    categorizeRun(run, applied.inspection, applied.validation);
-    return { ok: true, run: await saveRun(run) };
+    return await completeReviewedRun(run, field, null, {...message, answer});
   } finally {
     saveLocks.delete(tabId);
   }
@@ -2250,7 +2302,12 @@ async function applyDraft(message) {
 async function rewriteAnswer(message, inlineContext = null) {
   const draft = requiredBoundedText(message.draft, 'Draft answer', MAX_DRAFT_CHARS);
   const instruction = requiredBoundedText(message.instruction, 'Rewrite instruction', MAX_REWRITE_INSTRUCTION_CHARS);
-  const { suggestion, field } = inlineContext || await guardedDraftField(message);
+  const context = inlineContext || await guardedDraftField(message);
+  const { suggestion, field } = context;
+  const key = draftFieldKey(message.tabId, message.frameId, field);
+  const owner = crypto.randomUUID();
+  if (!claimDraftField(key, owner)) throw new Error('An answer is already being prepared for this field.');
+  try {
   const settings = await getSettings();
   const sessionId = inlineContext?.session?.attachedRun?.applicationId
     ? String(message.tabId) + ':' + inlineContext.session.attachedRun.applicationId
@@ -2265,17 +2322,26 @@ async function rewriteAnswer(message, inlineContext = null) {
     throw new Error(missingProviderKeyMessage(settings.aiProvider));
   }
   const records = await rewriteEvidence(suggestion, message);
-  let rewritten;
+  const page = mergeJobContext(inlineContext ? inlineContext.session.jobContext : context.run.jobContext, context.inspection?.page);
+  if (message.jobDescription != null && message.jobDescription !== '') page.jobDescription = requiredBoundedText(message.jobDescription, 'Job description', 16_000);
+  if (message.tailorToJob && !page.role?.trim() && !page.jobDescription?.trim()) throw new Error('Add the job description before tailoring this answer.');
   let traceOutcome = {retained: false, reason: 'incomplete'};
   try {
-    rewritten = await callAnswerRewriter({
+    const rewritten = await callAnswerRewriter({
       apiKey,
       question: field.label,
       draft,
       instruction,
       records,
-      page: inlineContext ? inlineContext.session.jobContext || {} : (await getRun(message.tabId))?.jobContext || {},
+      page,
     }, { provider: settings.aiProvider, model: settings.aiModel, sessionId, traceContext });
+    const current = inlineContext ? await guardedPanelInline(message) : await guardedDraftField(message);
+    if (field.currentValue !== current.field.currentValue || !sameFieldSnapshot(current.field, aiFieldSnapshot(field))
+      || JSON.stringify(await rewriteEvidence(current.suggestion, message)) !== JSON.stringify(records)
+      || JSON.stringify(inlineContext ? current.session.jobContext : current.run.jobContext) !== JSON.stringify(inlineContext ? context.session.jobContext : context.run.jobContext)
+      || JSON.stringify(current.inspection?.page) !== JSON.stringify(context.inspection?.page)) {
+      throw new Error('The page or supporting evidence changed. Your draft was kept; try again.');
+    }
     const answer = requiredBoundedText(rewritten.answer, 'Rewritten answer', MAX_DRAFT_CHARS);
     traceOutcome = {retained: true};
     void tracePhoenixEvent('answer_rewrite_result', {'application.field_id': field.id, 'ai.retained': true}, sessionId, {traceContext, output: {...rewritten, retained: true}});
@@ -2288,6 +2354,7 @@ async function rewriteAnswer(message, inlineContext = null) {
     void tracePhoenixEvent('answer_rewrite', {'application.field_id': field.id, 'ai.retained': Boolean(traceOutcome.retained)}, sessionId, {traceContext, root: true, statusCode: traceOutcome.retained ? 'OK' : 'ERROR', statusMessage: traceOutcome.reason || '', output: traceOutcome});
     void clearPhoenixAction(traceContext);
   }
+  } finally { releaseDraftField(key, owner); }
 }
 
 function savedClosingEvidence(field, datasource) {
@@ -2314,7 +2381,11 @@ async function generateSuggestions(message) {
   const jobDescription = message.jobDescription == null || (typeof message.jobDescription === 'string' && !message.jobDescription.trim())
     ? ''
     : requiredBoundedText(message.jobDescription, 'Job description', 16_000);
-  const { run, field, authority } = await guardedDraftField(message);
+  const { run, field, authority, inspection } = await guardedDraftField(message);
+  const key = draftFieldKey(message.tabId, message.frameId, field);
+  const owner = crypto.randomUUID();
+  if (!claimDraftField(key, owner)) throw new Error('An answer is already being prepared for this field.');
+  try {
   if (!readableQuestion(field)) throw new Error('The form question is unclear. Use Show on page and enter the answer manually.');
   const settings = await getSettings();
   const sessionId = String(message.tabId) + ':' + run.startedAt;
@@ -2359,6 +2430,7 @@ async function generateSuggestions(message) {
     void tracePhoenixEvent('answer_suggestions', {'application.field_id': field.id, 'ai.retained': Boolean(traceOutcome.retained)}, sessionId, {traceContext, root: true, statusCode: traceOutcome.retained ? 'OK' : 'ERROR', statusMessage: traceOutcome.reason || '', output: traceOutcome});
     void clearPhoenixAction(traceContext);
   }
+  } finally { releaseDraftField(key, owner); }
 }
 
 function hasBlockingIssues(run, validation) {
