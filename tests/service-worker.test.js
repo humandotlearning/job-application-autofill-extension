@@ -3748,6 +3748,26 @@ test('direct AI generation uses saved cover answers and current company context'
 });
 
 
+test('custom popup visibility preserves the page number and prepared answers', async () => {
+  const h = createHarness({waitForAI:false, pagesByTab:{7:{pages:[{
+    fields:[{id:'country',handle:'country-h',label:'Country',type:'select',widget:'custom',required:true}],
+    actions:[{id:'next',label:'Next',kind:'next'}],
+  }]}}});
+  await import(`../src/service-worker.js?popup-shape=${Date.now()}`);
+  const started = await h.dispatch({type:'JOB_RUN_START',tabId:7});
+  const originalSignature = started.run.pageSignature;
+  h.sessionData.applicationRun['7'].generatedSuggestions = {country:{field:{id:'country',handle:'country-h'},suggestions:[{answer:'India'}]}};
+  const field = h.tabs.get(7).frames[0].pages[0].fields[0];
+  for (const options of [['India', 'Canada'], []]) {
+    field.options = options;
+    const checked = await h.dispatch({type:'JOB_APP_NAVIGATED'}, {tab:{id:7},frameId:0});
+    assert.equal(checked.run.pageSignature, originalSignature);
+    assert.equal(checked.run.pageNumber, started.run.pageNumber);
+    assert.notEqual(checked.run.waitingFor, 'page_changed');
+    assert.equal(checked.run.generatedSuggestions.country.suggestions[0].answer, 'India');
+  }
+});
+
 test('manual same-document navigation exposes the new page without filling and can explicitly fill it', async () => {
   const h = createHarness({pagesByTab: {7: {pages: [
     {fields: [{id: 'email', label: 'Email address', type: 'email', required: true}], actions: [{id:'next', label:'Next', kind:'next'}]},

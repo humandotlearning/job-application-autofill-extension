@@ -59,7 +59,7 @@ if (!globalThis.__jobApplicationAutofillInstalled) {
       });
       const inspection = inspectDocument(document);
       return JSON.stringify([document.location.href, inspection.destination,
-        inspection.fields.map(field => [field.id, field.label, field.type, field.options]),
+        inspection.fields.map(field => [field.id, field.label, field.type, field.widget === 'custom' ? [] : field.options]),
         inspection.actions.map(action => [action.kind, action.label])]);
     });
   }

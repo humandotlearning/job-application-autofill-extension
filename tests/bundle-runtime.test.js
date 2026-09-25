@@ -323,6 +323,27 @@ test('active content reports structural application changes but ignores ordinary
 });
 
 
+test('opening and closing a custom menu does not report a new application page', async () => {
+  const bundle = await readFile(new URL('../dist/content.js', import.meta.url), 'utf8');
+  const dom = new JSDOM('<form><label for="country">Country</label><button type="button" id="country" aria-haspopup="listbox" aria-expanded="false" aria-controls="countries">Select One</button><ul id="countries" role="listbox" hidden><li role="option">India</li></ul></form>', {url:'https://jobs.example.com/apply'});
+  const sent = [];
+  const context = createContext({document:dom.window.document, setTimeout, clearTimeout, console, chrome:{runtime:{
+    onMessage:{addListener() {}},
+    sendMessage:async message=>{sent.push(message);return message.type==='JOB_APP_SITE_STATUS' ? {ok:true,enabled:true} : {ok:true};},
+  }}});
+  try {
+    new Script(bundle).runInContext(context);
+    await new Promise(resolve=>setTimeout(resolve,30));
+    sent.length = 0;
+    const popup = dom.window.document.getElementById('countries');
+    popup.hidden = false;
+    await new Promise(resolve=>setTimeout(resolve,600));
+    popup.hidden = true;
+    await new Promise(resolve=>setTimeout(resolve,600));
+    assert.equal(sent.filter(message=>message.type==='JOB_APP_NAVIGATED').length, 0);
+  } finally { dom.window.close(); }
+});
+
 test('content detects shadow-root steps and labels changed through existing text nodes', async () => {
   const bundle = await readFile(new URL('../dist/content.js', import.meta.url), 'utf8');
   const dom = new JSDOM('<div id="app"></div>', {url:'https://jobs.example.com/apply'});

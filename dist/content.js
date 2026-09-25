@@ -3,7 +3,7 @@
 // A lookup registry, not a persisted-key migration.
 const CONCEPT_REGISTRY = {
   generic_name: /^(?:name|your name|applicant name|candidate name)$/,
-  first_name: /^(?:first|given|forename) name$/,
+  first_name: /^(?:first|given|forename) names?(?: s)?$/,
   last_name: /^(?:last|family) name$|^surname$/,
   full_name: /^(?:full|complete|legal) name$/,
   preferred_name: /^(?:preferred name|nickname|preferred first name)$/,
@@ -660,7 +660,7 @@ function composedText(element) {
 
 const IGNORED_TYPES = new Set(['hidden', 'password', 'file', 'submit', 'button', 'reset', 'image', 'search']);
 const SECRET_MARKER = /(?:password|passcode|passwd|pwd|secret|token|csrf|auth[_-]?token)/i;
-const CUSTOM_WIDGET_SELECTOR = '[role="combobox"], button[aria-haspopup="listbox"]';
+const CUSTOM_WIDGET_SELECTOR = '[role="combobox"], button[aria-haspopup="listbox"], input[data-uxi-widget-type="selectinput"]';
 const EMPTY_CUSTOM_WIDGET_VALUE = /^(?:choose|select)\b/i;
 const CUSTOM_WIDGET_PROMPT_LABEL = /^(?:choose|select)(?:\s+(?:one|an?\s+option|an?\s+answer|a\s+value))?$/i;
 const trackedDocuments = new WeakSet();
@@ -991,7 +991,7 @@ function labelFor(document, element) {
 
 function isSupported(element) {
   if (!['INPUT', 'TEXTAREA', 'SELECT'].includes(element.tagName)) return false;
-  if (element.getAttribute('role') === 'combobox' || element.getAttribute('aria-haspopup') === 'listbox') return false;
+  if (element.matches(CUSTOM_WIDGET_SELECTOR)) return false;
   if (composedClosest(composedParent(element), CUSTOM_WIDGET_SELECTOR)) return false;
   if (isControlDisabled(element) || element.readOnly || element.getAttribute('aria-readonly') === 'true') return false;
   if (IGNORED_TYPES.has(String(element.type || '').toLowerCase())) return false;
@@ -1046,6 +1046,10 @@ function hasNearbyFormControl(element) {
 }
 
 function customWidgetValue(element) {
+  const selectedPills = element.matches('input[data-uxi-widget-type="selectinput"]')
+    ? [...(element.closest('[data-automation-id="multiselectInputContainer"]')?.querySelectorAll('[data-automation-id="selectedItem"] [data-automation-id="promptOption"]') || [])].map(composedText).filter(Boolean)
+    : [];
+  if (element.matches('input[data-uxi-widget-type="selectinput"]')) return selectedPills.join(', ');
   const liveState = JSON.stringify([element.value || '', element.getAttribute('aria-valuetext') || '', composedText(element)]);
   if (element.__jobApplicationCommittedState !== liveState) delete element.__jobApplicationCommittedLabel;
   const selectedOptions = customWidgetOptions(element.ownerDocument, element)
@@ -1053,7 +1057,7 @@ function customWidgetValue(element) {
     .map(customOptionText)
     .filter(Boolean);
   const typedValue = element.__jobApplicationSearchQuery || (element.getAttribute('aria-expanded') === 'true' && element.__jobApplicationUserEdited) ? '' : element.value;
-  const value = String(selectedOptions.length ? selectedOptions.join(', ') : (element.getAttribute('aria-valuetext') || element.__jobApplicationCommittedLabel || typedValue || composedText(element) || ''))
+  const value = String(selectedOptions.length ? selectedOptions.join(', ') : (element.getAttribute('aria-valuetext') || element.__jobApplicationCommittedLabel || (!isOpaqueIdentifier(typedValue) && typedValue) || composedText(element) || ''))
     .replace(/\s+/g, ' ').trim();
   return EMPTY_CUSTOM_WIDGET_VALUE.test(value) || isOpaqueIdentifier(value) ? '' : value;
 }
@@ -1154,6 +1158,7 @@ function customWidgetOptions(document, element) {
     ? ids.map((id) => rootElementById(element, id)).filter(Boolean).flatMap((node) => node.matches('[role="listbox"]') ? [node] : [...queryAll(node, '[role="listbox"]')])
     : [...queryAll(document, '[role="listbox"]')];
   const visibleListboxes = listboxes
+    .filter((listbox) => listbox.getAttribute('data-automation-id') !== 'selectedItemList')
     .filter((listbox) => isVisible(listbox))
     .filter((listbox) => ids.length || (listboxes.length === 1 && ![...queryAll(document, CUSTOM_WIDGET_SELECTOR)].some((owner) => owner !== element && String(owner.getAttribute('aria-controls') || owner.getAttribute('aria-owns') || '').split(/\s+/).includes(listbox.id))));
   return visibleListboxes
@@ -1499,96 +1504,115 @@ function waitForCustomOptions(document, element, answer, timeoutMs = 1500) {
   });
 }
 
+async function dismissCustomChoice(document, element, popup, deadline) {
+  const closed = () => element.getAttribute('aria-expanded') !== 'true' && (!popup?.isConnected || !isVisible(popup));
+  const waitForClose = async (timeoutMs) => {
+    const until = Math.min(deadline, Date.now() + timeoutMs);
+    while (!closed() && Date.now() < until) await new Promise(resolve => setTimeout(resolve, 25));
+    return closed();
+  };
+  if (await waitForClose(150)) return true;
+  for (const target of [popup, element].filter(Boolean)) {
+    for (const type of ['keydown', 'keyup']) target.dispatchEvent(new document.defaultView.KeyboardEvent(type, {
+      key: 'Escape', code: 'Escape', keyCode: 27, which: 27, bubbles: true, composed: true, cancelable: true,
+    }));
+    if (await waitForClose(100)) return true;
+  }
+  // Workday ignores Escape on the trigger and dismisses by toggling it.
+  if (element.isConnected && element.getAttribute('aria-expanded') === 'true' && !hasNativeFormAction(element)) element.click();
+  return waitForClose(250);
+}
+
 async function setCustomChoiceValue(document, element, answer, deadline = Infinity) {
   element.focus?.();
   if (hasNativeFormAction(element)) {
     return { ok: false, unresolved: true, reason: 'Refusing to activate a native submit/reset control' };
   }
   const controlledIds = String(element.getAttribute('aria-controls') || element.getAttribute('aria-owns') || '').split(/\s+/).filter(Boolean);
-  const expectsClosure = element.hasAttribute('aria-expanded') || controlledIds.some((id) => {
+  let expectsClosure = element.hasAttribute('aria-expanded') || controlledIds.some((id) => {
     const popup = rootElementById(element, id);
     return !popup || !isVisible(popup);
   });
-  if (element.getAttribute('aria-expanded') !== 'true') element.click();
-  const expected = normalizeText(answer);
-  const initialText = normalizeText(element.textContent || '');
-  const initialValue = String(element.value || '');
-  if (element.tagName === 'INPUT' && element.getAttribute('aria-autocomplete')) {
-    element.__jobApplicationSearchQuery = true;
-    setTextValue(element, answer);
-  }
-  const options = await waitForCustomOptions(document, element, answer, Math.max(0, Math.min(1500, deadline - Date.now())));
-  if (!options.length) {
-    if (element.tagName === 'INPUT') setTextValue(element, '');
-    return { ok: false, unresolved: true, reason: 'The custom widget did not reveal any options' };
-  }
-  const multiple = element.getAttribute('aria-multiselectable') === 'true'
-    || options[0]?.closest('[role="listbox"]')?.getAttribute('aria-multiselectable') === 'true';
-  const requested = multiple ? String(answer).split(/\s*[,;]\s*/).map(normalizeText).filter(Boolean) : [expected];
-  const candidates = requested.map((value) => matchingCustomOptions(options, value));
-  const matches = candidates.flat();
-  if (candidates.some((options) => options.length !== 1) || new Set(matches).size !== matches.length) {
-    return { ok: false, unresolved: true, reason: 'The custom widget does not expose one unique exact option' };
-  }
-  for (const match of matches) {
-    if (Date.now() >= deadline) return { ok: false, unresolved: true, reason: 'Autofill deadline reached' };
-    if (match.getAttribute('aria-selected') === 'true') continue;
-    // Recheck after awaiting options and after every preceding selection.
-    if (hasNativeFormAction(match)) {
-      return { ok: false, unresolved: true, reason: 'Refusing to activate a native submit/reset option' };
+  let popup = controlledIds.map(id => rootElementById(element, id)).find(Boolean);
+  let dismissalAttempted = false;
+  try {
+    if (element.getAttribute('aria-expanded') !== 'true') element.click();
+    const expected = normalizeText(answer);
+    const initialText = normalizeText(element.textContent || '');
+    const initialValue = String(element.value || '');
+    if (element.tagName === 'INPUT' && element.getAttribute('aria-autocomplete')) {
+      element.__jobApplicationSearchQuery = true;
+      setTextValue(element, answer);
     }
-    match.click();
-  }
-  await new Promise((resolve) => setTimeout(resolve, 50));
-  const selectionCommitted = matches.every((option) => option.getAttribute('aria-selected') === 'true')
-    || (!element.__jobApplicationSearchQuery && (normalizeText(element.textContent || '') !== initialText
-      || String(element.value || '') !== initialValue
-      || Boolean(element.getAttribute('aria-valuetext'))));
-  if (!selectionCommitted && element.tagName !== 'INPUT') return {ok: false, unresolved: true, reason: 'The custom widget did not accept the selected option'};
-  if (selectionCommitted) {
-    element.__jobApplicationCommittedLabel = customOptionText(matches[0]);
-    element.__jobApplicationCommittedState = JSON.stringify([element.value || '', element.getAttribute('aria-valuetext') || '', composedText(element)]);
-  }
-  const backingInput = [...(element.parentElement?.querySelectorAll('input, textarea') || [])].find((input) => input !== element);
-  const acceptedSingleValues = multiple ? [expected] : [...new Set([expected, ...customOptionAliases(matches[0])])];
-  if (element.tagName === 'INPUT') {
-    const committed = matches.every((option) => option.getAttribute('aria-selected') === 'true')
-      || acceptedSingleValues.includes(normalizeText(element.getAttribute('aria-valuetext')))
-      || acceptedSingleValues.includes(normalizeText(backingInput?.value || ''))
-      || (element.getAttribute('aria-expanded') === 'false' && acceptedSingleValues.includes(normalizeText(element.value)));
-    if (!committed) return { ok: false, unresolved: true, reason: 'The searchable widget has no committed selection' };
-    delete element.__jobApplicationSearchQuery;
-  }
-  if (backingInput) dispatchFormEvents(backingInput);
-  dispatchFormEvents(element);
-  const displayed = normalizeText(fieldValue(document, element));
-  const backingValue = normalizeText(backingInput?.value || '');
-  const displayedValues = fieldValue(document, element).split(/\s*[,;]\s*/).map(normalizeText).filter(Boolean);
-  const expectedValues = requested.slice().sort();
-  const displayedMatches = multiple
-    ? displayedValues.slice().sort().join('|') === expectedValues.slice().sort().join('|')
-    : acceptedSingleValues.includes(displayed) || acceptedSingleValues.includes(backingValue);
-  if (!displayedMatches && backingValue !== expected) {
-    return { ok: false, unresolved: true, reason: 'The custom widget did not accept the selected option' };
-  }
-  if (!multiple && expectsClosure) {
-    const popup = composedClosest(matches[0], '[role="listbox"]');
-    const closed = () => element.getAttribute('aria-expanded') === 'false' || !popup?.isConnected || !isVisible(popup);
-    const waitForClose = async (timeoutMs) => {
-      const until = Math.min(deadline, Date.now() + timeoutMs);
-      while (!closed() && Date.now() < until) await new Promise((resolve) => setTimeout(resolve, 25));
-      return closed();
-    };
-    if (!await waitForClose(300)) {
-      element.dispatchEvent(new document.defaultView.KeyboardEvent('keydown', { key: 'Escape', bubbles: true, composed: true, cancelable: true }));
-      if (!await waitForClose(150)) return { ok: false, unresolved: true, reason: 'The selected dropdown option did not close the menu' };
+    const options = await waitForCustomOptions(document, element, answer, Math.max(0, Math.min(1500, deadline - Date.now())));
+    popup = composedClosest(options[0], '[role="listbox"]') || rootElementById(element, element.getAttribute('aria-controls')) || popup;
+    expectsClosure ||= element.hasAttribute('aria-expanded');
+    if (!options.length) {
+      if (element.tagName === 'INPUT') setTextValue(element, '');
+      return { ok: false, unresolved: true, reason: 'The custom widget did not reveal any options' };
     }
-    const retained = normalizeText(fieldValue(document, element));
-    if (!acceptedSingleValues.includes(retained) && !acceptedSingleValues.includes(normalizeText(backingInput?.value || ''))) {
-      return { ok: false, unresolved: true, reason: 'The dropdown did not retain the selected option after closing' };
+    const multiple = element.getAttribute('aria-multiselectable') === 'true'
+      || options[0]?.closest('[role="listbox"]')?.getAttribute('aria-multiselectable') === 'true';
+    const requested = multiple ? String(answer).split(/\s*[,;]\s*/).map(normalizeText).filter(Boolean) : [expected];
+    const candidates = requested.map((value) => matchingCustomOptions(options, value));
+    const matches = candidates.flat();
+    if (candidates.some((options) => options.length !== 1) || new Set(matches).size !== matches.length) {
+      return { ok: false, unresolved: true, reason: 'The custom widget does not expose one unique exact option' };
     }
+    for (const match of matches) {
+      if (Date.now() >= deadline) return { ok: false, unresolved: true, reason: 'Autofill deadline reached' };
+      if (match.getAttribute('aria-selected') === 'true') continue;
+      // Recheck after awaiting options and after every preceding selection.
+      if (hasNativeFormAction(match)) {
+        return { ok: false, unresolved: true, reason: 'Refusing to activate a native submit/reset option' };
+      }
+      match.click();
+    }
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    const selectionCommitted = matches.every((option) => option.getAttribute('aria-selected') === 'true')
+      || (!element.__jobApplicationSearchQuery && (normalizeText(element.textContent || '') !== initialText
+        || String(element.value || '') !== initialValue
+        || Boolean(element.getAttribute('aria-valuetext'))));
+    if (!selectionCommitted && element.tagName !== 'INPUT') return {ok: false, unresolved: true, reason: 'The custom widget did not accept the selected option'};
+    if (selectionCommitted) {
+      element.__jobApplicationCommittedLabel = customOptionText(matches[0]);
+      element.__jobApplicationCommittedState = JSON.stringify([element.value || '', element.getAttribute('aria-valuetext') || '', composedText(element)]);
+    }
+    const backingInput = [...(element.parentElement?.querySelectorAll('input, textarea') || [])].find((input) => input !== element);
+    const acceptedSingleValues = multiple ? [expected] : [...new Set([expected, ...customOptionAliases(matches[0])])];
+    if (element.tagName === 'INPUT') {
+      const committed = matches.every((option) => option.getAttribute('aria-selected') === 'true')
+        || acceptedSingleValues.includes(normalizeText(element.getAttribute('aria-valuetext')))
+        || acceptedSingleValues.includes(normalizeText(backingInput?.value || ''))
+        || (element.getAttribute('aria-expanded') === 'false' && acceptedSingleValues.includes(normalizeText(element.value)));
+      if (!committed) return { ok: false, unresolved: true, reason: 'The searchable widget has no committed selection' };
+      delete element.__jobApplicationSearchQuery;
+    }
+    if (backingInput) dispatchFormEvents(backingInput);
+    dispatchFormEvents(element);
+    const displayed = normalizeText(fieldValue(document, element));
+    const backingValue = normalizeText(backingInput?.value || '');
+    const displayedValues = fieldValue(document, element).split(/\s*[,;]\s*/).map(normalizeText).filter(Boolean);
+    const expectedValues = requested.slice().sort();
+    const displayedMatches = multiple
+      ? displayedValues.slice().sort().join('|') === expectedValues.slice().sort().join('|')
+      : acceptedSingleValues.includes(displayed) || acceptedSingleValues.includes(backingValue);
+    if (!displayedMatches && backingValue !== expected) {
+      return { ok: false, unresolved: true, reason: 'The custom widget did not accept the selected option' };
+    }
+    if (!multiple && expectsClosure) {
+      dismissalAttempted = true;
+      if (!await dismissCustomChoice(document, element, popup, deadline)) return { ok: false, unresolved: true, reason: 'The selected dropdown option did not close the menu' };
+      const retained = normalizeText(fieldValue(document, element));
+      if (!acceptedSingleValues.includes(retained) && !acceptedSingleValues.includes(normalizeText(backingInput?.value || ''))) {
+        return { ok: false, unresolved: true, reason: 'The dropdown did not retain the selected option after closing' };
+      }
+    }
+    if (multiple) expectsClosure = false;
+    return { ok: true };
+  } finally {
+    if (expectsClosure && !dismissalAttempted) await dismissCustomChoice(document, element, popup, deadline);
   }
-  return { ok: true };
 }
 
 async function fillElement(document, element, answer, deadline = Infinity) {
@@ -1697,6 +1721,7 @@ function phoneDecision(field, action, value, reason, evidenceKeys = [], transfor
     confidence: action === 'fill' ? 'high' : 'low',
     sensitivity: 'safe',
     ...(action === 'fill' && transformation ? { transformation } : {}),
+    ...(transformation === 'format_phone' ? {matchKind: 'concept'} : {}),
     reason,
   };
 }
@@ -1733,7 +1758,10 @@ function phoneBlockDecisions(fields, records, profile = {}) {
     let splitEntry = null;
     let splitAmbiguous = false;
     if (countryField && /^\s*\+\d/.test(sourceAnswer)) {
-      const matches = phoneOptionEntries(countryField)
+      const entries = countryField.currentValue
+        ? [{label: countryField.currentValue, value: countryField.currentValue}]
+        : phoneOptionEntries(countryField);
+      const matches = entries
         .map((entry) => ({ entry, prefix: phoneCallingCode(entry) }))
         .filter(({ prefix }) => prefix && sourceDigits.startsWith(prefix.replace(/\D/g, '')));
       if (matches.length === 1 && phoneChoiceValue(matches[0].entry)) {
@@ -1744,7 +1772,8 @@ function phoneBlockDecisions(fields, records, profile = {}) {
       }
     }
     if (countryField) {
-      if (splitEntry && phoneChoiceValue(splitEntry)) decisions.set(countryField.id, phoneDecision(countryField, 'fill', phoneChoiceValue(splitEntry), 'Matched the unique country calling-code option', sourceKey, 'map_option'));
+      if (countryField.currentValue) decisions.set(countryField.id, phoneDecision(countryField, 'keep', null, 'Keep the selected country calling code'));
+      else if (splitEntry && phoneChoiceValue(splitEntry)) decisions.set(countryField.id, phoneDecision(countryField, 'fill', phoneChoiceValue(splitEntry), 'Matched the unique country calling-code option', sourceKey, 'map_option'));
       else if (splitAmbiguous || sourceAnswer) decisions.set(countryField.id, phoneDecision(countryField, 'ask_user', null, splitAmbiguous ? 'Country calling-code options are ambiguous' : 'No unique country calling-code option matches the stored number'));
     }
     if (numberField) {
@@ -2985,7 +3014,7 @@ if (!globalThis.__jobApplicationAutofillInstalled) {
       });
       const inspection = inspectDocument(document);
       return JSON.stringify([document.location.href, inspection.destination,
-        inspection.fields.map(field => [field.id, field.label, field.type, field.options]),
+        inspection.fields.map(field => [field.id, field.label, field.type, field.widget === 'custom' ? [] : field.options]),
         inspection.actions.map(action => [action.kind, action.label])]);
     });
   }

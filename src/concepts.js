@@ -1,7 +1,7 @@
 // A lookup registry, not a persisted-key migration.
 export const CONCEPT_REGISTRY = {
   generic_name: /^(?:name|your name|applicant name|candidate name)$/,
-  first_name: /^(?:first|given|forename) name$/,
+  first_name: /^(?:first|given|forename) names?(?: s)?$/,
   last_name: /^(?:last|family) name$|^surname$/,
   full_name: /^(?:full|complete|legal) name$/,
   preferred_name: /^(?:preferred name|nickname|preferred first name)$/,

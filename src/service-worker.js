@@ -1183,7 +1183,7 @@ function pageSignature(inspection, frame = null) {
     frame: frame ? [frame.frameId, frame.title, frame.pathname] : [],
     destination: inspection.destination || null,
     page: [inspection.page?.title, inspection.page?.domain],
-    fields: inspection.fields.map((field) => [field.id, field.label, field.type, field.options]),
+    fields: inspection.fields.map((field) => [field.id, field.label, field.type, field.widget === 'custom' ? [] : field.options]),
     actions: inspection.actions.map((action) => [action.kind, action.label]),
   });
 }

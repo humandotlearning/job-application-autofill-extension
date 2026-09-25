@@ -129,6 +129,7 @@ test('Ashby fixture commits delayed searchable and multiple-selection options', 
         list.firstElementChild.setAttribute('aria-selected', 'true');
         input.value = 'London';
         input.setAttribute('aria-expanded', 'false');
+        list.hidden = true;
       });
     }, 40);
   });

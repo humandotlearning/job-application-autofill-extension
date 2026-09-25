@@ -19,6 +19,75 @@ function makeDocument(html) {
   return new JSDOM(html, { url: 'https://jobs.example.com/apply' }).window.document;
 }
 
+test('Workday country uses the display label when its backing value is an opaque ID', () => {
+  const document = makeDocument('<form><label for="country">Country</label><button type="button" id="country" aria-haspopup="listbox" value="c4f78be1a8f14da0ab49ce1162348a5e" aria-label="Country India Required">India</button></form>');
+  assert.equal(collectFieldDescriptors(document)[0].currentValue, 'India');
+});
+
+test('Workday plural given-name label reuses confirmed first-name evidence', async () => {
+  const document = makeDocument('<form><label for="first">Given Name(s)</label><input id="first"><label for="local">Local Given Name(s)</label><input id="local"></form>');
+  const records = [{key: 'first_name', question: 'First name', answer: 'Ada', confirmationState: 'confirmed', sensitivity: 'safe'}];
+  const decisions = planDeterministicFill(collectFieldDescriptors(document), records);
+  assert.equal(decisions[0].disposition, 'autofill');
+  assert.notEqual(decisions[1].disposition, 'autofill');
+  const result = await applyDecisions(document, decisions);
+  assert.equal(result.applied.length, 1);
+  assert.equal(document.getElementById('first').value, 'Ada');
+});
+
+test('Workday selected phone-code pill supports splitting an international phone number', () => {
+  const document = makeDocument(`<form><label for="code">Country Phone Code</label>
+    <div data-automation-id="multiselectInputContainer"><div><input id="code" data-uxi-widget-type="selectinput" placeholder="Search" aria-required="true"></div>
+      <ul role="listbox" data-automation-id="selectedItemList"><li role="presentation"><div role="option" data-automation-id="selectedItem" aria-label="India (+91), press delete to clear value."><p data-automation-id="promptOption">India (+91)</p></div></li></ul></div>
+    <label for="phone">Phone Number</label><input id="phone" required></form>`);
+  const fields = collectFieldDescriptors(document);
+  assert.equal(fields[0].widget, 'custom');
+  assert.equal(fields[0].currentValue, 'India (+91)');
+  assert.deepEqual(fields[0].options, [], 'selected removable pills are not clickable choices');
+  const decisions = planDeterministicFill(fields, [{key:'phone_number', question:'Phone Number', answer:'+919876543210', confirmationState:'confirmed', sensitivity:'safe'}]);
+  assert.equal(decisions[0].action, 'keep');
+  assert.equal(decisions[1].value, '9876543210');
+  assert.equal(decisions[1].disposition, 'autofill');
+  const conflicting = planDeterministicFill(fields, [{key:'phone_number', question:'Phone Number', answer:'+14155550123', confirmationState:'confirmed', sensitivity:'safe'}]);
+  assert.equal(conflicting[1].action, 'ask_user', 'do not split a number against an incompatible selected code');
+  document.querySelector('[data-automation-id="selectedItem"]').remove();
+  document.getElementById('code').value = 'India';
+  assert.equal(collectFieldDescriptors(document)[0].currentValue, '', 'search text is not a committed selection');
+});
+
+test('dropdowns that add ARIA state on opening close via their trigger when Escape is ignored', async () => {
+  const document = makeDocument('<form><label for="country">Country</label><button type="button" id="country" aria-haspopup="listbox">Select One</button></form>');
+  const button = document.getElementById('country');
+  button.onclick = () => {
+    if (button.getAttribute('aria-expanded') === 'true') {
+      setTimeout(() => { document.getElementById('countries').remove(); button.removeAttribute('aria-expanded'); button.removeAttribute('aria-controls'); }, 50);
+      return;
+    }
+    button.setAttribute('aria-expanded', 'true');
+    button.setAttribute('aria-controls', 'countries');
+    const popup = document.createElement('ul');
+    popup.id = 'countries'; popup.setAttribute('role', 'listbox');
+    popup.innerHTML = '<li role="option">India</li>';
+    popup.firstChild.onclick = () => { button.textContent = 'India'; button.value = 'c4f78be1a8f14da0ab49ce1162348a5e'; };
+    document.body.append(popup);
+  };
+  const result = await applyDecisions(document, [{fieldId:'country', action:'fill', value:'India', approved:true}]);
+  assert.equal(result.applied.length, 1);
+  assert.equal(document.getElementById('countries'), null);
+  assert.equal(collectFieldDescriptors(document)[0].currentValue, 'India');
+});
+
+test('an unmatched option still dismisses the menu opened by autofill', async () => {
+  const document = makeDocument('<form><button type="button" id="country" aria-haspopup="listbox" aria-label="Country" aria-expanded="false" aria-controls="countries">Select One</button><ul id="countries" role="listbox" hidden><li role="option">India</li></ul></form>');
+  const button = document.getElementById('country');
+  const popup = document.getElementById('countries');
+  button.onclick = () => { popup.hidden = !popup.hidden; button.setAttribute('aria-expanded', String(!popup.hidden)); };
+  const result = await applyDecisions(document, [{fieldId:'country', action:'fill', value:'Missing', approved:true}], {deadline:Date.now()+2000});
+  assert.equal(result.applied.length, 0);
+  assert.equal(result.unresolved.length, 1);
+  assert.equal(popup.hidden, true);
+});
+
 test('adjacent block labels allow safe saved answers on Nutpaa-style forms', () => {
   const document = makeDocument(`<form>
     <div><div>First Name *</div><input name="firstname" required></div>
