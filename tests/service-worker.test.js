@@ -4,6 +4,15 @@ import { readFile } from 'node:fs/promises';
 import { Script, createContext } from 'node:vm';
 import { JSDOM } from 'jsdom';
 
+const jevAnswers = (body, selected = {}) => Object.fromEntries(Object.entries(body.questions).map(([id, question]) => {
+  if (question.type === 'noul') return [id, {type:'noul',noul:id.endsWith('_conflict')?0:1}];
+  if (question.type === 'score') return [id,{type:'score',score:3,confidence:1,
+    probabilities:{0:0,1:0,2:0,3:1},legend:Object.fromEntries(question.criteria.map((criterion,index)=>[index,criterion]))}];
+  const choice=selected[id] || 'none';
+  return [id,{type:'choice',choice,confidence:0.99,
+    probabilities:Object.fromEntries(Object.keys(question.criteria).map(key=>[key,key===choice?0.99:0.01/(Object.keys(question.criteria).length-1)]))}];
+}));
+
 function createHarness({
   autoAdvancePages = false,
   includeFormScreenshot = true,
@@ -14,6 +23,7 @@ function createHarness({
   pagesByTab = {},
 } = {}) {
   const localData = {
+    phoenixTracing: false, // Transport tracing has its own tests; keep provider mocks isolated.
     openaiApiKey: '',
     autoAdvancePages,
     includeFormScreenshot,
@@ -62,7 +72,8 @@ function createHarness({
       required: false,
       currentValue: '',
       ...field,
-      ...(Object.hasOwn(field, 'rawValue') ? {rawValue: Object.hasOwn(valueOverrides, field.id) ? valueOverrides[field.id] : field.rawValue} : {}),
+      rawValue: Object.hasOwn(valueOverrides, field.id) ? valueOverrides[field.id] : (field.rawValue ?? ''),
+      editRevision: field.editRevision ?? 0,
       currentValue: Object.prototype.hasOwnProperty.call(valueOverrides, field.id)
         ? valueOverrides[field.id]
         : (field.currentValue || ''),
@@ -80,10 +91,13 @@ function createHarness({
   function inspectionFor(tabId, frameId = 0) {
     const frame = frameFor(tabId, frameId);
     const page = frame.pages[frame.currentPage];
+    const fields = page.fields.map((field) => materializeField(field, page.values || {}));
+    const actions = page.actions || [];
     return {
       page: {...(page.page || { title: frame.context.title || `Step ${frame.currentPage + 1}`, domain: frame.context.domain || 'jobs.example.com' })},
-      fields: page.fields.map((field) => materializeField(field, page.values || {})),
-      actions: page.actions || [],
+      fields,
+      actions,
+      observation: {revision: JSON.stringify({controls: fields.map(field => [field.id, field.handle, field.type, field.currentValue, field.rawValue, field.editRevision]), actions})},
       pauseReasons: page.pauseReasons || [],
       ...(page.destination ? {destination: page.destination} : {}),
       ...(page.discovery ? {discovery: page.discovery} : {}),
@@ -152,7 +166,12 @@ function createHarness({
         state.messages.push(message);
         state.messageTargets.push({ message, frameId });
         const page = frame.pages[frame.currentPage];
-        if (message.type === 'JOB_APP_INSPECT') return { ok: true, inspection: inspectionFor(tabId, frameId) };
+        if (message.type === 'JOB_APP_INSPECT' || message.type === 'JOB_APP_DEBUG_INSPECT') return { ok: true, inspection: inspectionFor(tabId, frameId) };
+        if (message.type === 'JOB_APP_DEBUG_SNAPSHOT') return {ok: true, snapshot: page.debugSnapshot || {
+          html: '<form><label>Full name<input></label></form>',
+          inspection: {fields: [{label: 'Full name', type: 'text'}], actions: [], discovery: {code: 'ready'}, pauseReasons: []},
+        }};
+        if (message.type === 'JOB_APP_SELECT_FORM') return {ok: true, destination: inspectionFor(tabId, frameId).destination};
         if (message.type === 'JOB_APP_INSPECT_INLINE') {
           await page.onInlineInspect?.({ page, tabId, frameId });
           const inspection = inspectionFor(tabId, frameId);
@@ -161,21 +180,34 @@ function createHarness({
           return { ok: true, inspection, focusedFieldId: focused?.id ?? null, focusedHandle: focused?.handle ?? null,
             rawValue: focused ? (page.values?.[focused.id] ?? focused.rawValue) : null, editRevision: focused?.editRevision ?? null };
         }
+        if (message.type === 'JOB_APP_DISCOVER_OPTIONS') {
+          const result = page.discoveredOptions?.[message.fieldId] || {};
+          return {ok: true, fieldId: message.fieldId, handle: message.handle,
+            options: result.options || [], structuredOptions: result.structuredOptions || [],
+            optionsStatus: result.optionsStatus || (result.options?.length ? 'partial' : 'unavailable')};
+        }
         if (message.type === 'JOB_APP_APPLY') {
+          if (message.observationRevision && message.observationRevision !== inspectionFor(tabId, frameId).observation.revision) {
+            return {ok: false, code: 'destination_changed', error: 'The form changed before the answer could be applied.'};
+          }
           await page.beforeApply?.({ page, message, tabId, frameId });
           const failed = [];
           const applied = [];
           for (const decision of message.decisions || []) {
             if (decision.action !== 'fill') continue;
             const field = page.fields.find(field => field.id === decision.fieldId);
-            if ((Object.hasOwn(decision, 'expectedRawValue') && (page.values?.[field.id] ?? field.rawValue) !== decision.expectedRawValue)
-              || (Object.hasOwn(decision, 'expectedEditRevision') && field.editRevision !== decision.expectedEditRevision)) {
+            const live = materializeField(field, page.values || {});
+            if ((Object.hasOwn(decision, 'expectedRawValue') && live.rawValue !== decision.expectedRawValue)
+              || (Object.hasOwn(decision, 'expectedEditRevision') && live.editRevision !== decision.expectedEditRevision)) {
               failed.push({ fieldId: decision.fieldId, reason: 'Destination changed' });
               continue;
             }
             if (!page.values) page.values = {};
-            page.values[decision.fieldId] = decision.value;
+            if (!Object.hasOwn(page.values, decision.fieldId) || Object.hasOwn(decision, 'expectedRawValue')) {
+              page.values[decision.fieldId] = decision.value;
+            }
             applied.push({ fieldId: decision.fieldId, value: decision.value });
+            if (decision.matchKind === 'semantic') field.provenance = 'autofill';
           }
           page.onApply?.({ page, decisions: message.decisions || [] });
           return { ok: true, result: { applied, kept: [], reviewRequired: [], unresolved: [], failed } };
@@ -286,6 +318,185 @@ test('site controls normalize, persist, and match only the active exact hostname
   assert.deepEqual(harness.localData.disabledHostnames, []);
 });
 
+test('debug capture requires Developer mode and inspects without starting a fill', async () => {
+  const harness = createHarness({pagesByTab: {7: {pages: [{
+    page: {title: 'Job application', domain: 'jobs.example.com'},
+    fields: [{id: 'name', label: 'Full name', type: 'text'}, {id: 'resume', label: 'Resume', type: 'file'}],
+    actions: [{id: 'submit', label: 'Submit application', kind: 'submit'}],
+    destination: {documentId: 'document-1', regionId: 'form-1'},
+  }]}}});
+  await import(`../src/service-worker.js?debug-gate=${Date.now()}`);
+  const blocked = await harness.dispatch({type: 'JOB_RUN_DEBUG_CAPTURE'});
+  assert.equal(blocked.ok, false);
+  assert.match(blocked.error, /Developer mode/);
+  harness.localData.developerMode = true;
+  const captured = await harness.dispatch({type: 'JOB_RUN_DEBUG_CAPTURE'});
+  assert.equal(captured.ok, true, captured.error);
+  assert.equal(captured.case.schemaVersion, 1);
+  assert.equal(captured.case.sessionId, null);
+  assert.equal(captured.case.snapshot.inspection.fields[0].label, 'Full name');
+  assert.equal(harness.tabs.get(7).messages.some(message => ['JOB_APP_APPLY', 'JOB_APP_CLICK_NEXT'].includes(message.type)), false);
+  assert.equal(harness.sessionData.applicationRun, undefined);
+});
+
+test('content-side debug authorization requires a content sender and Developer mode', async () => {
+  const harness = createHarness();
+  await import(`../src/service-worker.js?debug-content-auth=${Date.now()}`);
+  const contentSender = {id: 'test-extension', tab: {id: 7, url: 'https://jobs.example.com/apply'}, frameId: 2, url: 'https://forms.other.example/frame'};
+  const blocked = await harness.dispatch({type: 'JOB_APP_DEBUG_AUTHORIZE'}, contentSender);
+  assert.equal(blocked.ok, false);
+  harness.localData.developerMode = true;
+  const authorized = await harness.dispatch({type: 'JOB_APP_DEBUG_AUTHORIZE'}, contentSender);
+  assert.equal(authorized.ok, true);
+  harness.localData.disabledHostnames = ['jobs.example.com'];
+  const disabledSite = await harness.dispatch({type: 'JOB_APP_DEBUG_AUTHORIZE'}, contentSender);
+  assert.equal(disabledSite.ok, false);
+  harness.localData.disabledHostnames = ['forms.other.example'];
+  const enabledTopLevelSite = await harness.dispatch({type: 'JOB_APP_DEBUG_AUTHORIZE'}, contentSender);
+  assert.equal(enabledTopLevelSite.ok, true);
+  harness.localData.disabledHostnames = [];
+  const extensionPage = await harness.dispatch({type: 'JOB_APP_DEBUG_AUTHORIZE'}, {id: 'test-extension', url: 'chrome-extension://test-extension/sidepanel.html'});
+  assert.equal(extensionPage.ok, false);
+  const otherExtension = await harness.dispatch({type: 'JOB_APP_DEBUG_AUTHORIZE'}, {...contentSender, id: 'other-extension'});
+  assert.equal(otherExtension.ok, false);
+});
+
+test('debug capture redacts URLs and entered answers from stored outcomes', async () => {
+  const destination = {documentId: 'document-1', regionId: 'form-1'};
+  const harness = createHarness({pagesByTab: {7: {pages: [{
+    page: {title: 'Job application', domain: 'jobs.example.com'},
+    fields: [{id: 'availability', label: 'Availability', type: 'text', currentValue: 'No'}],
+    actions: [], destination,
+  }]}}});
+  harness.localData.developerMode = true;
+  harness.sessionData.applicationRun = {'7': {
+    tabId: 7, startedAt: 'session-1', status: 'waiting_user', pageNumber: 1,
+    formOrigin: {domain: 'jobs.example.com', pathname: '/apply'},
+    frame: {frameId: 0, destination},
+    actionRequired: [{code: 'review', category: 'pause', reason: 'Review portal.private.example/apply; answer No.'}],
+    reviewRequired: [{label: 'No', reason: 'Retry at ftp://files.private.example/archive.'}],
+  }};
+  await import(`../src/service-worker.js?debug-outcome-redaction=${Date.now()}`);
+  const captured = await harness.dispatch({type: 'JOB_RUN_DEBUG_CAPTURE'});
+  assert.equal(captured.ok, true, captured.error);
+  assert.equal(captured.case.sessionId, '7:session-1');
+  assert.doesNotMatch(JSON.stringify(captured.case.outcomes), /portal\.private\.example|ftp:\/\/files\.private\.example|answer No/);
+  assert.match(captured.case.outcomes.actionRequired[0].reason, /answer \[redacted\]/);
+});
+
+test('ambiguous debug capture selects a form without invoking the fill workflow', async () => {
+  const frames = [0, 2].map(frameId => ({frameId, context: {title: 'Job application'}, pages: [{
+    page: {title: 'Job application', domain: 'jobs.example.com'},
+    fields: [{id: 'name', label: 'Full name', type: 'text'}, {id: 'resume', label: 'Resume', type: 'file'}],
+    actions: [{id: 'submit', label: 'Submit application', kind: 'submit'}],
+    destination: {documentId: `document-${frameId}`, regionId: `form-${frameId}`},
+  }]}));
+  const harness = createHarness({pagesByTab: {7: {frames}}});
+  harness.localData.developerMode = true;
+  await import(`../src/service-worker.js?debug-select=${Date.now()}`);
+  const first = await harness.dispatch({type: 'JOB_RUN_DEBUG_CAPTURE'});
+  assert.equal(first.selectionRequired, true);
+  const selection = harness.tabs.get(7).messages.find(message => message.type === 'JOB_APP_SELECT_FORM');
+  assert.equal(selection.debug, true);
+  const selected = await harness.dispatch({type: 'JOB_APP_FORM_SELECTED', token: selection.token,
+    destination: {documentId: 'document-2', regionId: 'form-2'}},
+    {id: 'test-extension', tab: {id: 7, url: 'https://jobs.example.com/apply'}, frameId: 2});
+  assert.equal(selected.debugSelection, true, selected.error);
+  const captured = await harness.dispatch({type: 'JOB_RUN_DEBUG_CAPTURE'});
+  assert.equal(captured.case.frameId, 2);
+  assert.equal(harness.tabs.get(7).messages.some(message => ['JOB_APP_APPLY', 'JOB_APP_CLICK_NEXT'].includes(message.type)), false);
+});
+
+test('saved-answer vote autofills by default and becomes review-only when disabled', async () => {
+  for (const enabled of [true, false]) {
+    const harness = createHarness({answerRecords: [
+      {key:'first_name',question:'First name',answer:'Nitin',sensitivity:'safe'},
+      {key:'given_name',question:'Given name',answer:'Nitin',sensitivity:'safe'},
+      {key:'old_first_name',question:'First name',answer:'Nithin',sensitivity:'safe'},
+    ],pagesByTab:{7:{pages:[{fields:[{id:'first_name',handle:'first-h',label:'First Name',type:'text',required:true}],
+      actions:[{id:'submit',label:'Submit application',kind:'submit'}]}]}}});
+    if (!enabled) harness.localData.voteAutofillEnabled = false;
+    await import(`../src/service-worker.js?vote-autofill=${enabled}-${Date.now()}`);
+    const response = await harness.dispatch({type:'JOB_RUN_START',tabId:7});
+    assert.equal(response.ok,true,response.error);
+    assert.equal(harness.tabs.get(7).frames[0].pages[0].values?.first_name,enabled ? 'Nitin' : undefined);
+    if (!enabled) assert.ok(response.run.suggestions?.first_name?.candidates?.length);
+  }
+});
+
+test('disabled vote autofill keeps the leading answer in review candidates', async () => {
+  const harness = createHarness({answerRecords: [
+    ...['aaa', 'bbb', 'ccc'].map(key => ({key, question:'First name', answer:key.toUpperCase(), sensitivity:'safe'})),
+    ...['zzz1', 'zzz2', 'zzz3', 'zzz4'].map(key => ({key, question:'First name', answer:'Nitin', sensitivity:'safe'})),
+  ],pagesByTab:{7:{pages:[{fields:[{id:'first_name',handle:'first-h',label:'First Name',type:'text',required:true}],
+    actions:[{id:'submit',label:'Submit application',kind:'submit'}]}]}}});
+  harness.localData.voteAutofillEnabled = false;
+  await import(`../src/service-worker.js?vote-review-winner=${Date.now()}`);
+  const response = await harness.dispatch({type:'JOB_RUN_START',tabId:7});
+  assert.equal(response.ok, true, response.error);
+  assert.equal(harness.tabs.get(7).frames[0].pages[0].values?.first_name, undefined);
+  assert.ok(response.run.suggestions.first_name.candidates.some(candidate => candidate.answer === 'Nitin'));
+});
+
+test('supported tabs stay content-disabled until Fill this form starts a session', async () => {
+  const harness = createHarness({pagesByTab: {7: {pages: [{
+    page: {title: 'Job application', domain: 'jobs.example.com'},
+    fields: [{id: 'name', label: 'Full name', type: 'text'}], actions: [],
+  }]}}});
+  await import(`../src/service-worker.js?form-session-default=${Date.now()}`);
+  const sender = {id: 'test-extension', tab: {id: 7, url: 'https://jobs.example.com/apply'}, frameId: 0};
+  const initial = await harness.dispatch({type: 'JOB_APP_SITE_STATUS'}, sender);
+  assert.equal(initial.ok, true, initial.error);
+  assert.equal(initial.enabled, false);
+  assert.equal(initial.sessionActive, false);
+
+  const started = await harness.dispatch({type: 'JOB_RUN_START', tabId: 7});
+  assert.equal(started.ok, true, started.error);
+  assert.equal(harness.tabs.get(7).messages.some(message => message.type === 'JOB_APP_SITE_STATE_CHANGED' && message.enabled === true), true);
+  const active = await harness.dispatch({type: 'JOB_APP_SITE_STATUS'}, sender);
+  assert.equal(active.enabled, true);
+  assert.equal(active.sessionActive, true);
+  const unrelatedForm = await harness.dispatch({type: 'JOB_APP_SITE_STATUS'}, {
+    ...sender, tab: {id: 7, url: 'https://jobs.example.com/another-form'},
+  });
+  assert.equal(unrelatedForm.enabled, false);
+  assert.equal(unrelatedForm.sessionActive, false);
+
+  await harness.dispatch({type: 'JOB_SITE_SET_DISABLED', tabId: 7, disabled: true});
+  await harness.dispatch({type: 'JOB_SITE_SET_DISABLED', tabId: 7, disabled: false});
+  const stateChanges = harness.tabs.get(7).messages.filter(message => message.type === 'JOB_APP_SITE_STATE_CHANGED');
+  assert.equal(stateChanges.at(-1).enabled, false);
+});
+
+test('form-session authorization survives an explicit next-page advance', async () => {
+  const harness = createHarness({pagesByTab: {7: {pages: [
+    {page: {title: 'Job application', domain: 'jobs.example.com'}, fields: [{id: 'name', label: 'Full name', type: 'text'}], actions: [{id: 'next', label: 'Next', kind: 'next'}], advanceOnClick: true},
+    {page: {title: 'Job application', domain: 'jobs.example.com'}, fields: [{id: 'email', label: 'Email', type: 'email'}], actions: []},
+  ]}}});
+  await import(`../src/service-worker.js?form-session-next=${Date.now()}`);
+  await harness.dispatch({type: 'JOB_RUN_START', tabId: 7});
+  const advanced = await harness.dispatch({type: 'JOB_RUN_ADVANCE_PAGE', tabId: 7});
+  assert.equal(advanced.ok, true, advanced.error);
+  const active = await harness.dispatch({type: 'JOB_APP_SITE_STATUS'}, {id: 'test-extension', tab: {id: 7, url: 'https://jobs.example.com/apply?step=2'}, frameId: 0});
+  assert.equal(active.enabled, true);
+  assert.equal(active.sessionActive, true);
+});
+
+test('reuses an accepted fact from an earlier page without sending it to an AI provider', async () => {
+  const harness = createHarness({pagesByTab: {7: {pages: [
+    {page: {title: 'Job application', domain: 'jobs.example.com'}, fields: [{id: 'country', label: 'Country', type: 'text', currentValue: 'India'}], actions: [{id: 'next', label: 'Next', kind: 'next'}], advanceOnClick: true},
+    {page: {title: 'Job application', domain: 'jobs.example.com'}, fields: [{id: 'country_confirm', label: 'Country', type: 'text', required: true}], actions: [{id: 'submit', label: 'Submit application', kind: 'submit', type: 'submit'}]},
+  ]}}});
+  await import(`../src/service-worker.js?application-memory=${Date.now()}`);
+  const started = await harness.dispatch({type: 'JOB_RUN_START', tabId: 7});
+  const advanced = await harness.dispatch({type: 'JOB_RUN_ADVANCE_PAGE', tabId: 7});
+  assert.equal(advanced.ok, true, advanced.error);
+  await harness.dispatch({type: 'JOB_APP_NAVIGATED'}, {tab: {id: 7}, frameId: 0});
+  assert.equal(harness.tabs.get(7).frames[0].pages[1].values.country_confirm, 'India');
+  assert.equal(harness.tabs.get(7).messages.some(message => message.type === 'JOB_APP_DISCOVER_OPTIONS'), false);
+  assert.equal(started.run.pages[0].values[0].answer, 'India');
+});
+
 test('disabled site rejects inline requests and prevents a late run write after revocation', async () => {
   const harness = createHarness({
     disabledHostnames: [],
@@ -309,7 +520,7 @@ test('disabled site rejects inline requests and prevents a late run write after 
   assert.match(inline.error, /disabled on this site/i);
 });
 
-test('inline lookup works with no run and never fills on focus', async () => {
+test('inline lookup is blocked until a form session is active', async () => {
   const harness = createHarness({pagesByTab: {7: {pages: [{
     page: {title: 'Job application', domain: 'jobs.example.com'},
     fields: [{id: 'name', handle: 'doc-a:name', label: 'Full name',
@@ -320,12 +531,200 @@ test('inline lookup works with no run and never fills on focus', async () => {
     documentId: 'doc-a', url: 'https://jobs.example.com/apply'};
   const response = await harness.dispatch({type: 'JOB_INLINE_QUERY',
     fieldId: 'name', handle: 'doc-a:name', requestId: 'query-1'}, sender);
-  assert.equal(response.ok, true, response.error);
-  assert.equal(response.candidates[0].answer, 'Nithin');
+  assert.equal(response.ok, false);
+  assert.match(response.error, /Fill this form/i);
   assert.equal(harness.sessionData.applicationRun?.['7'], undefined);
   assert.equal(harness.tabs.get(7).messages.some(m => m.type === 'JOB_APP_APPLY'), false);
   assert.equal(harness.tabs.get(7).nextClicks, 0);
   assert.equal(harness.tabs.get(7).submitCalls, 0);
+});
+
+test('Fill this page batches unresolved saved-answer choices and skips drafting matched fields', async () => {
+  const harness = createHarness({answerRecords: [
+    {key: 'reliability', question: 'Engineering achievement', answer: 'Reduced production outages with health checks and automated rollback.', sensitivity: 'safe'},
+    {key: 'teamwork', question: 'Leadership example', answer: 'Led a team through a difficult migration.', sensitivity: 'safe'},
+  ], pagesByTab: {7: {pages: [{
+    page: {title: 'Job application', domain: 'jobs.example.com'},
+    fields: [
+      {id: 'impact', handle: 'doc-a:impact', label: 'How have you made systems safer?', type: 'textarea', required: true, rawValue: '', editRevision: 0},
+      {id: 'collaboration', handle: 'doc-a:collaboration', label: 'How do you help groups work well together?', type: 'textarea', required: true, rawValue: '', editRevision: 0},
+    ], actions: [],
+  }]}}});
+  harness.localData.typesafeEnabled = true;
+  harness.localData.typesafeAutofillEnabled = false;
+  harness.localData.typesafeApiKey = 'ts_test';
+  const calls = [];
+  globalThis.fetch = async (url, options) => {
+    const body = JSON.parse(options.body);
+    calls.push({url, body});
+    return {ok: true, status: 200, json: async () => ({answers:jevAnswers(body,{f0:'r0',f1:'r1'})})};
+  };
+  await import(`../src/service-worker.js?test=typesafe-batch-${Date.now()}`);
+  const started = await harness.dispatch({type: 'JOB_RUN_START', tabId: 7});
+  assert.equal(started.ok, true, started.error);
+  assert.equal(calls.length, 1);
+  assert.match(calls[0].url, /api\.typesafe\.ai/);
+  assert.deepEqual(Object.keys(calls[0].body.questions), ['f0','f0_sufficiency','f0_conflict','f1','f1_sufficiency','f1_conflict']);
+  assert.equal(calls[0].body.state.records.length, 2);
+  assert.equal(started.run.suggestions.impact.candidates[0].kind, 'semantic');
+  assert.equal(started.run.suggestions.collaboration.candidates[0].kind, 'semantic');
+  assert.deepEqual(started.run.generatedSuggestions, {});
+});
+
+test('background AI leaves unopened custom dropdowns untouched', async () => {
+  const harness = createHarness({answerRecords: [{key: 'travel', question: 'Travel availability', answer: 'India', sensitivity: 'safe'}],
+    pagesByTab: {7: {pages: [{page: {title: 'Application', domain: 'jobs.example.com'}, fields: [
+      {id: 'full_name', handle: 'name-h', label: 'Full name', type: 'text', required: true, currentValue: 'Nithin', rawValue: 'Nithin', editRevision: 0},
+      {id: 'country', handle: 'country-h', label: 'Country', type: 'select', widget: 'custom', required: true, rawValue: '', editRevision: 0},
+    ], actions: []}]}}});
+  harness.localData.typesafeEnabled = true;
+  harness.localData.typesafeApiKey = 'ts_test';
+  globalThis.fetch = async () => ({ok: true, status: 200, json: async () => ({answers: {}})});
+  await import(`../src/service-worker.js?test=custom-options-${Date.now()}`);
+  const started = await harness.dispatch({type: 'JOB_RUN_START', tabId: 7});
+  assert.equal(started.ok, true, started.error);
+  assert.equal(harness.tabs.get(7).messages.some(message => message.type === 'JOB_APP_DISCOVER_OPTIONS'), false);
+  assert.equal(harness.tabs.get(7).frames[0].pages[0].values?.country, undefined);
+});
+
+test('opt-in JEV autofill applies a guarded low-risk option without user approval or learning promotion', async () => {
+  const harness=createHarness({answerRecords:[{key:'phone_kind',question:'Preferred telephone kind',answer:'Cellular',sensitivity:'safe',confirmationState:'confirmed'}],
+    pagesByTab:{7:{pages:[{page:{title:'Application',domain:'jobs.example.com'},fields:[
+      {id:'device',handle:'device-h',label:'Phone device type',labelConfidence:'high',type:'select',options:['Mobile','Landline'],required:true,rawValue:'',editRevision:0},
+      {id:'name',handle:'name-h',label:'Full name',labelConfidence:'high',type:'text',required:true,currentValue:'Nithin',rawValue:'Nithin',editRevision:0},
+    ],actions:[]}]}}});
+  harness.localData.typesafeEnabled=true;
+  harness.localData.typesafeAutofillEnabled=true;
+  harness.localData.typesafeApiKey='ts_test';
+  const calls=[];
+  globalThis.fetch=async(_url,options)=>{
+    const body=JSON.parse(options.body);
+    calls.push(body);
+    return {ok:true,status:200,json:async()=>({answers:jevAnswers(body,{f0:'o0'})})};
+  };
+  await import(`../src/service-worker.js?test=typesafe-autofill-${Date.now()}`);
+  const started=await harness.dispatch({type:'JOB_RUN_START',tabId:7});
+  assert.equal(started.ok,true,started.error);
+  assert.equal(harness.tabs.get(7).frames[0].pages[0].values?.device,'Mobile',JSON.stringify({
+    semanticSearch:started.run.semanticSearch,
+    calls,
+    actionRequired:started.run.actionRequired,
+    reviewRequired:started.run.reviewRequired,
+    aiOperations:started.run.aiOperations,
+    messages:harness.tabs.get(7).messages.filter(message=>message.type==='JOB_APP_APPLY'),
+  }));
+  const decision=harness.tabs.get(7).messages.find(message=>message.type==='JOB_APP_APPLY'
+    && message.decisions?.some(item=>item.matchKind==='semantic')).decisions[0];
+  assert.equal(decision.approved,undefined);
+  assert.equal(decision.expectedRawValue,'');
+  assert.equal(decision.expectedEditRevision,0);
+  assert.deepEqual(started.run.semanticAutofills.map(item=>[item.fieldId,item.value]),[['device','Mobile']]);
+  assert.equal(harness.localData.answerRecords.some(record=>record.question==='Phone device type'),false);
+  assert.equal(Object.values(harness.localData.applicationDrafts || {}).flatMap(item=>item.records || [])
+    .find(record=>record.question==='Phone device type')?.provenance,'autofill');
+});
+
+test('JEV chooses between conflicting saved first names before the local vote can fill', async () => {
+  const harness = createHarness({answerRecords: [
+    {key: 'first_name', question: 'First name', answer: 'Nitin', sensitivity: 'safe'},
+    {key: 'given_name', question: 'Given name', answer: 'Nitin', sensitivity: 'safe'},
+    {key: 'corrected_name', question: 'First name', answer: 'Nithin', sensitivity: 'safe'},
+  ], pagesByTab: {7: {pages: [{fields: [
+    {id: 'first_name', handle: 'first-h', label: 'First Name', type: 'text', required: true, rawValue: '', editRevision: 0},
+  ], actions: [{id: 'submit', label: 'Submit application', kind: 'submit'}]}]}}});
+  harness.localData.typesafeApiKey = 'ts_test';
+  let calls = 0;
+  globalThis.fetch = async (_url, options) => {
+    calls += 1;
+    const body = JSON.parse(options.body);
+    const choice = body.state.records.find(record => record.answer === 'Nithin').id;
+    return {ok: true, status: 200, json: async () => ({answers: jevAnswers(body, {f0: choice})})};
+  };
+  await import(`../src/service-worker.js?test=jev-conflicting-name-${Date.now()}`);
+  const started = await harness.dispatch({type: 'JOB_RUN_START', tabId: 7});
+  assert.equal(started.ok, true, started.error);
+  assert.equal(calls, 1, JSON.stringify({run: started.run, values: harness.tabs.get(7).frames[0].pages[0].values}));
+  assert.equal(harness.tabs.get(7).frames[0].pages[0].values?.first_name, 'Nithin');
+  assert.deepEqual(started.run.semanticAutofills.map(item => item.value), ['Nithin']);
+});
+
+test('JEV sensitive and no-match settings control automatic declaration answers', async () => {
+  for (const policy of [{sensitive: true, top: true, expected: 'Yes'},
+    {sensitive: false, top: true, expected: undefined},
+    {sensitive: true, top: false, expected: undefined},
+    {sensitive: true, top: true, reusePolicy: 'review_only', expected: undefined}]) {
+    const harness = createHarness({answerRecords: [
+      {key: 'consent', question: 'I agree to the terms and conditions', answer: 'Yes', sensitivity: 'legal', reusePolicy: policy.reusePolicy},
+    ], pagesByTab: {7: {pages: [{fields: [
+      {id: 'consent', handle: 'consent-h', label: 'I agree to the terms and conditions',
+        type: 'checkbox', options: ['Yes', 'No'], required: true, rawValue: '', editRevision: 0},
+    ], actions: [{id: 'submit', label: 'Submit application', kind: 'submit'}]}]}}});
+    harness.localData.typesafeApiKey = 'ts_test';
+    harness.localData.typesafeAutofillSensitive = policy.sensitive;
+    harness.localData.typesafeNoMatchTop = policy.top;
+    globalThis.fetch = async (_url, options) => {
+      const body = JSON.parse(options.body);
+      const answers = jevAnswers(body);
+      answers.f0 = {type: 'choice', choice: 'none', confidence: 0.4,
+        probabilities: {none: 0.6, o0: 0.3, o1: 0.1}};
+      return {ok: true, status: 200, json: async () => ({answers})};
+    };
+    await import(`../src/service-worker.js?test=jev-legal-${policy.sensitive}-${policy.top}-${Date.now()}`);
+    const started = await harness.dispatch({type: 'JOB_RUN_START', tabId: 7});
+    assert.equal(started.ok, true, started.error);
+    assert.equal(harness.tabs.get(7).frames[0].pages[0].values?.consent, policy.expected, JSON.stringify({run: started.run, policy}));
+  }
+});
+
+test('Fill this page makes no TypeSafe request when a usable local suggestion exists', async () => {
+  const harness = createHarness({answerRecords: [{key: 'story', question: 'Model deployment project',
+    answer: 'I trained machine learning models and deployed them to production.', sensitivity: 'safe'}],
+  pagesByTab: {7: {pages: [{page: {title: 'Application', domain: 'jobs.example.com'}, fields: [
+    {id: 'ml', handle: 'handle-ml', label: 'Describe your ML experience', type: 'textarea', required: true},
+  ], actions: [{id: 'submit', label: 'Submit application', kind: 'submit'}]}]}}});
+  harness.localData.typesafeEnabled = true;
+  harness.localData.typesafeAutofillEnabled = false;
+  harness.localData.typesafeApiKey = 'ts_test';
+  let calls = 0;
+  globalThis.fetch = async () => { calls += 1; throw new Error('TypeSafe should not be called'); };
+  await import(`../src/service-worker.js?test=typesafe-local-skip-${Date.now()}`);
+  const started = await harness.dispatch({type: 'JOB_RUN_START', tabId: 7});
+  assert.equal(started.ok, true, started.error);
+  assert.ok(started.run.suggestions.ml?.candidates.length, JSON.stringify(started.run));
+  assert.equal(calls, 0);
+});
+
+test('Fill this page still uses TypeSafe after an explicit local search found no candidates', async () => {
+  const harness = createHarness({waitForAI: false, answerRecords: [{key: 'reliability', question: 'Engineering achievement',
+    answer: 'Reduced production outages with health checks and automated rollback.', sensitivity: 'safe'}],
+  pagesByTab: {7: {pages: [{page: {title: 'Application', domain: 'jobs.example.com'}, fields: [
+    {id: 'impact', handle: 'handle-impact', label: 'How have you made systems safer?', type: 'textarea', required: true},
+  ], actions: [{id: 'submit', label: 'Submit application', kind: 'submit'}]}]}}});
+  await import(`../src/service-worker.js?test=typesafe-empty-local-search-${Date.now()}`);
+  const started = await harness.dispatch({type: 'JOB_RUN_START', tabId: 7});
+  assert.equal(started.ok, true, started.error);
+  const listed = started.run.actionRequired.find(item => item.fieldId === 'impact');
+  const origin = {tabId: 7, frameId: started.run.frame.frameId, applicationId: started.run.startedAt,
+    pageSignature: started.run.pageSignature, fieldId: 'impact', handle: listed.handle};
+  const searched = await harness.dispatch({type: 'JOB_RUN_SEARCH_ANSWERS', ...origin, query: 'no-such-keyword'});
+  assert.equal(searched.ok, true, searched.error);
+  assert.deepEqual(searched.candidates, []);
+
+  harness.localData.typesafeEnabled = true;
+  harness.localData.typesafeAutofillEnabled = false;
+  harness.localData.typesafeApiKey = 'ts_test';
+  harness.sessionData.applicationRun['7'].aiOperations = {planner: {status: 'failed'}};
+  harness.sessionData.applicationRun['7'].semanticSearch = {impact: {status: 'failed'}};
+  let calls = 0;
+  globalThis.fetch = async (_url,options) => {
+    calls += 1;
+    const body=JSON.parse(options.body);
+    return {ok:true,status:200,json:async()=>({answers:jevAnswers(body,{f0:'r0'})})};
+  };
+  await harness.dispatch({type: 'JOB_RUN_RETRY_AI', tabId: 7});
+  await waitUntil(() => harness.sessionData.applicationRun['7'].aiOperations.planner.status === 'completed');
+  assert.equal(calls, 1);
+  assert.equal(harness.sessionData.applicationRun['7'].suggestions.impact.candidates[0].kind, 'semantic');
 });
 
 const inlineSender = (overrides = {}) => ({ id: 'test-extension', tab: {id: 7}, frameId: 0, documentId: 'doc-a', url: 'https://jobs.example.com/apply', ...overrides });
@@ -336,12 +735,87 @@ async function waitUntil(predicate) {
   for (let i = 0; i < 100 && !predicate(); i++) await new Promise(resolve => setTimeout(resolve, 5));
   assert.ok(predicate(), 'Expected deferred provider operation to start');
 }
+
+test('pending JEV results are discarded when semantic field context changes', async () => {
+  for (const property of ['helpText','nearbyContext','section','labelConfidence','entityId','entityType']) {
+    const harness=createHarness({answerRecords:[
+      {key:'reliability',question:'Engineering achievement',answer:'Reduced production outages with health checks and automated rollback.',sensitivity:'safe'},
+      {key:'teamwork',question:'Leadership example',answer:'Led a team through a difficult migration.',sensitivity:'safe'},
+    ],
+    pagesByTab:{7:{pages:[{page:{title:'Application',domain:'jobs.example.com'},fields:[
+      {id:'impact',handle:'impact-h',label:'How have you made systems safer?',type:'textarea',required:true,
+        rawValue:'',editRevision:0,helpText:'Original help',nearbyContext:'Original context'},
+      {id:'collaboration',handle:'collaboration-h',label:'How do you help groups work well together?',type:'textarea',required:true,
+        rawValue:'',editRevision:0},
+    ],actions:[]}]}}});
+    harness.localData.typesafeEnabled=true;
+    harness.localData.typesafeApiKey='ts_test';
+    let release;
+    globalThis.fetch=async(_url,options)=>{
+      const body=JSON.parse(options.body);
+      await new Promise(resolve=>{release=resolve;});
+      return {ok:true,status:200,json:async()=>({answers:jevAnswers(body,{f0:'r0',f1:'r1'})})};
+    };
+    await import(`../src/service-worker.js?test=typesafe-stale-${property}-${Date.now()}`);
+    const starting=harness.dispatch({type:'JOB_RUN_START',tabId:7});
+    await waitUntil(()=>Boolean(release));
+    harness.tabs.get(7).frames[0].pages[0].fields[0][property]=`Changed ${property}`;
+    release();
+    const started=await starting;
+    assert.equal(started.ok,true,started.error);
+    assert.equal(started.run.suggestions?.impact,undefined,property);
+    assert.equal(harness.tabs.get(7).messages.some(message=>message.type==='JOB_APP_APPLY'),false,property);
+  }
+});
+
+test('pending JEV results are discarded when the employment mapping changes', async () => {
+  const harness=createHarness({answerRecords:[
+    {key:'reliability',question:'Engineering achievement',answer:'Reduced production outages with health checks and automated rollback.',sensitivity:'safe'},
+    {key:'teamwork',question:'Leadership example',answer:'Led a team through a difficult migration.',sensitivity:'safe'},
+  ],
+  pagesByTab:{7:{pages:[{page:{title:'Application',domain:'jobs.example.com'},fields:[
+    {id:'impact',handle:'impact-h',label:'How have you made systems safer?',type:'textarea',required:true,
+      rawValue:'',editRevision:0},
+    {id:'collaboration',handle:'collaboration-h',label:'How do you help groups work well together?',type:'textarea',required:true,
+      rawValue:'',editRevision:0},
+  ],actions:[]}]}}});
+  harness.localData.typesafeEnabled=true;
+  harness.localData.typesafeApiKey='ts_test';
+  let release;
+  globalThis.fetch=async(_url,options)=>{
+    const body=JSON.parse(options.body);
+    await new Promise(resolve=>{release=resolve;});
+    return {ok:true,status:200,json:async()=>({answers:jevAnswers(body,{f0:'r0',f1:'r1'})})};
+  };
+  await import(`../src/service-worker.js?test=typesafe-stale-employment-${Date.now()}`);
+  const starting=harness.dispatch({type:'JOB_RUN_START',tabId:7});
+  await waitUntil(()=>Boolean(release));
+  const run=harness.sessionData.applicationRun['7'];
+  run.employmentMappings={[`${run.pageSignature}:work-1`]:'emp-b'};
+  release();
+  const started=await starting;
+  assert.equal(started.ok,true,started.error);
+  assert.equal(started.run.suggestions?.impact,undefined);
+  assert.equal(harness.tabs.get(7).messages.some(message=>message.type==='JOB_APP_APPLY'),false);
+});
+
 const inlineAcceptance = (query, overrides = {}) => ({ type: 'JOB_INLINE_ACCEPT', sessionId: query.sessionId, requestId: 'accept-1', candidateId: query.candidates[0].candidateId, acceptanceToken: 'content-token', ...overrides });
-async function inlineHarness({ field = {}, page = {}, ...options } = {}) {
+async function inlineHarness({ field = {}, page = {}, sessionActive = true, ...options } = {}) {
   const harness = createHarness({pagesByTab: {7: {pages: [{page: {title: 'Job application', domain: 'jobs.example.com'}, fields: [
     {id: 'name', handle: 'doc-a:name', label: 'Full name', type: 'text', rawValue: '', editRevision: 0, ...field},
   ], actions: [], ...page}]}}, ...options});
   await import(`../src/service-worker.js?test=inline-${Date.now()}-${Math.random()}`);
+  if (sessionActive) {
+    const tab = harness.tabs.get(7);
+    const url = new URL(tab.url);
+    harness.sessionData.applicationRun = {
+      ...(harness.sessionData.applicationRun || {}),
+      '7': {
+      tabId: 7, siteRevision: 0, status: 'answers_saved', startedAt: 'inline-test-session', applicationId: 'inline-test-session', formOrigin: {domain: url.hostname, pathname: url.pathname},
+      frame: {frameId: 0, domain: url.hostname, pathname: url.pathname},
+      },
+    };
+  }
   return harness;
 }
 
@@ -358,6 +832,82 @@ test('inline search registers and approves evidence missed by automatic matching
   assert.equal(searched.candidates.length, 1);
   const applied = await harness.dispatch(inlineAcceptance(searched), inlineSender());
   assert.equal(applied.ok, true, applied.error);
+});
+
+test('inline TypeSafe search is explicit and rejects a source changed before approval', async () => {
+  const harness = await inlineHarness({field: {id: 'impact', handle: 'doc-a:impact',
+    label: 'How have you made systems safer?', type: 'textarea'}, answerRecords: [
+    {key: 'reliability', question: 'Engineering achievement',
+      answer: 'Reduced production outages with health checks and automated rollback.', sensitivity: 'safe'},
+  ]});
+  harness.localData.typesafeEnabled = true;
+  harness.localData.typesafeApiKey = 'ts_test';
+  let calls = 0;
+  globalThis.fetch = async (_url, options) => {
+    calls += 1;
+    const body = JSON.parse(options.body);
+    assert.deepEqual(Object.keys(body.questions), ['f0','f0_sufficiency','f0_conflict']);
+    return {ok:true,status:200,json:async()=>({answers:jevAnswers(body,{f0:'r0'})})};
+  };
+  const query = await harness.dispatch(inlineQuery({fieldId: 'impact', handle: 'doc-a:impact'}), inlineSender());
+  assert.equal(calls, 0, 'ordinary focus/query remains local');
+  const matched = await harness.dispatch({type: 'JOB_INLINE_SEMANTIC_SEARCH', sessionId: query.sessionId,
+    fieldId: 'impact', handle: 'doc-a:impact', requestId: 'semantic-1'}, inlineSender());
+  assert.equal(matched.semanticStatus, 'matched');
+  assert.equal(calls, 1);
+  harness.localData.answerRecords[0].answer = 'The saved source was edited after matching.';
+  const applied = await harness.dispatch({type: 'JOB_INLINE_ACCEPT', sessionId: query.sessionId,
+    requestId: 'accept-semantic', candidateId: matched.candidates[0].candidateId, acceptanceToken: 'content-token'}, inlineSender());
+  assert.equal(applied.ok, false);
+  assert.match(applied.error, /source|changed|available/i);
+  assert.equal(harness.tabs.get(7).messages.some(message => message.type === 'JOB_APP_APPLY'), false);
+});
+
+test('inline panel can search saved answers after focus leaves the page without applying them', async () => {
+  const harness = await inlineHarness({field: {label: 'How have you made systems safer?', type: 'textarea'}, answerRecords: [
+    {key: 'reliability', question: 'Engineering achievement',
+      answer: 'Reduced production outages with health checks and automated rollback.', sensitivity: 'safe'},
+  ]});
+  harness.localData.typesafeEnabled = true;
+  harness.localData.typesafeApiKey = 'ts_test';
+  let calls = 0;
+  globalThis.fetch = async (_url,options) => {
+    calls++;
+    const body=JSON.parse(options.body);
+    return {ok:true,status:200,json:async()=>({answers:jevAnswers(body,{f0:'r0'})})};
+  };
+  const query = await harness.dispatch(inlineQuery(), inlineSender());
+  await handoffInline(harness, query);
+  const {inlineSession} = await harness.dispatch({type: 'JOB_INLINE_PANEL_STATE', tabId: 7});
+  harness.tabs.get(7).frames[0].pages[0].focusedFieldId = null;
+  const response = await harness.dispatch({type: 'JOB_RUN_SEMANTIC_SEARCH', ...panelOrigin(inlineSession)});
+  assert.equal(response.ok, true, response.error);
+  assert.equal(response.semanticStatus, 'matched');
+  assert.equal(response.candidates.length, 1);
+  assert.equal(response.candidates[0].kind, 'semantic');
+  assert.equal(response.inlineSession.sessionId, inlineSession.sessionId);
+  assert.equal(calls, 1);
+  assert.equal(harness.tabs.get(7).messages.some(message => message.type === 'JOB_APP_APPLY'), false);
+});
+
+test('inline TypeSafe search preserves an existing candidate ID for a duplicate answer', async () => {
+  const harness = await inlineHarness({field: {label: 'Describe your ML deployment experience', type: 'textarea'}, answerRecords: [
+    {key: 'ml_delivery', question: 'Machine learning delivery project',
+      answer: 'I built and deployed machine learning models to production.', sensitivity: 'safe'},
+  ]});
+  harness.localData.typesafeEnabled = true;
+  harness.localData.typesafeApiKey = 'ts_test';
+  globalThis.fetch = async (_url,options) => {
+    const body=JSON.parse(options.body);
+    return {ok:true,status:200,json:async()=>({answers:jevAnswers(body,{f0:'r0'})})};
+  };
+  const query = await harness.dispatch(inlineQuery(), inlineSender());
+  assert.equal(query.candidates.length, 1);
+  const candidateId = query.candidates[0].candidateId;
+  const matched = await harness.dispatch({type: 'JOB_INLINE_SEMANTIC_SEARCH', sessionId: query.sessionId,
+    fieldId: 'name', handle: 'doc-a:name', requestId: 'semantic-duplicate'}, inlineSender());
+  assert.equal(matched.semanticStatus, 'matched');
+  assert.equal(matched.candidates[0].candidateId, candidateId);
 });
 
 test('clearing inline search registers fresh automatic candidates and rejects expired IDs', async () => {
@@ -389,7 +939,7 @@ async function handoffInline(harness, query, sender = inlineSender()) {
   return harness.dispatch({type: 'JOB_INLINE_EDIT_IN_PANEL', sessionId: query.sessionId, candidateId: query.candidates[0]?.candidateId}, sender);
 }
 
-for (const support of ['available', 'missing', 'rejected']) test(`inline panel handoff opens before async storage with ${support} API and no run`, async () => {
+for (const support of ['available', 'missing', 'rejected']) test(`inline panel handoff opens before async storage with ${support} API in an active form session`, async () => {
   const harness = await inlineHarness();
   const query = await harness.dispatch(inlineQuery(), inlineSender());
   const calls = [];
@@ -403,7 +953,7 @@ for (const support of ['available', 'missing', 'rejected']) test(`inline panel h
   const state = await harness.dispatch({type: 'JOB_INLINE_PANEL_STATE', tabId: 7});
   assert.equal(state.inlineSession.sessionId, query.sessionId);
   assert.equal(state.inlineSession.panelCandidateId, query.candidates[0].candidateId);
-  assert.equal(harness.sessionData.applicationRun?.['7'], undefined);
+  assert.equal(harness.sessionData.applicationRun?.['7']?.status, 'answers_saved');
   assert.equal((await harness.dispatch({type: 'JOB_INLINE_PANEL_STATE', tabId: 8})).inlineSession, null);
   assert.equal((await harness.dispatch({type: 'JOB_INLINE_PANEL_STATE', tabId: 7}, inlineSender())).ok, false);
   const closed = await harness.dispatch({type: 'JOB_INLINE_PANEL_STATE', ...panelOrigin(state.inlineSession), close: true});
@@ -427,7 +977,11 @@ test('inline panel child-frame focus and edited saved approval use the live sess
   const applied = await harness.dispatch({type: 'JOB_RUN_APPROVE_SUGGESTION', ...origin, sourceKey: 'full_name', answer: 'Nithin edited'});
   assert.equal(applied.ok, true, applied.error); assert.ok(applied.inlineSession);
   assert.equal(harness.tabs.get(7).frames[0].pages[0].values.name, 'Nithin edited');
-  assert.equal(harness.sessionData.applicationRun?.['7'], undefined);
+  const apply = harness.tabs.get(7).messages.find(message => message.type === 'JOB_APP_APPLY');
+  assert.ok(apply.observationRevision);
+  assert.equal(apply.decisions[0].expectedRawValue, '');
+  assert.equal(apply.decisions[0].expectedEditRevision, 0);
+  assert.equal(harness.sessionData.applicationRun?.['7']?.status, 'answers_saved');
 });
 
 test('inline panel rejects changed destinations and untrusted origins before applying', async () => {
@@ -490,6 +1044,7 @@ test('closing the latest handoff cannot resurrect an earlier requested frame', a
 
 async function inlinePanelIntegration(t) {
   const harness = await inlineHarness();
+  await harness.dispatch({type: 'JOB_RUN_START', tabId: 7});
   const content = new JSDOM('<form><label>Full name<input id="name"></label></form><button id="outside">Outside</button>', {url: 'https://jobs.example.com/apply', pretendToBeVisual: true});
   const panel = new JSDOM(await readFile(new URL('../sidepanel.html', import.meta.url), 'utf8'), {url: 'https://extension.local/sidepanel.html', pretendToBeVisual: true});
   t.after(() => {content.window.close(); panel.window.close();});
@@ -518,7 +1073,7 @@ async function inlinePanelIntegration(t) {
   await new Promise(resolve => setTimeout(resolve, 0));
   const popup = content.window.document.querySelector('[data-job-inline-autofill]').shadowRoot;
   popup.querySelector('[role="option"]').click();
-  [...popup.querySelectorAll('button')].find(button => button.textContent === 'Edit in panel').click();
+  [...popup.querySelectorAll('button')].find(button => button.textContent === 'Edit and use').click();
   await waitUntil(() => !panel.window.document.querySelector('#inline-field-card').hidden);
   const card = panel.window.document.querySelector('#inline-field-card');
   const draft = card.querySelector('[data-answer-draft]');
@@ -570,30 +1125,12 @@ test('panel Show on page rejects a same-ID replacement between worker inspection
   assert.equal(card.querySelector('[data-answer-draft]').value, 'Edited in the panel');
 });
 
-test('inline explicit generation without a run creates selectable drafts without learning or applying', async () => {
-  const harness = await inlineHarness({waitForAI: false});
+test('inline explicit generation is blocked without an active form session', async () => {
+  const harness = await inlineHarness({waitForAI: false, sessionActive: false});
   harness.localData.openaiApiKey = 'synthetic-test-key';
-  let calls = 0;
-  globalThis.fetch = async () => {calls++; return generatedResponse();};
-  const query = await harness.dispatch(inlineQuery(), inlineSender());
-  assert.equal(calls, 0, 'focus lookup cannot call AI');
-  const before = structuredClone(harness.localData.answerRecords);
-  const response = await harness.dispatch(inlineGeneration(query), inlineSender());
-  assert.equal(response.ok, true, response.error);
-  assert.equal(calls, 1);
-  assert.equal(response.generatedSuggestion.suggestions[0].answer, 'Nithin');
-  assert.ok(response.generatedSuggestion.snapshot.evidenceRevision);
-  assert.match(response.candidates[0].candidateId, /^saved:/);
-  const draft = response.candidates.find(candidate => candidate.kind === 'generated');
-  assert.match(draft.candidateId, /^generated:/);
-  assert.equal(draft.requiresApproval, false);
-  assert.deepEqual(draft.evidenceKeys, ['full_name']);
-  assert.equal(harness.tabs.get(7).messages.some(message => message.type === 'JOB_APP_APPLY'), false);
-  const accepted = await harness.dispatch(inlineAcceptance(response, {candidateId: draft.candidateId, answer: 'Forged'}), inlineSender());
-  assert.equal(accepted.ok, true, accepted.error);
-  assert.equal(harness.tabs.get(7).frames[0].pages[0].values.name, 'Nithin');
-  assert.deepEqual(harness.localData.answerRecords, before, 'generated provenance is not reusable evidence authority');
-  assert.equal(harness.sessionData.applicationRun?.['7'], undefined);
+  const response = await harness.dispatch(inlineQuery(), inlineSender());
+  assert.equal(response.ok, false);
+  assert.match(response.error, /Fill this form/i);
 });
 
 test('inline generation without a key or with provider failure preserves saved choices', async () => {
@@ -739,25 +1276,23 @@ test('inline generation reuses completed panel snapshots and deduplicates same-f
   }
 });
 
-test('inline Generate defers to same-field background work queued behind the planner', async () => {
+test('inline Generate deduplicates same-field background work started before the planner', async () => {
   const harness = await inlineHarness({waitForAI: false, field: {id: 'why', handle: 'doc-a:why', label: 'Why are you a good fit?', type: 'textarea', required: true},
     page: {actions: [{id: 'submit', kind: 'submit', label: 'Submit application'}]}});
   harness.localData.openaiApiKey = 'synthetic-test-key';
-  let releasePlanner, draftCalls = 0;
+  let releaseDraft, draftCalls = 0;
   globalThis.fetch = async (_url, options) => {
     const request = JSON.parse(JSON.parse(options.body).input[1].content[0].text);
-    if (request.fields) return new Promise(resolve => {releasePlanner = () => resolve({ok: true, json: async () => ({output_text: JSON.stringify({decisions: []})})});});
     draftCalls++;
-    return generatedResponse([], 'Add relevant experience.');
+    return new Promise(resolve => {releaseDraft = () => resolve(generatedResponse([], 'Add relevant experience.'));});
   };
   await harness.dispatch({type: 'JOB_RUN_START', tabId: 7});
-  await waitUntil(() => Boolean(releasePlanner));
+  await waitUntil(() => Boolean(releaseDraft));
   const query = await harness.dispatch(inlineQuery({fieldId: 'why', handle: 'doc-a:why'}), inlineSender());
-  let generated;
-  try { generated = await harness.dispatch(inlineGeneration(query), inlineSender()); }
-  finally { releasePlanner(); }
+  const generated = await harness.dispatch(inlineGeneration(query), inlineSender());
+  releaseDraft();
   await waitUntil(() => harness.sessionData.applicationRun['7'].aiOperations.planner.status === 'completed');
-  assert.equal(draftCalls, 1, 'planner release must not dispatch a second draft request for the inline field');
+  assert.equal(draftCalls, 1, 'the fast background draft remains the only provider request for the field');
   assert.equal(generated.ok, true, generated.error);
   assert.equal(generated.error, 'This answer is already being prepared');
   const cached = await harness.dispatch(inlineGeneration(query, 'generate-after-planner'), inlineSender());
@@ -783,16 +1318,16 @@ test('queued draft ownership keeps two background fields concurrent and blocks a
   await waitUntil(() => releases.size === 2);
   let generated, optional;
   try {
-    assert.deepEqual(calls, ['why1', 'why2'], 'existing two-consumer concurrency is preserved');
-    page.focusedFieldId = 'why3';
-    const query = await harness.dispatch(inlineQuery({fieldId: 'why3', handle: 'doc-a:why3'}), inlineSender());
+    assert.deepEqual(calls.slice(0,2).sort(), ['why2', 'why3'], 'company-specific drafts use the existing two-consumer concurrency');
+    page.focusedFieldId = 'why1';
+    const query = await harness.dispatch(inlineQuery({fieldId: 'why1', handle: 'doc-a:why1'}), inlineSender());
     generated = await harness.dispatch(inlineGeneration(query), inlineSender());
     page.focusedFieldId = 'optional';
     const other = await harness.dispatch(inlineQuery({fieldId: 'optional', handle: 'doc-a:optional', requestId: 'optional-query'}), inlineSender());
     optional = await harness.dispatch(inlineGeneration(other), inlineSender());
   } finally { for (const release of releases.values()) release(); }
   await waitUntil(() => harness.sessionData.applicationRun['7'].aiOperations.planner.status === 'completed');
-  assert.equal(calls.filter(id => id === 'why3').length, 1);
+  assert.equal(calls.filter(id => id === 'why1').length, 1);
   assert.equal(generated.error, 'This answer is already being prepared');
   assert.equal(optional.ok, true, optional.error);
   assert.equal(calls.filter(id => id === 'optional').length, 1, 'unrelated inline field can generate while background work is pending');
@@ -870,24 +1405,12 @@ test('worker restart interrupts actual pending inline work and rejects the old r
   assert.equal(harness.sessionData.inlineFieldSessions['7:0'].generatedSuggestions.name, undefined);
 });
 
-test('inline saved acceptance resolves worker candidate authority, persists once, and does not create a run', async () => {
-  const harness = await inlineHarness();
+test('inline saved acceptance is blocked without an active form session', async () => {
+  const harness = await inlineHarness({sessionActive: false});
   const query = await harness.dispatch(inlineQuery(), inlineSender());
-  assert.equal(query.ok, true, query.error);
-  const message = inlineAcceptance(query, {answer: 'Forged answer', sourceKey: 'foreign'});
-  const [accepted, duplicate] = await Promise.all([harness.dispatch(message, inlineSender()), harness.dispatch(message, inlineSender())]);
-  assert.equal(accepted.ok, true, accepted.error);
-  assert.equal(duplicate.ok, false);
-  assert.equal(harness.tabs.get(7).frames[0].pages[0].values.name, 'Nithin');
-  const applies = harness.tabs.get(7).messages.filter(message => message.type === 'JOB_APP_APPLY');
-  assert.equal(applies.length, 1);
-  assert.equal(applies[0].applicationId, undefined);
-  assert.equal(applies[0].decisions[0].expectedRawValue, '');
-  assert.equal(applies[0].decisions[0].expectedEditRevision, 0);
-  assert.equal(applies[0].approvalGuard.acceptanceToken, 'content-token');
+  assert.equal(query.ok, false);
+  assert.match(query.error, /Fill this form/i);
   assert.equal(harness.sessionData.applicationRun?.['7'], undefined);
-  assert.deepEqual(harness.sessionData.inlineFieldSessions['7:0'].suggestions, {});
-  assert.equal((await harness.dispatch(message, inlineSender())).ok, false);
 });
 
 test('inline query rejects forged origins and malformed identity before inspection', async () => {
@@ -963,7 +1486,7 @@ test('inline save failure reports applied but not saved and does not repeat the 
 test('inline sessions isolate identical field IDs in two frames and preserve unrelated live run', async () => {
   const pages = handle => [{page: {title: 'Job application', domain: 'jobs.example.com'}, fields: [{id: 'name', handle, label: 'Full name', type: 'text', rawValue: '', editRevision: 0}], actions: []}];
   const harness = await inlineHarness({pagesByTab: {7: {frames: [{frameId: 0, pages: pages('doc-a:name')}, {frameId: 2, pages: pages('doc-b:name')}]}}});
-  harness.sessionData.applicationRun = {'7': {tabId: 7, startedAt: 'other-run', status: 'waiting_user', frame: {frameId: 9}, revision: 23, suggestions: {foreign: {}}}};
+  harness.sessionData.applicationRun = {'7': {tabId: 7, startedAt: 'other-run', status: 'waiting_user', formOrigin: {domain: 'jobs.example.com', pathname: '/apply'}, frame: {frameId: 9}, revision: 23, suggestions: {foreign: {}}}};
   const runBefore = JSON.stringify(harness.sessionData.applicationRun);
   const [first, second] = await Promise.all([
     harness.dispatch(inlineQuery(), inlineSender()),
@@ -980,7 +1503,7 @@ test('inline sessions isolate identical field IDs in two frames and preserve unr
 
 test('all existing management and run endpoints require a trusted extension panel sender', async () => {
   const harness = await inlineHarness();
-  const routes = ['JOB_RUN_APPROVE_SUGGESTION', 'JOB_RUN_APPLY_DRAFT', 'JOB_RUN_REWRITE_ANSWER', 'JOB_RUN_GENERATE_SUGGESTIONS', 'JOB_RUN_START', 'JOB_RUN_CHECK_PAGE', 'JOB_RUN_ADVANCE_PAGE', 'JOB_RUN_FOCUS_FIELD', 'JOB_RUN_SAVE_ANSWERS', 'JOB_RUN_VALIDATE_PAGE', 'JOB_RUN_RETRY_AI', 'JOB_RUN_SELECT_EMPLOYMENT', 'JOB_RUN_SEARCH_ANSWERS', 'JOB_RUN_STATE', 'JOB_DATASOURCE_STATE', 'JOB_DATASOURCE_EXPORT', 'JOB_DATASOURCE_IMPORT', 'JOB_DATASOURCE_CORRECT', 'JOB_DATASOURCE_SUPPRESS_ANSWER', 'JOB_DATASOURCE_DELETE_ANSWER', 'JOB_DATASOURCE_PROFILE_UPDATE', 'JOB_LEARNING_INBOX_RESOLVE'];
+  const routes = ['JOB_RUN_APPROVE_SUGGESTION', 'JOB_RUN_APPLY_DRAFT', 'JOB_RUN_REWRITE_ANSWER', 'JOB_RUN_GENERATE_SUGGESTIONS', 'JOB_RUN_START', 'JOB_RUN_CHECK_PAGE', 'JOB_RUN_ADVANCE_PAGE', 'JOB_RUN_FOCUS_FIELD', 'JOB_RUN_SAVE_ANSWERS', 'JOB_RUN_VALIDATE_PAGE', 'JOB_RUN_RETRY_AI', 'JOB_RUN_SELECT_EMPLOYMENT', 'JOB_RUN_SEARCH_ANSWERS', 'JOB_RUN_STATE', 'JOB_DATASOURCE_STATE', 'JOB_DATASOURCE_EXPORT', 'JOB_DATASOURCE_IMPORT', 'JOB_DATASOURCE_CORRECT', 'JOB_DATASOURCE_DISMISS_CHANGE', 'JOB_DATASOURCE_SUPPRESS_ANSWER', 'JOB_DATASOURCE_DELETE_ANSWER', 'JOB_DATASOURCE_PROFILE_UPDATE', 'JOB_LEARNING_INBOX_RESOLVE'];
   for (const type of routes) {
     const result = await harness.dispatch({type, tabId: 7}, inlineSender());
     assert.equal(result.ok, false, type);
@@ -991,6 +1514,25 @@ test('all existing management and run endpoints require a trusted extension pane
   }
   assert.equal((await harness.dispatch({type: 'JOB_DATASOURCE_STATE'})).ok, true);
   assert.equal((await harness.dispatch({type: 'JOB_RUN_STATE', tabId: 7})).ok, true);
+});
+
+test('confirming or closing a learned change removes its notification without deleting the answer', async () => {
+  const harness = createHarness({ answerRecords: [
+    { key: 'email', question: 'Email', answer: 'new@example.com', history: [{ answer: 'old@example.com' }], provenance: 'user' },
+    { key: 'city', question: 'City', answer: 'Bengaluru', pendingAnswer: 'Chennai', confirmationState: 'pending' },
+  ] });
+  await import(`../src/service-worker.js?learned-change-review=${Date.now()}`);
+
+  assert.equal((await harness.dispatch({ type: 'JOB_DATASOURCE_STATE' })).datasource.learnedChanges.length, 2);
+  const confirmed = await harness.dispatch({ type: 'JOB_DATASOURCE_CORRECT', key: 'email', answer: 'new@example.com' });
+  assert.equal(confirmed.ok, true, confirmed.error);
+  assert.deepEqual(confirmed.datasource.learnedChanges.map((record) => record.key), ['city']);
+
+  const closed = await harness.dispatch({ type: 'JOB_DATASOURCE_DISMISS_CHANGE', key: 'city' });
+  assert.equal(closed.ok, true, closed.error);
+  assert.deepEqual(closed.datasource.learnedChanges, []);
+  assert.equal(harness.localData.answerRecords.find((record) => record.key === 'city').answer, 'Bengaluru');
+  assert.equal(harness.localData.answerRecords.length, 2);
 });
 
 test('inline acceptance rejects optional forged destination fields and unsupported numeric controls', async () => {
@@ -1177,7 +1719,7 @@ test('inline compatible run acceptance uses real learning identity and refreshes
 test('inline unresolved employment asks to choose employer instead of borrowing another frame mapping', async () => {
   const harness = await inlineHarness({field: {label: 'Job title', entityType: 'employment', entityId: 'work-1'}});
   harness.localData.profile = {employment: [{id: 'employer-a', company: 'Company A'}, {id: 'employer-b', company: 'Company B'}]};
-  harness.sessionData.applicationRun = {'7': {tabId: 7, startedAt: 'other', status: 'waiting_user', frame: {frameId: 9}, employmentMappings: {'work-1': 'employer-a'}}};
+  harness.sessionData.applicationRun = {'7': {tabId: 7, startedAt: 'other', status: 'waiting_user', formOrigin: {domain: 'jobs.example.com', pathname: '/apply'}, frame: {frameId: 9}, employmentMappings: {'work-1': 'employer-a'}}};
   const query = await harness.dispatch(inlineQuery(), inlineSender());
   assert.equal(query.ok, true, query.error);
   assert.deepEqual(query.candidates, []);
@@ -1211,11 +1753,12 @@ test('saved narrative and sensitive equivalents wait for scoped approval before 
     { id: 'ctc', handle: 'handle-ctc', label: 'Current CTC', type: 'textarea' },
   ], actions: [] }] } } });
   harness.localData.openaiApiKey = 'synthetic-test-key';
-  let plannerCalls = 0;
-  globalThis.fetch = async () => { plannerCalls++; throw new Error('synthetic planner unavailable'); };
+  const aiRequests = [];
+  globalThis.fetch = async (_url, options) => { aiRequests.push(JSON.parse(JSON.parse(options.body).input[1].content[0].text)); throw new Error('synthetic planner unavailable'); };
   await import(`../src/service-worker.js?test=reuse-${Date.now()}`);
   const started = await harness.dispatch({ type: 'JOB_RUN_START', tabId: 7 });
-  assert.equal(plannerCalls, 0, 'AI must not bypass local approval gates');
+  assert.ok(aiRequests.length > 0, 'related narrative evidence may be drafted');
+  assert.ok(aiRequests.every(request => request.field?.id === 'ml' || request.fields?.every(field => field.id === 'ml')), 'sensitive equivalents stay behind approval');
   assert.equal(harness.tabs.get(7).frames[0].pages[0].values?.ctc, undefined);
   const { JSDOM } = await import('jsdom');
   const { applyDecisions } = await import('../src/form-engine.js');
@@ -1262,20 +1805,20 @@ test('previous application drafts are source-qualified suggestions, not promoted
   assert.equal(harness.localData.answerRecords.find(record => record.question === 'Notice period').answer, 'Synthetic notice answer');
 });
 
-test('planner failure preserves diagnostics while required suggestion preparation continues', async () => {
+test('draft failure preserves diagnostics without invoking a planner when evidence is missing', async () => {
   const harness = createHarness({ pagesByTab: { 7: { pages: [{ fields: [{ id: 'unknown', label: 'Describe underwater welding', type: 'text', required: true }], actions: [{ id: 'submit', label: 'Submit application', kind: 'submit' }] }] } } });
   harness.localData.openaiApiKey = 'synthetic-key';
   const bodies = [];
   globalThis.fetch = async (_url, options) => { bodies.push(JSON.parse(options.body)); throw new Error('Synthetic network failure'); };
   await import(`../src/service-worker.js?test=bounded-${Date.now()}`);
   const first = await harness.dispatch({ type: 'JOB_RUN_START', tabId: 7 });
-  assert.deepEqual(JSON.parse(bodies[0].input[1].content[0].text).records, []);
+  assert.equal(JSON.parse(bodies[0].input[1].content[0].text).field.id, 'unknown');
   assert.match(first.run.llmError, /Synthetic network failure/);
   await harness.dispatch({ type: 'JOB_RUN_CHECK_PAGE', tabId: 7 });
-  assert.equal(bodies.length, 2);
+  assert.equal(bodies.length, 1);
 });
 
-test('Retry AI reruns only failed work and keeps completed drafts', async () => {
+test('Retry AI keeps completed drafts and avoids a planner call without factual evidence', async () => {
   const harness = createHarness({ answerRecords: [{
     key: 'experience', question: 'Experience', answer: 'Built reliable event processing services.', confirmationState: 'confirmed', sensitivity: 'safe',
   }], pagesByTab: { 7: { pages: [{
@@ -1287,7 +1830,7 @@ test('Retry AI reruns only failed work and keeps completed drafts', async () => 
   globalThis.fetch = async (_url, options) => {
     initialRequests += 1;
     const request = JSON.parse(JSON.parse(options.body).input[1].content[0].text);
-    if (request.fields) throw new Error('planner is temporarily unavailable');
+    if (request.fields) throw new Error('planner should not run without compatible factual evidence');
     return {
       ok: true, status: 200, statusText: 'OK',
       json: async () => ({ output_text: JSON.stringify({ suggestions: [{ answer: 'A reviewed draft.', evidenceKeys: ['experience'] }], missingContext: '' }) }),
@@ -1295,12 +1838,13 @@ test('Retry AI reruns only failed work and keeps completed drafts', async () => 
   };
   await import(`../src/service-worker.js?retry-completed=${Date.now()}`);
   const started = await harness.dispatch({ type: 'JOB_RUN_START', tabId: 7 });
-  assert.equal(initialRequests, 2);
-  assert.equal(started.run.aiOperations.planner.status, 'failed');
+  assert.equal(initialRequests, 1);
+  assert.equal(started.run.aiOperations.planner.status, 'completed');
   assert.equal(started.run.aiOperations['suggestion:why'].status, 'completed');
   assert.equal(started.run.generatedSuggestions.why.suggestions[0].answer, 'A reviewed draft.');
 
   let retryRequests = 0;
+  harness.sessionData.applicationRun['7'].aiOperations.planner.status = 'failed';
   globalThis.fetch = async (_url, options) => {
     retryRequests += 1;
     const request = JSON.parse(JSON.parse(options.body).input[1].content[0].text);
@@ -1313,7 +1857,7 @@ test('Retry AI reruns only failed work and keeps completed drafts', async () => 
     };
   };
   const retried = await harness.dispatch({ type: 'JOB_RUN_RETRY_AI', tabId: 7 });
-  assert.equal(retryRequests, 1);
+  assert.equal(retryRequests, 0);
   assert.equal(retried.run.aiOperations.planner.status, 'completed');
   assert.equal(retried.run.generatedSuggestions.why.suggestions[0].answer, 'A reviewed draft.');
 });
@@ -2051,7 +2595,9 @@ test('final site submission saves the supplied snapshot without recapturing or s
   assert.equal(saved.run.status, 'answers_saved');
   assert.equal(duplicate.ok, true);
   assert.equal(harness.localData.applicationDrafts[`${7}:${started.run.startedAt}`].records.some((record) => record.key === 'portfolio_url'), true);
-  assert.equal(harness.localData.learningInbox.filter((item) => item.candidate.id === 'portfolio_url').length, 1);
+  assert.equal(harness.localData.answerRecords.find((record) => record.key === 'portfolio_url')?.answer, 'https://example.com/nithin');
+  assert.equal(saved.persisted, 1);
+  assert.equal(duplicate.persisted, 0);
   assert.equal(harness.tabs.get(7).messages.slice(beforeMessages).some((message) => message.type === 'JOB_APP_CAPTURE'), false);
   assert.equal(harness.tabs.get(7).submitCalls, 0);
   assert.equal(harness.tabs.get(7).messages.some((message) => message.type === 'JOB_APP_SUBMIT'), false);
@@ -2358,14 +2904,14 @@ test('automatic generated drafts use job context and records, and regenerate onl
   assert.equal(started.run.status, 'waiting_user', JSON.stringify(started.run));
   const generated = started.run.generatedSuggestions.why;
   assert.equal(started.run.suggestions?.why, undefined, 'an adjacent experience record is context, not a verbatim saved answer');
-  assert.equal(bodies.length, 2, JSON.stringify(started.run));
+  assert.equal(bodies.length, 1, JSON.stringify(started.run));
   assert.ok(generated, started.run.llmError);
   assert.equal(generated.suggestions.length, 1);
-  assert.match(JSON.stringify(bodies[1]), /Build distributed systems/);
-  assert.match(JSON.stringify(bodies[1]), /event processing/);
+  assert.match(JSON.stringify(bodies[0]), /Build distributed systems/);
+  assert.match(JSON.stringify(bodies[0]), /event processing/);
   assert.deepEqual(harness.tabs.get(7).frames[0].pages[0].values || {}, {});
   const checked = await harness.dispatch({ type: 'JOB_RUN_CHECK_PAGE', tabId: 7 });
-  assert.equal(bodies.length, 2, 'the same page reuses cached generated drafts');
+  assert.equal(bodies.length, 1, 'the same page reuses cached generated drafts');
   assert.equal(checked.run.generatedSuggestions.why.suggestions.length, 1);
   const refreshed = await harness.dispatch({ type: 'JOB_RUN_GENERATE_SUGGESTIONS', tabId: 7, frameId: 0, applicationId: started.run.startedAt, pageSignature: started.run.pageSignature, fieldId: 'why', handle: 'why-h', jobDescription: 'Operate a large-scale distributed platform.' });
   assert.equal(refreshed.ok, true, refreshed.error);
@@ -2824,6 +3370,50 @@ test('a page edit during tailoring rejects the late AI result', async () => {
   assert.equal(page.values.summary, 'Applicant edit during tailoring.');
 });
 
+test('NeoXam related evidence still generates a draft and numeric CTC exposes its missing format', async () => {
+  const h = createHarness({answerRecords: [
+    {key:'project',question:'Experience building and deploying machine learning models',answer:'I built and deployed machine learning systems in production.',sensitivity:'safe'},
+    {key:'expected_ctc',question:'Expected CTC',answer:'40-60 LPA',sensitivity:'review'},
+    {key:'current_salary',question:'Current salary',answer:'Not currently salaried; last drawn salary was 21 LPA.',sensitivity:'review'},
+  ],pagesByTab:{7:{pages:[{fields:[
+    {id:'story',handle:'story-h',label:'Can you describe an AI/ML system you built and shipped to production?',type:'textarea',required:true},
+    {id:'expected',handle:'expected-h',label:'What is your expected CTC',type:'number',required:true},
+    {id:'current',handle:'current-h',label:'What is your current CTC',type:'text',required:true},
+  ],actions:[{id:'submit',label:'Submit application',kind:'submit'}]}]}}});
+  h.localData.openaiApiKey='test-key';
+  h.localData.phoenixTracing=true;
+  h.localData.developerMode=true;
+  const requests=[], spans=[];
+  globalThis.fetch=async(url,options)=>{
+    const body=JSON.parse(options.body);
+    if(String(url).startsWith('http://127.0.0.1:6006')) {
+      spans.push(...body.data);
+      return {ok:true,status:200,json:async()=>({})};
+    }
+    const request=JSON.parse(body.input[1].content[0].text);
+    requests.push(request);
+    const payload=request.fields ? {decisions:request.fields.map(field=>({fieldId:field.id,action:'ask_user',value:null,evidenceKeys:[],transformation:null,confidence:'high',sensitivity:'review',reason:'Choose one amount and specify its currency and scale.'}))}
+      : {suggestions:[{answer:'I built and deployed production machine learning systems.',evidenceKeys:['project']}],missingContext:''};
+    return {ok:true,status:200,json:async()=>({output_text:JSON.stringify(payload)})};
+  };
+  await import(`../src/service-worker.js?neoxam-regression=${Date.now()}`);
+  const started=await h.dispatch({type:'JOB_RUN_START',tabId:7});
+  assert.equal(started.ok,true,started.error);
+  assert.ok(requests.some(request=>request.field?.id==='story'),JSON.stringify({requests,ops:started.run.aiOperations,error:started.run.llmError,spans:spans.filter(s=>s.name==='fill_page_eligibility').map(s=>s.attributes),suggestions:started.run.suggestions?.story}));
+  assert.ok(requests.some(request=>request.fields?.some(field=>field.id==='expected')),'numeric CTC must reach planning');
+  const run=h.sessionData.applicationRun['7'];
+  assert.equal(run.generatedSuggestions.story.suggestions.length,1);
+  assert.equal(run.suggestions.current.candidates[0].sourceKey,'current_salary');
+  assert.equal(run.suggestions.expected.candidates[0].answer,'40-60 LPA');
+  assert.equal(h.tabs.get(7).frames[0].pages[0].values?.expected,undefined);
+  await waitUntil(()=>spans.some(span=>span.name==='fill_page_eligibility'));
+  const diagnostic=JSON.parse(spans.find(span=>span.name==='fill_page_eligibility').attributes['output.value']);
+  assert.equal(diagnostic.recordCount,3);
+  assert.equal(diagnostic.fields.find(field=>field.fieldId==='story').reason,'eligible');
+  assert.equal(diagnostic.fields.find(field=>field.fieldId==='current').reason,'saved_answer_ready');
+  assert.equal(diagnostic.fields.find(field=>field.fieldId==='expected').candidates[0].valueValid,false);
+});
+
 test('worker uses the selected Fireworks key and default model for planner requests', async () => {
   const harness = createHarness({
     pagesByTab: { 7: { pages: [{ fields: [{ id: 'unknown', label: 'Describe underwater welding', type: 'text', required: true }], actions: [{ id: 'submit', label: 'Submit application', kind: 'submit' }] }] } },
@@ -2862,15 +3452,15 @@ test('invalid optional fields block; validation-only refresh never fills or call
   assert.equal(h.tabs.get(7).nextClicks,0);
 });
 
-test('local results return before AI and optional questions do not generate automatically', async () => {
+test('local results return while the required fast draft runs, then optional questions are assisted', async () => {
   const h=createHarness({waitForAI:false,pagesByTab:{7:{pages:[{page:{title:'Application',domain:'example.test'},fields:[{id:'required',handle:'r-h',label:'Why this role?',type:'textarea',required:true},{id:'optional',handle:'o-h',label:'Additional information',type:'textarea'}],actions:[]}]}}});
   h.localData.openaiApiKey='test-key'; let release;const requests=[];
-  globalThis.fetch=async(_url,options)=>{const body=JSON.parse(options.body);const request=JSON.parse(body.input[1].content[0].text);requests.push(request);if(request.fields)await new Promise(resolve=>{release=resolve;});return{ok:true,json:async()=>({output_text:JSON.stringify(request.fields?{decisions:[]}:{suggestions:[],missingContext:'Add relevant experience'})})};};
+  globalThis.fetch=async(_url,options)=>{const body=JSON.parse(options.body);const request=JSON.parse(body.input[1].content[0].text);requests.push(request);if(request.field)await new Promise(resolve=>{release=resolve;});return{ok:true,json:async()=>({output_text:JSON.stringify(request.fields?{decisions:[]}:{suggestions:[],missingContext:'Add relevant experience'})})};};
   await import(`../src/service-worker.js?background-${Date.now()}`);
   const response=await Promise.race([h.dispatch({type:'JOB_RUN_START',tabId:7}),new Promise(resolve=>setTimeout(()=>resolve({error:'Blocked on AI'}),600))]);
-  try{assert.equal(response.ok,true,response.error);assert.notEqual(response.run.waitingFor,'extension_error');assert.ok(release,'planner actually started');}finally{release?.();}
+  try{assert.equal(response.ok,true,response.error);assert.notEqual(response.run.waitingFor,'extension_error');await waitUntil(()=>Boolean(release));}finally{release?.();}
   for(let n=0;n<100&&Object.values(h.sessionData.applicationRun['7'].aiOperations||{}).some(op=>op.status==='pending');n++)await new Promise(resolve=>setTimeout(resolve,5));
-  assert.equal(requests.filter(request=>request.field?.id==='optional').length,0);
+  assert.equal(requests.filter(request=>request.field?.id==='optional').length,1);
 });
 
 test('worker restart marks pending operations interrupted without replaying navigation', async () => {
@@ -2943,7 +3533,8 @@ test('application discovery accepts fields despite a search and alerts page titl
   assert.equal(run.status, 'ready_for_user_submit');
 });
 
-test('LLM interprets the YC Send Message form despite an unrelated frame timeout', async () => {
+for (const discoveryMode of ['modal heading without AI', 'AI fallback without a heading']) {
+test(`YC Send Message form fills using ${discoveryMode} despite an unrelated frame timeout`, async () => {
   const {inspectDocument, applyDecisions, validateDocument, clickAction, isFinalApplicationSubmit} = await import('../src/form-engine.js');
   // Reduced from the live YC application modal: placeholder labels, a portal,
   // and a native submit button whose label is "Send Message".
@@ -2951,6 +3542,7 @@ test('LLM interprets the YC Send Message form despite an unrelated frame timeout
     {url: 'https://www.ycombinator.com/companies/vahan/jobs/7zvIddz-lead-ai-engineer'});
   try {
     const document = dom.window.document;
+    if (discoveryMode.startsWith('AI')) document.querySelector('h3').remove();
     let submissions = 0;
     document.addEventListener('submit', event => { submissions++; event.preventDefault(); });
     const answerRecords = [
@@ -2960,7 +3552,7 @@ test('LLM interprets the YC Send Message form despite an unrelated frame timeout
     const harness = createHarness({answerRecords, pagesByTab: {7: {frames: [
       {frameId: 0, pages: [{fields: []}]}, {frameId: 1, pages: [{fields: []}]},
     ]}}});
-    harness.localData.openaiApiKey = 'synthetic-key';
+    harness.localData.openaiApiKey = discoveryMode.startsWith('AI') ? 'synthetic-key' : '';
     const liveInspection = inspectDocument(document);
     const interpretedFields = liveInspection.fields.filter(field => ['first_name', 'last_name', 'email', 'linkedin_url'].includes(field.id))
       .map(field => ({handle: field.handle, meaning: field.id === 'linkedin_url' ? 'linkedin_url' : field.id, question: field.label, required: true}));
@@ -2998,6 +3590,7 @@ test('LLM interprets the YC Send Message form despite an unrelated frame timeout
     assert.equal(harness.tabs.get(7).nextClicks, 0);
   } finally { dom.window.close(); }
 });
+}
 
 test('form screenshot capture follows the default-on preference and explicit opt-out', async () => {
   for (const enabled of [true, false]) {
@@ -3111,4 +3704,200 @@ test('explicit Save updates a correction already captured in the draft and keeps
   assert.equal(repeated.updated, 0);
   assert.ok(repeated.unchanged >= 1);
   assert.equal(harness.tabs.get(7).submitCalls, 0);
+});
+
+test('submission saves reusable answers even when panel still waits for a manual step', async () => {
+  const harness = createHarness({ pagesByTab: { 7: { pages: [{
+    fields: [{ id: 'required_detail', label: 'Required detail', type: 'text', required: true }],
+    actions: [{ id: 'submit', label: 'Submit application', kind: 'submit', type: 'submit' }],
+  }] } } });
+  await import(`../src/service-worker.js?submit-waiting=${Date.now()}`);
+  const { run } = await harness.dispatch({ type: 'JOB_RUN_START', tabId: 7 });
+  assert.equal(run.status, 'waiting_user');
+  const message = { type: 'JOB_APP_FINAL_SUBMISSION', applicationId: run.startedAt,
+    records: [{ key: 'portfolio_url', question: 'Portfolio URL', answer: 'https://example.com/work', type: 'url', sensitivity: 'safe', provenance: 'user' }] };
+  const sender = { tab: { id: 7 }, frameId: 0, url: 'https://jobs.example.com/apply' };
+  assert.equal((await harness.dispatch({ ...message, applicationId: 'stale' }, sender)).ok, false);
+  const saved = await harness.dispatch(message, sender);
+  assert.equal(saved.ok, true, saved.error);
+  assert.equal(harness.localData.answerRecords.find(record => record.key === 'portfolio_url')?.answer, 'https://example.com/work');
+  assert.equal(harness.tabs.get(7).submitCalls, 0);
+});
+
+test('direct AI generation uses saved cover answers and current company context', async () => {
+  const harness = createHarness({coverMessages: [{id: 'closing', label: 'Closing answer', body: 'I built and led a team delivering reliable AI systems.'}], pagesByTab: {7: {pages: [{
+    page: {title: 'Application', domain: 'example.test', company: 'AiPrise', role: 'Software engineer'},
+    fields: [{id: 'why', handle: 'why-h', label: 'Why are you a good fit?', type: 'textarea', required: true}],
+    actions: [{id: 'submit', label: 'Submit application', kind: 'submit'}],
+  }]}}});
+  await import(`../src/service-worker.js?closing-generation=${Date.now()}`);
+  const started = await harness.dispatch({type: 'JOB_RUN_START', tabId: 7});
+  assert.ok(started.run.frame, JSON.stringify(started));
+  harness.localData.openaiApiKey = 'synthetic-test-key';
+  const requests = [];
+  globalThis.fetch = async (url, options) => {
+    requests.push(JSON.parse(options.body));
+    return generatedResponse([{answer: 'My experience building AI systems fits this role.', evidenceKeys: ['cover:closing']}]);
+  };
+  const response = await harness.dispatch({type: 'JOB_RUN_GENERATE_SUGGESTIONS', ...draftOrigin(started.run, {id: 'why', handle: 'why-h'})});
+  assert.equal(response.ok, true, response.error);
+  const input = JSON.parse(requests[0].input[1].content[0].text);
+  assert.equal(input.records.find(record => record.key === 'cover:closing').answer, 'I built and led a team delivering reliable AI systems.');
+  assert.match(JSON.stringify(input.page), /AiPrise/);
+  assert.equal(response.run.generatedSuggestions.why.suggestions.length, 1);
+});
+
+
+test('manual same-document navigation exposes the new page without filling and can explicitly fill it', async () => {
+  const h = createHarness({pagesByTab: {7: {pages: [
+    {fields: [{id: 'email', label: 'Email address', type: 'email', required: true}], actions: [{id:'next', label:'Next', kind:'next'}]},
+    {fields: [{id: 'full_name', label: 'Full name', type: 'text', required: true}, {id:'city', label:'City', type:'text', currentValue:'User city'}], actions: [{id:'submit', label:'Submit application', kind:'submit'}]},
+  ]}}});
+  await import(`../src/service-worker.js?manual-page=${Date.now()}`);
+  const first = await h.dispatch({type:'JOB_RUN_START', tabId:7});
+  assert.equal(first.run.status, 'waiting_user');
+  h.tabs.get(7).currentPage = 1;
+  const changed = await h.dispatch({type:'JOB_APP_NAVIGATED'}, {tab:{id:7}, frameId:0});
+  assert.equal(changed.run.waitingFor, 'page_changed');
+  assert.equal(changed.run.pageNumber, 2);
+  assert.equal(changed.run.waitingLabel, null);
+  assert.deepEqual(changed.run.actionRequired.map(f=>f.fieldId), ['full_name']);
+  assert.equal(h.tabs.get(7).frames[0].pages[1].values?.full_name, undefined);
+  const repeated = await h.dispatch({type:'JOB_APP_NAVIGATED'}, {tab:{id:7}, frameId:0});
+  assert.equal(repeated.run.pageNumber, 2);
+  assert.equal(repeated.run.waitingFor, 'page_changed');
+  const filled = await h.dispatch({type:'JOB_RUN_CHECK_PAGE', tabId:7});
+  assert.equal(filled.ok, true, filled.error);
+  assert.equal(h.tabs.get(7).frames[0].pages[1].values.full_name, 'Nithin');
+  assert.equal(h.tabs.get(7).frames[0].pages[1].values.city, undefined);
+  assert.equal(h.tabs.get(7).frames[0].pages[1].fields[1].currentValue, 'User city');
+  assert.equal(h.tabs.get(7).submitCalls, 0);
+});
+
+test('on-demand AI keeps a valid result after an unrelated background status update', async () => {
+  const h = createHarness({waitForAI:false,pagesByTab:{7:{pages:[{
+    page:{title:'Application',domain:'jobs.example.com'},
+    fields:[{id:'why',handle:'why-h',label:'Why are you a good fit?',type:'textarea',required:true}],
+    actions:[{id:'submit',label:'Submit application',kind:'submit'}],
+  }]}}});
+  await import(`../src/service-worker.js?on-demand-background=${Date.now()}`);
+  const started = await h.dispatch({type:'JOB_RUN_START',tabId:7});
+  h.localData.aiProvider='openai';
+  h.localData.openaiApiKey='synthetic-test-key';
+  let release;
+  const requested = new Promise(resolve => { globalThis.fetch = async (url) => {
+    assert.equal(url,'https://api.openai.com/v1/responses');
+    resolve();
+    return new Promise(done => { release = () => done(generatedResponse([{answer:'I built reliable systems.',evidenceKeys:[]}])); });
+  }; });
+  const pending = h.dispatch({type:'JOB_RUN_GENERATE_SUGGESTIONS',...draftOrigin(started.run,{id:'why',handle:'why-h'})});
+  await requested;
+  const run = h.sessionData.applicationRun['7'];
+  h.sessionData.applicationRun['7'] = {...run,revision:run.revision+1,aiOperations:{...run.aiOperations,other:{status:'completed'}}};
+  release();
+  const response = await pending;
+  assert.equal(response.ok,true,response.error);
+  assert.equal(response.run.generatedSuggestions.why.suggestions[0].answer,'I built reliable systems.');
+});
+
+test('missing selected-provider key shows an AI error and sends no request', async () => {
+  const h = createHarness({waitForAI:false,pagesByTab:{7:{pages:[{
+    page:{title:'Application',domain:'jobs.example.com'},
+    fields:[{id:'why',handle:'why-h',label:'Why this role?',type:'textarea',required:true}],
+    actions:[{id:'submit',label:'Submit application',kind:'submit'}],
+  }]}}});
+  h.localData.aiProvider='fireworks';
+  h.localData.fireworksApiKey='';
+  let requests = 0;
+  globalThis.fetch = async () => {requests++; throw new Error('Unexpected AI request');};
+  await import(`../src/service-worker.js?missing-ai-key=${Date.now()}`);
+  const started = await h.dispatch({type:'JOB_RUN_START',tabId:7});
+  const origin = draftOrigin(started.run,{id:'why',handle:'why-h'});
+  const generated = await h.dispatch({type:'JOB_RUN_GENERATE_SUGGESTIONS',...origin});
+  const rewritten = await h.dispatch({type:'JOB_RUN_REWRITE_ANSWER',...origin,draft:'I built systems.',instruction:'Be concise.'});
+  assert.equal(generated.ok,false);
+  assert.equal(rewritten.ok,false);
+  assert.match(generated.error,/Fireworks.*Settings/);
+  assert.match(rewritten.error,/Fireworks.*Settings/);
+  assert.match(h.sessionData.applicationRun['7'].llmError,/Fireworks.*Settings/);
+  assert.equal(requests,0);
+});
+
+test('SmartRecruiters screening is recognized when opened directly without identity or Next controls', async () => {
+  const path = '/oneclick-ui/company/Assent/publication/3ecc84c8-7ad3-485f-9937-ac5728efc2d9/screening';
+  const h = createHarness({pagesByTab:{7:{url:`https://jobs.smartrecruiters.com${path}`,frames:[{
+    frameId:0,context:{title:'Senior AI Engineer',pathname:path},pages:[{
+      page:{title:'Senior AI Engineer',domain:'jobs.smartrecruiters.com'},
+      fields:[
+        {id:'salary',label:'What are your annual salary expectations?',type:'text',currentValue:'Existing answer'},
+      ],actions:[],
+    }],
+  }]}}});
+  await import(`../src/service-worker.js?smart-screening-direct=${Date.now()}`);
+  const first = await h.dispatch({type:'JOB_RUN_START',tabId:7});
+  assert.equal(first.ok,true,first.error);
+  assert.equal(first.run.frame.frameId,0);
+  assert.equal(first.run.waitingFor === 'no_supported_controls',false);
+  await h.dispatch({type:'JOB_RUN_CHECK_PAGE',tabId:7});
+  assert.equal(h.tabs.get(7).frames[0].pages[0].fields[0].currentValue,'Existing answer');
+  assert.equal(h.tabs.get(7).submitCalls,0);
+});
+
+test('manual SmartRecruiters Next keeps one publication session and rescans screening', async () => {
+  const publication = '/oneclick-ui/company/Assent/publication/3ecc84c8-7ad3-485f-9937-ac5728efc2d9';
+  const h = createHarness({pagesByTab:{7:{url:`https://jobs.smartrecruiters.com${publication}/personal`,frames:[{
+    frameId:0,context:{title:'Senior AI Engineer',pathname:`${publication}/personal`},pages:[
+      {destination:{documentId:'first-doc',regionId:'first-form'},page:{title:'Job application',domain:'jobs.smartrecruiters.com'},fields:[{id:'email',label:'Email address',type:'email',required:true}],actions:[{id:'next',label:'Next',kind:'next'}]},
+      {destination:{documentId:'screening-doc',regionId:'screening-form'},page:{title:'Senior AI Engineer',domain:'jobs.smartrecruiters.com'},fields:[
+        {id:'salary',label:'What are your annual salary expectations?',type:'text',currentValue:'Existing answer'},
+        {id:'experience',label:'How many years of related experience do you have?',type:'select',required:true},
+      ],actions:[]},
+    ],
+  }]}}});
+  await import(`../src/service-worker.js?smart-screening-next=${Date.now()}`);
+  const first = await h.dispatch({type:'JOB_RUN_START',tabId:7});
+  assert.equal(first.run.frame.destination.documentId,'first-doc');
+  const tab = h.tabs.get(7);
+  tab.currentPage = 1;
+  tab.url = `https://jobs.smartrecruiters.com${publication}/screening`;
+  tab.frames[0].context.pathname = `${publication}/screening`;
+  const site = await h.dispatch({type:'JOB_APP_SITE_STATUS'}, {id:'test-extension',tab:{id:7,url:tab.url,documentId:'screening-doc'},frameId:0});
+  assert.equal(site.sessionActive,true);
+  const send = chrome.tabs.sendMessage;
+  chrome.tabs.sendMessage = async (tabId,message,options) => message.destination?.documentId === 'first-doc'
+    ? {ok:false,code:'destination_changed'} : send(tabId,message,options);
+  h.updatedListeners[0](7,{status:'complete'});
+  await waitUntil(() => h.sessionData.applicationRun?.['7']?.waitingFor === 'page_changed');
+  const changed = await h.dispatch({type:'JOB_APP_NAVIGATED'},{tab:{id:7},frameId:0});
+  assert.equal(changed.run.waitingFor,'page_changed');
+  assert.equal(changed.run.frame.destination.documentId,'screening-doc');
+  assert.equal(changed.run.pageNumber,2);
+  await h.dispatch({type:'JOB_RUN_CHECK_PAGE',tabId:7});
+  await h.dispatch({type:'JOB_RUN_CHECK_PAGE',tabId:7});
+  assert.equal(tab.frames[0].pages[1].fields[0].currentValue,'Existing answer');
+  assert.equal(tab.submitCalls,0);
+  const other = await h.dispatch({type:'JOB_APP_SITE_STATUS'}, {id:'test-extension',tab:{id:7,url:tab.url.replace(publication,publication.replace('3ecc84c8','another-id'))},frameId:0});
+  assert.equal(other.sessionActive,false);
+});
+
+
+test('manual replacement of an explicitly selected form refreshes the selection used by Fill this page', async () => {
+  const destination = regionId => ({documentId:'document', regionId});
+  const h = createHarness({pagesByTab:{7:{pages:[
+    {destination:destination('old'), fields:[{id:'email',label:'Email address',type:'email',required:true}], actions:[{id:'next',label:'Next',kind:'next'}]},
+    {destination:destination('new'), fields:[{id:'full_name',label:'Full name',type:'text',required:true}], actions:[{id:'submit',label:'Submit application',kind:'submit'}]},
+  ]}}});
+  await import(`../src/service-worker.js?selected-manual-page=${Date.now()}`);
+  await h.dispatch({type:'JOB_RUN_START',tabId:7});
+  h.sessionData.applicationRun['7'].selectedDestination = {...destination('old'),frameId:0};
+  h.tabs.get(7).currentPage = 1;
+  const send = chrome.tabs.sendMessage;
+  chrome.tabs.sendMessage = async (tabId, message, options) => message.destination?.regionId === 'old'
+    ? {ok:false,code:'destination_changed'} : send(tabId,message,options);
+  const changed = await h.dispatch({type:'JOB_APP_NAVIGATED'}, {tab:{id:7},frameId:0});
+  assert.equal(changed.run.waitingFor,'page_changed');
+  assert.equal(changed.run.selectedDestination.regionId,'new');
+  const filled = await h.dispatch({type:'JOB_RUN_CHECK_PAGE',tabId:7});
+  assert.equal(filled.ok,true,filled.error);
+  assert.equal(h.tabs.get(7).frames[0].pages[1].values.full_name,'Nithin');
 });

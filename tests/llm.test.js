@@ -1,7 +1,49 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { JSDOM } from 'jsdom';
+import { collectFieldDescriptors } from '../src/form-engine.js';
 
 import { callAnswerPlanner, callAnswerRewriter, callAnswerSuggestions, callFormInterpreter, DEFAULT_FIREWORKS_MODEL, DEFAULT_PROVIDER } from '../src/llm.js';
+
+test('grouped question and options reach planner and suggestion requests for both providers', async () => {
+  const dom = new JSDOM(`<form><div class="application-question"><div class="application-label">Are you willing to relocate?</div>
+    <label><input type="checkbox" name="relocate" value="Yes">Yes</label>
+    <label><input type="checkbox" name="relocate" value="No">No</label></div></form>`);
+  try {
+    const fields = collectFieldDescriptors(dom.window.document);
+    const field = fields[0];
+    for (const provider of ['openai', 'fireworks']) {
+      for (const kind of ['planner', 'suggestions']) {
+        const fetchImpl = async (_url, options) => {
+          const body = JSON.parse(options.body);
+          const input = JSON.parse(provider === 'openai' ? body.input[1].content[0].text : body.messages[1].content);
+          const target = kind === 'planner' ? input.fields[0] : input.field;
+          if (kind === 'planner') assert.equal(input.fields.length, 1);
+          assert.equal(target.label, 'Are you willing to relocate?');
+          assert.deepEqual(target.options, ['Yes', 'No']);
+          assert.equal(target.multiple, true);
+          const payload = kind === 'planner' ? {decisions: [{fieldId: field.id, action: 'ask_user', value: null,
+            evidenceKeys: [], confidence: 'low', sensitivity: 'review', reason: 'No evidence', transformation: null}]}
+            : {suggestions: [], missingContext: 'No evidence'};
+          return createResponse(provider === 'openai'
+            ? {output: [{type: 'message', content: [{type: 'output_text', text: JSON.stringify(payload)}]}]}
+            : {choices: [{message: {content: JSON.stringify(payload)}}]});
+        };
+        if (kind === 'planner') await callAnswerPlanner({apiKey: 'test', fields, records: []}, {provider, fetchImpl});
+        else await callAnswerSuggestions({apiKey: 'test', field}, {provider, fetchImpl});
+      }
+    }
+  } finally { dom.window.close(); }
+});
+
+test('suggestions do not call the model for missing questions or orphaned option labels', async () => {
+  for (const label of ['', 'Yes', 'No', 'She/her']) {
+    const result = await callAnswerSuggestions({apiKey: 'test', field: {label, type: 'checkbox', options: ['Yes', 'No', 'She/her']}},
+      {fetchImpl: async () => { assert.fail('Missing question must be resolved before requesting an answer'); }});
+    assert.deepEqual(result.suggestions, []);
+    assert.match(result.missingContext, /full question is missing/i);
+  }
+});
 
 function createInput() {
   return {
@@ -206,8 +248,8 @@ test('sends one sanitized structured-output request and returns decisions', asyn
   assert.equal(body.text.format.schema.type, 'object');
   const plannerInput = JSON.parse(body.input[1].content[0].text);
   assert.deepEqual(plannerInput.page, { title: 'Senior Engineer Application', domain: 'jobs.example.com' });
-  assert.equal(plannerInput.fields[0].autocomplete, '');
-  assert.deepEqual(plannerInput.fields[0].constraints, {});
+  assert.equal(plannerInput.fields[0].autocomplete, undefined);
+  assert.equal(plannerInput.fields[0].constraints, undefined);
   assert.equal(JSON.stringify(body).includes('test-api-key'), false);
   assert.equal(JSON.stringify(body).includes('<form>secret</form>'), false);
   assert.equal(JSON.stringify(body).includes('<input>'), false);
@@ -249,11 +291,11 @@ test('uses Fireworks chat completions with the default provider and model', asyn
   assert.equal(request.options.headers.Authorization, 'Bearer fireworks-test-key');
   const body = JSON.parse(request.options.body);
   assert.equal(body.model, DEFAULT_FIREWORKS_MODEL);
-  assert.equal(body.max_tokens, 512);
+  assert.equal(body.max_tokens, 4096);
   assert.equal(body.top_k, 40);
   assert.equal(body.response_format.type, 'json_schema');
   assert.deepEqual(body.response_format.json_schema.schema, body.response_format.json_schema.schema);
-  assert.match(body.messages[0].content, /JSON schema/);
+  assert.doesNotMatch(body.messages[0].content, /additionalProperties/);
   assert.match(body.messages[0].content, /evidenceKeys/);
   assert.equal(body.messages[0].role, 'system');
   assert.equal(body.messages[1].role, 'user');

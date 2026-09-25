@@ -20,6 +20,7 @@ const AUTOCOMPLETE_KEYS = {
 };
 
 const GENERIC_NAME_LABELS = new Set(['name', 'your name', 'applicant name', 'candidate name']);
+const VOTABLE_IDENTITY_CONCEPTS = new Set(['first_name', 'last_name', 'full_name', 'preferred_name', 'email', 'github_url', 'linkedin_url', 'portfolio_url']);
 
 export function isOpaqueIdentifier(value) {
   const text = String(value ?? '').trim();
@@ -61,7 +62,9 @@ export function slugify(value = '') {
 
 export function inferSensitivity(question, key = '') {
   const text = normalizeText(`${key} ${question}`);
-  if (/\b(consent|agree|agreement|certif(?:y|ication)|attest|attestation|privacy|terms|declaration|conflict of interest|criminal|gender|race|ethnicity|disability|veteran)\b/.test(text)) {
+  // A stored fact (including demographics) is not the same thing as a legal
+  // declaration.  Only declarations and explicit consent stay manual.
+  if (/\b(consent|agree|agreement|certif(?:y|ication)|attest|attestation|privacy|terms|declaration|conflict of interest|criminal)\b/.test(text)) {
     return 'legal';
   }
   if (/\b(ctc|salary|compensation|notice period|sponsorship|sponsor|visa|citizenship|work authorization|reference|reason for leaving|relocat)\b/.test(text)) {
@@ -102,7 +105,7 @@ export function normalizeAnswerRecord(record = {}) {
     sensitivity,
     updatedAt,
   };
-  for (const key of ['id', 'concept', 'entityId', 'entityType', 'employmentId', 'context', 'provenance', 'confirmedAt', 'confirmationState', 'pendingAnswer', 'reusePolicy']) {
+  for (const key of ['id', 'concept', 'entityId', 'entityType', 'employmentId', 'context', 'provenance', 'confirmedAt', 'confirmationState', 'pendingAnswer', 'reusePolicy', 'reuseScope', 'country', 'validUntil', 'changeReviewedAt']) {
     if (record[key] != null && String(record[key]).trim()) normalized[key] = String(record[key]).trim();
   }
   if (Array.isArray(record.evidenceKeys)) normalized.evidenceKeys = uniqueStrings(record.evidenceKeys);
@@ -174,6 +177,7 @@ function profileUrlCompatible(concept, value) {
 
 export function recordScopeCompatible(field, record) {
   if (record.semantic?.reusePolicy === 'never' || record.reusePolicy === 'never') return false;
+  if (record.reuseScope === 'application') return false;
   if (record.suppressedFor?.includes(suggestionTargetKey(field))) return false;
   if (record.confirmationState === 'pending') return false;
   if (record.alternatives?.length && record.confirmationState !== 'confirmed') return false;
@@ -251,16 +255,35 @@ export function chooseRecord(field = {}, records = []) {
   const preferredKeys = AUTOCOMPLETE_KEYS[autocompleteToken] || AUTOCOMPLETE_KEYS[autocomplete] || [];
   const fieldConcept = canonicalConcept(field.label || field.name || field.id || '');
   const unambiguous = (candidates) => new Set(candidates.map((record) => String(record.answer).trim())).size === 1 ? candidates[0] : null;
+  const voted = (candidates, concept) => {
+    if (!VOTABLE_IDENTITY_CONCEPTS.has(concept) || inferSensitivity(field.label, field.id) !== 'safe') return null;
+    const votes = new Map();
+    const sources = new Set();
+    for (const record of candidates) {
+      if (recordConceptFor(record) !== concept || record.confirmationState !== 'confirmed' || record.sensitivity === 'legal') continue;
+      const source = record.id || record.key || record.question;
+      if (!source || sources.has(source)) continue;
+      sources.add(source);
+      const answer = String(record.answer).trim();
+      if (!votes.has(answer)) votes.set(answer, []);
+      votes.get(answer).push(record);
+    }
+    const ranked = [...votes.values()].sort((a, b) => b.length - a.length);
+    return ranked[0]?.length >= 2 && ranked[0].length > (ranked[1]?.length || 0) ? ranked[0][0] : null;
+  };
   if (fieldConcept === 'generic_name') {
-    const fullName = unambiguous(records.filter((record) => recordConceptFor(record) === 'full_name' && String(record.answer ?? '').trim()));
-    return fullName ? { record: fullName, confidence: 'high', score: 1, reason: 'generic-name:full_name' } : null;
+    const candidates = records.filter((record) => recordConceptFor(record) === 'full_name' && String(record.answer ?? '').trim());
+    const unanimous = unambiguous(candidates);
+    const fullName = unanimous || voted(candidates, 'full_name');
+    return fullName ? { record: fullName, confidence: 'high', score: 1, reason: unanimous ? 'generic-name:full_name' : 'vote:full_name' } : null;
   }
   if (fieldConcept) {
     const conceptCandidates = records.filter((record) => String(record.answer ?? '').trim()
       && [record.concept, record.key, record.question, ...(record.aliases || [])].filter(Boolean).some(label => canonicalConcept(label) === fieldConcept));
-    if (conceptCandidates.length > 1 && !unambiguous(conceptCandidates)) return null;
-    const conceptMatch = unambiguous(conceptCandidates);
-    if (conceptMatch) return { record: conceptMatch, confidence: 'high', score: 1, reason: `concept:${fieldConcept}` };
+    const unanimous = unambiguous(conceptCandidates);
+    const conceptMatch = unanimous || voted(conceptCandidates, fieldConcept);
+    if (conceptCandidates.length > 1 && !conceptMatch) return null;
+    if (conceptMatch) return { record: conceptMatch, confidence: 'high', score: 1, reason: `${unanimous ? 'concept' : 'vote'}:${fieldConcept}` };
   }
   if (preferredKeys.length || autocompleteToken === 'url') {
     let candidates = records.filter((record) => preferredKeys.includes(slugify(record.key)) && String(record.answer ?? '').trim());
@@ -320,8 +343,14 @@ export function validateFillValue(field = {}, value) {
   const text = String(value).trim();
   if (isOpaqueIdentifier(text)) return { ok: false, reason: 'value is an opaque internal identifier' };
   const constraints = field.constraints || {};
+  const type = normalizeText(field.type);
+  if (['select', 'select-one', 'radio'].includes(type) && field.optionsStatus
+    && !(field.options || []).some(option => String(option || '').trim())) {
+    return { ok: false, reason: 'field options are unavailable' };
+  }
   if (Array.isArray(field.options) && field.options.length) {
-    const values = field.multiple ? text.split(/\s*[,;]\s*/) : [text];
+    const exactOption = field.options.some(option => normalizeText(option) === normalizeText(text));
+    const values = field.multiple && !exactOption ? text.split(/\s*[,;]\s*/) : [text];
     if (!values.every((value) => field.options.some((option) => normalizeText(option) === normalizeText(value)))) {
       return { ok: false, reason: 'value is not one of the available options' };
     }
@@ -335,7 +364,6 @@ export function validateFillValue(field = {}, value) {
       return { ok: false, reason: 'field pattern is invalid' };
     }
   }
-  const type = normalizeText(field.type);
   if (type === 'email' && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(text)) return { ok: false, reason: 'value is not a valid email' };
   if (type === 'url') {
     try {
@@ -350,11 +378,33 @@ export function validateFillValue(field = {}, value) {
     if (!Number.isFinite(numeric)) return { ok: false, reason: 'value is not numeric' };
     if (constraints.min != null && numeric < numberConstraint(constraints.min, -Infinity)) return { ok: false, reason: 'value is below the minimum' };
     if (constraints.max != null && numeric > numberConstraint(constraints.max, Infinity)) return { ok: false, reason: 'value is above the maximum' };
+    if (constraints.step && constraints.step !== 'any') {
+      const step = Number(constraints.step), min = constraints.min != null ? Number(constraints.min) : 0;
+      if (Number.isFinite(step) && step > 0 && Number.isFinite(min) && Math.abs((numeric - min) / step - Math.round((numeric - min) / step)) > 1e-9) return { ok: false, reason: 'value does not match the field step' };
+    }
   }
+  if (type === 'date' && !/^\d{4}-\d{2}-\d{2}$/.test(text)) return { ok: false, reason: 'date must use YYYY-MM-DD' };
   if (type === 'checkbox' && !['yes', 'no', 'true', 'false', 'checked', 'unchecked'].includes(normalizeText(text))) {
     return { ok: false, reason: 'checkbox value must be yes or no' };
   }
   return { ok: true, reason: 'valid' };
+}
+
+export function lowRiskSemanticField(field = {}) {
+  if (field.widget || field.multiple || field.entityUnresolved || field.labelConfidence !== 'high'
+    || !['text', 'email', 'tel', 'url', 'select', 'select-one', 'radio'].includes(field.type)
+    || inferSensitivity(field.label, field.id) !== 'safe') return false;
+  const concept = canonicalConcept(field.label);
+  return ['generic_name', 'first_name', 'last_name', 'full_name', 'preferred_name', 'email',
+    'phone_number', 'phone_country_code', 'phone_device_type', 'address_line_1', 'address_line_2',
+    'city', 'postal_code', 'state', 'github_url', 'linkedin_url', 'portfolio_url', 'current_employer',
+    'current_city', 'current_location', 'employer', 'company', 'job_title', 'role', 'school',
+    'university', 'degree', 'highest_degree', 'field_of_study'].includes(concept);
+}
+
+export function semanticAutofillQualified(semantic = {}) {
+  return semantic.coverageComplete === true && semantic.selectedProbability >= 0.98
+    && semantic.confidence >= 0.90 && semantic.sufficiency >= 0.98 && semantic.conflict <= 0.02;
 }
 
 export function decideDisposition(decision = {}, field = {}) {
@@ -363,16 +413,20 @@ export function decideDisposition(decision = {}, field = {}) {
   const sensitivity = inferSensitivity(field.label || field.question, `${field.name || ''} ${field.id || ''}`);
   if (field.labelConfidence === 'low') return manual('Field meaning is unclear');
   if (field.entityUnresolved) return manual('Employment identity is unresolved');
-  if (sensitivity === 'legal' || decision.sensitivity === 'legal') return manual('Legal and consent answers require manual entry');
   if (decision.reusePolicy === 'never' || decision.semantic?.reusePolicy === 'never') return manual('Source prohibits reuse');
   if (decision.action === 'ask_user' || decision.value == null || !String(decision.value).trim() || decision.compatible === false || decision.conflicting) return manual('Missing, conflicting, or incompatible evidence');
   if (decision.confirmationState === 'pending') return manual('Saved answer has a pending conflict');
+  if (decision.matchKind === 'semantic' && decision.jevAutofill === true) return { disposition: 'autofill', reason: 'JEV-selected saved answer' };
+  if (sensitivity === 'legal' || decision.sensitivity === 'legal') return manual('Legal and consent answers require manual entry');
   if (decision.approved === true) return { disposition: 'autofill', reason: 'Explicitly approved answer' };
   if (decision.reusePolicy === 'review_only' || decision.semantic?.reusePolicy === 'review_only') return review('Source requires review on every reuse');
   if (sensitivity !== 'safe' || decision.sensitivity !== 'safe') return review('Sensitive answer requires approval');
   if (normalizeText(field.type) === 'textarea' || String(decision.value).length > 240 || /describe|tell us|why.*(?:join|company|work)|motivat/.test(normalizeText(field.label))) return review('Narrative answer requires approval');
   if (decision.confirmationState !== 'confirmed') return review('Saved answer is not confirmed');
-  if (!['exact', 'concept'].includes(decision.matchKind) || decision.confidence !== 'high') return review('Match requires explicit approval');
+  if (decision.matchKind === 'vote' && decision.voteAutofillEnabled === false) return review('Vote-based autofill is disabled');
+  if (decision.matchKind === 'semantic' && decision.compatible === true && lowRiskSemanticField(field)
+    && semanticAutofillQualified(decision.semantic)) return { disposition: 'autofill', reason: 'Validated low-risk JEV match' };
+  if (!['exact', 'concept', 'vote'].includes(decision.matchKind) || decision.confidence !== 'high') return review('Match requires explicit approval');
   return { disposition: 'autofill', reason: 'Unique confirmed compatible short fact' };
 }
 
@@ -445,6 +499,7 @@ export function mergeLearnedAnswers(existing = [], incoming = [], now = new Date
     } else if (changed) {
       result = result.map((record) => record.key === next.key ? {
         ...record,
+        changeReviewedAt: undefined,
         pendingAnswer: next.answer,
         confirmationState: 'pending',
         alternatives: uniqueStrings([...(record.alternatives || []), next.answer]),

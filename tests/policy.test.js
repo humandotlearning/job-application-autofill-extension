@@ -14,6 +14,22 @@ test('policy requires confirmed exact facts and keeps legal manual',()=>{
  assert.equal(core.decideDisposition({...d,reusePolicy:'never',approved:true},f).disposition,'manual');
  assert.equal(core.decideDisposition({...d,approved:true},{label:'I agree to terms',type:'checkbox'}).disposition,'manual');
 });
+
+test('keeps consent manual while allowing confirmed demographic facts to be reviewed',()=>{
+ const fact={value:'No',sensitivity:'review',matchKind:'exact',confirmationState:'confirmed',confidence:'high'};
+ assert.equal(core.inferSensitivity('Veteran status'),'safe');
+ assert.equal(core.decideDisposition(fact,{label:'Veteran status',type:'radio'}).disposition,'review');
+ assert.equal(core.inferSensitivity('I certify the information is accurate'),'legal');
+ assert.equal(core.decideDisposition({...fact,approved:true},{label:'I certify the information is accurate',type:'checkbox'}).disposition,'manual');
+});
+
+test('automatic learning confirms new safe facts but leaves changed facts pending',()=>{
+ const initial=core.mergeLearnedAnswers([], [{key:'city',question:'City',answer:'Pune',provenance:'user',sensitivity:'safe'}]);
+ assert.equal(initial[0].confirmationState,'confirmed');
+ const changed=core.mergeLearnedAnswers(initial, [{key:'city',question:'City',answer:'Delhi',provenance:'user',sensitivity:'safe'}]);
+ assert.equal(changed[0].answer,'Pune');
+ assert.equal(changed[0].pendingAnswer,'Delhi');
+});
 test('planner/executor protect legacy and invalid existing values',async()=>{
  const document=new JSDOM('<form><label>Email<input type="email" id="email"></label></form>').window.document;
  const fields=collectFieldDescriptors(document), decisions=planDeterministicFill(fields,[{...email,confirmationState:undefined}]);

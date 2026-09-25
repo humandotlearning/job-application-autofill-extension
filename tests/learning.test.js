@@ -108,3 +108,19 @@ test('conflicting corrections retain confirmed values and sensitive facts await 
   assert.equal(records.find((record) => record.key === 'salary').confirmationState, 'pending');
   assert.equal(records.some((record) => record.key === 'first_name'), false);
 });
+
+test('explicit capture completes valid typed text without waiting for blur', () => {
+  const dom = new JSDOM('<form aria-label="Job application"><label>Portfolio URL<input type="url" id="portfolio"></label></form>');
+  const document = dom.window.document;
+  collectAnswerRecords(document);
+  const input = document.querySelector('input');
+  input.value = 'https://example.com/work';
+  input.dispatchEvent(new dom.window.Event('input', { bubbles: true }));
+  assert.equal(collectAnswerRecords(document)[0].completed, false);
+  const records = collectAnswerRecords(document, { finalize: true });
+  assert.equal(records[0].completed, true);
+  assert.equal(mergeLearnedAnswers([], records, undefined, { confirm: true })[0].answer, input.value);
+  input.value = 'not a URL';
+  assert.equal(collectAnswerRecords(document, { finalize: true }).length, 0);
+  dom.window.close();
+});

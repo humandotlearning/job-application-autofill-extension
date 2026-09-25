@@ -3,9 +3,20 @@ const elements = {
   provider: byId('ai-provider'),
   fireworksApiKey: byId('fireworks-api-key'),
   openaiApiKey: byId('openai-api-key'),
+  typesafeEnabled: byId('typesafe-enabled'),
+  typesafeAutofillEnabled: byId('typesafe-autofill-enabled'),
+  typesafeAutofillSensitive: byId('typesafe-autofill-sensitive'),
+  typesafeNoMatchTop: byId('typesafe-no-match-top'),
+  voteAutofillEnabled: byId('vote-autofill-enabled'),
+  typesafeApiKey: byId('typesafe-api-key'),
   apiKey: byId('openai-api-key'),
   apiModel: byId('ai-model'),
   includeFormScreenshot: byId('include-form-screenshot'),
+  phoenixTracing: byId('phoenix-tracing'),
+  phoenixStatus: byId('phoenix-status'),
+  developerMode: byId('developer-mode'),
+  developerTools: byId('developer-tools'),
+  captureDebugCase: byId('capture-debug-case'),
   autoAdvance: byId('auto-advance-pages'),
   employerName: byId('employer-name'),
   relatedDefault: byId('related-default'),
@@ -24,8 +35,10 @@ const elements = {
   primaryAction: byId('primary-action'),
   secondaryActions: byId('secondary-actions'),
   checkPage: byId('check-page'),
+  fillPage: byId('fill-page'),
   advancePage: byId('advance-page'),
   saveAnswers: byId('save-answers'),
+  saveHint: byId('save-hint'),
   saveFeedback: byId('save-feedback'),
   employmentChoices: byId('employment-choices'),
   retryAi: byId('retry-ai'),
@@ -265,7 +278,7 @@ function renderSiteState(site = {}) {
     ? 'Site controls are unavailable on this browser or extension page.'
     : currentSite.disabled
     ? `Autofill is paused on ${currentSite.hostname}. No page data is inspected, filled, learned, or captured.`
-    : `Autofill is active on ${currentSite.hostname}. Disable it here whenever this site should stay untouched.`;
+    : `Autofill starts only after you press Fill this form. Disable this site here if it should stay untouched.`;
   setActionVisibility(currentRun);
   if (!currentSite.supported || currentSite.disabled) {
     renderRun(null);
@@ -323,7 +336,7 @@ function updateDatasourceSummary(datasource = {}) {
   elements.recordCount.textContent = `${answerCount} answer${answerCount === 1 ? '' : 's'}`;
   elements.coverMessageCount.textContent = `${coverMessageCount} cover message${coverMessageCount === 1 ? '' : 's'}`;
   if (datasource.learnedChanges) renderLearnedChanges(datasource.learnedChanges);
-  renderLearningInbox(datasource.learningInbox || []);
+  renderLearningInbox(datasource.learningInbox || [], datasource.undoAvailable === true);
   if (datasource.profile) {
     currentProfile = structuredClone(datasource.profile);
     elements.employerName.value = datasource.profile.employment?.[0]?.company || 'DeepSight AI Labs';
@@ -333,7 +346,17 @@ function updateDatasourceSummary(datasource = {}) {
   }
 }
 
-function renderLearningInbox(items) {
+async function refreshPhoenixStatus() {
+  if (!elements.phoenixStatus) return;
+  const stored = await chrome.storage.local.get({phoenixTraceQueue: [], phoenixTraceStatus: {}});
+  const status = stored.phoenixTraceStatus || {};
+  status.pending = Array.isArray(stored.phoenixTraceQueue) ? stored.phoenixTraceQueue.length : 0;
+  const last = status.lastSuccessAt ? ` Last sent ${new Date(status.lastSuccessAt).toLocaleTimeString()}.` : '';
+  const error = status.lastError ? ` Last error: ${status.lastError}.` : '';
+  elements.phoenixStatus.textContent = `Phoenix delivery: ${status.pending} pending, ${status.dropped} dropped.${last}${error}`;
+}
+
+function renderLearningInbox(items, undoAvailable = false) {
   elements.learningInboxCount.textContent = String(items.length);
   elements.learningInboxList.replaceChildren();
   for (const item of items) {
@@ -353,6 +376,16 @@ function renderLearningInbox(items) {
     elements.learningInboxList.append(row);
   }
   if (!items.length) elements.learningInboxList.textContent = 'No learning proposals waiting for review.';
+  if (undoAvailable) {
+    const undo = document.createElement('button');
+    undo.type = 'button'; undo.textContent = 'Undo latest automatic save';
+    undo.addEventListener('click', async () => {
+      const response = await chrome.runtime.sendMessage({ type: 'JOB_DATASOURCE_UNDO_LAST_AUTOSAVE' });
+      if (!response?.ok) { setStatus(response?.error || 'Could not undo the automatic save.', 'error'); return; }
+      updateDatasourceSummary(response.datasource); setStatus('Latest automatic save undone.');
+    });
+    elements.learningInboxList.append(undo);
+  }
 }
 
 function renderLearnedChanges(records) {
@@ -389,8 +422,12 @@ function renderLearnedChanges(records) {
     const button = document.createElement('button');
     button.type = 'button';
     button.textContent = 'Confirm value';
+    const close = document.createElement('button');
+    close.type = 'button';
+    close.textContent = 'Close';
+    close.setAttribute('aria-label', `Close ${readableQuestion} notification without confirming`);
     button.addEventListener('click', async () => {
-      button.disabled = true;
+      button.disabled = close.disabled = true;
       try {
         const submitted = input.value;
         const response = await chrome.runtime.sendMessage({ type: 'JOB_DATASOURCE_CORRECT', key: record.key, answer: submitted });
@@ -399,9 +436,20 @@ function renderLearnedChanges(records) {
         if (response.datasource) updateDatasourceSummary(response.datasource);
         setStatus('Correction saved. Previous values remain in history.');
       } catch (error) { setStatus(error.message, 'error'); }
-      finally { button.disabled = false; }
+      finally { button.disabled = close.disabled = false; }
     });
-    correction.append(input, button);
+    close.addEventListener('click', async () => {
+      button.disabled = close.disabled = true;
+      try {
+        const response = await chrome.runtime.sendMessage({ type: 'JOB_DATASOURCE_DISMISS_CHANGE', key: record.key });
+        if (!response?.ok) throw new Error(response?.error || 'Could not close the notification.');
+        correctionDrafts.delete(record.key);
+        if (response.datasource) updateDatasourceSummary(response.datasource);
+        setStatus('Notification closed. The saved answer was not changed.');
+      } catch (error) { setStatus(error.message, 'error'); }
+      finally { button.disabled = close.disabled = false; }
+    });
+    correction.append(input, button, close);
     row.append(previous, correction);
     elements.learnedChangeList.append(row);
   }
@@ -580,7 +628,7 @@ function answerWorkspace(item, displayLabel, responseHandler = response => rende
   textarea.value = state.answer;
   textarea.placeholder = item.generatedSuggestion ? 'Choose an AI draft, or write your own.' : item.suggestion ? 'Choose a saved answer, or write your own.' : 'Write the answer you want to send to the form.';
   textarea.setAttribute('aria-label', `Answer for ${displayLabel}`);
-  textarea.readOnly = Boolean(item.suggestion && !state.editing);
+  textarea.readOnly = Boolean(state.answer.trim() && item.suggestion && !state.editing);
   workspaceLabel.htmlFor = `answer-draft-${draftKey(origin, origin.fieldId)}`;
   textarea.id = workspaceLabel.htmlFor;
 
@@ -594,6 +642,14 @@ function answerWorkspace(item, displayLabel, responseHandler = response => rende
   rewrite.type = 'button';
   rewrite.dataset.rewriteAnswer = 'true';
   rewrite.textContent = 'Ask AI to rewrite';
+  const generate = document.createElement('button');
+  generate.type = 'button';
+  generate.dataset.generateSuggestions = 'true';
+  generate.textContent = 'Generate AI answer';
+  const feedback = document.createElement('p');
+  feedback.className = 'result-detail';
+  feedback.dataset.draftStatus = 'true';
+  feedback.setAttribute('role', 'status');
   const send = document.createElement('button');
   send.type = 'button';
   send.dataset.sendAnswer = 'true';
@@ -628,7 +684,7 @@ function answerWorkspace(item, displayLabel, responseHandler = response => rende
 
   const promptRow = document.createElement('div');
   promptRow.className = 'rewrite-prompt-row';
-  promptRow.hidden = true;
+  promptRow.hidden = !state.promptOpen;
   const prompt = document.createElement('textarea');
   prompt.dataset.rewritePrompt = 'true';
   prompt.value = state.rewriteInstruction;
@@ -654,7 +710,7 @@ function answerWorkspace(item, displayLabel, responseHandler = response => rende
   const updateControls = () => {
     const hasAnswer = Boolean(state.answer.trim()) && !isOpaqueIdentifier(state.answer);
     const pending = Boolean(state.pending);
-    textarea.readOnly = Boolean(item.suggestion && !state.editing);
+    textarea.readOnly = Boolean(state.answer.trim() && item.suggestion && !state.editing);
     textarea.disabled = pending && !origin.inlineSessionId;
     prompt.disabled = pending;
     edit.disabled = pending || !state.answer.trim();
@@ -670,6 +726,17 @@ function answerWorkspace(item, displayLabel, responseHandler = response => rende
     fieldStatus.hidden = !fieldStatus.textContent;
     retryRewrite.hidden = !state.lastRewrite;
     restoreDraft.hidden = !state.previousDraft;
+    generate.disabled = pending;
+    generate.textContent = state.pending === 'generate' ? 'Generating…' : 'Generate AI answer';
+    submitRewrite.textContent = ['rewrite', 'tailor'].includes(state.pending) ? 'Rewriting…' : 'Rewrite draft';
+    workspace.setAttribute('aria-busy', String(pending));
+    feedback.textContent = state.feedback || 'Generate from saved answers, or write a draft. Review before sending.';
+  };
+  // A storage refresh can replace this editor before an AI request returns.
+  // Always refresh the current editor, not the detached request-time nodes.
+  state.refresh = () => {
+    textarea.value = state.answer;
+    updateControls();
   };
   textarea.addEventListener('input', () => {
     updateDraftAnswer(state, textarea.value);
@@ -683,6 +750,7 @@ function answerWorkspace(item, displayLabel, responseHandler = response => rende
     textarea.focus();
   });
   rewrite.addEventListener('click', () => {
+    state.promptOpen = true;
     promptRow.hidden = false;
     prompt.focus();
   });
@@ -706,6 +774,7 @@ function answerWorkspace(item, displayLabel, responseHandler = response => rende
     const requestDraft = String(draft);
     state.lastRewrite = {instruction, tailorToJob, draft: requestDraft};
     state.pending = tailorToJob ? 'tailor' : 'rewrite';
+    state.feedback = 'Rewriting your draft…';
     updateControls();
     try {
       const response = await sendFieldAction('JOB_RUN_REWRITE_ANSWER', origin, {
@@ -714,7 +783,8 @@ function answerWorkspace(item, displayLabel, responseHandler = response => rende
         ...(state.replacement ? {replacement: state.replacement} : {}) });
       if (!response?.ok || typeof response.answer !== 'string') throw new Error(response?.error || 'Could not rewrite the answer.');
       if (state.revision !== requestRevision) {
-        setStatus('Draft changed while the rewrite was running. Your latest edit was kept.');
+        state.feedback = 'Draft changed while the rewrite was running. Your latest edit was kept.';
+        setStatus(state.feedback);
         return;
       }
       state.previousDraft = {
@@ -725,11 +795,12 @@ function answerWorkspace(item, displayLabel, responseHandler = response => rende
       textarea.value = state.answer;
       state.pending = null;
       if (origin.inlineSessionId) responseHandler(response);
-      setStatus('Draft rewritten. Review or edit it before sending it to the form.');
-    } catch (error) { setStatus(error.message, 'error'); }
+      state.feedback = 'Draft rewritten. Review or edit it before sending it to the form.';
+      setStatus(state.feedback);
+    } catch (error) { state.feedback = error.message; setStatus(error.message, 'error'); }
     finally {
       if (['rewrite', 'tailor'].includes(state.pending)) state.pending = null;
-      updateControls();
+      state.refresh();
     }
   };
   submitRewrite.addEventListener('click', () => performRewrite({instruction: prompt.value}));
@@ -747,6 +818,33 @@ function answerWorkspace(item, displayLabel, responseHandler = response => rende
     state.editing = true;
     updateControls();
     textarea.focus();
+  });
+  generate.addEventListener('click', async () => {
+    if (state.pending) return;
+    state.jobDescription = String(workspace.parentElement?.querySelector('[data-job-description]')?.value ?? state.jobDescription);
+    const actionRevision = runRevision;
+    const requestRevision = state.revision;
+    state.pending = 'generate';
+    state.feedback = 'Generating from your saved answers and this application…';
+    updateControls();
+    try {
+      const response = await sendFieldAction('JOB_RUN_GENERATE_SUGGESTIONS', origin, { jobDescription: state.jobDescription.trim() });
+      if (!response?.ok || (origin.inlineSessionId ? !response.inlineSession : !response.run)) throw new Error(response?.error || 'Could not generate an answer. Try again.');
+      if (!origin.inlineSessionId && !canRenderActionResponse(response.run, actionRevision)) throw new Error('The page changed while suggestions were prepared. Check the page again.');
+      const generated = origin.inlineSessionId
+        ? response.inlineSession.generatedSuggestions?.[origin.fieldId]
+        : response.run.generatedSuggestions?.[origin.fieldId] || [...(response.run.actionRequired || []), ...(response.run.optionalUnresolved || [])].find(field => field.fieldId === origin.fieldId)?.generatedSuggestion;
+      if (state.revision === requestRevision && !state.answer.trim() && generated?.suggestions?.[0]?.answer) {
+        updateDraftAnswer(state, generated.suggestions[0].answer);
+        state.sourceKey = null; state.sourceKeys = []; state.candidateKind = null;
+        state.editing = true;
+      }
+      state.pending = null;
+      state.feedback = generated?.missingContext || 'AI answers are ready. Review or rewrite before sending.';
+      responseHandler(response);
+      setStatus(state.feedback);
+    } catch (error) { state.feedback = error.message; setStatus(error.message, 'error'); }
+    finally { state.pending = null; state.refresh(); }
   });
   const applyAnswer = async () => {
     if (state.pending) return;
@@ -782,12 +880,12 @@ function answerWorkspace(item, displayLabel, responseHandler = response => rende
     } catch (error) { setStatus(error.message, 'error'); }
     finally {
       if (state.pending === 'apply') state.pending = null;
-      updateControls();
+      state.refresh();
     }
   };
   send.addEventListener('click', applyAnswer);
-  controls.append(edit, rewrite, send);
-  workspace.append(workspaceLabel, context, contextEditor, textarea, controls, promptRow, fieldStatus);
+  controls.append(generate, edit, rewrite, send);
+  workspace.append(workspaceLabel, context, contextEditor, textarea, controls, promptRow, fieldStatus, feedback);
   updateControls();
   return { workspace, state, origin, updateControls, applyAnswer, performRewrite };
 }
@@ -925,7 +1023,25 @@ function itemRow(item, { focus = false, detail = '', responseHandler = response 
     query.value = workspace.state.searchQuery;
     const button = document.createElement('button');
     button.type = 'button'; button.dataset.searchAnswers = 'true'; button.textContent = 'Search';
+    const semanticButton = document.createElement('button');
+    semanticButton.type = 'button'; semanticButton.dataset.findSavedAnswer = 'true'; semanticButton.textContent = 'Find saved answer';
     const results = document.createElement('div');
+    results.setAttribute('role', 'status');
+    const showCandidates = (candidates, emptyText, complete = false) => {
+      results.replaceChildren();
+      for (const candidate of candidates || []) {
+        if (isOpaqueIdentifier(candidate.answer)) continue;
+        const choice = document.createElement('button'); choice.type = 'button'; choice.dataset.searchResult = 'true';
+        choice.textContent = `${candidate.sourceQuestion || 'Saved answer'} — ${complete || candidate.answer.length <= 160 ? candidate.answer : `${candidate.answer.slice(0, 160)}…`}`;
+        choice.addEventListener('click', () => {
+          updateDraftAnswer(workspace.state, candidate.answer); workspace.state.sourceKey = candidate.sourceKey || null;
+          workspace.state.sourceKeys = candidate.sourceKeys || (candidate.sourceKey ? [candidate.sourceKey] : []); workspace.state.candidateKind = candidate.kind || null;
+          workspace.state.editing = true; workspace.workspace.querySelector('[data-answer-draft]').value = candidate.answer; workspace.updateControls();
+        });
+        results.append(choice);
+      }
+      if (!results.children.length) results.textContent = emptyText;
+    };
     button.addEventListener('click', async () => {
       if (button.disabled) return;
       const submittedQuery = workspace.state.searchQuery.trim();
@@ -938,19 +1054,7 @@ function itemRow(item, { focus = false, detail = '', responseHandler = response 
         if (!search.isConnected || workspace.state.searchQuery.trim() !== submittedQuery) return;
         if (!response?.ok) throw new Error(response?.error || 'Could not search saved answers.');
         if (origin.inlineSessionId) responseHandler(response, {preserveContent: true});
-        results.replaceChildren();
-        for (const candidate of response.candidates || []) {
-          if (isOpaqueIdentifier(candidate.answer)) continue;
-          const choice = document.createElement('button'); choice.type = 'button'; choice.dataset.searchResult = 'true';
-          choice.textContent = `${candidate.sourceQuestion || 'Saved answer'} — ${candidate.answer.length > 160 ? `${candidate.answer.slice(0, 160)}…` : candidate.answer}`;
-          choice.addEventListener('click', () => {
-            updateDraftAnswer(workspace.state, candidate.answer); workspace.state.sourceKey = candidate.sourceKey || null;
-            workspace.state.sourceKeys = candidate.sourceKeys || (candidate.sourceKey ? [candidate.sourceKey] : []); workspace.state.candidateKind = candidate.kind || null;
-            workspace.state.editing = true; workspace.workspace.querySelector('[data-answer-draft]').value = candidate.answer; workspace.updateControls();
-          });
-          results.append(choice);
-        }
-        if (!results.children.length) results.textContent = 'No saved answers found.';
+        showCandidates(response.candidates, 'No saved answers found.');
       } catch (error) { if (search.isConnected) setStatus(error.message, 'error'); } finally {
         if (workspace.state.pending === 'search') workspace.state.pending = null;
         button.disabled = false;
@@ -958,8 +1062,35 @@ function itemRow(item, { focus = false, detail = '', responseHandler = response 
         workspace.updateControls();
       }
     });
+    semanticButton.addEventListener('click', async () => {
+      if (semanticButton.disabled) return;
+      semanticButton.disabled = true; results.textContent = 'Searching saved answers…';
+      if (origin.inlineSessionId) workspace.state.pending = 'search';
+      try {
+        const response = await sendFieldAction('JOB_RUN_SEMANTIC_SEARCH', origin, {fieldId:origin.fieldId,retry:semanticButton.dataset.retry==='true'});
+        if (!search.isConnected) return;
+        if (!response?.ok) throw new Error(response?.error || 'Couldn’t search saved answers—try again.');
+        if (origin.inlineSessionId) responseHandler(response, {preserveContent: true});
+        if (response.semanticStatus === 'matched') {
+          semanticButton.dataset.retry = 'false'; semanticButton.textContent = 'Find saved answer';
+          showCandidates(response.candidates, 'No clear match.', true);
+        } else if (response.semanticStatus === 'none' || response.semanticStatus === 'skipped') {
+          semanticButton.dataset.retry = 'false'; semanticButton.textContent = 'Find saved answer'; results.textContent = 'No clear match.';
+        } else {
+          semanticButton.dataset.retry = 'true'; semanticButton.textContent = 'Try saved-answer search again'; results.textContent = 'Couldn’t search saved answers—try again.';
+        }
+      } catch (error) {
+        semanticButton.dataset.retry = 'true'; semanticButton.textContent = 'Try saved-answer search again';
+        if (search.isConnected) results.textContent = error.message;
+      } finally {
+        if (workspace.state.pending === 'search') workspace.state.pending = null;
+        semanticButton.disabled = false;
+        workspace.updateControls();
+      }
+    });
     query.addEventListener('input', () => { workspace.state.searchQuery = query.value; results.replaceChildren(); });
-    search.append(query, button, results); content.append(search);
+    search.append(semanticButton, query, button, results);
+    content.insertBefore(search, workspace.workspace);
   }
   if (generated) {
     const drafts = Array.isArray(generated.suggestions) ? generated.suggestions : [];
@@ -1109,7 +1240,7 @@ function itemRow(item, { focus = false, detail = '', responseHandler = response 
       const editCandidate = document.createElement('button');
       editCandidate.type = 'button';
       editCandidate.dataset.editCandidate = 'true';
-      editCandidate.textContent = 'Edit';
+      editCandidate.textContent = 'Edit and use';
       editCandidate.addEventListener('click', () => {
         selectCandidate(true)?.focus();
       });
@@ -1228,7 +1359,10 @@ function renderLazyList(details, container, items, options) {
 function setActionVisibility(run) {
   if (!currentSite.supported || currentSite.disabled) {
     elements.primaryAction.hidden = true;
+    elements.fillPage.hidden = true;
     elements.secondaryActions.hidden = true;
+    elements.saveAnswers.hidden = true;
+    elements.saveHint.hidden = true;
     elements.retryAi.hidden = true;
     elements.employmentChoices.replaceChildren();
     return;
@@ -1238,30 +1372,34 @@ function setActionVisibility(run) {
   const missingDestination = run?.frame === null;
   const selectForm = ['ambiguous_form', 'selecting_form'].includes(run?.waitingFor);
   elements.primaryAction.disabled = busy || status === 'running';
-  for (const button of [elements.checkPage, elements.advancePage, elements.saveAnswers]) {
+  for (const button of [elements.checkPage, elements.fillPage, elements.advancePage, elements.saveAnswers]) {
     button.disabled = busy || status === 'running';
   }
   elements.primaryAction.hidden = false;
+  elements.fillPage.hidden = !['waiting_user', 'page_ready', 'ready_for_user_submit', 'answers_saved'].includes(status) || run?.waitingFor === 'page_changed' || selectForm;
   elements.checkPage.hidden = !['waiting_user', 'page_ready'].includes(status);
-  // The primary action carries the state-specific Continue/Save copy. Keep the
-  // secondary row focused on the safe, repeatable “Check again” action.
+  // Saving stays visible independently of the application’s next step.
   elements.advancePage.hidden = true;
   elements.saveAnswers.hidden = !['waiting_user', 'page_ready', 'ready_for_user_submit', 'answers_saved'].includes(status);
-  elements.saveAnswers.textContent = saving ? 'Saving…' : (['ready_for_user_submit', 'answers_saved'].includes(status) ? 'Save draft checkpoint' : 'Save filled values');
+  elements.saveAnswers.textContent = saving ? 'Saving…' : 'Save answers for future forms';
+  elements.saveHint.hidden = elements.saveAnswers.hidden;
+  elements.saveHint.textContent = missingDestination
+    ? 'Find or select your application form before saving its answers.'
+    : 'Save current answers without submitting the application.';
   elements.saveAnswers.setAttribute('aria-busy', String(saving));
   elements.saveAnswers.disabled ||= missingDestination;
   elements.checkPage.textContent = missingDestination ? 'Retry scan' : 'Check again';
-  elements.secondaryActions.hidden = !hasRun || (elements.checkPage.hidden && elements.advancePage.hidden && elements.saveAnswers.hidden);
+  elements.secondaryActions.hidden = !hasRun || (elements.checkPage.hidden && elements.advancePage.hidden);
   if (!hasRun) {
     elements.retryAi.hidden = true;
-    elements.primaryAction.textContent = 'Fill this page';
+    elements.primaryAction.textContent = 'Fill this form';
     return;
   }
   if (status === 'running') elements.primaryAction.textContent = 'Filling this page…';
-  else if (status === 'waiting_user') elements.primaryAction.textContent = selectForm ? 'Select form' : missingDestination ? 'Retry scan' : (run.actionRequired || run.unresolved || [])[0]?.fieldId ? 'Review needed answers' : 'Check again';
+  else if (status === 'waiting_user') elements.primaryAction.textContent = run.waitingFor === 'page_changed' ? 'Fill this page' : selectForm ? 'Select form' : missingDestination ? 'Retry scan' : (run.actionRequired || run.unresolved || [])[0]?.fieldId ? 'Review needed answers' : 'Check again';
   else if (status === 'page_ready') elements.primaryAction.textContent = 'Continue to next page';
   else if (['ready_for_user_submit', 'answers_saved'].includes(status)) elements.primaryAction.textContent = 'Review on site';
-  else elements.primaryAction.textContent = 'Fill this page';
+  else elements.primaryAction.textContent = 'Fill this form';
 }
 
 function capturePanelState() {
@@ -1317,8 +1455,8 @@ function renderRun(run, {force = false} = {}) {
   }
   currentRun = run || null;
   if (!run) {
-    elements.runTitle.textContent = !currentSite.supported ? 'Open an application' : currentSite.disabled ? 'Autofill is paused' : 'Ready to fill this page';
-    elements.runSummary.textContent = !currentSite.supported ? 'Switch to a job application to get started.' : currentSite.disabled ? 'Re-enable this site using the site access menu above.' : 'Use your saved answers to get started.';
+    elements.runTitle.textContent = !currentSite.supported ? 'Open an application' : currentSite.disabled ? 'Autofill is paused' : 'Ready to fill this form';
+    elements.runSummary.textContent = !currentSite.supported ? 'Switch to a job application to get started.' : currentSite.disabled ? 'Re-enable this site using the site access menu above.' : 'Press Fill this form to enable autofill for this application.';
     elements.runState.textContent = !currentSite.supported ? 'Unavailable' : currentSite.disabled ? 'Paused' : 'Ready';
     elements.runState.className = 'pill neutral';
     elements.runHint.textContent = 'Review each page before continuing.';
@@ -1344,6 +1482,9 @@ function renderRun(run, {force = false} = {}) {
   const appliedAnswers = Object.values(run.appliedAnswers || {});
   const requiredDisplay = [...actionRequired, ...appliedAnswers.filter(item => item.list === 'required')];
   const optionalDisplay = [...optionalUnresolved, ...appliedAnswers.filter(item => item.list !== 'required')];
+  const semanticAutofills = run.semanticAutofills || [];
+  const filledCount = audit.length + semanticAutofills.filter(fill => !audit.some(item =>
+    item.question === fill.label && String(item.answer) === String(fill.value))).length;
   elements.runHint.hidden = false;
   elements.runTitle.textContent = run.status === 'running' ? 'Filling this page…'
     : run.frame === null ? 'Let’s find your form'
@@ -1352,7 +1493,7 @@ function renderRun(run, {force = false} = {}) {
     : ['page_ready', 'ready_for_user_submit'].includes(run.status) ? 'This page is filled'
     : 'Current application';
   elements.runSummary.textContent = run.frame === null ? 'Choose or rescan the application form.'
-    : `${audit.length} filled value${audit.length === 1 ? '' : 's'}${reviewRequired.length ? ` · ${reviewRequired.length} to review` : ''}${run.frame?.interpretationMode ? ` · AI ${run.frame.interpretationMode} context` : ''}`;
+    : `${filledCount} filled value${filledCount === 1 ? '' : 's'}${semanticAutofills.length ? ` · ${semanticAutofills.length} filled by JEV` : ''}${reviewRequired.length ? ` · ${reviewRequired.length} to review` : ''}${actionRequired.length ? ` · ${actionRequired.length} need answers` : ''}${run.frame?.interpretationMode ? ` · AI ${run.frame.interpretationMode} context` : ''}`;
   const failedAi = Object.values(run.aiOperations || {}).some((operation) => ['failed', 'interrupted'].includes(operation?.status || operation));
   elements.retryAi.hidden = !failedAi && !run.llmError;
   elements.employmentChoices.replaceChildren();
@@ -1375,6 +1516,11 @@ function renderRun(run, {force = false} = {}) {
   setActionVisibility(run);
 
   elements.actionRequiredCount.textContent = String(actionRequired.length);
+  // Reveal field actions on the first result/new page, but respect a user's
+  // collapse choice during subsequent background updates of the same page.
+  if (requiredDisplay.length && (elements.actionRequiredCard.hidden || previousOrigin !== nextOrigin)) {
+    panelState.openDetails[elements.actionRequiredCard.id] = true;
+  }
   elements.actionRequiredCard.hidden = requiredDisplay.length === 0;
   renderList(elements.actionRequiredList, requiredDisplay, { focus: run.frame !== null, emptyDetail: 'No blockers on this page.' });
 
@@ -1394,7 +1540,7 @@ function renderRun(run, {force = false} = {}) {
   if (run.status === 'waiting_user') {
     const waitingLabel = String(run.waitingLabel || '').trim();
     const visibleWaitingLabel = waitingLabel && !isOpaqueIdentifier(waitingLabel) ? waitingLabel : '';
-    elements.runHint.textContent = run.frame === null ? (run.actionRequired?.[0]?.reason || 'Retry the scan to find the application form.') : visibleWaitingLabel
+    elements.runHint.textContent = run.waitingFor === 'page_changed' ? 'The application page changed. Fill this page using your saved answers, then review it before continuing.' : run.frame === null ? (run.actionRequired?.[0]?.reason || 'Retry the scan to find the application form.') : visibleWaitingLabel
       ? `Complete “${visibleWaitingLabel}” on the application page, then click Check again.`
       : 'Complete the highlighted field or handle the manual step, then click Check again.';
     setStatus(run.llmError ? 'Couldn’t prepare AI answers. Try Retry AI.' : 'Action is required on the application page.', run.llmError ? 'error' : 'ok', run.llmError || '');
@@ -1402,7 +1548,7 @@ function renderRun(run, {force = false} = {}) {
     elements.runHint.textContent = 'This page is filled and validated. Review it, then continue when you are ready.';
     setStatus(`Page ${run.pageNumber || 1} is ready for your approval.`);
   } else if (run.status === 'ready_for_user_submit') {
-    elements.runHint.textContent = 'Review on the site, then submit there. Save a draft checkpoint if needed.';
+    elements.runHint.textContent = 'Review on the site, then submit there. You can save your answers for future forms at any time.';
     setStatus('Final page is ready. Submission stays manual; final values are captured automatically.');
   } else if (run.status === 'answers_saved') {
     elements.runHint.textContent = 'Saved locally. Final values are captured automatically when you submit on the site.';
@@ -1485,6 +1631,7 @@ async function sendRunAction(type) {
 
 async function runPrimaryAction() {
   if (currentRun?.status === 'waiting_user') {
+    if (currentRun.waitingFor === 'page_changed') return sendRunAction('JOB_RUN_CHECK_PAGE');
     if (['ambiguous_form', 'selecting_form'].includes(currentRun.waitingFor)) return sendRunAction('JOB_RUN_SELECT_FORM');
     if (currentRun.frame === null) return sendRunAction('JOB_RUN_CHECK_PAGE');
     if (!elements.actionRequiredCard.hidden) {
@@ -1532,7 +1679,7 @@ async function refresh() {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
   activeTabId = tab?.id || null;
   await refreshSiteState();
-  const stored = await chrome.storage.local.get({ answerRecords: [], openaiApiKey: '', fireworksApiKey: '', aiProvider: '', aiModel: '', openaiModel: 'gpt-5.6-terra', includeFormScreenshot: true, autoAdvancePages: false });
+  const stored = await chrome.storage.local.get({ answerRecords: [], openaiApiKey: '', fireworksApiKey: '', typesafeApiKey: '', typesafeEnabled: null, typesafeAutofillEnabled: true, typesafeAutofillSensitive: true, typesafeNoMatchTop: true, voteAutofillEnabled: true, aiProvider: '', aiModel: '', openaiModel: 'gpt-5.6-terra', includeFormScreenshot: true, autoAdvancePages: false, phoenixTracing: true, developerMode: false });
   const provider = stored.aiProvider === 'openai' || stored.aiProvider === 'fireworks'
     ? stored.aiProvider
     : (stored.openaiApiKey ? 'openai' : 'fireworks');
@@ -1541,8 +1688,21 @@ async function refresh() {
   elements.provider.selectedIndex = provider === 'openai' ? 1 : 0;
   elements.fireworksApiKey.value = stored.fireworksApiKey || '';
   elements.openaiApiKey.value = stored.openaiApiKey || '';
+  elements.typesafeApiKey.value = stored.typesafeApiKey || '';
+  elements.typesafeEnabled.checked = stored.typesafeEnabled === null ? Boolean(stored.typesafeApiKey) : Boolean(stored.typesafeEnabled);
+  elements.typesafeAutofillEnabled.checked = stored.typesafeAutofillEnabled !== false;
+  elements.typesafeAutofillSensitive.checked = stored.typesafeAutofillSensitive !== false;
+  elements.typesafeNoMatchTop.checked = stored.typesafeNoMatchTop !== false;
+  elements.voteAutofillEnabled.checked = stored.voteAutofillEnabled !== false;
+  elements.typesafeAutofillEnabled.disabled = !elements.typesafeEnabled.checked;
+  elements.typesafeAutofillSensitive.disabled = !elements.typesafeEnabled.checked || !elements.typesafeAutofillEnabled.checked;
+  elements.typesafeNoMatchTop.disabled = !elements.typesafeEnabled.checked || !elements.typesafeAutofillEnabled.checked;
   elements.apiModel.value = stored.aiModel || (provider === 'openai' ? stored.openaiModel : '') || defaultModel;
   elements.includeFormScreenshot.checked = stored.includeFormScreenshot !== false;
+  elements.phoenixTracing.checked = stored.phoenixTracing !== false;
+  elements.developerMode.checked = stored.developerMode === true;
+  elements.developerTools.hidden = !elements.developerMode.checked;
+  await refreshPhoenixStatus();
   elements.autoAdvance.checked = Boolean(stored.autoAdvancePages);
   updateDatasourceSummary({ answerCount: stored.answerRecords.length });
   const datasourceResponse = await chrome.runtime.sendMessage({ type: 'JOB_DATASOURCE_STATE' });
@@ -1594,6 +1754,15 @@ async function importDatasource(file) {
 async function saveApiKey(input, storageKey, providerLabel) {
   const value = input.value.trim();
   await chrome.storage.local.set({ [storageKey]: value });
+  if (storageKey === 'typesafeApiKey' && value) {
+    const { typesafeEnabled } = await chrome.storage.local.get({ typesafeEnabled: null });
+    if (typesafeEnabled === null) {
+      elements.typesafeEnabled.checked = true;
+      elements.typesafeAutofillEnabled.disabled = false;
+      elements.typesafeAutofillSensitive.disabled = !elements.typesafeAutofillEnabled.checked;
+      elements.typesafeNoMatchTop.disabled = !elements.typesafeAutofillEnabled.checked;
+    }
+  }
   setStatus(value ? `${providerLabel} API key saved in trusted extension storage.` : `${providerLabel} API key cleared. Local answers still work.`);
 }
 
@@ -1625,6 +1794,35 @@ async function saveScreenshotSetting() {
   setStatus(elements.includeFormScreenshot.checked ? 'Visual form context enabled.' : 'Using text form context only.');
 }
 
+async function saveTypeSafeSetting() {
+  const typesafeEnabled = Boolean(elements.typesafeEnabled.checked);
+  elements.typesafeAutofillEnabled.disabled = !typesafeEnabled;
+  elements.typesafeAutofillSensitive.disabled = !typesafeEnabled || !elements.typesafeAutofillEnabled.checked;
+  elements.typesafeNoMatchTop.disabled = !typesafeEnabled || !elements.typesafeAutofillEnabled.checked;
+  await chrome.storage.local.set({ typesafeEnabled });
+  setStatus(typesafeEnabled ? 'JEV-assisted filling enabled.' : 'JEV-assisted filling disabled.');
+}
+
+async function saveTypeSafeAutofillSetting() {
+  await chrome.storage.local.set({ typesafeAutofillEnabled: elements.typesafeAutofillEnabled.checked });
+  elements.typesafeAutofillSensitive.disabled = !elements.typesafeEnabled.checked || !elements.typesafeAutofillEnabled.checked;
+  elements.typesafeNoMatchTop.disabled = !elements.typesafeEnabled.checked || !elements.typesafeAutofillEnabled.checked;
+  setStatus(elements.typesafeAutofillEnabled.checked ? 'JEV top-answer autofill enabled.' : 'JEV matches require review.');
+}
+
+async function saveTypeSafeAnswerPolicy() {
+  await chrome.storage.local.set({
+    typesafeAutofillSensitive: elements.typesafeAutofillSensitive.checked,
+    typesafeNoMatchTop: elements.typesafeNoMatchTop.checked,
+  });
+  setStatus('JEV answer policy saved.');
+}
+
+async function saveVoteAutofillSetting() {
+  await chrome.storage.local.set({ voteAutofillEnabled: elements.voteAutofillEnabled.checked });
+  setStatus(elements.voteAutofillEnabled.checked ? 'Saved-answer vote autofill enabled.' : 'Saved-answer vote matches require review.');
+}
+
 async function saveProfile(changedField) {
   try {
     const company = elements.employerName.value.trim() || 'DeepSight AI Labs';
@@ -1648,7 +1846,7 @@ async function saveProfile(changedField) {
   } catch (error) { setStatus(error.message, 'error'); }
 }
 
-for (const [input, key, label] of [[elements.fireworksApiKey, 'fireworksApiKey', 'Fireworks'], [elements.openaiApiKey, 'openaiApiKey', 'OpenAI']]) {
+for (const [input, key, label] of [[elements.fireworksApiKey, 'fireworksApiKey', 'Fireworks'], [elements.openaiApiKey, 'openaiApiKey', 'OpenAI'], [elements.typesafeApiKey, 'typesafeApiKey', 'TypeSafe']]) {
   input.addEventListener('change', () => saveApiKey(input, key, label));
   input.addEventListener('blur', () => saveApiKey(input, key, label));
   input.addEventListener('input', () => saveApiKey(input, key, label));
@@ -1658,6 +1856,40 @@ elements.apiModel.addEventListener('change', saveModel);
 elements.apiModel.addEventListener('blur', saveModel);
 elements.autoAdvance.addEventListener('change', saveSettings);
 elements.includeFormScreenshot.addEventListener('change', saveScreenshotSetting);
+elements.typesafeEnabled.addEventListener('change', saveTypeSafeSetting);
+elements.typesafeAutofillEnabled.addEventListener('change', saveTypeSafeAutofillSetting);
+elements.typesafeAutofillSensitive.addEventListener('change', saveTypeSafeAnswerPolicy);
+elements.typesafeNoMatchTop.addEventListener('change', saveTypeSafeAnswerPolicy);
+elements.voteAutofillEnabled.addEventListener('change', saveVoteAutofillSetting);
+elements.phoenixTracing.addEventListener('change', async () => {
+  await chrome.storage.local.set({ phoenixTracing: elements.phoenixTracing.checked });
+  setStatus(elements.phoenixTracing.checked ? 'Local Phoenix tracing enabled.' : 'AI tracing disabled.');
+  await refreshPhoenixStatus();
+});
+elements.developerMode.addEventListener('change', async () => {
+  const enabled = elements.developerMode.checked;
+  await chrome.storage.local.set({developerMode: enabled});
+  elements.developerTools.hidden = !enabled;
+  setStatus(enabled ? 'Developer mode enabled.' : 'Developer mode disabled.');
+  await refreshPhoenixStatus();
+});
+elements.captureDebugCase.addEventListener('click', async () => {
+  elements.captureDebugCase.disabled = true;
+  try {
+    const response = await chrome.runtime.sendMessage({type: 'JOB_RUN_DEBUG_CAPTURE'});
+    if (!response?.ok) throw new Error(response?.error || 'Could not capture the form.');
+    if (response.selectionRequired) { setStatus('Click a field in the application form, then Capture debug case again.'); return; }
+    const blob = new Blob([JSON.stringify(response.case, null, 2)], {type: 'application/json'});
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = `job-form-debug-${new Date().toISOString().replaceAll(':', '-')}.json`;
+    link.click();
+    URL.revokeObjectURL(url);
+    setStatus('Debug case downloaded. Review it before sharing.');
+  } catch (error) { setStatus(error.message, 'error'); }
+  finally { elements.captureDebugCase.disabled = false; }
+});
 for (const [field, key] of [[elements.employerName, 'employerName'], [elements.relatedDefault, 'relatedToHiringCompany'], [elements.knownDefault, 'knownAtHiringCompany'], [elements.phoneDeviceDefault, 'phoneDeviceType']]) field.addEventListener('change', () => saveProfile(key));
 elements.exportDatasource.addEventListener('click', exportDatasource);
 elements.importDatasourceButton.addEventListener('click', () => elements.importDatasource.click());
@@ -1672,6 +1904,7 @@ byId('open-settings').addEventListener('click', () => {
   byId('settings-data').open = true;
   byId('settings-data').querySelector('summary').focus();
 });
+elements.fillPage.addEventListener('click', () => sendRunAction('JOB_RUN_CHECK_PAGE'));
 elements.checkPage.addEventListener('click', () => sendRunAction('JOB_RUN_VALIDATE_PAGE'));
 elements.closeInlineField.addEventListener('click', async () => {
   const session = currentInlineSession;
@@ -1705,7 +1938,14 @@ chrome.storage.onChanged.addListener((changes, area) => {
     elements.autoAdvance.checked = Boolean(changes.autoAdvancePages.newValue);
     if (currentRun?.status === 'running') renderRun(currentRun, {force: true});
   }
+  if (area === 'local' && changes.phoenixTracing) elements.phoenixTracing.checked = changes.phoenixTracing.newValue !== false;
+  if (area === 'local' && changes.developerMode) {
+    elements.developerMode.checked = changes.developerMode.newValue === true;
+    elements.developerTools.hidden = !elements.developerMode.checked;
+  }
+  if (area === 'local' && (changes.phoenixTraceQueue || changes.phoenixTraceStatus || changes.phoenixTracing)) refreshPhoenixStatus().catch(() => {});
   if (area === 'local' && changes.includeFormScreenshot) elements.includeFormScreenshot.checked = changes.includeFormScreenshot.newValue !== false;
+  if (area === 'local' && changes.voteAutofillEnabled) elements.voteAutofillEnabled.checked = changes.voteAutofillEnabled.newValue !== false;
   if (area === 'local' && changes.disabledHostnames) refreshSiteState().catch(error => setStatus(error.message, 'error'));
   if (area === 'session' && changes.applicationRun && activeTabId) renderRun(changes.applicationRun.newValue?.[String(activeTabId)] || null);
   if (area === 'session' && changes.inlineFieldSessions) loadInlineField().catch(error => setStatus(error.message, 'error'));

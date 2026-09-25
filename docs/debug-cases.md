@@ -1,0 +1,8 @@
+# Real-form debug cases
+
+1. Reload the unpacked extension and any already-open application tab. Open the side panel and, under **Settings & data**, enable **Developer mode**. Enable **Save AI traces to local Phoenix** if you want AI request and decision spans; start Phoenix as described in [Phoenix setup](phoenix.md).
+2. Click **Capture debug case** on the application page. If asked to select a form, click a field inside the intended form, then click **Capture debug case** again. Repeat on each application step you want to keep. Capture reads the page; it does not fill, navigate, upload, or submit.
+3. Run `node scripts/export-debug-case.mjs <downloaded-capture.json>` from the project folder. The command writes `fixture-candidate.json` and, when available, `trace.json` in ignored `logs/cases/<capture-id>/`. Raw traces can include personal answers and provider prompts. If Phoenix is offline, the fixture candidate is still saved and the command reports the failure.
+4. Review the candidate fixture's labels, options, help text, and HTML for personal data. Copy only reviewed cases into `tests/fixtures/real/`. The fixture contains no raw Phoenix spans, but automatic value removal cannot guarantee that site-authored text is anonymous.
+
+The capture file links to Phoenix through `sessionId` when an application run is active. A capture before **Fill this form**, or a run that made no AI calls, can have zero spans and remains useful for form-discovery tests. Open shadow roots are serialized as `<template shadowrootmode="open">`; tests rehydrate them before inspection. Closed shadow roots cannot be captured. Existing Phoenix sessions remain available after Developer mode is turned off.

@@ -63,6 +63,7 @@ const AUTOCOMPLETE_KEYS = {
 };
 
 const GENERIC_NAME_LABELS = new Set(['name', 'your name', 'applicant name', 'candidate name']);
+const VOTABLE_IDENTITY_CONCEPTS = new Set(['first_name', 'last_name', 'full_name', 'preferred_name', 'email', 'github_url', 'linkedin_url', 'portfolio_url']);
 
 function isOpaqueIdentifier(value) {
   const text = String(value ?? '').trim();
@@ -104,7 +105,9 @@ function slugify(value = '') {
 
 function inferSensitivity(question, key = '') {
   const text = normalizeText(`${key} ${question}`);
-  if (/\b(consent|agree|agreement|certif(?:y|ication)|attest|attestation|privacy|terms|declaration|conflict of interest|criminal|gender|race|ethnicity|disability|veteran)\b/.test(text)) {
+  // A stored fact (including demographics) is not the same thing as a legal
+  // declaration.  Only declarations and explicit consent stay manual.
+  if (/\b(consent|agree|agreement|certif(?:y|ication)|attest|attestation|privacy|terms|declaration|conflict of interest|criminal)\b/.test(text)) {
     return 'legal';
   }
   if (/\b(ctc|salary|compensation|notice period|sponsorship|sponsor|visa|citizenship|work authorization|reference|reason for leaving|relocat)\b/.test(text)) {
@@ -145,7 +148,7 @@ function normalizeAnswerRecord(record = {}) {
     sensitivity,
     updatedAt,
   };
-  for (const key of ['id', 'concept', 'entityId', 'entityType', 'employmentId', 'context', 'provenance', 'confirmedAt', 'confirmationState', 'pendingAnswer', 'reusePolicy']) {
+  for (const key of ['id', 'concept', 'entityId', 'entityType', 'employmentId', 'context', 'provenance', 'confirmedAt', 'confirmationState', 'pendingAnswer', 'reusePolicy', 'reuseScope', 'country', 'validUntil', 'changeReviewedAt']) {
     if (record[key] != null && String(record[key]).trim()) normalized[key] = String(record[key]).trim();
   }
   if (Array.isArray(record.evidenceKeys)) normalized.evidenceKeys = uniqueStrings(record.evidenceKeys);
@@ -217,6 +220,7 @@ function profileUrlCompatible(concept, value) {
 
 function recordScopeCompatible(field, record) {
   if (record.semantic?.reusePolicy === 'never' || record.reusePolicy === 'never') return false;
+  if (record.reuseScope === 'application') return false;
   if (record.suppressedFor?.includes(suggestionTargetKey(field))) return false;
   if (record.confirmationState === 'pending') return false;
   if (record.alternatives?.length && record.confirmationState !== 'confirmed') return false;
@@ -294,16 +298,35 @@ function chooseRecord(field = {}, records = []) {
   const preferredKeys = AUTOCOMPLETE_KEYS[autocompleteToken] || AUTOCOMPLETE_KEYS[autocomplete] || [];
   const fieldConcept = canonicalConcept(field.label || field.name || field.id || '');
   const unambiguous = (candidates) => new Set(candidates.map((record) => String(record.answer).trim())).size === 1 ? candidates[0] : null;
+  const voted = (candidates, concept) => {
+    if (!VOTABLE_IDENTITY_CONCEPTS.has(concept) || inferSensitivity(field.label, field.id) !== 'safe') return null;
+    const votes = new Map();
+    const sources = new Set();
+    for (const record of candidates) {
+      if (recordConceptFor(record) !== concept || record.confirmationState !== 'confirmed' || record.sensitivity === 'legal') continue;
+      const source = record.id || record.key || record.question;
+      if (!source || sources.has(source)) continue;
+      sources.add(source);
+      const answer = String(record.answer).trim();
+      if (!votes.has(answer)) votes.set(answer, []);
+      votes.get(answer).push(record);
+    }
+    const ranked = [...votes.values()].sort((a, b) => b.length - a.length);
+    return ranked[0]?.length >= 2 && ranked[0].length > (ranked[1]?.length || 0) ? ranked[0][0] : null;
+  };
   if (fieldConcept === 'generic_name') {
-    const fullName = unambiguous(records.filter((record) => recordConceptFor(record) === 'full_name' && String(record.answer ?? '').trim()));
-    return fullName ? { record: fullName, confidence: 'high', score: 1, reason: 'generic-name:full_name' } : null;
+    const candidates = records.filter((record) => recordConceptFor(record) === 'full_name' && String(record.answer ?? '').trim());
+    const unanimous = unambiguous(candidates);
+    const fullName = unanimous || voted(candidates, 'full_name');
+    return fullName ? { record: fullName, confidence: 'high', score: 1, reason: unanimous ? 'generic-name:full_name' : 'vote:full_name' } : null;
   }
   if (fieldConcept) {
     const conceptCandidates = records.filter((record) => String(record.answer ?? '').trim()
       && [record.concept, record.key, record.question, ...(record.aliases || [])].filter(Boolean).some(label => canonicalConcept(label) === fieldConcept));
-    if (conceptCandidates.length > 1 && !unambiguous(conceptCandidates)) return null;
-    const conceptMatch = unambiguous(conceptCandidates);
-    if (conceptMatch) return { record: conceptMatch, confidence: 'high', score: 1, reason: `concept:${fieldConcept}` };
+    const unanimous = unambiguous(conceptCandidates);
+    const conceptMatch = unanimous || voted(conceptCandidates, fieldConcept);
+    if (conceptCandidates.length > 1 && !conceptMatch) return null;
+    if (conceptMatch) return { record: conceptMatch, confidence: 'high', score: 1, reason: `${unanimous ? 'concept' : 'vote'}:${fieldConcept}` };
   }
   if (preferredKeys.length || autocompleteToken === 'url') {
     let candidates = records.filter((record) => preferredKeys.includes(slugify(record.key)) && String(record.answer ?? '').trim());
@@ -363,8 +386,14 @@ function validateFillValue(field = {}, value) {
   const text = String(value).trim();
   if (isOpaqueIdentifier(text)) return { ok: false, reason: 'value is an opaque internal identifier' };
   const constraints = field.constraints || {};
+  const type = normalizeText(field.type);
+  if (['select', 'select-one', 'radio'].includes(type) && field.optionsStatus
+    && !(field.options || []).some(option => String(option || '').trim())) {
+    return { ok: false, reason: 'field options are unavailable' };
+  }
   if (Array.isArray(field.options) && field.options.length) {
-    const values = field.multiple ? text.split(/\s*[,;]\s*/) : [text];
+    const exactOption = field.options.some(option => normalizeText(option) === normalizeText(text));
+    const values = field.multiple && !exactOption ? text.split(/\s*[,;]\s*/) : [text];
     if (!values.every((value) => field.options.some((option) => normalizeText(option) === normalizeText(value)))) {
       return { ok: false, reason: 'value is not one of the available options' };
     }
@@ -378,7 +407,6 @@ function validateFillValue(field = {}, value) {
       return { ok: false, reason: 'field pattern is invalid' };
     }
   }
-  const type = normalizeText(field.type);
   if (type === 'email' && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(text)) return { ok: false, reason: 'value is not a valid email' };
   if (type === 'url') {
     try {
@@ -393,11 +421,33 @@ function validateFillValue(field = {}, value) {
     if (!Number.isFinite(numeric)) return { ok: false, reason: 'value is not numeric' };
     if (constraints.min != null && numeric < numberConstraint(constraints.min, -Infinity)) return { ok: false, reason: 'value is below the minimum' };
     if (constraints.max != null && numeric > numberConstraint(constraints.max, Infinity)) return { ok: false, reason: 'value is above the maximum' };
+    if (constraints.step && constraints.step !== 'any') {
+      const step = Number(constraints.step), min = constraints.min != null ? Number(constraints.min) : 0;
+      if (Number.isFinite(step) && step > 0 && Number.isFinite(min) && Math.abs((numeric - min) / step - Math.round((numeric - min) / step)) > 1e-9) return { ok: false, reason: 'value does not match the field step' };
+    }
   }
+  if (type === 'date' && !/^\d{4}-\d{2}-\d{2}$/.test(text)) return { ok: false, reason: 'date must use YYYY-MM-DD' };
   if (type === 'checkbox' && !['yes', 'no', 'true', 'false', 'checked', 'unchecked'].includes(normalizeText(text))) {
     return { ok: false, reason: 'checkbox value must be yes or no' };
   }
   return { ok: true, reason: 'valid' };
+}
+
+function lowRiskSemanticField(field = {}) {
+  if (field.widget || field.multiple || field.entityUnresolved || field.labelConfidence !== 'high'
+    || !['text', 'email', 'tel', 'url', 'select', 'select-one', 'radio'].includes(field.type)
+    || inferSensitivity(field.label, field.id) !== 'safe') return false;
+  const concept = canonicalConcept(field.label);
+  return ['generic_name', 'first_name', 'last_name', 'full_name', 'preferred_name', 'email',
+    'phone_number', 'phone_country_code', 'phone_device_type', 'address_line_1', 'address_line_2',
+    'city', 'postal_code', 'state', 'github_url', 'linkedin_url', 'portfolio_url', 'current_employer',
+    'current_city', 'current_location', 'employer', 'company', 'job_title', 'role', 'school',
+    'university', 'degree', 'highest_degree', 'field_of_study'].includes(concept);
+}
+
+function semanticAutofillQualified(semantic = {}) {
+  return semantic.coverageComplete === true && semantic.selectedProbability >= 0.98
+    && semantic.confidence >= 0.90 && semantic.sufficiency >= 0.98 && semantic.conflict <= 0.02;
 }
 
 function decideDisposition(decision = {}, field = {}) {
@@ -406,16 +456,20 @@ function decideDisposition(decision = {}, field = {}) {
   const sensitivity = inferSensitivity(field.label || field.question, `${field.name || ''} ${field.id || ''}`);
   if (field.labelConfidence === 'low') return manual('Field meaning is unclear');
   if (field.entityUnresolved) return manual('Employment identity is unresolved');
-  if (sensitivity === 'legal' || decision.sensitivity === 'legal') return manual('Legal and consent answers require manual entry');
   if (decision.reusePolicy === 'never' || decision.semantic?.reusePolicy === 'never') return manual('Source prohibits reuse');
   if (decision.action === 'ask_user' || decision.value == null || !String(decision.value).trim() || decision.compatible === false || decision.conflicting) return manual('Missing, conflicting, or incompatible evidence');
   if (decision.confirmationState === 'pending') return manual('Saved answer has a pending conflict');
+  if (decision.matchKind === 'semantic' && decision.jevAutofill === true) return { disposition: 'autofill', reason: 'JEV-selected saved answer' };
+  if (sensitivity === 'legal' || decision.sensitivity === 'legal') return manual('Legal and consent answers require manual entry');
   if (decision.approved === true) return { disposition: 'autofill', reason: 'Explicitly approved answer' };
   if (decision.reusePolicy === 'review_only' || decision.semantic?.reusePolicy === 'review_only') return review('Source requires review on every reuse');
   if (sensitivity !== 'safe' || decision.sensitivity !== 'safe') return review('Sensitive answer requires approval');
   if (normalizeText(field.type) === 'textarea' || String(decision.value).length > 240 || /describe|tell us|why.*(?:join|company|work)|motivat/.test(normalizeText(field.label))) return review('Narrative answer requires approval');
   if (decision.confirmationState !== 'confirmed') return review('Saved answer is not confirmed');
-  if (!['exact', 'concept'].includes(decision.matchKind) || decision.confidence !== 'high') return review('Match requires explicit approval');
+  if (decision.matchKind === 'vote' && decision.voteAutofillEnabled === false) return review('Vote-based autofill is disabled');
+  if (decision.matchKind === 'semantic' && decision.compatible === true && lowRiskSemanticField(field)
+    && semanticAutofillQualified(decision.semantic)) return { disposition: 'autofill', reason: 'Validated low-risk JEV match' };
+  if (!['exact', 'concept', 'vote'].includes(decision.matchKind) || decision.confidence !== 'high') return review('Match requires explicit approval');
   return { disposition: 'autofill', reason: 'Unique confirmed compatible short fact' };
 }
 
@@ -488,6 +542,7 @@ function mergeLearnedAnswers(existing = [], incoming = [], now = new Date().toIS
     } else if (changed) {
       result = result.map((record) => record.key === next.key ? {
         ...record,
+        changeReviewedAt: undefined,
         pendingAnswer: next.answer,
         confirmationState: 'pending',
         alternatives: uniqueStrings([...(record.alternatives || []), next.answer]),
@@ -632,7 +687,7 @@ function isUtilityRegion(region) {
   const label = [region.id, region.getAttribute('role'), region.getAttribute('aria-label'), region.getAttribute('name'),
     ...queryAll(region, 'h1,h2,h3,legend').filter(el => composedClosest(el, 'form,[role="form"]') === region).map(composedText),
     ...queryAll(region, 'button,input[type="submit"]').filter(el => composedClosest(el, 'form,[role="form"]') === region).map(actionLabel)].join(' ');
-  return /\b(?:subscribe|newsletter|job.?alerts?|login|sign.?in)\b/i.test(label)
+  return /\b(?:subscribe|newsletter|job.?alerts?|login|sign.?in|chat|ask\s+(?:a\s+)?follow.?up)\b/i.test(label)
     || region.getAttribute('role') === 'search' || /^search$/i.test(region.id || '');
 }
 
@@ -713,6 +768,7 @@ function inApplication(document, element) {
   if (selectedField) return element === selectedField;
   if (root !== document) {
     const owner = composedClosest(element, 'form,[role="form"]') || element.form;
+    if (owner && owner !== root && isUtilityRegion(owner)) return false;
     if (owner && owner !== root && applicationRegions(document).candidates.includes(owner)) return false;
     return composedContains(root, element) || element.form === root;
   }
@@ -722,10 +778,23 @@ function inApplication(document, element) {
 
 function ensureEditTracking(document) {
   if (trackedDocuments.has(document)) return;
+  const consumeExpectedTrustedInput = (element) => {
+    const expected = document.__jobApplicationExpectedTrustedInput;
+    if (!expected || Date.now() > expected.expiresAt) {
+      delete document.__jobApplicationExpectedTrustedInput;
+      return false;
+    }
+    if (expected.handle && expected.handle !== controlHandle(element)) return false;
+    expected.remaining -= 1;
+    if (expected.remaining <= 0) delete document.__jobApplicationExpectedTrustedInput;
+    return true;
+  };
   const markEdited = (event) => {
     let element = eventControl(event);
     if (isExtensionElement(element)) return;
-    if (!element || element.__jobApplicationAutofillDispatch || (document.__jobApplicationFilling && !event.isTrusted)) return;
+    if (!element || element.__jobApplicationAutofillDispatch || document.__jobApplicationDiscovering
+      || (document.__jobApplicationFilling && !event.isTrusted)) return;
+    const expectedTrustedInput = event.isTrusted && consumeExpectedTrustedInput(element);
     if (event.type === 'click') {
       const listbox = composedClosest(composedClosest(element, '[role="option"]'), '[role="listbox"]');
       if (!listbox?.id) return;
@@ -733,6 +802,8 @@ function ensureEditTracking(document) {
       if (!element) return;
       delete element.__jobApplicationSearchQuery;
     }
+    if (document.__jobApplicationFilling && event.isTrusted && !expectedTrustedInput) document.__jobApplicationUserInterrupted = true;
+    if (expectedTrustedInput) return;
     if (event.type === 'blur' && !element.__jobApplicationUserEdited) return;
     if (event.type === 'input' || event.type === 'change') {
       element.__jobApplicationEditRevision = (element.__jobApplicationEditRevision || 0) + 1;
@@ -768,7 +839,7 @@ function extractJobContext(document) {
 function textFromIds(element, ids = '') {
   return String(ids)
     .split(/\s+/)
-    .map((id) => rootElementById(element, id) ? labelText(rootElementById(element, id)) : '')
+    .map((id) => { const label = rootElementById(element, id); return label && !labelBadge(label, label) ? labelText(label) : ''; })
     .filter(Boolean)
     .join(' ');
 }
@@ -779,7 +850,7 @@ function cleanLabelString(value) {
   // name. Keep the question and leave the menu entries in structured options.
   const phoneMenu = /^((?:phone|mobile|telephone)(?:\s+number)?)\s*[*:]?\s*Afghanistan\b.*\+93\s*Albania\b.*\+355/i.exec(text);
   if (phoneMenu) return phoneMenu[1];
-  return text.replace(/\s*\*+\s*$/, '').trim();
+  return text.replace(/\s*[*✱]+\s*$/, '').trim();
 }
 
 function labelText(label) {
@@ -791,6 +862,7 @@ function labelText(label) {
     // nested widget content without discarding the referenced label root.
     if (node !== label) {
       if (node.matches(excluded)) return '';
+      if (labelBadge(node, label)) return '';
       const style = node.ownerDocument.defaultView?.getComputedStyle(node);
       if (style?.display === 'none' || style?.visibility === 'hidden' || style?.contentVisibility === 'hidden') return '';
     }
@@ -800,28 +872,89 @@ function labelText(label) {
   return cleanLabelString(read(label));
 }
 
-function nearbyQuestion(element) {
+function labelBadge(node, label) {
+  if (!node.matches('span,sup,abbr') || node.hidden || node.getAttribute('aria-hidden') === 'true') return '';
+  const style = node.ownerDocument.defaultView?.getComputedStyle(node);
+  if (style?.display === 'none' || style?.visibility === 'hidden') return '';
+  const marker = (node.getAttribute('title') || node.textContent).trim().match(/^\(?(required|optional)\)?$/i)?.[1]?.toLowerCase();
+  if (!marker) return '';
+  // A word inside a sentence is not a badge. Explicit badge markup may occur
+  // before the question; otherwise only accept a trailing marker.
+  if (node.matches('.sr-only,.required,.optional,[data-asterisk],abbr[title]')) return marker;
+  for (let current = node; current && current !== label; current = current.parentElement) {
+    for (let next = current.nextSibling; next; next = next.nextSibling) {
+      if (next.textContent.trim()) return '';
+    }
+  }
+  return marker;
+}
+
+function fieldRequired(element) {
+  if (element.required || element.getAttribute('aria-required') === 'true') return true;
+  if (element.getAttribute('aria-required') === 'false') return false;
+  if (/(?:\([Rr]equired\)|(?:^|\s)Required)\s*$/.test(element.getAttribute('aria-label') || '')) return true;
+  const referenced = node => String(node.getAttribute('aria-labelledby') || '').split(/\s+/)
+    .map(id => rootElementById(node, id)).filter(Boolean);
+  const labels = [...(element.labels || []), ...referenced(element)];
+  if (!element.labels && element.id) labels.push(...queryAll(element.getRootNode(), 'label').filter(label => label.getAttribute('for') === element.id));
+  if (['radio', 'checkbox'].includes(element.type)) {
+    const group = composedClosest(element, 'fieldset,[role="radiogroup"],[role="group"]');
+    if (group?.getAttribute('aria-required') === 'true') return true;
+    if (group) labels.push(group.querySelector(':scope > legend'), ...referenced(group));
+  }
+  if (labels.filter(Boolean).some(label => labelBadge(label, label) === 'required'
+    || [...label.querySelectorAll('span,sup,abbr')].some(badge => labelBadge(badge, label) === 'required'))) return true;
+  const question = nearbyQuestionElement(element);
+  return Boolean(question && (/(?:required)\s*$/i.test(question.textContent || '')
+    || /[*✱]\s*$/.test(question.textContent || '')));
+}
+
+function nearbyQuestionElement(element) {
   const controls = 'input:not([type="hidden"]),textarea,select,[role="combobox"],button[aria-haspopup="listbox"]';
+  const sibling = element.previousElementSibling;
+  const parent = composedParent(element);
+  if (parent && sibling?.matches('div,span') && isVisible(sibling)
+    && !sibling.closest('[role="alert"],.error,.help,.hint')
+    && !sibling.querySelector(controls)
+    && [...queryAll(parent, controls)].filter(isVisible).every(peer => peer === element)) {
+    const text = labelText(sibling);
+    if (text && text.length <= 500) return sibling;
+  }
   for (let wrapper = composedParent(element), depth = 0; wrapper && depth < 6; wrapper = composedParent(wrapper), depth++) {
     if (wrapper.matches('form,section,main,body')) break;
     const peers = [...queryAll(wrapper, controls)].filter(isVisible);
-    if (peers.some(peer => peer !== element && !(element.type === 'radio' && peer.type === 'radio' && peer.name === element.name))) break;
-    const candidates = [...queryAll(wrapper, '.application-label .text,h3,h4,[role="heading"],legend,label')]
+    if (peers.some(peer => peer !== element && !(['radio', 'checkbox'].includes(element.type) && peer.type === element.type
+      && element.name && peer.name === element.name && peer.form === element.form))) break;
+    const candidates = [...queryAll(wrapper, '.application-label .text,h3,h4,[role="heading"],legend,label,p,[data-field-label],.font-semibold')]
       .filter(node => isVisible(node) && !node.contains(element) && !node.querySelector(controls)
         && !node.matches('[for]') && !node.closest('[role="alert"],.error,.help,.hint')
         && Boolean(node.compareDocumentPosition(element) & 4));
-    const labels = [...new Set(candidates.map(labelText).filter(text => text && text.length <= 500))];
-    if (labels.length > 1) return '';
-    if (labels.length === 1) return labels[0];
+    const labels = new Map(candidates.map(node => [labelText(node), node]).filter(([text]) => text && text.length <= 500));
+    if (labels.size > 1) return null;
+    if (labels.size === 1) return [...labels.values()][0];
   }
-  return '';
+  return null;
+}
+
+function nearbyQuestion(element) {
+  const question = nearbyQuestionElement(element);
+  return question ? labelText(question) : '';
 }
 
 function questionMetadata(document, element) {
   const native = [...(element.labels || [])].map(labelText).filter(Boolean).join(' ');
+  if (checkboxGroup(document, element).length > 1) {
+    const container = checkboxContainer(element);
+    const heading = container?.querySelector(':scope > legend,.application-label');
+    const question = container && (textFromIds(container, container.getAttribute('aria-labelledby'))
+      || container.getAttribute('aria-label') || (heading && labelText(heading)));
+    const nearby = question || nearbyQuestion(element);
+    return {label: nearby || '', labelSource: nearby ? 'group' : 'identity', labelConfidence: nearby ? 'high' : 'low'};
+  }
   if (element.type === 'radio') {
     const group = composedClosest(element, 'fieldset,[role="radiogroup"],[role="group"]');
-    const explicit = group && (textFromIds(group, group.getAttribute('aria-labelledby')) || group.getAttribute('aria-label') || group.querySelector(':scope > legend')?.textContent?.trim());
+    const legend = group?.querySelector(':scope > legend');
+    const explicit = group && (textFromIds(group, group.getAttribute('aria-labelledby')) || group.getAttribute('aria-label') || (legend && labelText(legend)));
     if (explicit) return { label: explicit, labelSource: 'group', labelConfidence: 'high' };
     const peers = radioGroup(document, element);
     const aria = peer => textFromIds(peer, peer.getAttribute('aria-labelledby')) || peer.getAttribute('aria-label') || '';
@@ -902,9 +1035,9 @@ function customWidgetElements(document) {
     .filter((element) => !hasNativeFormAction(element))
     .filter((element) => inApplication(document, element) && !isControlDisabled(element) && !element.readOnly && element.getAttribute('aria-readonly') !== 'true')
     .filter((element) => isVisible(element))
-    .filter((element) => composedClosest(element, 'form, main, [role="main"]') || hasNearbyFormControl(element))
+    .filter((element) => composedClosest(element, 'form, main, [role="main"]') || hasNearbyFormControl(element) || nearbyQuestion(element))
     .filter((element) => element.getAttribute('aria-label') || element.getAttribute('name')
-      || textFromIds(element, element.getAttribute('aria-labelledby')) || associatedLabelText(document, element) || hasNearbyFormControl(element)));
+      || textFromIds(element, element.getAttribute('aria-labelledby')) || associatedLabelText(document, element) || hasNearbyFormControl(element) || nearbyQuestion(element)));
 }
 
 function hasNearbyFormControl(element) {
@@ -923,12 +1056,6 @@ function customWidgetValue(element) {
   const value = String(selectedOptions.length ? selectedOptions.join(', ') : (element.getAttribute('aria-valuetext') || element.__jobApplicationCommittedLabel || typedValue || composedText(element) || ''))
     .replace(/\s+/g, ' ').trim();
   return EMPTY_CUSTOM_WIDGET_VALUE.test(value) || isOpaqueIdentifier(value) ? '' : value;
-}
-
-function customWidgetRequired(element) {
-  return element.getAttribute('aria-required') === 'true'
-    || /\brequired\b/i.test(element.getAttribute('aria-label') || '')
-    || Boolean(element.required);
 }
 
 function visibleText(element) {
@@ -1050,6 +1177,7 @@ function uniqueFields(document) {
   const fields = [];
   const seenRadioGroups = new Set();
   for (const [index, element] of formElements(document).entries()) {
+    if (element.type === 'checkbox' && checkboxGroup(document, element)[0] !== element) continue;
     if (element.type === 'radio' && element.name) {
       const group = radioGroup(document, element)[0];
       if (seenRadioGroups.has(group)) continue;
@@ -1061,6 +1189,8 @@ function uniqueFields(document) {
 }
 
 function fieldOptions(document, element) {
+  const checkboxes = checkboxGroup(document, element);
+  if (checkboxes.length > 1) return checkboxes.map(optionText).filter(Boolean);
   if (customWidgetElements(document).includes(element)) {
     return customWidgetOptions(document, element)
       .flatMap((option) => [customOptionText(option), customOptionValue(option)])
@@ -1089,6 +1219,8 @@ function optionText(element) {
 function fieldValue(document, element) {
   if (customWidgetElements(document).includes(element)) return customWidgetValue(element);
   if (element.type === 'checkbox') {
+    const group = checkboxGroup(document, element);
+    if (group.length > 1) return group.filter(candidate => candidate.checked).map(optionText).join(', ');
     return element.checked ? 'Yes' : (element.__jobApplicationUserEdited || element.__jobApplicationAutofillValue != null ? 'No' : '');
   }
   if (element.type === 'radio') {
@@ -1105,7 +1237,7 @@ function fieldValue(document, element) {
 
 function constraintsFor(element) {
   const constraints = {};
-  for (const attribute of ['min', 'max', 'pattern']) {
+  for (const attribute of ['min', 'max', 'step', 'pattern']) {
     if (element.hasAttribute(attribute)) constraints[attribute] = element.getAttribute(attribute);
   }
   for (const attribute of ['minLength', 'maxLength']) {
@@ -1116,11 +1248,15 @@ function constraintsFor(element) {
 }
 
 function describeField(document, element, index) {
-  const type = element.tagName === 'SELECT' ? 'select' : element.tagName === 'TEXTAREA' ? 'textarea' : (element.type || 'text');
+  const checkboxes = checkboxGroup(document, element);
+  const grouped = checkboxes.length > 1;
+  const type = grouped || element.tagName === 'SELECT' ? 'select' : element.tagName === 'TEXTAREA' ? 'textarea' : (element.type || 'text');
   const descriptor = {
     id: fieldIdentity(element, index, [...formElements(document), ...customWidgetElements(document)]),
     handle: controlHandle(element),
-    multiple: Boolean(element.multiple),
+    rect: visualRect(element),
+    multiple: grouped || Boolean(element.multiple),
+    ...(grouped ? {widget: 'checkbox-group'} : {}),
     selectedValues: element.tagName === 'SELECT' ? [...element.selectedOptions].filter((option) => option.value).map((option) => option.value) : [],
     structuredOptions: element.tagName === 'SELECT' ? [...element.options].map((option) => ({ label: option.textContent.trim(), value: option.value, selected: option.selected, disabled: option.disabled })) : [],
     ...questionMetadata(document, element),
@@ -1128,10 +1264,12 @@ function describeField(document, element, index) {
     nearbyContext: nearbyQuestion(element).slice(0, 1000),
     type,
     autocomplete: element.autocomplete || '',
+    inputMode: element.getAttribute('inputmode') || '',
     placeholder: element.getAttribute('placeholder') || '',
-    required: Boolean(element.required) || element.getAttribute('aria-required') === 'true',
+    required: (grouped ? checkboxes : element.type === 'radio' ? radioGroup(document, element) : [element]).some(fieldRequired),
     currentValue: fieldValue(document, element),
     options: fieldOptions(document, element),
+    optionsStatus: 'complete',
     constraints: constraintsFor(element),
     ...fieldContext(element),
   };
@@ -1155,6 +1293,7 @@ function collectFieldDescriptorsImpl(document) {
     .map((element, index) => ({ element, field: {
       id: fieldIdentity(element, formElements(document).length + index, [...formElements(document), ...customElements]),
       handle: controlHandle(element),
+      rect: visualRect(element),
       multiple: element.getAttribute('aria-multiselectable') === 'true' || rootElementById(element, element.getAttribute('aria-controls'))?.getAttribute('aria-multiselectable') === 'true',
       structuredOptions: customWidgetOptions(document, element).map((option) => ({ label: customOptionText(option), value: customOptionValue(option), selected: option.getAttribute('aria-selected') === 'true', disabled: option.getAttribute('aria-disabled') === 'true' })),
       label: customWidgetLabel(document, element),
@@ -1163,9 +1302,11 @@ function collectFieldDescriptorsImpl(document) {
       type: 'select',
       widget: 'custom',
       autocomplete: element.getAttribute('autocomplete') || '',
-      required: customWidgetRequired(element),
+      inputMode: element.getAttribute('inputmode') || '',
+      required: fieldRequired(element),
       currentValue: fieldValue(document, element),
       options: fieldOptions(document, element),
+      optionsStatus: fieldOptions(document, element).length ? 'partial' : 'unavailable',
       constraints: {},
       ...fieldContext(element),
     } }));
@@ -1190,7 +1331,7 @@ function collectFieldDescriptorsImpl(document) {
 
 function descriptorForElement(document, element) {
   if (!element || element.ownerDocument !== document || !element.isConnected) return null;
-  const handle = controlHandle(element);
+  const handle = controlHandle(checkboxGroup(document, element)[0] || element);
   const described = collectFieldDescriptors(document).find((field) => field.handle === handle);
   if (described) return described;
   // Inline focus can scope one field without granting bulk-fill authority.
@@ -1239,6 +1380,9 @@ function checkValidityWithoutPattern(element) {
 
 function checkValiditySafely(element) {
   if (element?.getAttribute('aria-invalid') === 'true') return false;
+  const checkboxes = element && checkboxGroup(element.ownerDocument, element);
+  if (checkboxes?.length > 1) return !checkboxes.some(candidate => candidate.getAttribute('aria-invalid') === 'true' || candidate.validity?.customError)
+    && (!checkboxes.some(candidate => candidate.required || candidate.getAttribute('aria-required') === 'true') || checkboxes.some(candidate => candidate.checked));
   if (typeof element?.checkValidity !== 'function') return true;
   const pattern = element.getAttribute('pattern');
   if (pattern !== null) {
@@ -1285,6 +1429,41 @@ function radioGroup(document, element) {
   return formElements(document).filter((candidate) => candidate.type === 'radio' && (element.name ? candidate.name === element.name && candidate.form === element.form && candidate.getRootNode() === element.getRootNode() : candidate === element));
 }
 
+function checkboxContainer(element) {
+  return composedClosest(element, '.application-question,fieldset,[role="group"]');
+}
+
+function checkboxGroup(document, element) {
+  if (element?.type !== 'checkbox') return [];
+  const container = checkboxContainer(element);
+  if (!container && !element.name) return [element];
+  const peers = formElements(document).filter(candidate => candidate.type === 'checkbox'
+    && candidate.form === element.form && candidate.getRootNode() === element.getRootNode()
+    && checkboxContainer(candidate) === container);
+  const names = new Set(peers.map(candidate => candidate.name).filter(Boolean));
+  // Lever includes a nameless Custom option alongside its named pronoun choices.
+  // Generic fieldsets may instead contain unrelated consent checkboxes.
+  return container?.matches('.application-question') && names.size <= 1 ? peers
+    : peers.filter(candidate => element.name ? candidate.name === element.name : candidate === element);
+}
+
+function setCheckboxGroup(document, element, answer) {
+  const group = checkboxGroup(document, element);
+  const exact = group.find(candidate => normalizeText(optionText(candidate)) === normalizeText(answer));
+  const requested = exact ? [exact] : String(answer).split(/\s*[,;]\s*/).map(value =>
+    group.find(candidate => normalizeText(optionText(candidate)) === normalizeText(value)));
+  if (!requested.length || requested.some(candidate => !candidate)) return false;
+  for (const candidate of group) {
+    candidate.__jobApplicationAutofillValue = String(answer);
+    delete candidate.__jobApplicationUserEdited;
+    if (candidate.checked !== requested.includes(candidate)) {
+      candidate.checked = requested.includes(candidate);
+      dispatchFormEvents(candidate);
+    }
+  }
+  return true;
+}
+
 function setRadioGroup(document, element, answer) {
   const expected = normalizeText(answer);
   const option = radioGroup(document, element).find((candidate) => normalizeText(candidate.value) === expected || normalizeText(optionText(candidate)) === expected);
@@ -1309,8 +1488,8 @@ function waitForCustomOptions(document, element, answer, timeoutMs = 1500) {
       const options = customWidgetOptions(document, element);
       const multiple = element.getAttribute('aria-multiselectable') === 'true'
         || options[0]?.closest('[role="listbox"]')?.getAttribute('aria-multiselectable') === 'true';
-      const requested = multiple ? String(answer).split(/\s*[,;]\s*/).map(normalizeText).filter(Boolean) : [normalizeText(answer)];
-      if ((options.length && requested.every((value) => matchingCustomOptions(options, value).length)) || Date.now() - startedAt >= timeoutMs) {
+      const requested = answer == null ? [] : (multiple ? String(answer).split(/\s*[,;]\s*/).map(normalizeText).filter(Boolean) : [normalizeText(answer)]);
+      if ((options.length && (!requested.length || requested.every((value) => matchingCustomOptions(options, value).length))) || Date.now() - startedAt >= timeoutMs) {
         resolve(options);
         return;
       }
@@ -1325,6 +1504,11 @@ async function setCustomChoiceValue(document, element, answer, deadline = Infini
   if (hasNativeFormAction(element)) {
     return { ok: false, unresolved: true, reason: 'Refusing to activate a native submit/reset control' };
   }
+  const controlledIds = String(element.getAttribute('aria-controls') || element.getAttribute('aria-owns') || '').split(/\s+/).filter(Boolean);
+  const expectsClosure = element.hasAttribute('aria-expanded') || controlledIds.some((id) => {
+    const popup = rootElementById(element, id);
+    return !popup || !isVisible(popup);
+  });
   if (element.getAttribute('aria-expanded') !== 'true') element.click();
   const expected = normalizeText(answer);
   const initialText = normalizeText(element.textContent || '');
@@ -1387,6 +1571,23 @@ async function setCustomChoiceValue(document, element, answer, deadline = Infini
   if (!displayedMatches && backingValue !== expected) {
     return { ok: false, unresolved: true, reason: 'The custom widget did not accept the selected option' };
   }
+  if (!multiple && expectsClosure) {
+    const popup = composedClosest(matches[0], '[role="listbox"]');
+    const closed = () => element.getAttribute('aria-expanded') === 'false' || !popup?.isConnected || !isVisible(popup);
+    const waitForClose = async (timeoutMs) => {
+      const until = Math.min(deadline, Date.now() + timeoutMs);
+      while (!closed() && Date.now() < until) await new Promise((resolve) => setTimeout(resolve, 25));
+      return closed();
+    };
+    if (!await waitForClose(300)) {
+      element.dispatchEvent(new document.defaultView.KeyboardEvent('keydown', { key: 'Escape', bubbles: true, composed: true, cancelable: true }));
+      if (!await waitForClose(150)) return { ok: false, unresolved: true, reason: 'The selected dropdown option did not close the menu' };
+    }
+    const retained = normalizeText(fieldValue(document, element));
+    if (!acceptedSingleValues.includes(retained) && !acceptedSingleValues.includes(normalizeText(backingInput?.value || ''))) {
+      return { ok: false, unresolved: true, reason: 'The dropdown did not retain the selected option after closing' };
+    }
+  }
   return { ok: true };
 }
 
@@ -1397,7 +1598,8 @@ async function fillElement(document, element, answer, deadline = Infinity) {
   if (customWidgetElements(document).includes(element)) return setCustomChoiceValue(document, element, answer, deadline);
   if (element.tagName === 'SELECT') return { ok: setSelectValue(element, answer) };
   if (element.type === 'radio') return { ok: setRadioGroup(document, element, answer) };
-  if (element.type === 'checkbox') return { ok: setCheckbox(element, answer) };
+  if (element.type === 'checkbox') return { ok: checkboxGroup(document, element).length > 1
+    ? setCheckboxGroup(document, element, answer) : setCheckbox(element, answer) };
   return { ok: setTextValue(element, answer) };
 }
 
@@ -1610,7 +1812,7 @@ function hiringCompanyDefault(field, profile = {}, page = {}) {
   return null;
 }
 
-function planDeterministicFill(fields, records, coverMessages = [], profile = {}, page = {}) {
+function planDeterministicFill(fields, records, coverMessages = [], profile = {}, page = {}, { voteAutofillEnabled = true } = {}) {
   const phoneDecisions = phoneBlockDecisions(fields, records, profile);
   return fields.map((field) => {
     const phonePlan = phoneDecisions.get(field.id);
@@ -1653,11 +1855,12 @@ function planDeterministicFill(fields, records, coverMessages = [], profile = {}
       confidence: usableMatch.confidence === 'exact' ? 'high' : usableMatch.confidence,
       sensitivity: usableMatch.record.sensitivity || inferSensitivity(field.label, field.id),
       reason: usableMatch.reason,
-      matchKind: usableMatch.score === 1 ? (usableMatch.reason.startsWith('concept:') ? 'concept' : 'exact') : 'fuzzy',
+      matchKind: usableMatch.score === 1 ? (usableMatch.reason.startsWith('vote:') ? 'vote' : usableMatch.reason.startsWith('concept:') ? 'concept' : 'exact') : 'fuzzy',
     };
   }).map((decision, index) => {
     const sources = (decision.evidenceKeys || []).map(key => records.find(record => record.key === key)).filter(Boolean);
     const decorated = { ...decision, handle: fields[index].handle,
+      voteAutofillEnabled,
       confirmationState: sources.length && sources.every(record => record.confirmationState === 'confirmed') ? 'confirmed' : 'unconfirmed',
       reusePolicy: sources.some(record => (record.semantic?.reusePolicy || record.reusePolicy) === 'never') ? 'never' : sources.some(record => (record.semantic?.reusePolicy || record.reusePolicy) === 'review_only') ? 'review_only' : 'allowed',
       matchKind: decision.matchKind || (decision.transformation ? 'derived' : 'exact'),
@@ -1670,6 +1873,10 @@ async function applyDecisions(document, decisions = [], { deadline = Infinity, b
   const result = { applied: [], kept: [], reviewRequired: [], unresolved: [], failed: [] };
   for (const decision of decisions) {
     try {
+    if (document.__jobApplicationUserInterrupted) {
+      result.failed.push({ fieldId: decision.fieldId, reason: 'Autofill paused after user interaction' });
+      break;
+    }
     if (Date.now() >= deadline) { result.unresolved.push({ fieldId: decision.fieldId, reason: 'Autofill deadline reached' }); continue; }
     const {field, element} = withDomSnapshot(document, () => ({
       field: currentField(document, decision.fieldId),
@@ -1708,16 +1915,21 @@ async function applyDecisions(document, decisions = [], { deadline = Infinity, b
     }
     // Custom options may be filtered, stale, or loaded only after opening/searching.
     // Validate their exact match against the live popup in setCustomChoiceValue.
-    const validation = validateFillValue(field.widget === 'custom' ? { ...field, options: [] } : field, decision.value);
+    const validation = validateFillValue(field.widget === 'custom' ? { ...field, options: [], optionsStatus: '' } : field, decision.value);
     if (!validation.ok) {
       result.failed.push({ fieldId: field.id, label: field.label, value: decision.value, reason: validation.reason });
       continue;
     }
     const hasExpectedRawValue = Object.hasOwn(decision, 'expectedRawValue');
     const hasExpectedEditRevision = Object.hasOwn(decision, 'expectedEditRevision');
-    const rawValueMatches = !hasExpectedRawValue || String(element?.value ?? '') === String(decision.expectedRawValue);
-    const editRevisionMatches = !hasExpectedEditRevision || (element?.__jobApplicationEditRevision || 0) === decision.expectedEditRevision;
-    if (!beforeFill({field, element, decision}) || !rawValueMatches || !editRevisionMatches) {
+    const rawValueMatches = !hasExpectedRawValue || String(field.rawValue ?? '') === String(decision.expectedRawValue ?? '');
+    const editRevisionMatches = !hasExpectedEditRevision || (element?.__jobApplicationEditRevision || 0) === (decision.expectedEditRevision ?? 0);
+    const allowed = beforeFill({field, element, decision});
+    if (document.__jobApplicationUserInterrupted) {
+      result.failed.push({ fieldId: field.id, reason: 'Autofill paused after user interaction' });
+      break;
+    }
+    if (!allowed || !rawValueMatches || !editRevisionMatches) {
       result.failed.push({ fieldId: field.id, reason: 'The field changed before the answer could be applied' });
       continue;
     }
@@ -1808,17 +2020,24 @@ function isFinalApplicationSubmit(document, event) {
 function pauseReasons(document) {
   const reasons = [];
   const visibleText = composedText(document.body);
-  if ([...queryAll(document, 'input[type="file"]:not([disabled])')].some((element) => isVisible(element) && !(element.files?.length || element.value))) reasons.push('file_upload');
+  const visibleUpload = (element) => {
+    if (isVisible(element)) return true;
+    const label = element.id && queryAll(document, 'label').find(item => item.getAttribute('for') === element.id);
+    if (label && isVisible(label)) return true;
+    for (let parent = composedParent(element), depth = 0; parent && depth < 4; parent = composedParent(parent), depth++) {
+      if (isVisible(parent) && /\b(?:upload|attach|resume|cv|file)\b/i.test(composedText(parent))) return true;
+    }
+    return false;
+  };
+  if ([...queryAll(document, 'input[type="file"]:not([disabled])')].some((element) => visibleUpload(element) && !(element.files?.length || element.value))) reasons.push('file_upload');
   const captchaElement = [...queryAll(document, '[id*="captcha" i], [class*="captcha" i], [id*="recaptcha" i], [class*="recaptcha" i]')].some(isVisible);
   if (captchaElement || /\bcaptcha\b/i.test(visibleText)) reasons.push('captcha');
   const loginPath = /(?:^|\/)(?:login|signin|sign-in)(?:\/|$)/i.test(document.location?.pathname || '');
   const loginForm = [...queryAll(document, 'form[action]')].some((form) => /login|signin|sign-in/i.test(form.action || form.getAttribute('action') || ''));
   const loginHeading = [...queryAll(document, 'h1, h2, h3')].some((element) => isVisible(element) && /^(?:sign in|log in|login)$/i.test(element.textContent.trim()));
   if ([...queryAll(document, 'input[type="password"]:not([disabled])')].some(isVisible) || loginPath || loginForm || loginHeading) reasons.push('login');
-  const unresolvedCustomWidget = customWidgetElements(document)
-    .some((element) => customWidgetRequired(element) && !customWidgetValue(element));
   const contentEditable = [...queryAll(document, '[contenteditable="true"]')].some(isVisible);
-  if (contentEditable || unresolvedCustomWidget) reasons.push('unsupported_widget');
+  if (contentEditable) reasons.push('unsupported_widget');
   const nextCount = collectActions(document).filter((action) => action.kind === 'next').length;
   const submitCount = collectActions(document).filter((action) => action.kind === 'submit').length;
   if (nextCount > 1 || submitCount > 1) reasons.push('ambiguous_navigation');
@@ -1832,11 +2051,37 @@ function inspectDocument(document) {
   return inspection;
 }
 
+function observationFor(fields, actions) {
+  const controls = fields.map(field => ({
+    id: field.id,
+    handle: field.handle,
+    label: field.label,
+    type: field.type,
+    operations: field.widget === 'custom' || field.type === 'select' || field.type === 'radio' || field.type === 'checkbox' ? ['select'] : ['fill'],
+    ...(field.rect ? {rect: field.rect} : {}),
+  }));
+  const revision = JSON.stringify([
+    controls.map(control => [control.id, control.handle, control.label, control.type]),
+    fields.map(field => [field.handle, field.currentValue, field.options, field.editRevision || 0]),
+    actions.map(action => [action.handle, action.kind, action.label]),
+  ]);
+  return {revision, controls};
+}
+
 function inspectDocumentImpl(document) {
   const started = Date.now();
   const actions = collectActions(document);
   const fields = collectFieldDescriptors(document);
   const destination = applicationDestination(document);
+  const root = applicationRoot(document);
+  const dialog = composedClosest(root, 'dialog,[role="dialog"]');
+  // Portal dialogs often put the application heading outside the form.
+  // Restrict this hint to the selected region and its dialog, not the whole page.
+  const applicationLabel = [...new Set([root, dialog].filter(node => node?.nodeType === 1))]
+    .filter(isVisible)
+    .flatMap(node => [node.getAttribute('aria-label'), textFromIds(node, node.getAttribute('aria-labelledby')),
+      ...queryAll(node, 'h1,h2,h3,legend').filter(isVisible).map(labelText)])
+    .filter(Boolean).join(' ').slice(0, 1000);
   const {candidates, controls} = applicationRegions(document);
   const view = document.defaultView;
   const regions = candidates.map(region => ({
@@ -1847,8 +2092,10 @@ function inspectDocumentImpl(document) {
     .filter(isVisible).map(visualRect).filter(Boolean);
   return {
     page: extractJobContext(document),
+    applicationLabel,
     fields,
     actions,
+    observation: observationFor(fields, actions),
     pauseReasons: pauseReasons(document),
     destination,
     visualContext: {
@@ -1877,11 +2124,11 @@ function validateDocumentImpl(document) {
   return { ok: requiredEmpty.length === 0 && invalid.length === 0, requiredEmpty, invalid };
 }
 
-function collectAnswerRecords(document) {
-  return withDomSnapshot(document, () => collectAnswerRecordsImpl(document));
+function collectAnswerRecords(document, { finalize = false } = {}) {
+  return withDomSnapshot(document, () => collectAnswerRecordsImpl(document, finalize));
 }
 
-function collectAnswerRecordsImpl(document) {
+function collectAnswerRecordsImpl(document, finalize) {
   ensureEditTracking(document);
   const fields = collectFieldDescriptors(document);
   const invalidIds = new Set(validateDocument(document).invalid.map((field) => field.fieldId));
@@ -1894,7 +2141,9 @@ function collectAnswerRecordsImpl(document) {
       occurrenceByKey.set(baseKey, occurrence);
       const repeated = occurrence > 1 || /__\d+$/.test(field.id);
       const element = elementForField(document, field.id);
-      const provenance = (element?.type === 'radio' ? radioGroup(document, element).some((item) => item.__jobApplicationUserEdited) : element?.__jobApplicationUserEdited)
+      const userEdited = (element?.type === 'radio' ? radioGroup(document, element)
+        : element?.type === 'checkbox' ? checkboxGroup(document, element) : [element]).some(item => item?.__jobApplicationUserEdited);
+      const provenance = userEdited
         || element?.__jobApplicationAutofillValue == null
         ? 'user'
         : 'autofill';
@@ -1908,8 +2157,8 @@ function collectAnswerRecordsImpl(document) {
         sensitivity: inferSensitivity(field.label, field.id),
         concept: concept === 'generic_name' ? 'full_name' : concept,
         provenance,
-        userEdited: Boolean(element?.type === 'radio' ? radioGroup(document, element).some((item) => item.__jobApplicationUserEdited) : element?.__jobApplicationUserEdited),
-        completed: field.labelConfidence !== 'low' && element?.__jobApplicationUserCompleted !== false,
+        userEdited,
+        completed: field.labelConfidence !== 'low' && (finalize || element?.__jobApplicationUserCompleted !== false),
         ...(field.entityId ? { entityId: field.entityId } : {}),
         ...(field.entityType ? { entityType: field.entityType } : {}),
         ...(field.section ? { context: field.section } : {}),
@@ -2007,6 +2256,107 @@ function waitForDocumentSettled(document, { quietMs = 150, minWaitMs = 400, time
 }
 
 
+
+const OMIT_TAGS = new Set(['script', 'style', 'link', 'meta', 'iframe', 'object', 'embed', 'img', 'svg', 'canvas', 'video', 'audio', 'template']);
+const KEEP_ATTRIBUTES = new Set(['id', 'class', 'name', 'type', 'for', 'role', 'required', 'disabled', 'readonly', 'multiple', 'autocomplete', 'inputmode', 'placeholder', 'min', 'max', 'step', 'pattern', 'minlength', 'maxlength', 'hidden', 'contenteditable']);
+const URL_PATTERN = /(?:\b[a-z][a-z\d+.-]*:\/\/|\/\/|www\.)[^\s<>"'`]+|\b[a-z][a-z\d+.-]*:[^\s<>"'`]+|\b[a-z\d](?:[a-z\d-]*[a-z\d])?(?:\.[a-z\d](?:[a-z\d-]*[a-z\d])?)+(?::\d+)?(?:[/?#][^\s<>"'`]+)?|(?<![\w/])\/(?:[a-z\d._~-]+\/)*[a-z\d._~-]+(?:[?#][^\s<>"'`]+)?|(?<![\w.])\.{1,2}\/[^\s<>"'`]+/gi;
+
+function scrubDebugText(value, enteredValues = []) {
+  let text = String(value ?? '');
+  for (const answer of enteredValues) {
+    if (answer.trim().length >= 3) {
+      text = text.replaceAll(answer, '[redacted]');
+    } else if (/^[\p{L}\p{N}_]+$/u.test(answer.trim())) {
+      const escaped = answer.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      text = text.replace(new RegExp(`(^|[^\\p{L}\\p{N}_])${escaped}(?=$|[^\\p{L}\\p{N}_])`, 'giu'), '$1[redacted]');
+    } else if (text.trim() === answer.trim()) {
+      text = text.replace(answer.trim(), '[redacted]');
+    }
+  }
+  return text.replace(URL_PATTERN, '[redacted URL]');
+}
+
+function captureDebugSnapshot(document) {
+  const inspection = inspectDocument(document);
+  if (!inspection.destination?.regionId || !inspection.fields.length) throw new Error('Select a loaded application form before capturing it.');
+  const root = applicationRoot(document);
+  const entered = [...new Set(inspection.fields.flatMap(field => [field.rawValue, field.currentValue])
+    .filter(value => typeof value === 'string' && value.trim()))]
+    .sort((a, b) => b.length - a.length);
+  const scrub = value => scrubDebugText(value, entered);
+  const clean = value => {
+    if (!value || typeof value !== 'object') return typeof value === 'string' ? scrub(value) : value;
+    if (Array.isArray(value)) return value.map(clean);
+    return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, clean(item)]));
+  };
+  const cleanStatic = value => {
+    if (typeof value === 'string') return scrubDebugText(value);
+    if (!value || typeof value !== 'object') return value;
+    if (Array.isArray(value)) return value.map(cleanStatic);
+    return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, cleanStatic(item)]));
+  };
+  const copy = (node, preserveAnswerText = false) => {
+    if (node.nodeType === 3) return document.createTextNode(scrubDebugText(node.textContent, preserveAnswerText ? [] : entered));
+    if (node.nodeType !== 1 || isExtensionElement(node)) return null;
+    const tag = node.localName;
+    if (OMIT_TAGS.has(tag) || (tag === 'input' && ['hidden', 'password'].includes(node.type))) return null;
+    const isChoice = tag === 'option' || node.getAttribute('role') === 'option';
+    const preserveChildren = preserveAnswerText || isChoice || ['label', 'legend'].includes(tag);
+    const clone = document.createElement(tag);
+    for (const attribute of node.attributes) {
+      const name = attribute.name.toLowerCase();
+      if (KEEP_ATTRIBUTES.has(name) || (name.startsWith('aria-') && !['aria-valuenow', 'aria-valuetext', 'aria-selected', 'aria-checked'].includes(name))
+        || (name === 'value' && (tag === 'option' || (tag === 'input' && ['radio', 'checkbox'].includes(node.type))))
+        || (name === 'data-value' && node.getAttribute('role') === 'option')) {
+        clone.setAttribute(name, scrubDebugText(attribute.value, isChoice ? [] : entered));
+      }
+    }
+    if (node.shadowRoot) {
+      const template = document.createElement('template');
+      template.setAttribute('shadowrootmode', 'open');
+      for (const child of node.shadowRoot.childNodes) { const safe = copy(child, preserveChildren); if (safe) template.content.append(safe); }
+      clone.append(template);
+    }
+    if (tag !== 'textarea' && !node.hasAttribute('contenteditable')) {
+      for (const child of node.childNodes) { const safe = copy(child, preserveChildren); if (safe) clone.append(safe); }
+    }
+    return clone;
+  };
+  const source = root === document ? document.body : root;
+  let clone = copy(source);
+  const external = new Set();
+  for (const element of queryAll(source, '[aria-controls],[aria-owns],[aria-labelledby],[aria-describedby]')) {
+    for (const name of ['aria-controls', 'aria-owns', 'aria-labelledby', 'aria-describedby']) {
+      for (const id of String(element.getAttribute(name) || '').split(/\s+/).filter(Boolean)) {
+        const referenced = rootElementById(element, id);
+        if (referenced && referenced.getRootNode() === document && !composedContains(source, referenced)) external.add(referenced);
+      }
+    }
+  }
+  const extras = [...external].filter(node => ![...external].some(parent => parent !== node && parent.contains(node)));
+  if (extras.length) {
+    const wrapper = document.createElement('main');
+    wrapper.append(clone);
+    for (const node of extras) { const safe = copy(node); if (safe) wrapper.append(safe); }
+    clone = wrapper;
+  }
+  const html = clone?.outerHTML || '';
+  if (html.length > 500_000) throw new Error('This form is too large for a debug case. Capture a smaller form region.');
+  return {
+    html,
+    inspection: {
+      fields: inspection.fields.map(field => ({label: cleanStatic(field.label), type: field.type, required: field.required,
+        options: cleanStatic(field.options), widget: cleanStatic(field.widget || ''), section: cleanStatic(field.section || ''),
+        helpText: clean(field.helpText || ''), placeholder: clean(field.placeholder || ''), constraints: cleanStatic(field.constraints || {})})),
+      actions: inspection.actions.map(action => ({label: cleanStatic(action.label), kind: action.kind, type: action.type})),
+      discovery: clean(inspection.discovery),
+      pauseReasons: clean(inspection.pauseReasons),
+    },
+    limitations: {closedShadowRoots: 'Closed shadow roots cannot be captured or replayed.'},
+  };
+}
+
+
 // Learning is enabled only by the worker for the selected application frame.
 function createLearningSession(document, { capture, send, onFinalSubmit, onRevalidate, validationDelayMs = 500, delayMs = 350 }) {
   let applicationId = null;
@@ -2043,7 +2393,7 @@ function createLearningSession(document, { capture, send, onFinalSubmit, onReval
     flush().catch(() => {});
     if (event?.type !== 'submit' || !applicationId || document.__jobApplicationFilling || typeof onFinalSubmit !== 'function') return;
     try {
-      Promise.resolve(onFinalSubmit({ applicationId, records: capture(), event })).catch(() => {});
+      Promise.resolve(onFinalSubmit({ applicationId, records: capture({ finalize: true }), event })).catch(() => {});
     } catch (_) {}
   };
   for (const name of ['input', 'change', 'blur', 'click']) document.addEventListener(name, schedule, true);
@@ -2071,13 +2421,14 @@ function createLearningSession(document, { capture, send, onFinalSubmit, onReval
 
 function createInlineAutofill(document, {send, describe}) {
   const view = document.defaultView;
-  let host, shadow, dialog, question, searchInput, list, preview, status, use, generate, edit, hint, retrySearch;
+  let host, shadow, dialog, dragHandle, question, searchInput, list, preview, status, use, generate, edit, findSaved, hint, retrySearch;
   let target = null, snapshot = null, sessionId = null, requestId = null;
   let answers = [], index = -1, epoch = 0, acceptance = null;
-  let loading = false, retry = false, composing = false, disposed = false, restoringFocus = false;
+  let loading = false, retry = false, semanticSearching = false, semanticRetry = false, composing = false, disposed = false, restoringFocus = false;
   let searchTimer = null;
   let searchVersion = 0, searchPending = null, searchReady = false, searching = false;
   let positionFrame = null, mutationObserver = null, resizeObserver = null;
+  let drag = null, manualPosition = null;
   const listeners = [];
   const requestFrame = callback => view.requestAnimationFrame ? view.requestAnimationFrame(callback) : view.setTimeout(callback, 0);
   const cancelFrame = id => view.cancelAnimationFrame ? view.cancelAnimationFrame(id) : view.clearTimeout(id);
@@ -2087,6 +2438,7 @@ function createInlineAutofill(document, {send, describe}) {
   function eligible(element) {
     if (!element?.isConnected || element.ownerDocument !== document || isExtensionElement(element)
       || !((element.tagName === 'INPUT' && ['text', 'email', 'tel', 'url'].includes(element.type)) || element.tagName === 'TEXTAREA')) return null;
+    if (composedClosest(element, '[role="listbox"],[role="option"],[role="combobox"],[aria-haspopup="listbox"]')) return null;
     const field = describe(document, element);
     return field && !field.widget && !field.multiple && ['text', 'textarea', 'email', 'tel', 'url'].includes(field.type) ? field : null;
   }
@@ -2155,8 +2507,13 @@ function createInlineAutofill(document, {send, describe}) {
       [data-search] { width: 100%; margin: 0; padding: 9px 10px; border: 1px solid #bdcad8; border-radius: 7px;
         flex-shrink: 0; color: #17212b; background: #fff; font: inherit; }
       [data-secondary] { margin-top: 4px; }
+      [data-drag-handle] { align-self: flex-start; margin: 0 0 8px; padding: 3px 8px; font-size: 12px; cursor: grab; touch-action: none; }
+      [data-drag-handle]:active { cursor: grabbing; }
     `));
     dialog = node('section', null, {role: 'dialog', 'aria-label': 'Application answer suggestions'});
+    dragHandle = node('button', 'Move suggestions', {type: 'button', tabindex: '-1', 'data-drag-handle': '', 'aria-label': 'Move suggestions: drag or use arrow keys'});
+    dragHandle.addEventListener('pointerdown', startDrag);
+    dragHandle.addEventListener('keydown', moveWithKeys);
     question = node('p', null, {'data-question': ''});
     searchInput = node('input', null, {type: 'search', maxlength: '200', 'data-search': '', 'aria-label': 'Search previous answers', placeholder: 'Search previous answers'});
     searchInput.addEventListener('input', scheduleSearch);
@@ -2165,15 +2522,16 @@ function createInlineAutofill(document, {send, describe}) {
     use = button('Use and save reviewed answer', accept);
     use.setAttribute('data-primary', '');
     generate = button('Generate answer', generateAnswer);
-    edit = button('Edit in panel', editInPanel);
+    edit = button('Edit and use', editInPanel);
+    findSaved = button('Find saved answer', findSavedAnswer);
     retrySearch = button('Retry search', scheduleSearch);
     status = node('div', '', {role: 'status', 'aria-live': 'polite', 'aria-atomic': 'true'});
     hint = node('small', 'Arrow keys choose an answer; Tab uses the selection. Alt+ArrowDown enters controls. Escape closes.');
     const secondary = node('div', null, {'data-secondary': ''});
-    secondary.append(generate, edit);
+    secondary.append(findSaved, generate, edit);
     const results = node('div', null, {'data-results': ''});
     results.append(list, preview, secondary, hint);
-    dialog.append(question, searchInput, status, retrySearch, results, use);
+    dialog.append(dragHandle, question, searchInput, status, retrySearch, results, use);
     shadow.append(dialog);
   }
   function controlsMode(enabled) {
@@ -2192,11 +2550,11 @@ function createInlineAutofill(document, {send, describe}) {
   }
   function provenance(answer) {
     return answer.kind === 'generated' ? `Draft · Evidence: ${(answer.evidenceKeys || []).join(', ') || 'No candidate facts cited'}`
-      : `Source: ${answer.sourceQuestion || 'Reviewed answer'} · ${answer.kind || 'saved'}`;
+      : `Source: ${answer.sourceQuestion || 'Reviewed answer'} · Saved answer`;
   }
   function render() {
     const kept = snapshot?.rawValue !== '';
-    question.hidden = searchInput.hidden = list.hidden = preview.hidden = generate.hidden = edit.hidden = hint.hidden = kept;
+    question.hidden = searchInput.hidden = list.hidden = preview.hidden = findSaved.hidden = generate.hidden = edit.hidden = hint.hidden = kept;
     question.textContent = snapshot?.label || 'Application question';
     searchInput.disabled = loading && Boolean(sessionId) && !searching;
     retrySearch.hidden = !retry || !sessionId || kept;
@@ -2205,7 +2563,8 @@ function createInlineAutofill(document, {send, describe}) {
     answers.forEach((answer, answerIndex) => {
       const option = node('div', null, {role: 'option', id: `inline-answer-${answerIndex}`, 'aria-selected': String(index === answerIndex)});
       const text = String(answer.answer ?? '');
-      option.append(node('p', answer.sourceQuestion || 'Generated answer'), node('p', text.length > 160 ? `${text.slice(0, 160)}…` : text));
+      option.append(node('p', answer.sourceQuestion || 'Generated answer'),
+        node('p', answer.kind === 'semantic' || text.length <= 160 ? text : `${text.slice(0, 160)}…`));
       if (answer.kind === 'generated') option.append(node('small', provenance(answer)));
       option.addEventListener('click', () => select(answerIndex));
       list.append(option);
@@ -2213,6 +2572,8 @@ function createInlineAutofill(document, {send, describe}) {
     updateSelection();
     generate.disabled = loading || !sessionId || snapshot?.rawValue !== '';
     edit.disabled = loading || !sessionId;
+    findSaved.disabled = loading || semanticSearching || !sessionId || snapshot?.rawValue !== '';
+    findSaved.textContent = semanticSearching ? 'Searching saved answers…' : semanticRetry ? 'Try saved-answer search again' : 'Find saved answer';
     schedulePosition();
   }
   function updateSelection() {
@@ -2222,7 +2583,7 @@ function createInlineAutofill(document, {send, describe}) {
     preview.textContent = answer ? `${answer.answer}\n${provenance(answer)}\n${answer.requiresApproval === false ? 'Review this draft before use.' : 'Using this answer also saves it as a reviewed answer.'}` : '';
     if (answer) list.setAttribute('aria-activedescendant', `inline-answer-${index}`);
     else list.removeAttribute('aria-activedescendant');
-    use.textContent = answer?.requiresApproval === false ? 'Use draft' : 'Use and save reviewed answer';
+    use.textContent = answer?.requiresApproval === false ? 'Use draft' : answer?.kind === 'semantic' ? 'Use answer' : 'Use and save reviewed answer';
     use.disabled = loading || !answer;
     use.hidden = !answer;
     schedulePosition();
@@ -2235,6 +2596,33 @@ function createInlineAutofill(document, {send, describe}) {
   }
   function cancelSession(id = sessionId, request = requestId) {
     if (id && request) message({type: 'JOB_INLINE_CANCEL', sessionId: id, requestId: request}).catch(() => {});
+  }
+  function startDrag(event) {
+    if (event.button !== 0 || host.hidden) return;
+    position();
+    drag = {id: event.pointerId, x: event.clientX, y: event.clientY, left: parseFloat(host.style.left), top: parseFloat(host.style.top)};
+    dragHandle.focus();
+    try { dragHandle.setPointerCapture?.(event.pointerId); } catch {}
+    event.preventDefault();
+  }
+  function moveDrag(event) {
+    if (!drag || event.pointerId !== drag.id) return;
+    manualPosition = {left: drag.left + event.clientX - drag.x, top: drag.top + event.clientY - drag.y};
+    position();
+  }
+  function endDrag(event) {
+    if (!drag || (event && event.pointerId !== drag.id)) return;
+    try { dragHandle.releasePointerCapture?.(drag.id); } catch {}
+    drag = null;
+  }
+  function moveWithKeys(event) {
+    const steps = {ArrowLeft: [-1, 0], ArrowRight: [1, 0], ArrowUp: [0, -1], ArrowDown: [0, 1]};
+    const step = steps[event.key];
+    if (!step || event.ctrlKey || event.altKey || event.metaKey) return;
+    event.preventDefault();
+    manualPosition ||= {left: parseFloat(host.style.left), top: parseFloat(host.style.top)};
+    manualPosition = {left: manualPosition.left + step[0] * (event.shiftKey ? 48 : 16), top: manualPosition.top + step[1] * (event.shiftKey ? 48 : 16)};
+    position();
   }
   function stopObserving() {
     mutationObserver?.disconnect(); resizeObserver?.disconnect();
@@ -2251,7 +2639,8 @@ function createInlineAutofill(document, {send, describe}) {
     if (searchTimer !== null) { view.clearTimeout(searchTimer); searchTimer = null; }
     if (searchInput) searchInput.value = '';
     searchVersion++; searchPending = null; searchReady = searching = false;
-    target = snapshot = null; answers = []; index = -1; loading = false; retry = false;
+    target = snapshot = null; answers = []; index = -1; loading = false; retry = false; semanticSearching = semanticRetry = false;
+    endDrag(); manualPosition = null;
     stopObserving();
     if (host) { host.hidden = true; controlsMode(false); }
     if ((returnFocus || popupFocused) && previous?.isConnected) {
@@ -2295,6 +2684,29 @@ function createInlineAutofill(document, {send, describe}) {
       searchPending = null; runSearch();
     });
   }
+  function findSavedAnswer() {
+    if(loading||semanticSearching||!sessionId||!isCurrent(epoch,target,fingerprint(snapshot))||snapshot.rawValue!=='')return;
+    semanticSearching=true; render(); setStatus('Searching saved answers…');
+    const version=epoch,element=target,expected=fingerprint(snapshot),session=sessionId;
+    requestId=uniqueId(); const request=requestId;
+    const selectedId=answers[index]?.candidateId;
+    message({type:'JOB_INLINE_SEMANTIC_SEARCH',sessionId:session,fieldId:snapshot.id,handle:snapshot.handle,
+      requestId:request,retry:semanticRetry}).then(response=>{
+      if(!isCurrent(version,element,expected))return;
+      if(!response?.ok)throw new Error(response?.error||'Couldn’t search saved answers—try again.');
+      if(response.sessionId!==session||response.requestId!==request)throw new Error('Saved-answer search changed. Try again.');
+      if(response.semanticStatus==='matched') {
+        answers=(response.candidates||[]).slice(0,20);
+        index=selectedId?answers.findIndex(answer=>answer.candidateId===selectedId):-1;
+        semanticRetry=false; setStatus('Saved answer found. Review the original question and full answer.');
+      } else if(response.semanticStatus==='none'||response.semanticStatus==='skipped') {
+        semanticRetry=false; setStatus('No clear match. You can search by keyword or generate an answer.');
+      } else {
+        semanticRetry=true; setStatus('Couldn’t search saved answers—try again.','error');
+      }
+    }).catch(()=>{if(isCurrent(version,element,expected)){semanticRetry=true;setStatus('Couldn’t search saved answers—try again.','error');}})
+      .finally(()=>{if(isCurrent(version,element,expected)){semanticSearching=false;render();}});
+  }
   function observe() {
     stopObserving();
     mutationObserver = new view.MutationObserver(() => {
@@ -2322,11 +2734,14 @@ function createInlineAutofill(document, {send, describe}) {
     const above = Math.max(0, rect.top - topEdge - 14);
     const desiredHeight = Math.min(360, dialog.scrollHeight || 300);
     const flip = below < desiredHeight && above > below;
-    const popupHeight = Math.min(desiredHeight, flip ? above : below, Math.max(0, height - 16));
+    const popupHeight = Math.min(desiredHeight, manualPosition ? height - 16 : flip ? above : below, Math.max(0, height - 16));
+    const left = Math.max(leftEdge + 8, Math.min(manualPosition?.left ?? rect.left, leftEdge + width - popupWidth - 8));
+    const top = Math.max(topEdge + 8, Math.min(manualPosition?.top ?? (flip ? rect.top - popupHeight - 6 : rect.bottom + 6), topEdge + height - popupHeight - 8));
     host.style.width = `${popupWidth}px`;
     host.style.maxHeight = `${popupHeight}px`;
-    host.style.left = `${Math.max(leftEdge + 8, Math.min(rect.left, leftEdge + width - popupWidth - 8))}px`;
-    host.style.top = `${Math.max(topEdge + 8, Math.min(flip ? rect.top - popupHeight - 6 : rect.bottom + 6, topEdge + height - popupHeight - 8))}px`;
+    host.style.left = `${left}px`;
+    host.style.top = `${top}px`;
+    if (manualPosition) manualPosition = {left, top};
   }
   function show(element, field) {
     dismiss();
@@ -2357,6 +2772,7 @@ function createInlineAutofill(document, {send, describe}) {
   function activate(element) {
     if (disposed || composing || restoringFocus) return;
     if (element === host) return;
+    if (document.__jobApplicationFilling) { dismiss(); return; }
     const field = eligible(element);
     if (!field) { dismiss(); return; }
     if (target === element && !host?.hidden && fingerprint(field) === fingerprint(snapshot) && !retry) return;
@@ -2439,6 +2855,7 @@ function createInlineAutofill(document, {send, describe}) {
   function keydown(event) {
     if (composing || event.isComposing || event.keyCode === 229 || !target || host.hidden) return;
     const inPopup = event.composedPath().includes(host);
+    if (!inPopup && eventControl(event) !== target) return;
     if (event.key === 'Escape' && !event.ctrlKey && !event.altKey && !event.metaKey) {
       event.preventDefault(); dismiss({returnFocus: inPopup}); return;
     }
@@ -2483,10 +2900,13 @@ function createInlineAutofill(document, {send, describe}) {
   listen(document, 'focusout', event => {
     if (restoringFocus || !target) return;
     if (event.relatedTarget === host || event.relatedTarget === target) return;
-    if (event.composedPath().includes(host) && event.relatedTarget?.getRootNode() === shadow) return;
+    if (event.relatedTarget?.getRootNode() === shadow) return;
     dismiss();
   });
   listen(document, 'keydown', keydown, true);
+  listen(view, 'pointermove', moveDrag);
+  listen(view, 'pointerup', endDrag);
+  listen(view, 'pointercancel', endDrag);
   listen(document, 'input', event => {
     if (document.__jobApplicationFilling || eventControl(event)?.__jobApplicationAutofillDispatch || composing) return;
     if (eventControl(event) === target || eventControl(event) === deepActiveElement(document)) { acceptance = null; activate(event.composedPath().includes(host) ? host : eventControl(event)); }
@@ -2523,6 +2943,7 @@ function createInlineAutofill(document, {send, describe}) {
 
 
 
+
 let runtimeDisconnected = false;
 async function sendRuntimeMessage(message) {
   if (runtimeDisconnected) throw new Error('Extension context invalidated.');
@@ -2538,7 +2959,7 @@ function notifyNavigation() {
   waitForDocumentSettled(document).then(() => sendRuntimeMessage({ type: 'JOB_APP_NAVIGATED' })).catch(() => {});
 }
 
-const CONTENT_VERSION = 'autofill-ux-5';
+const CONTENT_VERSION = 'autofill-ux-10';
 if (!globalThis.__jobApplicationAutofillInstalled) {
   globalThis.__jobApplicationAutofillInstalled = CONTENT_VERSION;
   let inline = null;
@@ -2549,6 +2970,39 @@ if (!globalThis.__jobApplicationAutofillInstalled) {
   let forcedState = null;
   let selectionRequest = null;
   let selectionTimer = null;
+  let pageObserver = null;
+  let pageChangeTimer = null;
+  let observedPage = null;
+
+  function formShape() {
+    return withDomSnapshot(document, index => {
+      // Mutation observers do not cross shadow boundaries. Refresh the roots
+      // after structural changes so newly inserted component forms are watched.
+      pageObserver?.disconnect();
+      for (const root of index.roots) pageObserver?.observe(root, {
+        subtree: true, childList: true, characterData: true, attributes: true,
+        attributeFilter: ['hidden', 'aria-hidden', 'class', 'style', 'disabled', 'required', 'aria-label'],
+      });
+      const inspection = inspectDocument(document);
+      return JSON.stringify([document.location.href, inspection.destination,
+        inspection.fields.map(field => [field.id, field.label, field.type, field.options]),
+        inspection.actions.map(action => [action.kind, action.label])]);
+    });
+  }
+
+  function schedulePageCheck() {
+    if (!active || document.__jobApplicationDiscovering || Date.now() < Number(document.__jobApplicationDiscoverySettlingUntil || 0)) return;
+    clearTimeout(pageChangeTimer);
+    pageChangeTimer = setTimeout(() => {
+      if (!active || document.__jobApplicationDiscovering || Date.now() < Number(document.__jobApplicationDiscoverySettlingUntil || 0)) return;
+      const current = formShape();
+      if (current === observedPage) return;
+      observedPage = current;
+      sendRuntimeMessage({type: 'JOB_APP_NAVIGATED'}).catch(() => {});
+    }, 350);
+  }
+  document.defaultView.addEventListener('popstate', schedulePageCheck);
+  document.defaultView.addEventListener('hashchange', schedulePageCheck);
   const readyPromise = new Promise(resolve => { resolveReady = resolve; });
 
   function cancelSelection() {
@@ -2565,7 +3019,7 @@ if (!globalThis.__jobApplicationAutofillInstalled) {
   document.defaultView.addEventListener('hashchange', invalidateDestination);
   document.addEventListener('click', event => {
     const request = selectionRequest;
-    if (!active || !request || !event.isTrusted || Date.now() > request.expiresAt) return;
+    if ((!active && !request?.debug) || !request || !event.isTrusted || Date.now() > request.expiresAt) return;
     const control = eventControl(event);
     const destination = selectApplicationRegion(document, control);
     if (!destination?.regionId && !selectApplicationField(document, control)) return;
@@ -2594,6 +3048,10 @@ if (!globalThis.__jobApplicationAutofillInstalled) {
   }
 
   function disable() {
+    clearTimeout(pageChangeTimer);
+    pageObserver?.disconnect();
+    pageObserver = null;
+    observedPage = null;
     invalidateDestination();
     if (inline) inline.dispose();
     if (learning) learning.dispose();
@@ -2605,9 +3063,15 @@ if (!globalThis.__jobApplicationAutofillInstalled) {
   function enable() {
     if (active) return;
     active = true;
+    pageObserver = new document.defaultView.MutationObserver(changes => {
+      if (changes.some(change => !isExtensionElement(change.target)
+        && !(change.type === 'childList' && [...change.addedNodes, ...change.removedNodes]
+          .every(node => node.nodeType === 1 && node.matches('[data-job-inline-autofill]'))))) schedulePageCheck();
+    });
+    observedPage = formShape();
     inline = createInlineAutofill(document, {send: message => sendRuntimeMessage(message), describe: descriptorForElement});
     learning = createLearningSession(document, {
-      capture: () => collectAnswerRecords(document),
+      capture: (options) => collectAnswerRecords(document, options),
       send: (message) => sendRuntimeMessage(message),
       onRevalidate: ({applicationId}) => sendRuntimeMessage({type:'JOB_APP_REVALIDATE',applicationId}),
       onFinalSubmit: ({ applicationId, records, event }) => {
@@ -2634,9 +3098,9 @@ if (!globalThis.__jobApplicationAutofillInstalled) {
       }
       switch (message?.type) {
         case 'JOB_APP_SELECT_FORM':
-          if (!active) { sendResponse({ok: false, disabled: true}); break; }
+          if (!active && !message.debug) { sendResponse({ok: false, disabled: true}); break; }
           cancelSelection();
-          selectionRequest = {token: message.token, expiresAt: Math.min(message.expiresAt, Date.now() + 60_000)};
+          selectionRequest = {token: message.token, expiresAt: Math.min(message.expiresAt, Date.now() + 60_000), debug: message.debug === true};
           selectionTimer = setTimeout(cancelSelection, Math.max(0, selectionRequest.expiresAt - Date.now()));
           sendResponse({ok: true, destination: applicationDestination(document)});
           break;
@@ -2657,11 +3121,40 @@ if (!globalThis.__jobApplicationAutofillInstalled) {
           inspectWhenReady().then(inspection => sendResponse({ ok: true, inspection, version: CONTENT_VERSION }))
             .catch((error) => sendResponse({ ok: false, code: 'inspection_error', error: error.message }));
           return true;
+        case 'JOB_APP_DEBUG_INSPECT':
+          sendRuntimeMessage({type: 'JOB_APP_DEBUG_AUTHORIZE'}).then(async authorization => {
+            if (!authorization?.ok) {
+              sendResponse({ok: false, disabled: true, code: 'developer_mode_disabled', error: 'Enable Developer mode in Settings to capture debug cases.'});
+              return;
+            }
+            const inspection = await inspectWhenReady();
+            sendResponse({ok: true, inspection, version: CONTENT_VERSION});
+          }).catch(error => sendResponse({ok: false, code: 'inspection_error', error: error.message}));
+          return true;
+        case 'JOB_APP_DEBUG_SNAPSHOT':
+          sendRuntimeMessage({type: 'JOB_APP_DEBUG_AUTHORIZE'}).then(authorization => {
+            if (!authorization?.ok) {
+              sendResponse({ok: false, disabled: true, code: 'developer_mode_disabled', error: 'Enable Developer mode in Settings to capture debug cases.'});
+              return;
+            }
+            try { sendResponse({ok: true, snapshot: captureDebugSnapshot(document)}); }
+            catch (error) { sendResponse({ok: false, code: 'snapshot_error', error: error.message}); }
+          }).catch(error => sendResponse({ok: false, code: 'snapshot_error', error: error.message}));
+          return true;
         case 'JOB_APP_INSPECT_INLINE': {
           if (!active) { sendResponse({ok: false, disabled: true}); break; }
-          const inspection = inspectDocument(document);
+          let focused, focusInspected = false;
+          const inspection = withDomSnapshot(document, () => {
+            const current = inspectDocument(document);
+            if (current.fields.some(field => field.id === message.fieldId && field.handle === message.handle)) {
+              focused = descriptorForElement(document, inline.activeField());
+              focusInspected = true;
+            }
+            return current;
+          });
           inspection.page.url = document.location.href;
-          const focused = descriptorForElement(document, inline.activeField());
+          // A field outside the selected region needs its own temporary selection and fresh snapshot.
+          if (!focusInspected) focused = descriptorForElement(document, inline.activeField());
           if (focused && !inspection.fields.some(field => field.handle === focused.handle)) inspection.fields.push(focused);
           sendResponse({ok: true, inspection, focusedFieldId: focused?.id ?? null, focusedHandle: focused?.handle ?? null,
             rawValue: focused?.rawValue ?? null, editRevision: focused?.editRevision ?? null});
@@ -2669,6 +3162,10 @@ if (!globalThis.__jobApplicationAutofillInstalled) {
         }
         case 'JOB_APP_APPLY': {
           if (!active) { sendResponse({ok: false, disabled: true, result: {applied: [], kept: [], reviewRequired: [], unresolved: [], failed: []}}); break; }
+          if (message.observationRevision && inspectDocument(document).observation?.revision !== message.observationRevision) {
+            sendResponse({ok: false, code: 'destination_changed', error: 'The form changed before the answer could be applied.'});
+            break;
+          }
           const destination = message.destination || applicationDestination(document);
           if (!destination.regionId) {
             const focused = descriptorForElement(document, inline.activeField());
@@ -2680,15 +3177,23 @@ if (!globalThis.__jobApplicationAutofillInstalled) {
             selectApplicationField(document, inline.activeField());
           }
           if (message.applicationId) learning.activate(message.applicationId);
+          document.__jobApplicationUserInterrupted = false;
           applyDecisions(document, message.decisions || [], {deadline: message.deadline ?? Infinity,
-            beforeFill: args => active && destinationMatches(destination) && inline.beforeFill({...args, acceptanceToken: message.approvalGuard?.acceptanceToken})})
+            beforeFill: args => active && !document.__jobApplicationUserInterrupted && destinationMatches(destination)
+              && inline.beforeFill({...args, acceptanceToken: message.approvalGuard?.acceptanceToken})})
             .then((result) => sendResponse({ ok: true, result }))
-            .catch((error) => sendResponse({ ok: false, error: error.message }));
+            .catch((error) => sendResponse({ ok: false, error: error.message }))
+            .finally(() => { delete document.__jobApplicationUserInterrupted; });
           return true;
         }
+        case 'JOB_APP_EXPECT_TRUSTED_INPUT':
+          if (message.clear) delete document.__jobApplicationExpectedTrustedInput;
+          else document.__jobApplicationExpectedTrustedInput = {handle: message.handle || '', remaining: 1, expiresAt: Date.now() + 250};
+          sendResponse({ok: true});
+          break;
         case 'JOB_APP_CAPTURE':
           if (!active) { sendResponse({ok: false, disabled: true, records: []}); break; }
-          sendResponse({ ok: true, records: collectAnswerRecords(document) });
+          sendResponse({ ok: true, records: collectAnswerRecords(document, { finalize: message.finalize === true }) });
           break;
         case 'JOB_APP_VALIDATE':
           if (!active) { sendResponse({ok: false, disabled: true, validation: {ok: false, requiredEmpty: [], invalid: []}}); break; }
@@ -2726,7 +3231,7 @@ if (!globalThis.__jobApplicationAutofillInstalled) {
 
   sendRuntimeMessage({ type: 'JOB_APP_SITE_STATUS' }).then((response) => {
     const enabled = forcedState == null
-      ? response?.enabled !== false && response?.supported !== false
+      ? response?.enabled === true
       : forcedState;
     if (!enabled) disable();
     else enable();

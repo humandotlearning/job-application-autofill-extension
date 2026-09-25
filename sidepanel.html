@@ -22,7 +22,7 @@
         <span id="site-control-state" class="pill neutral">Unavailable</span>
       </summary>
       <div class="details-body">
-        <p id="site-control-hint" class="hint compact">Site controls are unavailable on this browser page.</p>
+        <p id="site-control-hint" class="hint compact">Autofill starts only after you press Fill this form.</p>
         <button id="site-toggle" type="button" hidden>Disable on this site</button>
       </div>
     </details>
@@ -32,18 +32,20 @@
         <span class="eyebrow">Current application</span>
         <span id="run-state" class="pill neutral">Ready</span>
       </div>
-      <h1 id="run-title">Ready to fill this page</h1>
+      <h1 id="run-title">Ready to fill this form</h1>
       <p id="run-summary" class="run-summary" aria-live="polite">Use your saved answers to get started.</p>
-      <button id="primary-action" class="primary full" type="button">Fill this page</button>
+      <button id="primary-action" class="primary full" type="button">Fill this form</button>
+      <button id="fill-page" class="full" type="button" hidden>Fill this page</button>
+      <button id="save-answers" class="full save-answers" type="button" aria-describedby="save-hint" hidden>Save answers for future forms</button>
+      <p id="save-hint" class="hint compact" hidden>Save current answers without submitting the application.</p>
+      <p id="save-feedback" class="save-feedback" role="status" aria-live="polite" aria-atomic="true" hidden></p>
       <details id="secondary-actions" class="secondary-actions" hidden>
         <summary>More actions</summary>
         <div class="button-row">
         <button id="check-page" type="button">Check again</button>
         <button id="advance-page" type="button">Continue to next page</button>
-        <button id="save-answers" type="button">Save answers</button>
         </div>
       </details>
-      <p id="save-feedback" class="save-feedback" role="status" aria-live="polite" aria-atomic="true" hidden></p>
       <div id="employment-choices"></div>
       <button id="retry-ai" type="button" data-retry-ai hidden>Retry AI</button>
       <p id="run-hint" class="hint">Review each page before continuing.</p>
@@ -101,6 +103,10 @@
           <h2 id="profile-title">Answer profile</h2>
           <span id="record-count" class="pill neutral">0 answers</span>
         </div>
+        <label class="checkbox-row" for="vote-autofill-enabled">
+          <input id="vote-autofill-enabled" type="checkbox" checked>
+          <span>Automatically fill when a saved-answer vote has a clear winner</span>
+        </label>
         <label for="ai-provider">AI provider</label>
         <select id="ai-provider">
           <option value="fireworks">Fireworks (default)</option>
@@ -110,6 +116,25 @@
         <input id="fireworks-api-key" type="password" autocomplete="off" spellcheck="false" placeholder="Paste your Fireworks key">
         <label for="openai-api-key">OpenAI API key <span class="muted">(optional alternative)</span></label>
         <input id="openai-api-key" type="password" autocomplete="off" spellcheck="false" placeholder="sk-…">
+        <label class="checkbox-row" for="typesafe-enabled">
+          <input id="typesafe-enabled" type="checkbox">
+          <span>Use JEV to assist form filling</span>
+        </label>
+        <label class="checkbox-row" for="typesafe-autofill-enabled">
+          <input id="typesafe-autofill-enabled" type="checkbox" checked>
+          <span>Automatically fill JEV's top saved answer</span>
+        </label>
+        <label class="checkbox-row" for="typesafe-autofill-sensitive">
+          <input id="typesafe-autofill-sensitive" type="checkbox" checked>
+          <span>Include sensitive answers and declarations</span>
+        </label>
+        <label class="checkbox-row" for="typesafe-no-match-top">
+          <input id="typesafe-no-match-top" type="checkbox" checked>
+          <span>Fill the top candidate even when JEV says no match</span>
+        </label>
+        <label for="typesafe-api-key">TypeSafe API key <span class="muted">(stored locally)</span></label>
+        <input id="typesafe-api-key" type="password" autocomplete="off" spellcheck="false" placeholder="ts_…">
+        <p class="muted">JEV selects supported saved facts and options. Sensitive, narrative, ambiguous, and incomplete matches still require review.</p>
         <label for="employer-name">Confirmed employer</label>
         <input id="employer-name" type="text" autocomplete="organization" value="DeepSight AI Labs">
         <p class="muted">Only saved employment for cross-site work-history fields.</p>
@@ -125,6 +150,21 @@
           <option value="accounts/fireworks/models/glm-5p3-flash"></option>
         </datalist>
         <p class="muted">Choose Fireworks above to use its model IDs, or enter any compatible model ID.</p>
+        <label class="checkbox-row" for="developer-mode">
+          <input id="developer-mode" type="checkbox">
+          <span>Developer mode</span>
+        </label>
+        <div id="developer-tools" hidden>
+          <button id="capture-debug-case" type="button">Capture debug case</button>
+          <p class="muted">Downloads the current form structure without filling or submitting it. Review the file before sharing it.</p>
+          <label class="checkbox-row" for="phoenix-tracing">
+            <input id="phoenix-tracing" type="checkbox" checked>
+            <span>Save AI traces to local Phoenix</span>
+          </label>
+          <p class="muted">Saves full prompts, answers, and included screenshots on this computer while Phoenix is running.</p>
+          <p><a href="http://127.0.0.1:6006" target="_blank" rel="noreferrer">Open AI trace dashboard</a></p>
+          <p id="phoenix-status" class="muted" aria-live="polite">Phoenix delivery: checking…</p>
+        </div>
         <label class="checkbox-row" for="include-form-screenshot">
           <input id="include-form-screenshot" type="checkbox">
           <span>Include form screenshot for AI interpretation</span>

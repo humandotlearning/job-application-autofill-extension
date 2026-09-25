@@ -10,13 +10,13 @@ async function readJson(path) {
   return JSON.parse(await readFile(new URL(path, root), 'utf8'));
 }
 
-test('manifest has only the permissions needed for local autofill', async () => {
+test('manifest declares browser control for adaptive accessibility and input', async () => {
   const manifest = await readJson('manifest.json');
   assert.equal(manifest.manifest_version, 3);
-  assert.equal(manifest.minimum_chrome_version, '114');
-  assert.equal(manifest.version, '0.1.7');
+  assert.equal(manifest.minimum_chrome_version, '125');
+  assert.match(manifest.version, /^\d+\.\d+\.\d+$/);
   assert.equal(manifest.side_panel.default_path, 'sidepanel.html');
-  assert.deepEqual(manifest.permissions.sort(), ['activeTab', 'scripting', 'sidePanel', 'storage'].sort());
+  assert.deepEqual(manifest.permissions.sort(), ['activeTab', 'alarms', 'debugger', 'scripting', 'sidePanel', 'storage'].sort());
   assert.equal(manifest.permissions.includes('identity'), false);
   assert.equal('oauth2' in manifest, false);
   assert.ok(manifest.host_permissions.includes('<all_urls>'));
@@ -36,11 +36,19 @@ test('side panel contains the guided workflow, review groups, and settings contr
   const html = await readFile(new URL('sidepanel.html', root), 'utf8');
   assert.match(html, /id="openai-api-key"/);
   assert.match(html, /id="fireworks-api-key"/);
+  assert.match(html, /id="typesafe-enabled"/);
+  assert.match(html, /id="typesafe-autofill-enabled"[^>]*checked/);
+  assert.match(html, /id="typesafe-autofill-sensitive"[^>]*checked/);
+  assert.match(html, /id="typesafe-no-match-top"[^>]*checked/);
+  assert.match(html, /id="typesafe-api-key"/);
   assert.match(html, /id="ai-provider"/);
   assert.match(html, /id="ai-model"/);
   assert.match(html, /accounts\/fireworks\/models\/glm-5p3-flash/);
   assert.match(html, /id="auto-advance-pages"/);
   assert.match(html, /id="include-form-screenshot"/);
+  assert.match(html, /id="developer-mode" type="checkbox"/);
+  assert.match(html, /id="developer-tools" hidden/);
+  assert.match(html, /id="capture-debug-case"/);
   assert.match(html, /id="export-datasource"/);
   assert.match(html, /id="import-datasource-button"/);
   assert.match(html, /id="import-datasource"/);
@@ -156,7 +164,7 @@ test('README documents deliberate inline review without activating whole-page le
   assert.match(readme, /ArrowDown.*Tab|Tab.*ArrowDown/i);
   assert.match(readme, /second Tab|next Tab/i);
   assert.match(readme, /Alt\+ArrowDown/i);
-  assert.match(readme, /Edit in panel/i);
+  assert.match(readme, /Edit and use/i);
   assert.match(readme, /standalone inline use does not activate whole-page learning/i);
   assert.match(readme, /saved-candidate approval retains existing reviewed save behavior/i);
   assert.match(readme, /generated draft does not automatically create reusable facts/i);

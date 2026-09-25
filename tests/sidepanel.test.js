@@ -31,7 +31,8 @@ async function setupPanel({
   approveSuggestionResponse = { ok: true, run },
   rewriteResponse = { ok: true, answer: 'Rewritten answer.' },
   generateResponse = { ok: true, run },
-  validateResponse = { ok: true, run }, retryAiResponse = { ok: true, run }, searchResponse = { ok: true, candidates: [], run }, selectEmploymentResponse = { ok: true, run },
+  validateResponse = { ok: true, run }, retryAiResponse = { ok: true, run }, searchResponse = { ok: true, candidates: [], run },
+  semanticSearchResponse = {ok: true, semanticStatus: 'none', candidates: [], run}, selectEmploymentResponse = { ok: true, run },
 } = {}) {
   const dom = new JSDOM(await loadPanelHtml(), {
     url: 'https://extension.local/sidepanel.html',
@@ -114,8 +115,10 @@ async function setupPanel({
         if (message.type === 'JOB_RUN_VALIDATE_PAGE') return validateResponse;
         if (message.type === 'JOB_RUN_RETRY_AI') return retryAiResponse;
         if (message.type === 'JOB_RUN_SEARCH_ANSWERS') return typeof searchResponse === 'function' ? searchResponse(message) : searchResponse;
+        if (message.type === 'JOB_RUN_SEMANTIC_SEARCH') return typeof semanticSearchResponse === 'function' ? semanticSearchResponse(message) : semanticSearchResponse;
         if (message.type === 'JOB_RUN_SELECT_EMPLOYMENT') return selectEmploymentResponse;
         if (message.type === 'JOB_DATASOURCE_EXPORT') return { ok: true, backup: '{"schemaVersion":1}' };
+        if (message.type === 'JOB_RUN_DEBUG_CAPTURE') return {ok: true, case: {schemaVersion: 1, snapshot: {html: '<form></form>'}}};
         if (message.type === 'JOB_DATASOURCE_IMPORT') return { ok: true, datasource };
         return { ok: true };
       },
@@ -168,6 +171,31 @@ async function setupPanel({
 }
 
 const panelTick = () => new Promise(resolve => setTimeout(resolve, 0));
+
+test('Developer mode reveals capture and Phoenix controls and can be turned off again', async () => {
+  const harness = await setupPanel();
+  try {
+    const document = harness.dom.window.document;
+    const toggle = document.getElementById('developer-mode');
+    const tools = document.getElementById('developer-tools');
+    assert.equal(toggle.checked, false);
+    assert.equal(tools.hidden, true);
+    toggle.checked = true;
+    toggle.dispatchEvent(new Event('change'));
+    await panelTick();
+    assert.equal(harness.localData.developerMode, true);
+    assert.equal(tools.hidden, false);
+    document.getElementById('capture-debug-case').click();
+    await panelTick();
+    assert.equal(harness.sentMessages.some(message => message.type === 'JOB_RUN_DEBUG_CAPTURE'), true);
+    assert.equal(harness.clickedDownloads.length, 1);
+    toggle.checked = false;
+    toggle.dispatchEvent(new Event('change'));
+    await panelTick();
+    assert.equal(harness.localData.developerMode, false);
+    assert.equal(tools.hidden, true);
+  } finally { harness.cleanup(); }
+});
 function panelInlineSession(kind = 'saved') {
   const field = {id: 'name', handle: 'doc:name', label: 'Full name', type: 'text'};
   const candidate = {candidateId: 'choice-1', answer: 'Selected answer', kind: kind === 'saved' ? 'equivalent' : 'generated', sourceKey: 'name-source', sourceQuestion: 'Full name'};
@@ -408,8 +436,8 @@ test('panel hides an opaque source question without an info button while keeping
     assert.equal(row.querySelector('[data-internal-id]'), null);
     assert.equal(row.querySelector('[data-internal-id-popover]'), null);
     assert.doesNotMatch(row.textContent, new RegExp(internalQuestion, 'i'));
-    assert.equal([...row.querySelectorAll('button')].some((button) => /Use this saved answer|Edit and use/.test(button.textContent)), false);
-    assert.ok(row.querySelector('[data-choose-answer]'));
+    assert.equal(row.querySelector('[data-choose-answer]').textContent, 'Use answer');
+    assert.equal(row.querySelector('[data-edit-candidate]').textContent, 'Edit and use');
   } finally { harness.cleanup(); }
 });
 
@@ -555,6 +583,18 @@ test('visual form context defaults on and persists an explicit opt-out', async (
   } finally { disabled.cleanup(); }
 });
 
+test('saved-answer vote autofill defaults on and persists an explicit opt-out', async () => {
+  const harness = await setupPanel({localData: {}});
+  try {
+    const checkbox = harness.dom.window.document.querySelector('#vote-autofill-enabled');
+    assert.equal(checkbox.checked, true);
+    checkbox.checked = false;
+    checkbox.dispatchEvent(new harness.dom.window.Event('change', {bubbles: true}));
+    await panelTick();
+    assert.equal(harness.localData.voteAutofillEnabled, false);
+  } finally { harness.cleanup(); }
+});
+
 test('panel persists settings, focuses blockers, and saves answers without any submit control', async () => {
   const run = {
     status: 'ready_for_user_submit',
@@ -617,6 +657,22 @@ test('panel defaults to Fireworks and persists its key and selected model', asyn
   }
 });
 
+test('panel keeps TypeSafe opt-in, key, and matching separate from answer generation', async () => {
+  const harness = await setupPanel({localData: {fireworksApiKey: '', openaiApiKey: '', typesafeApiKey: '',
+    typesafeEnabled: false, aiProvider: '', aiModel: '', autoAdvancePages: false}});
+  try {
+    const {document, Event} = harness.dom.window;
+    const enabled = document.querySelector('#typesafe-enabled');
+    const key = document.querySelector('#typesafe-api-key');
+    enabled.checked = true; enabled.dispatchEvent(new Event('change', {bubbles: true}));
+    key.value = 'ts_live'; key.dispatchEvent(new Event('input', {bubbles: true}));
+    await panelTick();
+    assert.equal(harness.localData.typesafeEnabled, true);
+    assert.equal(harness.localData.typesafeApiKey, 'ts_live');
+    assert.equal(harness.localData.aiProvider, '');
+  } finally { harness.cleanup(); }
+});
+
 test('panel exposes and saves the phone device profile default', async () => {
   const harness = await setupPanel({
     datasource: { answerCount: 3, coverMessageCount: 1, profile: { employment: [{ company: 'Example' }], defaults: { relatedToHiringCompany: 'No', knownAtHiringCompany: 'No', phoneDeviceType: 'Mobile' } } },
@@ -648,7 +704,7 @@ test('panel offers local saving while a page is ready to continue', async () => 
     const { document } = harness.dom.window;
     assert.equal(document.querySelector('#primary-action').textContent.trim(), 'Continue to next page');
     assert.equal(document.querySelector('#save-answers').hidden, false);
-    assert.equal(document.querySelector('#save-answers').textContent.trim(), 'Save filled values');
+    assert.equal(document.querySelector('#save-answers').textContent.trim(), 'Save answers for future forms');
 
     document.querySelector('#save-answers').click();
     await new Promise((resolve) => setTimeout(resolve, 0));
@@ -744,9 +800,16 @@ test('panel exports datasource backups through a generated download link', async
 });
 
 test('panel shows learned changes and sends a user correction to the worker', async () => {
-  const harness = await setupPanel({ datasource: { answerCount: 1, coverMessageCount: 0, learnedChanges: [
+  const datasource = { answerCount: 1, coverMessageCount: 0, learnedChanges: [
     { key: 'email', question: 'Email', answer: 'new@example.com', history: [{ answer: 'old@example.com' }], alternatives: [] },
-  ] } });
+  ] };
+  const harness = await setupPanel({ datasource });
+  const original = chrome.runtime.sendMessage;
+  chrome.runtime.sendMessage = async (message) => {
+    if (message.type !== 'JOB_DATASOURCE_CORRECT') return original(message);
+    harness.sentMessages.push(message);
+    return { ok: true, datasource: { ...datasource, learnedChanges: [] } };
+  };
   try {
     const document = harness.dom.window.document;
     assert.match(document.querySelector('#learned-change-list').textContent, /old@example.com/);
@@ -755,6 +818,27 @@ test('panel shows learned changes and sends a user correction to the worker', as
     document.querySelector('#learned-change-list button').click();
     await new Promise((resolve) => setTimeout(resolve, 0));
     assert.ok(harness.sentMessages.some((message) => message.type === 'JOB_DATASOURCE_CORRECT' && message.answer === 'correct@example.com'));
+    assert.equal(document.querySelectorAll('#learned-change-list input').length, 0);
+  } finally { harness.cleanup(); }
+});
+
+test('panel closes a learned-change notification without confirming its value', async () => {
+  const datasource = { answerCount: 1, coverMessageCount: 0, learnedChanges: [
+    { key: 'email', question: 'Email', answer: 'new@example.com', confirmationState: 'pending' },
+  ] };
+  const harness = await setupPanel({ datasource });
+  const original = chrome.runtime.sendMessage;
+  chrome.runtime.sendMessage = async (message) => {
+    if (message.type !== 'JOB_DATASOURCE_DISMISS_CHANGE') return original(message);
+    harness.sentMessages.push(message);
+    return { ok: true, datasource: { ...datasource, learnedChanges: [] } };
+  };
+  try {
+    const document = harness.dom.window.document;
+    [...document.querySelectorAll('#learned-change-list button')].find((button) => button.textContent === 'Close').click();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assert.ok(harness.sentMessages.some((message) => message.type === 'JOB_DATASOURCE_DISMISS_CHANGE' && message.key === 'email'));
+    assert.equal(document.querySelectorAll('#learned-change-list input').length, 0);
   } finally { harness.cleanup(); }
 });
 
@@ -817,7 +901,7 @@ test('answer workspace stays blank until a readable candidate is chosen', async 
   } finally { harness.cleanup(); }
 });
 
-test('AI answer selection opens a review draft without filling', async () => {
+test('AI Use answer loads the selected draft for review before sending', async () => {
   const generatedSuggestion = {
     tabId: 7, frameId: 3, applicationId: 'run-ai', pageSignature: 'page-one',
     field: { id: 'summary', handle: 'handle-summary' },
@@ -831,9 +915,12 @@ test('AI answer selection opens a review draft without filling', async () => {
     assert.equal(row.querySelector('.result-label').textContent, 'Why are you a good fit?');
     row.querySelector('[data-choose-generated-answer]').click();
     await new Promise(resolve => setTimeout(resolve, 0));
-    const sent = harness.sentMessages.find(message => message.type === 'JOB_RUN_APPLY_DRAFT');
-    assert.equal(sent, undefined);
     assert.equal(row.querySelector('[data-answer-draft]').value, 'I built event processing systems that match this role.');
+    assert.equal(pageMutationMessages(harness.sentMessages).length, 0);
+    row.querySelector('[data-send-answer]').click();
+    await new Promise(resolve => setTimeout(resolve, 0));
+    const sent = harness.sentMessages.find(message => message.type === 'JOB_RUN_APPLY_DRAFT');
+    assert.equal(sent.answer, 'I built event processing systems that match this role.');
   } finally { harness.cleanup(); }
 });
 
@@ -1231,6 +1318,76 @@ test('unanswered fields can search saved answers and use a returned candidate', 
   } finally { harness.cleanup(); }
 });
 
+test('unanswered fields explicitly find one complete saved answer without changing the draft', async () => {
+  const answer = 'A complete saved answer that remains unchanged until the user chooses it. '.repeat(4).trim();
+  const run = {status: 'waiting_user', applicationId: 'run-semantic', pageSignature: 'page-one',
+    actionRequired: [{fieldId: 'impact', label: 'How did you improve reliability?'}], optionalUnresolved: [], reviewRequired: [], audit: []};
+  const semanticSearchResponse = {ok: true, semanticStatus: 'matched', candidates: [{sourceKey: 'impact-story',
+    sourceQuestion: 'Describe your reliability impact', answer, kind: 'semantic'}], run};
+  const harness = await setupPanel({run, semanticSearchResponse});
+  try {
+    const card = harness.dom.window.document.querySelector('#action-required-card');
+    assert.equal(card.open, true, 'field actions are visible without opening a disclosure');
+    const row = harness.dom.window.document.querySelector('#action-required-list .result-item');
+    const draft = row.querySelector('[data-answer-draft]');
+    assert.ok(row.querySelector('[data-find-saved-answer]').compareDocumentPosition(draft) & 4,
+      'saved-answer search comes before the draft editor');
+    assert.equal(harness.sentMessages.some(({type}) => type === 'JOB_RUN_SEMANTIC_SEARCH'), false);
+    row.querySelector('[data-find-saved-answer]').click();
+    await panelTick();
+    assert.equal(draft.value, '');
+    const result = row.querySelector('[data-search-result]');
+    assert.match(result.textContent, /Describe your reliability impact/);
+    assert.match(result.textContent, new RegExp(answer));
+    assert.equal(harness.sentMessages.find(({type}) => type === 'JOB_RUN_SEMANTIC_SEARCH').fieldId, 'impact');
+    result.click();
+    assert.equal(draft.value, answer);
+    card.open = false;
+    harness.storageListeners.forEach(listener => listener({applicationRun: {newValue: {7: run}}}, 'session'));
+    await panelTick();
+    assert.equal(card.open, false, 'background updates preserve deliberate collapsing');
+  } finally { harness.cleanup(); }
+});
+
+test('saved-answer search shows the actionable settings error instead of a no-match result', async () => {
+  const run = {status: 'waiting_user', applicationId: 'settings-search', pageSignature: 'page',
+    actionRequired: [{fieldId: 'impact', label: 'Describe your impact'}]};
+  const harness = await setupPanel({run, semanticSearchResponse: {ok: false,
+    error: 'Enable TypeSafe saved-answer search and add its API key in Settings.'}});
+  try {
+    const row = harness.dom.window.document.querySelector('#action-required-list .result-item');
+    row.querySelector('[data-find-saved-answer]').click();
+    await panelTick();
+    assert.match(row.querySelector('.answer-search [role="status"]').textContent, /Enable TypeSafe.*Settings/);
+    assert.doesNotMatch(row.querySelector('.answer-search').textContent, /No clear match/);
+    assert.equal(pageMutationMessages(harness.sentMessages).length, 0);
+  } finally { harness.cleanup(); }
+});
+
+test('inline semantic search preserves its editor during storage refresh and returns a selectable answer', async () => {
+  const session = panelInlineSession('saved');
+  let resolveSearch;
+  const harness = await setupPanel({inlineSession: session,
+    semanticSearchResponse: () => new Promise(resolve => { resolveSearch = resolve; })});
+  try {
+    const row = harness.dom.window.document.querySelector('#inline-field-list .result-item');
+    const draft = row.querySelector('[data-answer-draft]');
+    row.querySelector('[data-find-saved-answer]').click();
+    await panelTick();
+    const candidate = {sourceKey: 'new-source', sourceQuestion: 'Original question', answer: 'New saved answer', kind: 'semantic'};
+    const updated = {...session, suggestions: {name: {field: session.field, candidates: [candidate]}}};
+    harness.handoff(updated);
+    await panelTick();
+    assert.equal(draft.isConnected, true);
+    resolveSearch({ok: true, semanticStatus: 'matched', candidates: [candidate], inlineSession: updated});
+    await panelTick();
+    assert.equal(draft.isConnected, true);
+    row.querySelector('[data-search-result]').click();
+    assert.equal(draft.value, candidate.answer);
+    assert.equal(pageMutationMessages(harness.sentMessages).length, 0);
+  } finally { harness.cleanup(); }
+});
+
 test('long review questions have a keyboard-accessible expansion', async () => {
   const question = 'Describe your experience delivering complex projects and explain the decisions you made while working with different teams.';
   const harness = await setupPanel({run: {status: 'waiting_user', actionRequired: [{fieldId: 'experience', label: question}], optionalUnresolved: [], reviewRequired: [], audit: []}});
@@ -1325,8 +1482,9 @@ test('Sage Focus opens needed answers and settings without applying a value', as
   try {
     const doc = panel.dom.window.document;
     assert.equal(doc.querySelector('#run-title').textContent, '1 item needs your attention');
-    assert.equal(doc.querySelector('#run-summary').textContent, '1 filled value');
-    assert.equal(doc.querySelector('#action-required-card').open, false);
+    assert.equal(doc.querySelector('#run-summary').textContent, '1 filled value · 1 need answers');
+    assert.equal(doc.querySelector('#action-required-card').open, true);
+    doc.querySelector('#action-required-card').open = false;
     assert.equal(doc.querySelector('#optional-details').hidden, true);
     assert.equal(doc.querySelector('#secondary-actions').open, false);
     for (const id of ['run-hint', 'save-feedback', 'employment-choices', 'retry-ai']) assert.equal(doc.getElementById(id).closest('#secondary-actions'), null);
@@ -1365,6 +1523,150 @@ test('Sage Focus keeps planner diagnostics in a disclosure and clears them on a 
     panel.storageListeners.forEach(listener => listener({applicationRun: {newValue: {}}}, 'session'));
     assert.equal(doc.querySelector('#status-details').hidden, true);
     assert.equal(doc.querySelector('#retry-ai').hidden, true);
-    assert.equal(doc.querySelector('#run-title').textContent, 'Ready to fill this page');
+    assert.equal(doc.querySelector('#run-title').textContent, 'Ready to fill this form');
   } finally { panel.cleanup(); }
+});
+
+for (const status of ['waiting_user', 'page_ready', 'ready_for_user_submit', 'answers_saved']) {
+  test(`reopened panel exposes saving outside collapsed actions while ${status}`, async () => {
+    const panel = await setupPanel({ run: { status, frame: { frameId: 0 }, startedAt: 'restored-application' } });
+    try {
+      const doc = panel.dom.window.document;
+      const save = doc.querySelector('#save-answers');
+      assert.equal(doc.querySelector('#secondary-actions').open, false);
+      assert.equal(save.closest('details'), null);
+      assert.equal(save.hidden, false);
+      assert.equal(save.disabled, false);
+      save.click();
+      await panelTick();
+      assert.equal(panel.sentMessages.filter(message => message.type === 'JOB_RUN_SAVE_ANSWERS').length, 1);
+      assert.equal(doc.querySelector('#save-feedback').hidden, false);
+      assert.equal(panel.sentMessages.some(message => message.type === 'JOB_RUN_START'), false);
+    } finally { panel.cleanup(); }
+  });
+}
+
+test('standalone save controls stay hidden on paused sites', async () => {
+  const panel = await setupPanel({ run: { status: 'waiting_user', frame: { frameId: 0 } } });
+  try {
+    const doc = panel.dom.window.document;
+    doc.querySelector('#site-toggle').click();
+    await panelTick();
+    assert.equal(doc.querySelector('#save-answers').hidden, true);
+    assert.equal(doc.querySelector('#save-hint').hidden, true);
+  } finally { panel.cleanup(); }
+});
+
+test('first rewrite completes in the visible editor after a background run refresh', async () => {
+  let resolveRewrite;
+  const run = {status: 'waiting_user', applicationId: 'race', pageSignature: 'one', frameId: 0,
+    actionRequired: [{fieldId: 'why', label: 'Why this company?'}], optionalUnresolved: [], reviewRequired: [], audit: []};
+  const harness = await setupPanel({run, rewriteResponse: () => new Promise(resolve => { resolveRewrite = resolve; })});
+  try {
+    const doc = harness.dom.window.document;
+    const draft = doc.querySelector('[data-answer-draft]');
+    draft.value = 'I built reliable systems.'; draft.dispatchEvent(new Event('input'));
+    doc.querySelector('[data-rewrite-answer]').click();
+    const prompt = doc.querySelector('[data-rewrite-prompt]');
+    prompt.value = 'Tailor to this company'; prompt.dispatchEvent(new Event('input'));
+    doc.querySelector('[data-submit-rewrite]').click();
+    harness.storageListeners.forEach(listener => listener({applicationRun: {newValue: {'7': {...run}}}}, 'session'));
+    assert.equal(doc.querySelector('[data-submit-rewrite]').textContent, 'Rewriting…');
+    resolveRewrite({ok: true, answer: 'I can apply my systems experience here.'});
+    await panelTick();
+    const visible = doc.querySelector('[data-answer-draft]');
+    assert.equal(visible.value, 'I can apply my systems experience here.');
+    assert.equal(visible.disabled, false);
+    assert.equal(visible.readOnly, false);
+    assert.equal(doc.querySelector('[data-send-answer]').disabled, false);
+    assert.match(doc.querySelector('[data-draft-status]').textContent, /Draft rewritten/);
+    assert.equal(harness.sentMessages.filter(message => message.type === 'JOB_RUN_REWRITE_ANSWER').length, 1);
+    assert.equal(pageMutationMessages(harness.sentMessages).length, 0);
+  } finally { harness.cleanup(); }
+});
+
+test('AI errors remain visible beside the field after a background panel refresh', async () => {
+  const run = {status:'waiting_user',applicationId:'ai-errors',pageSignature:'one',frameId:0,
+    actionRequired:[{fieldId:'why',label:'Why this role?'}],optionalUnresolved:[],reviewRequired:[],audit:[]};
+  const harness = await setupPanel({run,
+    generateResponse:{ok:false,error:'Add a Fireworks API key in Settings to use AI answers.'},
+    rewriteResponse:{ok:false,error:'Answer rewrite request timed out'},
+  });
+  try {
+    const doc = harness.dom.window.document;
+    doc.querySelector('[data-generate-suggestions]').click();
+    await panelTick();
+    harness.storageListeners.forEach(listener => listener({applicationRun:{newValue:{'7':{...run}}}},'session'));
+    assert.match(doc.querySelector('[data-draft-status]').textContent,/Fireworks API key.*Settings/);
+    assert.equal(doc.querySelector('[data-generate-suggestions]').disabled,false);
+    const draft = doc.querySelector('[data-answer-draft]');
+    draft.value = 'I built reliable systems.';
+    draft.dispatchEvent(new Event('input'));
+    doc.querySelector('[data-rewrite-answer]').click();
+    const prompt = doc.querySelector('[data-rewrite-prompt]');
+    prompt.value = 'Be concise.';
+    prompt.dispatchEvent(new Event('input'));
+    doc.querySelector('[data-submit-rewrite]').click();
+    await panelTick();
+    harness.storageListeners.forEach(listener => listener({applicationRun:{newValue:{'7':{...run}}}},'session'));
+    assert.match(doc.querySelector('[data-draft-status]').textContent,/timed out/);
+    assert.equal(doc.querySelector('[data-submit-rewrite]').disabled,false);
+  } finally { harness.cleanup(); }
+});
+
+test('empty drafts can generate directly, retry failure, and rewrite the generated answer', async () => {
+  const run = {status: 'waiting_user', applicationId: 'generate', pageSignature: 'one', frameId: 0,
+    actionRequired: [{fieldId: 'why', label: 'Why this company?'}], optionalUnresolved: [], reviewRequired: [], audit: []};
+  let fail = true;
+  const generated = {...run, generatedSuggestions: {why: {suggestions: [{answer: 'I built relevant systems.'}], missingContext: ''}}};
+  const harness = await setupPanel({run, generateResponse: () => fail ? {ok: false, error: 'Service unavailable. Try again.'} : {ok: true, run: generated}});
+  try {
+    const doc = harness.dom.window.document;
+    doc.querySelector('[data-generate-suggestions]').click(); await panelTick();
+    assert.match(doc.querySelector('[data-draft-status]').textContent, /Service unavailable/);
+    assert.equal(doc.querySelector('[data-generate-suggestions]').disabled, false);
+    fail = false;
+    doc.querySelector('[data-generate-suggestions]').click(); await panelTick();
+    assert.equal(doc.querySelector('[data-answer-draft]').value, 'I built relevant systems.');
+    assert.equal(doc.querySelector('[data-rewrite-answer]').disabled, false);
+    assert.equal(doc.querySelector('[data-answer-draft]').readOnly, false);
+    assert.equal(pageMutationMessages(harness.sentMessages).length, 0);
+  } finally { harness.cleanup(); }
+});
+
+test('Phoenix setting loads, persists and follows changes from another panel', async () => {
+  const harness = await setupPanel({localData: {phoenixTracing: false}});
+  try {
+    const checkbox = harness.dom.window.document.getElementById('phoenix-tracing');
+    assert.equal(checkbox.checked, false);
+    checkbox.checked = true;
+    checkbox.dispatchEvent(new harness.dom.window.Event('change'));
+    await panelTick();
+    assert.equal(harness.localData.phoenixTracing, true);
+    for (const listener of harness.storageListeners) listener({phoenixTracing: {newValue: false}}, 'local');
+    assert.equal(checkbox.checked, false);
+  } finally { harness.cleanup(); }
+});
+
+
+test('changed pages offer a primary fill action and every paused run has a visible refill action', async () => {
+  for (const waitingFor of ['page_changed', 'invalid_field']) {
+    const run = {status:'waiting_user', waitingFor, actionRequired:[{fieldId:'name', label:'Full name'}], optionalUnresolved:[], reviewRequired:[], audit:[]};
+    const h = await setupPanel({run});
+    try {
+      const d = h.dom.window.document;
+      const fill = d.querySelector('#fill-page');
+      assert.ok(fill);
+      if (waitingFor === 'page_changed') {
+        assert.equal(d.querySelector('#primary-action').textContent, 'Fill this page');
+        d.querySelector('#primary-action').click();
+      } else {
+        assert.equal(fill.hidden, false);
+        assert.equal(fill.closest('details'), null);
+        fill.click();
+      }
+      await new Promise(resolve=>setTimeout(resolve, 0));
+      assert.ok(h.sentMessages.some(m=>m.type==='JOB_RUN_CHECK_PAGE'));
+    } finally { h.cleanup(); }
+  }
 });

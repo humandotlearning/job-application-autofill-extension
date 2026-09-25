@@ -19,6 +19,186 @@ function makeDocument(html) {
   return new JSDOM(html, { url: 'https://jobs.example.com/apply' }).window.document;
 }
 
+test('adjacent block labels allow safe saved answers on Nutpaa-style forms', () => {
+  const document = makeDocument(`<form>
+    <div><div>First Name *</div><input name="firstname" required></div>
+    <div><div>Last Name *</div><input name="lastname" required></div>
+    <div><div>Email Address *</div><input name="email" type="email" required></div>
+    <div><div class="hint">Optional explanation</div><input name="opaque"></div>
+  </form>`);
+  const fields = collectFieldDescriptors(document);
+  assert.deepEqual(fields.slice(0, 3).map(field => [field.label, field.labelConfidence]), [
+    ['First Name', 'high'], ['Last Name', 'high'], ['Email Address', 'high'],
+  ]);
+  assert.equal(fields[3].labelConfidence, 'low');
+  const records = [
+    {key: 'first_name_one', question: 'First Name', answer: 'Example', confirmationState: 'confirmed', sensitivity: 'safe'},
+    {key: 'first_name_two', question: 'First Name', answer: 'Example', confirmationState: 'confirmed', sensitivity: 'safe'},
+    {key: 'first_name_three', question: 'First Name', answer: 'Other', confirmationState: 'confirmed', sensitivity: 'safe'},
+    {key: 'last_name', question: 'Last Name', answer: 'Person', confirmationState: 'confirmed', sensitivity: 'safe'},
+    {key: 'email', question: 'Email Address', answer: 'example@example.com', confirmationState: 'confirmed', sensitivity: 'safe'},
+  ];
+  const decisions = planDeterministicFill(fields, records);
+  assert.equal(decisions[0].matchKind, 'vote');
+  assert.deepEqual(decisions.slice(0, 3).map(decision => decision.disposition),
+    ['autofill', 'autofill', 'autofill']);
+});
+
+test('required badges work across native, ARIA, grouped and custom controls', () => {
+  const document = makeDocument(`<form>
+    <label>Native<input id="native" required></label>
+    <span id="aria-label">Start date<span>(Required)</span></span><input id="aria" aria-labelledby="aria-label">
+    <label for="select">Country<abbr title="required">*</abbr></label><select id="select"><option value="">Choose</option><option>India</option></select>
+    <fieldset><legend>Work mode<span>Required</span></legend><label><input id="radio" type="radio" name="mode" value="remote">Remote</label><label><input type="radio" name="mode" value="onsite">Onsite</label></fieldset>
+    <div role="group" aria-labelledby="check-label"><span id="check-label">Tools<span>Required</span></span><label><input id="check" type="checkbox" name="tools" value="Python">Python</label><label><input type="checkbox" name="tools" value="JS">JS</label></div>
+    <span id="custom-label">Department<span class="sr-only">Required</span></span><div id="custom" role="combobox" aria-labelledby="custom-label" aria-expanded="false" tabindex="0"></div>
+    <label for="optional">Optional field<span>Required</span></label><input id="optional" aria-required="false">
+    <label for="sentence">Tools <span>required</span> for this role</label><textarea id="sentence"></textarea>
+    <span id="split-question">Availability</span><span id="split-required">Required</span><input id="split" aria-labelledby="split-question split-required">
+    <label for="custom-for">Office<span>Required</span></label><div id="custom-for" role="combobox" aria-expanded="false" tabindex="0"></div>
+    <label for="hidden">Hidden marker<span hidden>Required</span></label><input id="hidden">
+  </form>`);
+  const fields = collectFieldDescriptors(document);
+  for (const id of ['native', 'aria', 'select', 'radio', 'check', 'custom', 'split', 'custom-for']) assert.equal(fields.find(f => f.id === id)?.required, true, id);
+  assert.equal(fields.find(f => f.id === 'optional').required, false);
+  assert.equal(fields.find(f => f.id === 'sentence').label, 'Tools required for this role');
+  assert.equal(fields.find(f => f.id === 'sentence').required, false);
+  assert.equal(fields.find(f => f.id === 'hidden').required, false);
+  assert.equal(fields.find(f => f.id === 'custom').label, 'Department');
+  assert.equal(fields.find(f => f.id === 'split').label, 'Availability');
+});
+
+test('required label references stay scoped to their shadow root', () => {
+  const document = makeDocument('<span id="question">Unrelated outside question</span><div id="host"></div>');
+  const shadow = document.querySelector('#host').attachShadow({mode:'open'});
+  shadow.innerHTML = '<span id="question">Start date<span>Required</span></span><input id="date" type="date" aria-labelledby="question">';
+  const field = collectFieldDescriptors(document).find(field => field.id === 'date');
+  assert.equal(field.label, 'Start date');
+  assert.equal(field.required, true);
+});
+
+test('Teamtailor required badges do not corrupt CTC questions or hide required fields', () => {
+  const document = makeDocument(`<form>
+    <label for="expected">What is your expected CTC<sup data-asterisk="true" aria-hidden="true">*</sup><span class="sr-only">Required</span></label>
+    <input id="expected" type="number" inputmode="numeric" pattern="[0-9]*">
+    <label for="current">What is your current CTC<sup aria-hidden="true">*</sup><span class="sr-only">Required</span></label><input id="current">
+    <label for="experience">Describe your <strong>required experience</strong><span>Optional</span></label><textarea id="experience"></textarea>
+  </form>`);
+  const fields = collectFieldDescriptors(document);
+  assert.deepEqual(fields.map(f => f.label), ['What is your expected CTC', 'What is your current CTC', 'Describe your required experience']);
+  assert.deepEqual(fields.map(f => f.required), [true, true, false]);
+  assert.deepEqual(validateDocument(document).requiredEmpty.map(f => f.fieldId), ['expected', 'current']);
+});
+
+test('Lever checkbox options share their question through reading, filling, focus and learning', async () => {
+  const document = makeDocument(`<form><ul>
+    <li class="application-question"><div class="application-label">Pronouns</div>
+      <div class="application-field"><ul><div class="column-wrapper"><div class="table-row">
+      <li><label><input type="checkbox" name="pronouns" value="She/her">She/her</label></li>
+      <li><label><input type="checkbox" name="pronouns" value="They/them">They/them</label></li>
+      </div></div><li><label><input type="checkbox" id="custom" value="Custom">Custom</label>
+      <input type="text" name="pronouns" style="display:none"></li></ul></div></li>
+    <li class="application-question"><div><div class="application-label"><div class="text">Are you willing to relocate?<span>✱</span></div></div>
+      <div class="application-field"><ul>
+      <li><label><input type="checkbox" name="cards[field0]" value="Yes" required>Yes</label></li>
+      <li><label><input type="checkbox" name="cards[field0]" value="No" required>No</label></li>
+      </ul></div></div></li>
+    <li><label><input type="checkbox" id="consent">I agree</label></li>
+  </ul></form>`);
+  try {
+    const fields = collectFieldDescriptors(document);
+    assert.equal(fields.length, 3);
+    assert.deepEqual(fields.map(f => f.label), ['Pronouns', 'Are you willing to relocate?', 'I agree']);
+    assert.deepEqual(fields[0].options, ['She/her', 'They/them', 'Custom']);
+    assert.deepEqual(fields[1].options, ['Yes', 'No']);
+    assert.equal(fields[0].multiple, true);
+    assert.equal(fields[2].type, 'checkbox');
+    const no = document.querySelector('input[value="No"]');
+    assert.equal(descriptorForElement(document, no).handle, fields[1].handle);
+    const result = await applyDecisions(document, [
+      {fieldId: fields[0].id, action: 'fill', value: 'She/her, They/them', approved: true, sensitivity: 'review'},
+      {fieldId: fields[1].id, action: 'fill', value: 'No', approved: true, sensitivity: 'review'},
+    ]);
+    assert.equal(result.applied.length, 2, JSON.stringify(result));
+    assert.equal(no.checked, true);
+    assert.equal(document.querySelector('input[value="Yes"]').checked, false);
+    assert.equal(validateDocument(document).ok, true);
+    no.dispatchEvent(new document.defaultView.Event('input', {bubbles: true}));
+    const records = collectAnswerRecords(document, {finalize: true});
+    assert.deepEqual(records.map(r => [r.question, r.answer]), [
+      ['Pronouns', 'She/her, They/them'], ['Are you willing to relocate?', 'No'],
+    ]);
+    assert.equal(records[1].userEdited, true);
+  } finally { document.defaultView.close(); }
+});
+
+test('checkbox grouping respects question containers and separate form owners', () => {
+  const document = makeDocument(`<form>
+    <fieldset><legend>Locations</legend><label><input type="checkbox" name="choice" value="Japan">Japan</label><label><input type="checkbox" name="choice" value="Asia">Asia</label></fieldset>
+    <fieldset><legend>Teams</legend><label><input type="checkbox" name="choice" value="A">A</label><label><input type="checkbox" name="choice" value="B">B</label></fieldset>
+    </form><form><label><input type="checkbox" name="choice">Consent</label></form>`);
+  try {
+    selectApplicationRegion(document, document.querySelector('form input'));
+    const fields = collectFieldDescriptors(document);
+    assert.deepEqual(fields.map(f => f.label), ['Locations', 'Teams']);
+    assert.deepEqual(fields[0].options, ['Japan', 'Asia']);
+    assert.deepEqual(fields[1].options, ['A', 'B']);
+    selectApplicationRegion(document, document.querySelectorAll('form')[1].querySelector('input'));
+    assert.equal(collectFieldDescriptors(document)[0].type, 'checkbox');
+  } finally { document.defaultView.close(); }
+});
+
+test('checkbox groups accept an exact option containing a comma', async () => {
+  const document = makeDocument(`<fieldset><legend>Regions</legend>
+    <label><input type="checkbox" name="regions">Central America, South America</label>
+    <label><input type="checkbox" name="regions">Asia</label></fieldset>`);
+  try {
+    const [field] = collectFieldDescriptors(document);
+    const result = await applyDecisions(document, [{fieldId: field.id, action: 'fill', value: 'Central America, South America', approved: true}]);
+    assert.equal(result.applied.length, 1, JSON.stringify(result));
+    assert.equal(collectFieldDescriptors(document)[0].currentValue, 'Central America, South America');
+  } finally { document.defaultView.close(); }
+});
+
+test('unnamed consent checkboxes remain independent and grouped choices preserve custom errors', () => {
+  const document = makeDocument(`<form><fieldset><legend>Agreements</legend>
+    <label><input type="checkbox" required checked>I agree to privacy</label>
+    <label><input type="checkbox" required>I agree to terms</label></fieldset>
+    <fieldset><legend>Locations</legend><label><input type="checkbox" name="location" value="Japan" checked>Japan</label>
+    <label><input type="checkbox" name="location" value="Asia">Asia</label></fieldset></form>`);
+  try {
+    const fields = collectFieldDescriptors(document);
+    assert.deepEqual(fields.map(f => f.label), ['I agree to privacy', 'I agree to terms', 'Locations']);
+    assert.equal(validateDocument(document).ok, false);
+    document.querySelectorAll('input')[1].checked = true;
+    assert.equal(validateDocument(document).ok, true);
+    document.querySelector('input[value="Japan"]').setCustomValidity('Unavailable');
+    assert.equal(validateDocument(document).ok, false);
+    assert.equal(validateDocument(document).invalid[0].label, 'Locations');
+  } finally { document.defaultView.close(); }
+});
+
+test('application discovery reads only the selected form and its visible dialog heading', () => {
+  const document = makeDocument(`
+    <h1>Apply for other jobs</h1>
+    <div role="dialog" aria-labelledby="application-title">
+      <h3 id="application-title">Apply to Andromeda Surgical</h3>
+      <h3 hidden>Hidden heading</h3>
+      <form><input placeholder="First Name"><input placeholder="Last Name"><button>Send Message</button></form>
+    </div>
+    <div role="dialog" hidden><h3>Other application</h3></div>
+  `);
+  try {
+    assert.match(inspectDocument(document).applicationLabel, /Apply to Andromeda Surgical/);
+    assert.doesNotMatch(inspectDocument(document).applicationLabel, /other jobs|Hidden heading|Other application/);
+    const form = document.querySelector('form');
+    document.body.append(form);
+    assert.equal(inspectDocument(document).applicationLabel, '');
+    form.setAttribute('aria-label', 'Candidate application');
+    assert.equal(inspectDocument(document).applicationLabel, 'Candidate application');
+  } finally { document.defaultView.close(); }
+});
+
 test('an approved stale text decision cannot replace typing', async () => {
   const document = makeDocument('<label>Full name<input id="name"></label>');
   const input = document.querySelector('input');
@@ -138,9 +318,9 @@ test('includes external form-associated actions when classifying a submitter-les
 });
 
 test('fills a custom dropdown identified by a linked label', async () => {
-  const document = makeDocument('<form><label id="country-label" for="country">Country</label><button type="button" id="country" role="combobox" aria-labelledby="country-label" aria-controls="countries">Select one</button><div id="countries" role="listbox"><div role="option">India</div></div></form>');
+  const document = makeDocument('<form><label id="country-label" for="country">Country</label><button type="button" id="country" role="combobox" aria-labelledby="country-label" aria-expanded="true" aria-controls="countries">Select one</button><div id="countries" role="listbox"><div role="option">India</div></div></form>');
   const button = document.getElementById('country');
-  document.querySelector('[role="option"]').onclick = () => { button.textContent = 'India'; };
+  document.querySelector('[role="option"]').onclick = () => { button.textContent = 'India'; button.setAttribute('aria-expanded', 'false'); document.getElementById('countries').hidden = true; };
   const fields = collectFieldDescriptors(document);
   assert.equal(fields.length, 1);
   const result = await applyDecisions(document, planDeterministicFill(fields, [{ key: 'country', answer: 'India', sensitivity: 'safe', confirmationState: 'confirmed', matchKind: 'exact' }]));
@@ -195,14 +375,50 @@ test('leaves ambiguous numbered dropdown labels unresolved', async () => {
   assert.equal(selections, 0);
 });
 
-test('uses an already open dropdown without toggling it closed', async () => {
+test('uses an already open dropdown without clicking its trigger again', async () => {
   const document = makeDocument('<form><button id="country" type="button" role="combobox" aria-label="Country" aria-expanded="true" aria-controls="countries">Select one</button><ul id="countries" role="listbox"><li role="option">India</li></ul></form>');
   const button = document.getElementById('country');
-  button.onclick = () => { document.getElementById('countries').remove(); };
-  document.querySelector('[role="option"]').onclick = () => { button.textContent = 'India'; };
+  let triggerClicks = 0;
+  button.onclick = () => { triggerClicks++; document.getElementById('countries').remove(); };
+  document.querySelector('[role="option"]').onclick = () => { button.textContent = 'India'; button.setAttribute('aria-expanded', 'false'); document.getElementById('countries').hidden = true; };
   const result = await applyDecisions(document, [{ fieldId: 'country', action: 'fill', value: 'India', approved: true }]);
   assert.equal(result.applied.length, 1);
   assert.equal(button.textContent, 'India');
+  assert.equal(triggerClicks, 0);
+});
+
+test('closes a Workday-like single-choice dropdown with Escape after autofill selection', async () => {
+  const document = makeDocument('<form><label for="heard">How did you hear about us?</label><div><button id="heard" type="button" role="combobox" aria-expanded="false" aria-controls="heard-options">Search</button><input type="hidden"><div id="heard-options" role="listbox" hidden><div role="option" data-value="recruiter">Recruiter</div></div></div></form>');
+  const button = document.getElementById('heard');
+  const popup = document.getElementById('heard-options');
+  button.onclick = () => { button.setAttribute('aria-expanded', 'true'); popup.hidden = false; };
+  popup.firstChild.onclick = () => { button.textContent = 'Recruiter'; button.parentElement.querySelector('input').value = 'recruiter'; };
+  let escapes = 0;
+  button.onkeydown = event => { if (event.key === 'Escape') { escapes++; button.setAttribute('aria-expanded', 'false'); popup.hidden = true; } };
+  const result = await applyDecisions(document, [{ fieldId: 'heard', action: 'fill', value: 'Recruiter', approved: true }]);
+  assert.equal(result.applied.length, 1);
+  assert.equal(escapes, 1);
+  assert.equal(button.getAttribute('aria-expanded'), 'false');
+  assert.equal(popup.hidden, true);
+});
+
+test('does not report a single-choice dropdown as filled while its menu remains open', async () => {
+  const document = makeDocument('<form><button id="heard" type="button" role="combobox" aria-label="How did you hear about us?" aria-expanded="true" aria-controls="heard-options">Search</button><div id="heard-options" role="listbox"><div role="option">Recruiter</div></div></form>');
+  const button = document.getElementById('heard');
+  document.querySelector('[role="option"]').onclick = () => { button.textContent = 'Recruiter'; };
+  const result = await applyDecisions(document, [{ fieldId: 'heard', action: 'fill', value: 'Recruiter', approved: true }]);
+  assert.equal(result.applied.length, 0);
+  assert.equal(result.unresolved[0]?.reason, 'The selected dropdown option did not close the menu');
+});
+
+test('does not report a dropdown as filled when Escape discards its selection', async () => {
+  const document = makeDocument('<form><button id="heard" type="button" role="combobox" aria-label="How did you hear about us?" aria-expanded="true" aria-controls="heard-options">Search</button><div id="heard-options" role="listbox"><div role="option">Recruiter</div></div></form>');
+  const button = document.getElementById('heard');
+  document.querySelector('[role="option"]').onclick = () => { button.textContent = 'Recruiter'; };
+  button.onkeydown = event => { if (event.key === 'Escape') { button.textContent = 'Search'; button.setAttribute('aria-expanded', 'false'); document.getElementById('heard-options').hidden = true; } };
+  const result = await applyDecisions(document, [{ fieldId: 'heard', action: 'fill', value: 'Recruiter', approved: true }]);
+  assert.equal(result.applied.length, 0);
+  assert.equal(result.unresolved[0]?.reason, 'The dropdown did not retain the selected option after closing');
 });
 
 test('replaces a disabled native dropdown placeholder with a real selection', async () => {
@@ -347,7 +563,7 @@ test('phone instructions with dialing examples are preserved', () => {
   assert.equal(collectFieldDescriptors(document)[0].label, question);
 });
 
-test('pauses for an empty required custom choice field', () => {
+test('does not pause for a supported empty custom choice field', () => {
   const document = makeDocument(`
     <main>
       <button id="previous-worker" name="previousWorker" aria-haspopup="listbox" aria-label="Have you worked here? Required">Select One</button>
@@ -356,7 +572,7 @@ test('pauses for an empty required custom choice field', () => {
   `);
   const inspection = inspectDocument(document);
   const validation = validateDocument(document);
-  assert.equal(inspection.pauseReasons.includes('unsupported_widget'), true);
+  assert.equal(inspection.pauseReasons.includes('unsupported_widget'), false);
   assert.equal(validation.ok, false);
   assert.deepEqual(validation.requiredEmpty.map((field) => field.fieldId), ['previous-worker']);
 });
@@ -737,6 +953,18 @@ test('keeps untouched legal checkbox manual', async () => {
   assert.equal(collectFieldDescriptors(document)[0].currentValue, '');
 });
 
+test('applies a JEV-selected declaration only through the explicit autofill policy', async () => {
+  const document = makeDocument('<form><label><input id="consent" type="checkbox">I agree to terms and conditions</label></form>');
+  const field = collectFieldDescriptors(document)[0];
+  const result = await applyDecisions(document, [{
+    fieldId: field.id, handle: field.handle, action: 'fill', value: 'Yes',
+    matchKind: 'semantic', jevAutofill: true, confirmationState: 'confirmed',
+    expectedRawValue: field.rawValue, expectedEditRevision: field.editRevision,
+  }]);
+  assert.equal(result.applied.length, 1, JSON.stringify({field, result}));
+  assert.equal(document.querySelector('#consent').checked, true);
+});
+
 test('fills an anonymous native input without throwing', async () => {
   const document = makeDocument('<label>Email<input type="email"></label>');
   const field = collectFieldDescriptors(document)[0];
@@ -864,6 +1092,44 @@ test('does not steal options when its controlled popup is missing', async () => 
   assert.deepEqual(collectFieldDescriptors(document)[0].options, []);
 });
 
+test('recovers sibling questions and required markers without including an embedded chat form', () => {
+  const document = makeDocument(`<main>
+    <div><p class="font-semibold">Full name <span>*</span></p><input id="name"></div>
+    <div><p>Email <span>*</span></p><input id="email" type="email"></div>
+    <div><p>Years of experience in TypeScript <span>*</span></p><input id="typescript" placeholder="Enter years"></div>
+    <div><p>Years of experience in React <span>*</span></p><input id="react" placeholder="Enter years"></div>
+    <div><p>Are you willing to work from office? <span>*</span></p><input id="office" role="combobox" aria-expanded="false"></div>
+    <div><p>Upload your resume <span>*</span></p><input id="resume" type="file" accept=".pdf" style="display:none"></div>
+    <form aria-label="Chat"><p>Ask a follow-up</p><input id="chat"></form>
+  </main>`);
+  const inspection = inspectDocument(document);
+  assert.deepEqual(inspection.fields.map(field => field.label), [
+    'Full name', 'Email', 'Years of experience in TypeScript', 'Years of experience in React', 'Are you willing to work from office?',
+  ]);
+  assert.ok(inspection.fields.every(field => field.required));
+  assert.equal(inspection.fields.find(field => field.id === 'office')?.widget, 'custom');
+  assert.equal(inspection.fields.some(field => field.id === 'chat'), false);
+  assert.ok(inspection.pauseReasons.includes('file_upload'));
+  assert.equal(inspection.observation.controls.length, inspection.fields.length);
+});
+
+test('stops a batch when user interaction interrupts the active fill', async () => {
+  const document = makeDocument('<form><label>First<input id="first"></label><label>Last<input id="last"></label></form>');
+  const fields = collectFieldDescriptors(document);
+  const result = await applyDecisions(document, [
+    {fieldId: fields[0].id, handle: fields[0].handle, action: 'fill', value: 'Ada', sensitivity: 'safe', confirmationState: 'confirmed', approved: true},
+    {fieldId: fields[1].id, handle: fields[1].handle, action: 'fill', value: 'Lovelace', sensitivity: 'safe', confirmationState: 'confirmed', approved: true},
+  ], {beforeFill: () => {
+    const nextAttempt = (document.__jobApplicationFillAttempts || 0) + 1;
+    document.__jobApplicationFillAttempts = nextAttempt;
+    if (nextAttempt === 2) document.__jobApplicationUserInterrupted = true;
+    return true;
+  }});
+  assert.equal(document.querySelector('#first').value, 'Ada');
+  assert.equal(document.querySelector('#last').value, '');
+  assert.match(result.failed[0].reason, /paused after user interaction/i);
+});
+
 test('composes full names locally from unambiguous name parts', () => {
   const document = makeDocument('<label>Name<input id="name"></label>');
   const decisions = planDeterministicFill(collectFieldDescriptors(document), [
@@ -871,6 +1137,27 @@ test('composes full names locally from unambiguous name parts', () => {
   ]);
   assert.equal(decisions[0].value, 'Ada Lovelace');
   assert.equal(decisions[0].transformation, 'compose_name');
+});
+
+test('fills identity fields from the leading saved-answer vote', async () => {
+  const document = makeDocument('<form><label>First Name *<input name="firstName" required></label><label>Email Address *<input name="email" type="email" required></label></form>');
+  const records = [
+    { key: 'first_name', question: 'First name', answer: 'Nitin', sensitivity: 'safe', confirmationState: 'confirmed' },
+    { key: 'given_name', question: 'Given name', answer: 'Nitin', sensitivity: 'safe', confirmationState: 'confirmed' },
+    { key: 'old_first_name', question: 'First name', answer: 'Nithin', sensitivity: 'safe', confirmationState: 'confirmed' },
+    { key: 'email', question: 'Email', answer: 'nitin@example.com', sensitivity: 'safe', confirmationState: 'confirmed' },
+    { key: 'email_address', question: 'Email address', answer: 'nitin@example.com', sensitivity: 'safe', confirmationState: 'confirmed' },
+    { key: 'old_email', question: 'Email', answer: 'other@example.com', sensitivity: 'safe', confirmationState: 'confirmed' },
+  ];
+  const decisions = planDeterministicFill(collectFieldDescriptors(document), records);
+  assert.deepEqual(decisions.map(({ action, disposition }) => [action, disposition]), [['fill', 'autofill'], ['fill', 'autofill']]);
+  const result = await applyDecisions(document, decisions);
+  assert.equal(result.applied.length, 2);
+  assert.equal(document.querySelector('[name="firstName"]').value, 'Nitin');
+  assert.equal(document.querySelector('[name="email"]').value, 'nitin@example.com');
+  const reviewed = planDeterministicFill(collectFieldDescriptors(makeDocument('<label>First Name<input></label>')), records, [], {}, {}, { voteAutofillEnabled: false });
+  assert.equal(reviewed[0].matchKind, 'vote');
+  assert.equal(reviewed[0].disposition, 'review');
 });
 
 test('round trips repeated employers with their original entity IDs', () => {

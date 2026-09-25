@@ -46,7 +46,7 @@ test('generated rows show draft provenance and missing context and require selec
   assert.match(f.root().textContent, /Draft/);
   assert.match(f.root().textContent, /profile:experience/);
   assert.match(f.root().textContent, /Add the job description/);
-  assert.equal(f.button('Edit in panel').hidden, false);
+  assert.equal(f.button('Edit and use').hidden, false);
   assert.equal(f.key('Tab').defaultPrevented, false);
   f.root().querySelectorAll('[role="option"]')[2].click();
   f.button('Use draft').click();
@@ -66,6 +66,30 @@ test('popup searches saved answers from the current question and keeps dismissal
   assert.equal(request.query, 'linkedin');
   assert.equal(request.sessionId, 's1');
   assert.equal(f.root().querySelectorAll('[role="option"]').length, candidates.length);
+});
+
+test('saved-answer matching is explicit and keeps local results and selection while it runs', async t => {
+  let finishSemantic;
+  const semantic = {candidateId: 'semantic:1', answer: 'A directly reusable saved answer.',
+    sourceQuestion: 'Equivalent saved question', kind: 'semantic', requiresApproval: true};
+  const f = fixture(t, message => message.type === 'JOB_INLINE_SEMANTIC_SEARCH'
+    ? new Promise(resolve => { finishSemantic = () => resolve({ok: true, sessionId: 's1', requestId: message.requestId,
+      semanticStatus: 'matched', candidates: [semantic, ...candidates]}); })
+    : {ok: true, sessionId: 's1', requestId: message.requestId, candidates});
+  f.field.focus(); await tick();
+  assert.equal(f.messages.some(message => message.type === 'JOB_INLINE_SEMANTIC_SEARCH'), false,
+    'ordinary focus stays local');
+  f.root().querySelectorAll('[role="option"]')[1].click();
+  const selectedId = f.root().querySelector('[aria-selected="true"]').id;
+  f.button('Find saved answer').click();
+  assert.equal(f.root().querySelectorAll('[role="option"]').length, candidates.length,
+    'local results remain visible while matching runs');
+  assert.equal(f.root().querySelector('[aria-selected="true"]').id, selectedId);
+  assert.match(f.root().querySelector('[role="status"]').textContent, /Searching saved answers/);
+  finishSemantic(); await tick();
+  assert.equal(f.root().querySelectorAll('[role="option"]').length, 3);
+  assert.equal(f.root().querySelector('[aria-selected="true"]').textContent.includes(candidates[1].answer), true);
+  assert.match(f.root().querySelector('[role="status"]').textContent, /Saved answer found/);
 });
 
 test('busy acceptance keeps the selected answer available for explicit retry', async t => {
@@ -271,7 +295,7 @@ test('Alt+ArrowDown enters popup controls; Escape restores field focus and close
 test('returning from popup controls to the unchanged field restores ordinary Tab order', async t => {
   const f = fixture(t); f.field.focus(); await tick();
   f.key('ArrowDown', {altKey: true});
-  const controls = [f.root().querySelector('[role="listbox"]'), f.button('Generate answer'), f.button('Edit in panel'), f.root().querySelector('[data-search]')];
+  const controls = [f.root().querySelector('[role="listbox"]'), f.button('Generate answer'), f.button('Edit and use'), f.root().querySelector('[data-search]')];
   f.button('Generate answer').focus();
   assert.ok(controls.every(control => control.tabIndex === 0), 'focus within the popup preserves normal control Tab order');
   f.field.focus();
@@ -341,7 +365,7 @@ test('nonempty input keeps the answer; erasing starts a new query; autofill even
   assert.match(f.root().textContent, /Your answer is kept/);
   assert.equal(f.root().querySelectorAll('[role="option"]').length, 0);
   assert.equal(f.button('Generate answer').hidden, true);
-  assert.equal(f.button('Edit in panel').hidden, true);
+  assert.equal(f.button('Edit and use').hidden, true);
   assert.equal(f.dom.window.getComputedStyle(f.root().querySelector('small[hidden]')).display, 'none');
   f.input(''); await tick();
   assert.equal(f.messages.filter(m => m.type === 'JOB_INLINE_QUERY').length, 1);
@@ -402,24 +426,24 @@ test('worker error envelopes without request IDs surface locally and allow retry
   assert.equal(f.messages.filter(m => m.type === 'JOB_INLINE_QUERY').length, 2);
 });
 
-test('Edit in panel displays the toolbar fallback without cancelling the handed-off session', async t => {
+test('Edit and use displays the toolbar fallback without cancelling the handed-off session', async t => {
   const fallback = 'Open the extension toolbar button to continue editing';
   const f = fixture(t, message => message.type === 'JOB_INLINE_EDIT_IN_PANEL'
     ? {ok: true, error: fallback}
     : {ok: true, sessionId: 's1', requestId: message.requestId, candidates});
   f.field.focus(); await tick();
-  f.button('Edit in panel').click(); await tick();
+  f.button('Edit and use').click(); await tick();
   assert.equal(f.host().hidden, false);
   assert.equal(f.root().querySelector('[role="status"]').textContent, fallback);
   assert.equal(f.messages.some(message => message.type === 'JOB_INLINE_CANCEL'), false);
 });
 
-test('Generate routes only explicit activation and Edit in panel retains the session without cancel', async t => {
+test('Generate routes only explicit activation and Edit and use retains the session without cancel', async t => {
   const f = fixture(t); f.field.focus(); await tick();
   assert.equal(f.messages.some(m => m.type === 'JOB_INLINE_GENERATE'), false);
   f.button('Generate answer').click(); await tick();
   assert.equal(f.messages.find(m => m.type === 'JOB_INLINE_GENERATE').sessionId, 's1');
-  f.button('Edit in panel').click(); await tick();
+  f.button('Edit and use').click(); await tick();
   assert.equal(f.messages.find(m => m.type === 'JOB_INLINE_EDIT_IN_PANEL').sessionId, 's1');
   assert.equal(f.messages.some(m => m.type === 'JOB_INLINE_CANCEL'), false);
   assert.equal(f.host().hidden, true);
@@ -433,6 +457,42 @@ test('coordinates flip and clamp to the frame viewport and update after scroll',
   assert.ok(parseFloat(f.host().style.top) < top);
   top = 20; f.document.dispatchEvent(new f.dom.window.Event('scroll')); await new Promise(resolve => setTimeout(resolve, 25));
   assert.equal(parseFloat(f.host().style.top), 56);
+});
+
+test('dropdown search inputs get no inline suggestion and dropdown keys stay on the page', async t => {
+  const f = fixture(t, null, '<form><label>Name<input id="name"></label><button type="button" role="combobox" aria-label="Source" aria-expanded="true" aria-controls="source-options">Search</button><div id="source-options" role="listbox"><input id="dropdown-search" type="text"><div role="option">Recruiter</div></div></form>');
+  const dropdownSearch = f.document.getElementById('dropdown-search');
+  dropdownSearch.focus(); await tick();
+  assert.equal(f.host(), null);
+  f.field.focus(); await tick();
+  assert.equal(f.host().hidden, false);
+  const arrow = f.key('ArrowDown', {}, dropdownSearch);
+  assert.equal(arrow.defaultPrevented, false);
+  dropdownSearch.focus();
+  assert.equal(f.host().hidden, true);
+});
+
+test('suggestion handle drags and moves by arrow keys within the viewport, then resets', async t => {
+  const f = fixture(t); f.field.focus(); await new Promise(resolve => setTimeout(resolve, 25));
+  const handle = f.root().querySelector('[data-drag-handle]');
+  const initialLeft = parseFloat(f.host().style.left);
+  const initialTop = parseFloat(f.host().style.top);
+  handle.dispatchEvent(new f.dom.window.MouseEvent('pointerdown', {bubbles: true, composed: true, cancelable: true, button: 0, clientX: 20, clientY: 20}));
+  assert.equal(f.host().hidden, false);
+  f.dom.window.dispatchEvent(new f.dom.window.MouseEvent('pointermove', {clientX: 120, clientY: 100}));
+  assert.ok(parseFloat(f.host().style.left) > initialLeft);
+  assert.ok(parseFloat(f.host().style.top) > initialTop);
+  f.dom.window.dispatchEvent(new f.dom.window.MouseEvent('pointermove', {clientX: 10000, clientY: 10000}));
+  assert.ok(parseFloat(f.host().style.left) + parseFloat(f.host().style.width) <= f.dom.window.innerWidth);
+  assert.ok(parseFloat(f.host().style.top) + parseFloat(f.host().style.maxHeight) <= f.dom.window.innerHeight);
+  f.dom.window.dispatchEvent(new f.dom.window.MouseEvent('pointerup'));
+  const left = parseFloat(f.host().style.left);
+  assert.equal(f.key('ArrowLeft', {}, handle).defaultPrevented, true);
+  assert.ok(parseFloat(f.host().style.left) < left);
+  f.key('Escape', {}, handle);
+  f.field.click(); await new Promise(resolve => setTimeout(resolve, 25));
+  assert.equal(parseFloat(f.host().style.left), initialLeft);
+  assert.equal(parseFloat(f.host().style.top), initialTop);
 });
 
 test('invalidated extension shows recovery instructions and preserves form entries', async t => {

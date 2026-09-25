@@ -1,13 +1,14 @@
-import { composedParent, deepActiveElement, eventControl, isExtensionElement } from './dom.js';
+import { composedClosest, composedParent, deepActiveElement, eventControl, isExtensionElement } from './dom.js';
 export function createInlineAutofill(document, {send, describe}) {
   const view = document.defaultView;
-  let host, shadow, dialog, question, searchInput, list, preview, status, use, generate, edit, hint, retrySearch;
+  let host, shadow, dialog, dragHandle, question, searchInput, list, preview, status, use, generate, edit, findSaved, hint, retrySearch;
   let target = null, snapshot = null, sessionId = null, requestId = null;
   let answers = [], index = -1, epoch = 0, acceptance = null;
-  let loading = false, retry = false, composing = false, disposed = false, restoringFocus = false;
+  let loading = false, retry = false, semanticSearching = false, semanticRetry = false, composing = false, disposed = false, restoringFocus = false;
   let searchTimer = null;
   let searchVersion = 0, searchPending = null, searchReady = false, searching = false;
   let positionFrame = null, mutationObserver = null, resizeObserver = null;
+  let drag = null, manualPosition = null;
   const listeners = [];
   const requestFrame = callback => view.requestAnimationFrame ? view.requestAnimationFrame(callback) : view.setTimeout(callback, 0);
   const cancelFrame = id => view.cancelAnimationFrame ? view.cancelAnimationFrame(id) : view.clearTimeout(id);
@@ -17,6 +18,7 @@ export function createInlineAutofill(document, {send, describe}) {
   function eligible(element) {
     if (!element?.isConnected || element.ownerDocument !== document || isExtensionElement(element)
       || !((element.tagName === 'INPUT' && ['text', 'email', 'tel', 'url'].includes(element.type)) || element.tagName === 'TEXTAREA')) return null;
+    if (composedClosest(element, '[role="listbox"],[role="option"],[role="combobox"],[aria-haspopup="listbox"]')) return null;
     const field = describe(document, element);
     return field && !field.widget && !field.multiple && ['text', 'textarea', 'email', 'tel', 'url'].includes(field.type) ? field : null;
   }
@@ -85,8 +87,13 @@ export function createInlineAutofill(document, {send, describe}) {
       [data-search] { width: 100%; margin: 0; padding: 9px 10px; border: 1px solid #bdcad8; border-radius: 7px;
         flex-shrink: 0; color: #17212b; background: #fff; font: inherit; }
       [data-secondary] { margin-top: 4px; }
+      [data-drag-handle] { align-self: flex-start; margin: 0 0 8px; padding: 3px 8px; font-size: 12px; cursor: grab; touch-action: none; }
+      [data-drag-handle]:active { cursor: grabbing; }
     `));
     dialog = node('section', null, {role: 'dialog', 'aria-label': 'Application answer suggestions'});
+    dragHandle = node('button', 'Move suggestions', {type: 'button', tabindex: '-1', 'data-drag-handle': '', 'aria-label': 'Move suggestions: drag or use arrow keys'});
+    dragHandle.addEventListener('pointerdown', startDrag);
+    dragHandle.addEventListener('keydown', moveWithKeys);
     question = node('p', null, {'data-question': ''});
     searchInput = node('input', null, {type: 'search', maxlength: '200', 'data-search': '', 'aria-label': 'Search previous answers', placeholder: 'Search previous answers'});
     searchInput.addEventListener('input', scheduleSearch);
@@ -95,15 +102,16 @@ export function createInlineAutofill(document, {send, describe}) {
     use = button('Use and save reviewed answer', accept);
     use.setAttribute('data-primary', '');
     generate = button('Generate answer', generateAnswer);
-    edit = button('Edit in panel', editInPanel);
+    edit = button('Edit and use', editInPanel);
+    findSaved = button('Find saved answer', findSavedAnswer);
     retrySearch = button('Retry search', scheduleSearch);
     status = node('div', '', {role: 'status', 'aria-live': 'polite', 'aria-atomic': 'true'});
     hint = node('small', 'Arrow keys choose an answer; Tab uses the selection. Alt+ArrowDown enters controls. Escape closes.');
     const secondary = node('div', null, {'data-secondary': ''});
-    secondary.append(generate, edit);
+    secondary.append(findSaved, generate, edit);
     const results = node('div', null, {'data-results': ''});
     results.append(list, preview, secondary, hint);
-    dialog.append(question, searchInput, status, retrySearch, results, use);
+    dialog.append(dragHandle, question, searchInput, status, retrySearch, results, use);
     shadow.append(dialog);
   }
   function controlsMode(enabled) {
@@ -122,11 +130,11 @@ export function createInlineAutofill(document, {send, describe}) {
   }
   function provenance(answer) {
     return answer.kind === 'generated' ? `Draft · Evidence: ${(answer.evidenceKeys || []).join(', ') || 'No candidate facts cited'}`
-      : `Source: ${answer.sourceQuestion || 'Reviewed answer'} · ${answer.kind || 'saved'}`;
+      : `Source: ${answer.sourceQuestion || 'Reviewed answer'} · Saved answer`;
   }
   function render() {
     const kept = snapshot?.rawValue !== '';
-    question.hidden = searchInput.hidden = list.hidden = preview.hidden = generate.hidden = edit.hidden = hint.hidden = kept;
+    question.hidden = searchInput.hidden = list.hidden = preview.hidden = findSaved.hidden = generate.hidden = edit.hidden = hint.hidden = kept;
     question.textContent = snapshot?.label || 'Application question';
     searchInput.disabled = loading && Boolean(sessionId) && !searching;
     retrySearch.hidden = !retry || !sessionId || kept;
@@ -135,7 +143,8 @@ export function createInlineAutofill(document, {send, describe}) {
     answers.forEach((answer, answerIndex) => {
       const option = node('div', null, {role: 'option', id: `inline-answer-${answerIndex}`, 'aria-selected': String(index === answerIndex)});
       const text = String(answer.answer ?? '');
-      option.append(node('p', answer.sourceQuestion || 'Generated answer'), node('p', text.length > 160 ? `${text.slice(0, 160)}…` : text));
+      option.append(node('p', answer.sourceQuestion || 'Generated answer'),
+        node('p', answer.kind === 'semantic' || text.length <= 160 ? text : `${text.slice(0, 160)}…`));
       if (answer.kind === 'generated') option.append(node('small', provenance(answer)));
       option.addEventListener('click', () => select(answerIndex));
       list.append(option);
@@ -143,6 +152,8 @@ export function createInlineAutofill(document, {send, describe}) {
     updateSelection();
     generate.disabled = loading || !sessionId || snapshot?.rawValue !== '';
     edit.disabled = loading || !sessionId;
+    findSaved.disabled = loading || semanticSearching || !sessionId || snapshot?.rawValue !== '';
+    findSaved.textContent = semanticSearching ? 'Searching saved answers…' : semanticRetry ? 'Try saved-answer search again' : 'Find saved answer';
     schedulePosition();
   }
   function updateSelection() {
@@ -152,7 +163,7 @@ export function createInlineAutofill(document, {send, describe}) {
     preview.textContent = answer ? `${answer.answer}\n${provenance(answer)}\n${answer.requiresApproval === false ? 'Review this draft before use.' : 'Using this answer also saves it as a reviewed answer.'}` : '';
     if (answer) list.setAttribute('aria-activedescendant', `inline-answer-${index}`);
     else list.removeAttribute('aria-activedescendant');
-    use.textContent = answer?.requiresApproval === false ? 'Use draft' : 'Use and save reviewed answer';
+    use.textContent = answer?.requiresApproval === false ? 'Use draft' : answer?.kind === 'semantic' ? 'Use answer' : 'Use and save reviewed answer';
     use.disabled = loading || !answer;
     use.hidden = !answer;
     schedulePosition();
@@ -165,6 +176,33 @@ export function createInlineAutofill(document, {send, describe}) {
   }
   function cancelSession(id = sessionId, request = requestId) {
     if (id && request) message({type: 'JOB_INLINE_CANCEL', sessionId: id, requestId: request}).catch(() => {});
+  }
+  function startDrag(event) {
+    if (event.button !== 0 || host.hidden) return;
+    position();
+    drag = {id: event.pointerId, x: event.clientX, y: event.clientY, left: parseFloat(host.style.left), top: parseFloat(host.style.top)};
+    dragHandle.focus();
+    try { dragHandle.setPointerCapture?.(event.pointerId); } catch {}
+    event.preventDefault();
+  }
+  function moveDrag(event) {
+    if (!drag || event.pointerId !== drag.id) return;
+    manualPosition = {left: drag.left + event.clientX - drag.x, top: drag.top + event.clientY - drag.y};
+    position();
+  }
+  function endDrag(event) {
+    if (!drag || (event && event.pointerId !== drag.id)) return;
+    try { dragHandle.releasePointerCapture?.(drag.id); } catch {}
+    drag = null;
+  }
+  function moveWithKeys(event) {
+    const steps = {ArrowLeft: [-1, 0], ArrowRight: [1, 0], ArrowUp: [0, -1], ArrowDown: [0, 1]};
+    const step = steps[event.key];
+    if (!step || event.ctrlKey || event.altKey || event.metaKey) return;
+    event.preventDefault();
+    manualPosition ||= {left: parseFloat(host.style.left), top: parseFloat(host.style.top)};
+    manualPosition = {left: manualPosition.left + step[0] * (event.shiftKey ? 48 : 16), top: manualPosition.top + step[1] * (event.shiftKey ? 48 : 16)};
+    position();
   }
   function stopObserving() {
     mutationObserver?.disconnect(); resizeObserver?.disconnect();
@@ -181,7 +219,8 @@ export function createInlineAutofill(document, {send, describe}) {
     if (searchTimer !== null) { view.clearTimeout(searchTimer); searchTimer = null; }
     if (searchInput) searchInput.value = '';
     searchVersion++; searchPending = null; searchReady = searching = false;
-    target = snapshot = null; answers = []; index = -1; loading = false; retry = false;
+    target = snapshot = null; answers = []; index = -1; loading = false; retry = false; semanticSearching = semanticRetry = false;
+    endDrag(); manualPosition = null;
     stopObserving();
     if (host) { host.hidden = true; controlsMode(false); }
     if ((returnFocus || popupFocused) && previous?.isConnected) {
@@ -225,6 +264,29 @@ export function createInlineAutofill(document, {send, describe}) {
       searchPending = null; runSearch();
     });
   }
+  function findSavedAnswer() {
+    if(loading||semanticSearching||!sessionId||!isCurrent(epoch,target,fingerprint(snapshot))||snapshot.rawValue!=='')return;
+    semanticSearching=true; render(); setStatus('Searching saved answers…');
+    const version=epoch,element=target,expected=fingerprint(snapshot),session=sessionId;
+    requestId=uniqueId(); const request=requestId;
+    const selectedId=answers[index]?.candidateId;
+    message({type:'JOB_INLINE_SEMANTIC_SEARCH',sessionId:session,fieldId:snapshot.id,handle:snapshot.handle,
+      requestId:request,retry:semanticRetry}).then(response=>{
+      if(!isCurrent(version,element,expected))return;
+      if(!response?.ok)throw new Error(response?.error||'Couldn’t search saved answers—try again.');
+      if(response.sessionId!==session||response.requestId!==request)throw new Error('Saved-answer search changed. Try again.');
+      if(response.semanticStatus==='matched') {
+        answers=(response.candidates||[]).slice(0,20);
+        index=selectedId?answers.findIndex(answer=>answer.candidateId===selectedId):-1;
+        semanticRetry=false; setStatus('Saved answer found. Review the original question and full answer.');
+      } else if(response.semanticStatus==='none'||response.semanticStatus==='skipped') {
+        semanticRetry=false; setStatus('No clear match. You can search by keyword or generate an answer.');
+      } else {
+        semanticRetry=true; setStatus('Couldn’t search saved answers—try again.','error');
+      }
+    }).catch(()=>{if(isCurrent(version,element,expected)){semanticRetry=true;setStatus('Couldn’t search saved answers—try again.','error');}})
+      .finally(()=>{if(isCurrent(version,element,expected)){semanticSearching=false;render();}});
+  }
   function observe() {
     stopObserving();
     mutationObserver = new view.MutationObserver(() => {
@@ -252,11 +314,14 @@ export function createInlineAutofill(document, {send, describe}) {
     const above = Math.max(0, rect.top - topEdge - 14);
     const desiredHeight = Math.min(360, dialog.scrollHeight || 300);
     const flip = below < desiredHeight && above > below;
-    const popupHeight = Math.min(desiredHeight, flip ? above : below, Math.max(0, height - 16));
+    const popupHeight = Math.min(desiredHeight, manualPosition ? height - 16 : flip ? above : below, Math.max(0, height - 16));
+    const left = Math.max(leftEdge + 8, Math.min(manualPosition?.left ?? rect.left, leftEdge + width - popupWidth - 8));
+    const top = Math.max(topEdge + 8, Math.min(manualPosition?.top ?? (flip ? rect.top - popupHeight - 6 : rect.bottom + 6), topEdge + height - popupHeight - 8));
     host.style.width = `${popupWidth}px`;
     host.style.maxHeight = `${popupHeight}px`;
-    host.style.left = `${Math.max(leftEdge + 8, Math.min(rect.left, leftEdge + width - popupWidth - 8))}px`;
-    host.style.top = `${Math.max(topEdge + 8, Math.min(flip ? rect.top - popupHeight - 6 : rect.bottom + 6, topEdge + height - popupHeight - 8))}px`;
+    host.style.left = `${left}px`;
+    host.style.top = `${top}px`;
+    if (manualPosition) manualPosition = {left, top};
   }
   function show(element, field) {
     dismiss();
@@ -287,6 +352,7 @@ export function createInlineAutofill(document, {send, describe}) {
   function activate(element) {
     if (disposed || composing || restoringFocus) return;
     if (element === host) return;
+    if (document.__jobApplicationFilling) { dismiss(); return; }
     const field = eligible(element);
     if (!field) { dismiss(); return; }
     if (target === element && !host?.hidden && fingerprint(field) === fingerprint(snapshot) && !retry) return;
@@ -369,6 +435,7 @@ export function createInlineAutofill(document, {send, describe}) {
   function keydown(event) {
     if (composing || event.isComposing || event.keyCode === 229 || !target || host.hidden) return;
     const inPopup = event.composedPath().includes(host);
+    if (!inPopup && eventControl(event) !== target) return;
     if (event.key === 'Escape' && !event.ctrlKey && !event.altKey && !event.metaKey) {
       event.preventDefault(); dismiss({returnFocus: inPopup}); return;
     }
@@ -413,10 +480,13 @@ export function createInlineAutofill(document, {send, describe}) {
   listen(document, 'focusout', event => {
     if (restoringFocus || !target) return;
     if (event.relatedTarget === host || event.relatedTarget === target) return;
-    if (event.composedPath().includes(host) && event.relatedTarget?.getRootNode() === shadow) return;
+    if (event.relatedTarget?.getRootNode() === shadow) return;
     dismiss();
   });
   listen(document, 'keydown', keydown, true);
+  listen(view, 'pointermove', moveDrag);
+  listen(view, 'pointerup', endDrag);
+  listen(view, 'pointercancel', endDrag);
   listen(document, 'input', event => {
     if (document.__jobApplicationFilling || eventControl(event)?.__jobApplicationAutofillDispatch || composing) return;
     if (eventControl(event) === target || eventControl(event) === deepActiveElement(document)) { acceptance = null; activate(event.composedPath().includes(host) ? host : eventControl(event)); }

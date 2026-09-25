@@ -5,6 +5,7 @@ import {
   chooseRecord,
   canonicalConcept,
   inferSensitivity,
+  mergeLearnedAnswers,
   normalizeAnswerRecord,
   normalizeText,
   shouldReviewDecision,
@@ -158,6 +159,39 @@ test('does not confuse different name concepts or choose conflicting canonical r
   ]), null);
 });
 
+test('uses the most supported confirmed identity answer and leaves tied votes unresolved', () => {
+  const records = [
+    { key: 'first_name', question: 'First name', answer: 'Nitin', confirmationState: 'confirmed', sensitivity: 'safe' },
+    { key: 'given_name', question: 'Given name', answer: 'Nitin', confirmationState: 'confirmed', sensitivity: 'safe' },
+    { key: 'application_first_name', question: 'First name', answer: 'Nithin', confirmationState: 'confirmed', sensitivity: 'safe' },
+  ];
+  assert.equal(chooseRecord({ label: 'First Name', type: 'text' }, records)?.record.answer, 'Nitin');
+  assert.equal(chooseRecord({ label: 'First Name', type: 'text' }, [...records, {
+    key: 'legal_first_name', question: 'First name', answer: 'Nithin', confirmationState: 'confirmed', sensitivity: 'safe',
+  }]), null);
+  assert.equal(chooseRecord({ label: 'First Name', type: 'text' }, [records[0], { ...records[0] }, records[2]]), null);
+  assert.equal(chooseRecord({ label: 'First Name', type: 'text' }, [
+    {...records[0], confirmationState: 'unconfirmed'},
+    {...records[1], confirmationState: 'unconfirmed'},
+    records[2],
+  ]), null);
+});
+
+test('does not count a local reuse clone as another identity vote', () => {
+  const original = { id: 'saved-first-name', key: 'first_name', question: 'First name', answer: 'Nitin', confirmationState: 'confirmed', sensitivity: 'safe' };
+  const clone = { ...original, key: 'application_1_first_name' };
+  const conflict = { id: 'saved-old-first-name', key: 'old_first_name', question: 'First name', answer: 'Nithin', confirmationState: 'confirmed', sensitivity: 'safe' };
+  assert.equal(chooseRecord({ label: 'First name' }, [original, conflict, clone]), null);
+});
+
+test('does not vote through conflicting employment facts', () => {
+  assert.equal(chooseRecord({ label: 'Current company' }, [
+    { key: 'a', question: 'Current company', answer: 'Old Co', confirmationState: 'confirmed' },
+    { key: 'b', question: 'Current company', answer: 'Old Co', confirmationState: 'confirmed' },
+    { key: 'c', question: 'Current company', answer: 'New Co', confirmationState: 'confirmed' },
+  ]), null);
+});
+
 test('keeps scoped repeated records separate while retaining the shared label alias', () => {
   const merged = upsertAnswerRecords([], [
     { key: 'company__entry_1', question: 'Company', answer: 'Analytical Engines', aliases: ['Company'], entityId: 'employment-1' },
@@ -227,6 +261,13 @@ test('validates options, patterns, lengths, and numeric bounds', () => {
 test('only high-confidence safe short answers are unreviewed', () => {
   const field = { type: 'text', label: 'Full name' };
   assert.equal(shouldReviewDecision({ confidence: 'high', sensitivity: 'safe', value: 'Nithin', confirmationState: 'confirmed', matchKind: 'exact' }, field), false);
+  const semantic = { sensitivity: 'safe', value: 'person@example.com', confirmationState: 'confirmed', matchKind: 'semantic', compatible: true,
+    semantic: { coverageComplete: true, selectedProbability: 0.99, confidence: 0.96, sufficiency: 0.99, conflict: 0.01 } };
+  assert.equal(shouldReviewDecision(semantic, { type: 'email', label: 'Email address', labelConfidence: 'high' }), false);
+  assert.equal(shouldReviewDecision({ ...semantic, semantic: { ...semantic.semantic, coverageComplete: false } },
+    { type: 'email', label: 'Email address', labelConfidence: 'high' }), true);
+  assert.equal(shouldReviewDecision({ ...semantic, value: '100000' },
+    { type: 'text', label: 'Salary expectation', labelConfidence: 'high' }), true);
   assert.equal(shouldReviewDecision({ confidence: 'medium', sensitivity: 'safe', value: 'Nithin' }, field), true);
   assert.equal(shouldReviewDecision({ confidence: 'high', sensitivity: 'review', value: '14 days' }, field), true);
   assert.equal(shouldReviewDecision({ confidence: 'high', sensitivity: 'safe', value: 'long answer' }, { type: 'textarea' }), true);
@@ -267,6 +308,15 @@ test('retains user correction history when a confirmed answer changes', () => {
     key: 'email', question: 'Email address', answer: 'new@example.com', provenance: 'user',
   }], '2026-01-01T00:00:00.000Z');
   assert.deepEqual(merged[0].history.map((item) => item.answer), ['old@example.com']);
+});
+
+test('new learned values reopen a previously dismissed notification', () => {
+  const [record] = mergeLearnedAnswers([
+    { key: 'city', question: 'City', answer: 'Bengaluru', provenance: 'user', changeReviewedAt: '2026-01-01T00:00:00.000Z' },
+  ], [{ key: 'city', question: 'City', answer: 'Chennai', provenance: 'user', completed: true }], '2026-01-02T00:00:00.000Z');
+  assert.equal(record.confirmationState, 'pending');
+  assert.equal(record.changeReviewedAt, undefined);
+  assert.equal(record.pendingAnswer, 'Chennai');
 });
 
 test('keeps existing records with a safe migration shape', () => {

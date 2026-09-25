@@ -13,7 +13,8 @@ import {
   selectApplicationField,
   clearApplicationSelection,
 } from './form-engine.js';
-import { eventControl } from './dom.js';
+import { isExtensionElement, eventControl, withDomSnapshot } from './dom.js';
+import { captureDebugSnapshot } from './debug-case.js';
 import { createLearningSession } from './learning.js';
 import { createInlineAutofill } from './inline-autofill.js';
 
@@ -32,7 +33,7 @@ function notifyNavigation() {
   waitForDocumentSettled(document).then(() => sendRuntimeMessage({ type: 'JOB_APP_NAVIGATED' })).catch(() => {});
 }
 
-const CONTENT_VERSION = 'autofill-ux-5';
+const CONTENT_VERSION = 'autofill-ux-10';
 if (!globalThis.__jobApplicationAutofillInstalled) {
   globalThis.__jobApplicationAutofillInstalled = CONTENT_VERSION;
   let inline = null;
@@ -43,6 +44,39 @@ if (!globalThis.__jobApplicationAutofillInstalled) {
   let forcedState = null;
   let selectionRequest = null;
   let selectionTimer = null;
+  let pageObserver = null;
+  let pageChangeTimer = null;
+  let observedPage = null;
+
+  function formShape() {
+    return withDomSnapshot(document, index => {
+      // Mutation observers do not cross shadow boundaries. Refresh the roots
+      // after structural changes so newly inserted component forms are watched.
+      pageObserver?.disconnect();
+      for (const root of index.roots) pageObserver?.observe(root, {
+        subtree: true, childList: true, characterData: true, attributes: true,
+        attributeFilter: ['hidden', 'aria-hidden', 'class', 'style', 'disabled', 'required', 'aria-label'],
+      });
+      const inspection = inspectDocument(document);
+      return JSON.stringify([document.location.href, inspection.destination,
+        inspection.fields.map(field => [field.id, field.label, field.type, field.options]),
+        inspection.actions.map(action => [action.kind, action.label])]);
+    });
+  }
+
+  function schedulePageCheck() {
+    if (!active || document.__jobApplicationDiscovering || Date.now() < Number(document.__jobApplicationDiscoverySettlingUntil || 0)) return;
+    clearTimeout(pageChangeTimer);
+    pageChangeTimer = setTimeout(() => {
+      if (!active || document.__jobApplicationDiscovering || Date.now() < Number(document.__jobApplicationDiscoverySettlingUntil || 0)) return;
+      const current = formShape();
+      if (current === observedPage) return;
+      observedPage = current;
+      sendRuntimeMessage({type: 'JOB_APP_NAVIGATED'}).catch(() => {});
+    }, 350);
+  }
+  document.defaultView.addEventListener('popstate', schedulePageCheck);
+  document.defaultView.addEventListener('hashchange', schedulePageCheck);
   const readyPromise = new Promise(resolve => { resolveReady = resolve; });
 
   function cancelSelection() {
@@ -59,7 +93,7 @@ if (!globalThis.__jobApplicationAutofillInstalled) {
   document.defaultView.addEventListener('hashchange', invalidateDestination);
   document.addEventListener('click', event => {
     const request = selectionRequest;
-    if (!active || !request || !event.isTrusted || Date.now() > request.expiresAt) return;
+    if ((!active && !request?.debug) || !request || !event.isTrusted || Date.now() > request.expiresAt) return;
     const control = eventControl(event);
     const destination = selectApplicationRegion(document, control);
     if (!destination?.regionId && !selectApplicationField(document, control)) return;
@@ -88,6 +122,10 @@ if (!globalThis.__jobApplicationAutofillInstalled) {
   }
 
   function disable() {
+    clearTimeout(pageChangeTimer);
+    pageObserver?.disconnect();
+    pageObserver = null;
+    observedPage = null;
     invalidateDestination();
     if (inline) inline.dispose();
     if (learning) learning.dispose();
@@ -99,9 +137,15 @@ if (!globalThis.__jobApplicationAutofillInstalled) {
   function enable() {
     if (active) return;
     active = true;
+    pageObserver = new document.defaultView.MutationObserver(changes => {
+      if (changes.some(change => !isExtensionElement(change.target)
+        && !(change.type === 'childList' && [...change.addedNodes, ...change.removedNodes]
+          .every(node => node.nodeType === 1 && node.matches('[data-job-inline-autofill]'))))) schedulePageCheck();
+    });
+    observedPage = formShape();
     inline = createInlineAutofill(document, {send: message => sendRuntimeMessage(message), describe: descriptorForElement});
     learning = createLearningSession(document, {
-      capture: () => collectAnswerRecords(document),
+      capture: (options) => collectAnswerRecords(document, options),
       send: (message) => sendRuntimeMessage(message),
       onRevalidate: ({applicationId}) => sendRuntimeMessage({type:'JOB_APP_REVALIDATE',applicationId}),
       onFinalSubmit: ({ applicationId, records, event }) => {
@@ -128,9 +172,9 @@ if (!globalThis.__jobApplicationAutofillInstalled) {
       }
       switch (message?.type) {
         case 'JOB_APP_SELECT_FORM':
-          if (!active) { sendResponse({ok: false, disabled: true}); break; }
+          if (!active && !message.debug) { sendResponse({ok: false, disabled: true}); break; }
           cancelSelection();
-          selectionRequest = {token: message.token, expiresAt: Math.min(message.expiresAt, Date.now() + 60_000)};
+          selectionRequest = {token: message.token, expiresAt: Math.min(message.expiresAt, Date.now() + 60_000), debug: message.debug === true};
           selectionTimer = setTimeout(cancelSelection, Math.max(0, selectionRequest.expiresAt - Date.now()));
           sendResponse({ok: true, destination: applicationDestination(document)});
           break;
@@ -151,11 +195,40 @@ if (!globalThis.__jobApplicationAutofillInstalled) {
           inspectWhenReady().then(inspection => sendResponse({ ok: true, inspection, version: CONTENT_VERSION }))
             .catch((error) => sendResponse({ ok: false, code: 'inspection_error', error: error.message }));
           return true;
+        case 'JOB_APP_DEBUG_INSPECT':
+          sendRuntimeMessage({type: 'JOB_APP_DEBUG_AUTHORIZE'}).then(async authorization => {
+            if (!authorization?.ok) {
+              sendResponse({ok: false, disabled: true, code: 'developer_mode_disabled', error: 'Enable Developer mode in Settings to capture debug cases.'});
+              return;
+            }
+            const inspection = await inspectWhenReady();
+            sendResponse({ok: true, inspection, version: CONTENT_VERSION});
+          }).catch(error => sendResponse({ok: false, code: 'inspection_error', error: error.message}));
+          return true;
+        case 'JOB_APP_DEBUG_SNAPSHOT':
+          sendRuntimeMessage({type: 'JOB_APP_DEBUG_AUTHORIZE'}).then(authorization => {
+            if (!authorization?.ok) {
+              sendResponse({ok: false, disabled: true, code: 'developer_mode_disabled', error: 'Enable Developer mode in Settings to capture debug cases.'});
+              return;
+            }
+            try { sendResponse({ok: true, snapshot: captureDebugSnapshot(document)}); }
+            catch (error) { sendResponse({ok: false, code: 'snapshot_error', error: error.message}); }
+          }).catch(error => sendResponse({ok: false, code: 'snapshot_error', error: error.message}));
+          return true;
         case 'JOB_APP_INSPECT_INLINE': {
           if (!active) { sendResponse({ok: false, disabled: true}); break; }
-          const inspection = inspectDocument(document);
+          let focused, focusInspected = false;
+          const inspection = withDomSnapshot(document, () => {
+            const current = inspectDocument(document);
+            if (current.fields.some(field => field.id === message.fieldId && field.handle === message.handle)) {
+              focused = descriptorForElement(document, inline.activeField());
+              focusInspected = true;
+            }
+            return current;
+          });
           inspection.page.url = document.location.href;
-          const focused = descriptorForElement(document, inline.activeField());
+          // A field outside the selected region needs its own temporary selection and fresh snapshot.
+          if (!focusInspected) focused = descriptorForElement(document, inline.activeField());
           if (focused && !inspection.fields.some(field => field.handle === focused.handle)) inspection.fields.push(focused);
           sendResponse({ok: true, inspection, focusedFieldId: focused?.id ?? null, focusedHandle: focused?.handle ?? null,
             rawValue: focused?.rawValue ?? null, editRevision: focused?.editRevision ?? null});
@@ -163,6 +236,10 @@ if (!globalThis.__jobApplicationAutofillInstalled) {
         }
         case 'JOB_APP_APPLY': {
           if (!active) { sendResponse({ok: false, disabled: true, result: {applied: [], kept: [], reviewRequired: [], unresolved: [], failed: []}}); break; }
+          if (message.observationRevision && inspectDocument(document).observation?.revision !== message.observationRevision) {
+            sendResponse({ok: false, code: 'destination_changed', error: 'The form changed before the answer could be applied.'});
+            break;
+          }
           const destination = message.destination || applicationDestination(document);
           if (!destination.regionId) {
             const focused = descriptorForElement(document, inline.activeField());
@@ -174,15 +251,23 @@ if (!globalThis.__jobApplicationAutofillInstalled) {
             selectApplicationField(document, inline.activeField());
           }
           if (message.applicationId) learning.activate(message.applicationId);
+          document.__jobApplicationUserInterrupted = false;
           applyDecisions(document, message.decisions || [], {deadline: message.deadline ?? Infinity,
-            beforeFill: args => active && destinationMatches(destination) && inline.beforeFill({...args, acceptanceToken: message.approvalGuard?.acceptanceToken})})
+            beforeFill: args => active && !document.__jobApplicationUserInterrupted && destinationMatches(destination)
+              && inline.beforeFill({...args, acceptanceToken: message.approvalGuard?.acceptanceToken})})
             .then((result) => sendResponse({ ok: true, result }))
-            .catch((error) => sendResponse({ ok: false, error: error.message }));
+            .catch((error) => sendResponse({ ok: false, error: error.message }))
+            .finally(() => { delete document.__jobApplicationUserInterrupted; });
           return true;
         }
+        case 'JOB_APP_EXPECT_TRUSTED_INPUT':
+          if (message.clear) delete document.__jobApplicationExpectedTrustedInput;
+          else document.__jobApplicationExpectedTrustedInput = {handle: message.handle || '', remaining: 1, expiresAt: Date.now() + 250};
+          sendResponse({ok: true});
+          break;
         case 'JOB_APP_CAPTURE':
           if (!active) { sendResponse({ok: false, disabled: true, records: []}); break; }
-          sendResponse({ ok: true, records: collectAnswerRecords(document) });
+          sendResponse({ ok: true, records: collectAnswerRecords(document, { finalize: message.finalize === true }) });
           break;
         case 'JOB_APP_VALIDATE':
           if (!active) { sendResponse({ok: false, disabled: true, validation: {ok: false, requiredEmpty: [], invalid: []}}); break; }
@@ -220,7 +305,7 @@ if (!globalThis.__jobApplicationAutofillInstalled) {
 
   sendRuntimeMessage({ type: 'JOB_APP_SITE_STATUS' }).then((response) => {
     const enabled = forcedState == null
-      ? response?.enabled !== false && response?.supported !== false
+      ? response?.enabled === true
       : forcedState;
     if (!enabled) disable();
     else enable();

@@ -21,8 +21,8 @@ test('migrates legacy datasource state to a profile with confirmed employer defa
     answerRecords: [{ key: 'email', question: 'Email', answer: 'nithin@example.com' }],
     datasourceMeta: { schemaVersion: 1 },
   });
-  assert.equal(DATASOURCE_SCHEMA_VERSION, 3);
-  assert.equal(migrated.schemaVersion, 3);
+  assert.equal(DATASOURCE_SCHEMA_VERSION, 4);
+  assert.equal(migrated.schemaVersion, 4);
   assert.deepEqual(migrated.profile.employment.map((entry) => entry.company), ['DeepSight AI Labs']);
   assert.equal(migrated.profile.defaults.relatedToHiringCompany, 'No');
   assert.equal(migrated.profile.defaults.knownAtHiringCompany, 'No');
@@ -72,7 +72,7 @@ test('confirms only untouched bundled public links', async () => {
     answerRecords: seeded.answerRecords.map((record) => ['github', 'linkedin'].includes(record.key)
       ? { ...record, confirmationState: undefined, confirmedAt: undefined, provenance: undefined }
       : record),
-    datasourceMeta: { schemaVersion: 3, seedId: 'resume.xlsx' },
+    datasourceMeta: { schemaVersion: 4, seedId: 'resume.xlsx' },
   };
   const migrated = confirmBundledPublicLinks(legacy, seed, '2026-09-04T00:00:00.000Z');
   assert.equal(migrated.answerRecords.find((record) => record.key === 'github').confirmationState, 'confirmed');

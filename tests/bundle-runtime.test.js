@@ -8,12 +8,12 @@ test('fresh classic bundle executes and same-version reinjection preserves value
   const bundle = await readFile(new URL('../dist/content.js', import.meta.url), 'utf8');
   const dom = new JSDOM('<form><label>Current CTC<textarea id="ctc">Unsaved synthetic value</textarea></label></form>');
   const listeners = new Set();
-  const context = createContext({ document: dom.window.document, setTimeout, clearTimeout, console, chrome: { runtime: { sendMessage: async () => ({}), onMessage: { addListener: listener => listeners.add(listener), removeListener: listener => listeners.delete(listener) } } } });
+  const context = createContext({ document: dom.window.document, setTimeout, clearTimeout, console, chrome: { runtime: { sendMessage: async message => message.type === 'JOB_APP_SITE_STATUS' ? {ok: true, enabled: true, supported: true} : {}, onMessage: { addListener: listener => listeners.add(listener), removeListener: listener => listeners.delete(listener) } } } });
   new Script(bundle).runInContext(context);
   new Script(bundle).runInContext(context);
   assert.equal(listeners.size, 1);
   const ping = await new Promise(resolve => [...listeners][0]({ type: 'JOB_APP_PING' }, {}, resolve));
-  assert.equal(ping.version, 'autofill-ux-5');
+  assert.equal(ping.version, 'autofill-ux-10');
   const result = await new Promise(resolve => [...listeners][0]({ type: 'JOB_APP_INSPECT' }, {}, resolve));
   assert.equal(result.ok, true, result.error);
   assert.equal(result.inspection.fields[0].label, 'Current CTC');
@@ -26,7 +26,7 @@ test('classic content listener inspects the live focused descriptor and exact ra
   const dom = new JSDOM('<form><label>Full name<input id="name"></label><label>Search<input type="search" id="search"></label></form>', {url: 'https://jobs.example.com/apply'});
   const listeners = [];
   const context = createContext({document: dom.window.document, setTimeout, clearTimeout, console, chrome: {runtime: {
-    sendMessage: async () => ({}), onMessage: {addListener: listener => listeners.push(listener)},
+    sendMessage: async message => message.type === 'JOB_APP_SITE_STATUS' ? {ok: true, enabled: true, supported: true} : {}, onMessage: {addListener: listener => listeners.push(listener)},
   }}});
   new Script(bundle).runInContext(context);
   const dispatch = message => new Promise(resolve => {
@@ -55,7 +55,38 @@ test('classic content listener inspects the live focused descriptor and exact ra
   dom.window.close();
 });
 
-test('disabled site status keeps the content script inert until explicitly re-enabled', async () => {
+test('content debug handlers require Developer-mode authorization before inspecting or snapshotting', async () => {
+  const bundle = await readFile(new URL('../dist/content.js', import.meta.url), 'utf8');
+  const dom = new JSDOM('<form aria-label="Application"><label>Name<input name="name" value="Private"></label></form>', {url: 'https://jobs.example.com/apply'});
+  const listeners = [], messages = [];
+  let developerMode = false;
+  const context = createContext({document: dom.window.document, setTimeout, clearTimeout, console, chrome: {runtime: {
+    sendMessage: async message => {
+      messages.push(message);
+      if (message.type === 'JOB_APP_DEBUG_AUTHORIZE') return {ok: developerMode};
+      if (message.type === 'JOB_APP_SITE_STATUS') return {ok: true, enabled: true, supported: true};
+      return {};
+    }, onMessage: {addListener: listener => listeners.push(listener)},
+  }}});
+  new Script(bundle).runInContext(context);
+  const dispatch = message => new Promise(resolve => listeners[0](message, {}, resolve));
+  try {
+    for (const type of ['JOB_APP_DEBUG_INSPECT', 'JOB_APP_DEBUG_SNAPSHOT']) {
+      const response = await dispatch({type});
+      assert.equal(response.ok, false);
+      assert.equal(response.code, 'developer_mode_disabled');
+    }
+    assert.equal(messages.filter(message => message.type === 'JOB_APP_DEBUG_AUTHORIZE').length, 2);
+    developerMode = true;
+    const inspection = await dispatch({type: 'JOB_APP_DEBUG_INSPECT'});
+    assert.equal(inspection.ok, true);
+    const snapshot = await dispatch({type: 'JOB_APP_DEBUG_SNAPSHOT'});
+    assert.equal(snapshot.ok, true);
+    assert.doesNotMatch(snapshot.snapshot.html, /Private/);
+  } finally { dom.window.close(); }
+});
+
+test('inactive form-session status keeps the content script inert until explicitly enabled', async () => {
   const bundle = await readFile(new URL('../dist/content.js', import.meta.url), 'utf8');
   const dom = new JSDOM('<form><label>Full name<input id="name"></label></form>', {url: 'https://jobs.example.com/apply', pretendToBeVisual: true});
   const listeners = [];
@@ -88,6 +119,30 @@ test('disabled site status keeps the content script inert until explicitly re-en
   dom.window.close();
 });
 
+test('content ignores option-popup mutations while discovery is active', async () => {
+  const bundle = await readFile(new URL('../dist/content.js', import.meta.url), 'utf8');
+  const dom = new JSDOM('<form><label>Full name<input id="name"></label><button type="button" role="combobox" aria-label="Country" aria-controls="countries">Select one</button><div id="countries" role="listbox" hidden></div></form>', {url: 'https://jobs.example.com/apply', pretendToBeVisual: true});
+  const document = dom.window.document;
+  const listeners = []; const messages = [];
+  const context = createContext({document, setTimeout, clearTimeout, console, chrome: {runtime: {
+    sendMessage: async message => {
+      messages.push(message);
+      return message.type === 'JOB_APP_SITE_STATUS' ? {ok: true, enabled: true, supported: true} : {ok: true};
+    }, onMessage: {addListener: listener => listeners.push(listener)},
+  }}});
+  new Script(bundle).runInContext(context);
+  await new Promise(resolve => setTimeout(resolve, 0));
+  messages.length = 0;
+  document.__jobApplicationDiscovering = true;
+  const listbox = document.querySelector('#countries');
+  listbox.hidden = false;
+  listbox.innerHTML = '<div role="option">India</div>';
+  await new Promise(resolve => setTimeout(resolve, 450));
+  assert.equal(messages.some(message => message.type === 'JOB_APP_NAVIGATED'), false);
+  document.__jobApplicationDiscovering = false;
+  dom.window.close();
+});
+
 test('bundled inline suggestions approve through the live listener once and stay out of page inspection and capture', async () => {
   const bundle = await readFile(new URL('../dist/content.js', import.meta.url), 'utf8');
   const dom = new JSDOM('<form aria-label="Job application"><label>Name<input id="name"></label><label>Existing answer<textarea id="existing">Kept page answer</textarea></label></form>', {url: 'https://jobs.example.com/apply', pretendToBeVisual: true});
@@ -97,6 +152,7 @@ test('bundled inline suggestions approve through the live listener once and stay
     sendMessage: async message => {
       messages.push(message);
       if (message.type === 'JOB_INLINE_ACCEPT') return new Promise(() => {});
+      if (message.type === 'JOB_APP_SITE_STATUS') return {ok: true, enabled: true, supported: true};
       return {ok: true, sessionId: 's1', requestId: message.requestId, candidates: [{candidateId: 'c1', answer: 'Ada', sourceQuestion: 'Name', requiresApproval: true}]};
     }, onMessage: {addListener: listener => listeners.push(listener)},
   }}});
@@ -145,7 +201,7 @@ test('content rejects stale document and region identities without changing a fi
   const dom = new JSDOM('<form><label>Full name<input id="name"></label><button>Next</button></form>', {url: 'https://jobs.example.com/apply'});
   const listeners = [];
   const context = createContext({document: dom.window.document, setTimeout, clearTimeout, console, chrome: {runtime: {
-    sendMessage: async () => ({}), onMessage: {addListener: listener => listeners.push(listener)},
+    sendMessage: async message => message.type === 'JOB_APP_SITE_STATUS' ? {ok: true, enabled: true, supported: true} : {}, onMessage: {addListener: listener => listeners.push(listener)},
   }}});
   new Script(bundle).runInContext(context);
   const dispatch = message => new Promise(resolve => listeners[0](message, {}, resolve));
@@ -169,7 +225,7 @@ test('ambiguous forms expose only the focused control to inline suggestions and 
   const dom = new JSDOM('<form><label>Full name<input id="one"></label></form><form><label>Full name<input id="two"></label></form>', {url: 'https://jobs.example.com/apply'});
   const listeners = [];
   const context = createContext({document: dom.window.document, setTimeout, clearTimeout, console, chrome: {runtime: {
-    sendMessage: async () => ({}), onMessage: {addListener: listener => listeners.push(listener)},
+    sendMessage: async message => message.type === 'JOB_APP_SITE_STATUS' ? {ok: true, enabled: true, supported: true} : {}, onMessage: {addListener: listener => listeners.push(listener)},
   }}});
   new Script(bundle).runInContext(context);
   const dispatch = message => new Promise(resolve => listeners[0](message, {}, resolve));
@@ -204,7 +260,7 @@ test('armed form selection accepts a custom combobox without a native descriptor
     return addListener(type, callback, options);
   };
   const context = createContext({document, setTimeout, clearTimeout, console, chrome: {runtime: {
-    sendMessage: async message => {sent.push(message); return {};}, onMessage: {addListener: listener => listeners.push(listener)},
+    sendMessage: async message => {sent.push(message); return message.type === 'JOB_APP_SITE_STATUS' ? {ok: true, enabled: true, supported: true} : {};}, onMessage: {addListener: listener => listeners.push(listener)},
   }}});
   new Script(bundle).runInContext(context);
   const dispatch = message => new Promise(resolve => listeners[0](message, {}, resolve));
@@ -236,4 +292,59 @@ test('synchronous invalidation during startup is caught without changing page va
   await new Promise(resolve => setTimeout(resolve, 0));
   assert.equal(dom.window.document.querySelector('input').value, 'Unsaved name');
   dom.window.close();
+});
+
+
+test('active content reports structural application changes but ignores ordinary value edits', async () => {
+  const bundle = await readFile(new URL('../dist/content.js', import.meta.url), 'utf8');
+  const dom = new JSDOM('<form aria-label="Job application"><label>Email<input id="email"></label><button type="button">Next</button></form>', {url:'https://jobs.example.com/apply'});
+  const sent = [];
+  const listeners = [];
+  const context = createContext({document:dom.window.document, setTimeout, clearTimeout, console, chrome:{runtime:{
+    onMessage:{addListener:listener=>listeners.push(listener)},
+    sendMessage:async message=>{sent.push(message);return message.type==='JOB_APP_SITE_STATUS' ? {ok:true,enabled:true} : {ok:true};},
+  }}});
+  new Script(bundle).runInContext(context);
+  await new Promise(resolve=>setTimeout(resolve, 30));
+  sent.length = 0;
+  const input = dom.window.document.querySelector('input');
+  input.value = 'kept@example.com';
+  input.dispatchEvent(new dom.window.Event('input', {bubbles:true}));
+  await new Promise(resolve=>setTimeout(resolve, 450));
+  assert.equal(sent.filter(m=>m.type==='JOB_APP_NAVIGATED').length, 0);
+  dom.window.document.querySelector('form').innerHTML = '<label>LinkedIn<input id="linkedin"></label><button type="button">Next</button>';
+  await new Promise(resolve=>setTimeout(resolve, 700));
+  assert.equal(sent.filter(m=>m.type==='JOB_APP_NAVIGATED').length, 1);
+  await new Promise(resolve=>listeners[0]({type:'JOB_APP_SITE_STATE_CHANGED', enabled:false}, {}, resolve));
+  dom.window.document.querySelector('form').innerHTML = '<label>City<input id="city"></label>';
+  await new Promise(resolve=>setTimeout(resolve, 450));
+  assert.equal(sent.filter(m=>m.type==='JOB_APP_NAVIGATED').length, 1);
+  dom.window.close();
+});
+
+
+test('content detects shadow-root steps and labels changed through existing text nodes', async () => {
+  const bundle = await readFile(new URL('../dist/content.js', import.meta.url), 'utf8');
+  const dom = new JSDOM('<div id="app"></div>', {url:'https://jobs.example.com/apply'});
+  const root = dom.window.document.querySelector('#app').attachShadow({mode:'open'});
+  root.innerHTML = '<form aria-label="Job application"><label>Email<input id="answer"></label><button type="button">Next</button></form>';
+  const sent = [], listeners = [];
+  const context = createContext({document:dom.window.document,setTimeout,clearTimeout,console,chrome:{runtime:{
+    onMessage:{addListener:listener=>listeners.push(listener)},
+    sendMessage:async message=>{sent.push(message);return message.type==='JOB_APP_SITE_STATUS' ? {ok:true,enabled:true} : {ok:true};},
+  }}});
+  try {
+    new Script(bundle).runInContext(context);
+    await new Promise(resolve=>setTimeout(resolve,30));
+    sent.length = 0;
+    root.querySelector('form').innerHTML = '<label>LinkedIn<input id="linkedin"></label><button type="button">Next</button>';
+    await new Promise(resolve=>setTimeout(resolve,700));
+    assert.equal(sent.filter(m=>m.type==='JOB_APP_NAVIGATED').length,1);
+    root.querySelector('label').firstChild.data = 'Portfolio';
+    await new Promise(resolve=>setTimeout(resolve,700));
+    assert.equal(sent.filter(m=>m.type==='JOB_APP_NAVIGATED').length,2);
+  } finally {
+    await new Promise(resolve=>listeners[0]({type:'JOB_APP_SITE_STATE_CHANGED',enabled:false},{},resolve));
+    dom.window.close();
+  }
 });
